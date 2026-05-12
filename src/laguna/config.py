@@ -42,12 +42,16 @@ class Config:
                 "protocol": "modbus",
                 "timeout": 5.0,
             },
+            # Legacy single-camera config — still supported for backwards compatibility.
+            # Prefer the 'cameras' list for new experiments.
             "camera": {
                 "device_id": 0,
                 "fps": 30,
                 "resolution": (1920, 1080),
                 "capture_format": "BGR",
             },
+            # List of camera configs (local or network).  Takes precedence over 'camera'.
+            "cameras": [],
             "hydraulics": {
                 "port": "/dev/ttyUSB1",
                 "baudrate": 9600,
@@ -60,6 +64,10 @@ class Config:
             "storage": {
                 "enabled": False,
                 "type": "local",  # local, s3, sftp
+            },
+            "timing": {
+                "checkpoint_file": "./experiment_checkpoint.json",
+                "event_log": "./experiment_events.csv",
             },
         }
     

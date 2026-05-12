@@ -7,14 +7,36 @@ robot:
   protocol: "modbus"            # or "ascii"
   timeout: 5.0
 
+# Camera list — supports local (USB/CSI) and network (Pi) cameras.
+# 'cameras' takes precedence over the legacy 'camera' key below.
+cameras:
+  - name: pi_array
+    type: network
+    hosts:
+      - antares.laguna
+      - sirius.laguna
+    ssh_user: pi
+    ssh_key: ~/.ssh/id_rsa
+    # ssh_passphrase is read from ~/.config/laguna/ssh_passphrase at runtime
+    lead_time: 5.0
+    output_dir: ./captures
+
+  # Uncomment to add a local USB camera alongside the Pi array:
+  # - name: side_view
+  #   type: local
+  #   device_id: 0
+  #   fps: 30
+  #   resolution: [1920, 1080]
+
+# Legacy single-camera config — still accepted if 'cameras' list is empty.
 camera:
-  device_id: 0                  # Camera device number
-  fps: 30                       # Frames per second
-  resolution: [1920, 1080]      # Width, Height
-  capture_format: "BGR"         # BGR, RGB, or GRAY
+  device_id: 0
+  fps: 30
+  resolution: [1920, 1080]
+  capture_format: "BGR"
 
 hydraulics:
-  port: "/dev/ttyUSB1"          # Serial port for hydraulics
+  port: "/dev/ttyUSB1"
   baudrate: 9600
   poll_interval: 0.1            # Seconds between status polls
 
@@ -29,10 +51,14 @@ storage:
   # bucket: "my-bucket"
   # region: "us-east-1"
   # credentials: "~/.aws/credentials"
-  
+
   # For SFTP:
   # host: "remote.server.edu"
   # port: 22
   # username: "labuser"
   # key_file: "~/.ssh/id_rsa"
   # remote_path: "/data/experiments"
+
+timing:
+  checkpoint_file: "./experiment_checkpoint.json"
+  event_log: "./experiment_events.csv"
