@@ -15,8 +15,8 @@ cameras:
     hosts:
       - antares.laguna
       - sirius.laguna
-    ssh_user: pi
-    ssh_key: ~/.ssh/id_rsa
+    ssh_user: ucrs
+    ssh_key: /home/eric/.ssh/id_ed25519
     # ssh_passphrase is read from ~/.config/laguna/ssh_passphrase at runtime
     lead_time: 5.0
     output_dir: ./captures

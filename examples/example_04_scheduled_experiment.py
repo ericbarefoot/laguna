@@ -22,8 +22,8 @@ from laguna import FlumeLab, CheckpointStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-CAPTURE_TIMES = [30, 60, 120, 180, 240, 300]   # runtime seconds
-EXPERIMENT_DURATION = 310                         # seconds
+CAPTURE_TIMES = [10, 20, 30, 40, 50, 60]   # runtime seconds
+EXPERIMENT_DURATION = 75                         # seconds
 CHECKPOINT_FILE = "./experiment_checkpoint.json"
 
 

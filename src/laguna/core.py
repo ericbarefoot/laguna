@@ -51,6 +51,8 @@ class FlumeLab:
 
         # Camera subsystem — prefer the 'cameras' list; fall back to legacy 'camera' dict.
         camera_configs = self.config.get("cameras") or []
+        if isinstance(camera_configs, dict):
+            camera_configs = [camera_configs]
         if not camera_configs:
             legacy = dict(self.config.get("camera"))
             legacy.setdefault("type", "local")
