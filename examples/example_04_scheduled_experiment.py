@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 
 from laguna import FlumeLab, CheckpointStore
+from laguna.camera import CameraManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -26,9 +27,23 @@ CAPTURE_TIMES = [10, 20, 30, 40, 50, 60]   # runtime seconds
 EXPERIMENT_DURATION = 75                         # seconds
 CHECKPOINT_FILE = "./experiment_checkpoint.json"
 
+# Camera configs: a networked Pi array.  Edit hosts/paths for your setup.
+CAMERA_CONFIGS = [
+    {
+        "name": "pi_array",
+        "type": "network",
+        "hosts": ["antares.laguna", "sirius.laguna"],
+        "ssh_user": "pi",
+        "ssh_key": "~/.ssh/id_rsa",
+        "lead_time": 5.0,
+        "output_dir": "./captures",
+    }
+]
+
 
 def main(resume: bool) -> None:
     lab = FlumeLab("config/example_config.yaml")
+    lab.add(CameraManager(CAMERA_CONFIGS))
 
     if not lab.connect_all():
         logging.error("Could not connect all subsystems — aborting.")

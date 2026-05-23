@@ -49,6 +49,8 @@ class CameraManager:
     local frames, returning a flat list of CaptureResult objects.
     """
 
+    subsystem_name = "cameras"
+
     def __init__(self, configs: List[Dict[str, Any]]) -> None:
         self._network: List[CameraArray] = []
         self._local: List[LocalCamera] = []
@@ -175,3 +177,20 @@ class CameraManager:
 
     def get_frame_count(self) -> int:
         return sum(c.get_frame_count() for c in self._local)
+
+    def get_status(self) -> dict:
+        """Return a status snapshot for this subsystem.
+
+        Returns:
+            dict with at minimum 'subsystem' and 'num_cameras', plus
+            counts of network vs local cameras, recording state, and
+            total frames captured so far.
+        """
+        return {
+            "subsystem": self.subsystem_name,
+            "num_cameras": len(self._network) + len(self._local),
+            "num_network_arrays": len(self._network),
+            "num_local_cameras": len(self._local),
+            "is_recording": self.is_recording,
+            "frames_captured": self.get_frame_count(),
+        }

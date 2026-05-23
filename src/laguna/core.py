@@ -1,16 +1,10 @@
 """Core orchestrator module that combines all subsystems."""
 
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 import logging
 
 from .config import Config
-from .robot import RobotController
-from .camera import CameraAcquisition, CameraManager
-from .hydraulics import HydraulicsSystem
-from .data import DataProcessor
-from .storage import RemoteStorage
 from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
 
 logging.basicConfig(
@@ -23,19 +17,21 @@ logger = logging.getLogger(__name__)
 class FlumeLab:
     """Main orchestrator for the flume lab robotic system.
 
-    Coordinates all subsystems (robot, cameras, hydraulics, data processing,
-    storage, timing) and provides a unified interface for running experiments.
+    Creates a timing backbone immediately; hardware subsystems are registered
+    explicitly via ``lab.add(subsystem)``.
+
+    Example::
+
+        lab = FlumeLab("config.yaml")
+        lab.add(CameraManager(configs)).add(RobotController(cfg))
+        lab.connect_all()
+        with lab.experiment() as clock:
+            lab.scheduler.run(duration=300)
 
     Attributes:
-        robot:          Robot control subsystem
-        cameras:        Camera manager (local + networked Pi arrays)
-        camera:         Backwards-compatibility alias for cameras
-        hydraulics:     Hydraulics control subsystem
-        data_processor: Data processing subsystem
-        storage:        Remote storage subsystem
-        clock:          Experiment clock (wall time + runtime)
-        scheduler:      Action scheduler tied to the experiment clock
-        event_log:      Append-only CSV event log
+        clock:      Experiment clock (wall time + runtime)
+        scheduler:  Action scheduler tied to the experiment clock
+        event_log:  Append-only CSV event log
     """
 
     def __init__(self, config_file: Optional[str] = None) -> None:
@@ -43,40 +39,57 @@ class FlumeLab:
 
         self.config = Config(config_file=config_file)
 
-        # Core hardware subsystems
-        self.robot = RobotController(self.config.get("robot"))
-        self.hydraulics = HydraulicsSystem(self.config.get("hydraulics"))
-        self.data_processor = DataProcessor(self.config.get("data"))
-        self.storage = RemoteStorage(self.config.get("storage"))
-
-        # Camera subsystem — prefer the 'cameras' list; fall back to legacy 'camera' dict.
-        camera_configs = self.config.get("cameras") or []
-        if isinstance(camera_configs, dict):
-            camera_configs = [camera_configs]
-        if not camera_configs:
-            legacy = dict(self.config.get("camera"))
-            legacy.setdefault("type", "local")
-            legacy.setdefault("name", "default")
-            camera_configs = [legacy]
-        self.cameras = CameraManager(camera_configs)
-        self.camera = self.cameras  # backwards-compat alias
-
-        # Timing subsystem
+        # Timing subsystem — always present
         self.clock = ExperimentClock()
         self.event_log = EventLog(
             self.config.get_value("timing.event_log", "./experiment_events.csv")
         )
         self.scheduler = Scheduler(clock=self.clock, event_log=self.event_log)
 
+        # Registry for opt-in hardware subsystems
+        self._subsystems: Dict[str, Any] = {}
+
         self.is_running = False
-        logger.info("FlumeLab system initialized successfully")
+        logger.info("FlumeLab timing backbone ready — add subsystems via lab.add()")
+
+    # ------------------------------------------------------------------
+    # Opt-in subsystem registration
+    # ------------------------------------------------------------------
+
+    def add(self, subsystem: Any) -> "FlumeLab":
+        """Register a hardware subsystem by its ``subsystem_name`` attribute.
+
+        The subsystem is stored both in ``self._subsystems`` (keyed by name)
+        and as a direct attribute (``self.<subsystem_name>``), making
+        ``lab.cameras``, ``lab.robot``, etc. work naturally.
+
+        Args:
+            subsystem: Any object with a ``subsystem_name`` class or instance
+                       attribute (e.g. CameraManager, RobotController).
+
+        Returns:
+            self — so calls can be chained: ``lab.add(cam).add(robot)``
+        """
+        name = getattr(subsystem, "subsystem_name", None)
+        if not name:
+            raise ValueError(
+                f"{type(subsystem).__name__} has no 'subsystem_name' attribute; "
+                "cannot register as a FlumeLab subsystem."
+            )
+        self._subsystems[name] = subsystem
+        setattr(self, name, subsystem)
+        logger.info("Registered subsystem '%s' (%s)", name, type(subsystem).__name__)
+        return self
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def connect_all(self) -> bool:
-        """Establish connections to all subsystems.
+        """Establish connections to all registered subsystems.
+
+        Calls ``connect()`` or ``start()`` on each subsystem if the method
+        exists, and collects failures.
 
         Returns:
             True if all connections successful, False if any failed.
@@ -84,33 +97,26 @@ class FlumeLab:
         logger.info("Connecting to all subsystems...")
         ok = True
 
-        if not self.robot.connect():
-            logger.warning("Failed to connect robot")
-            ok = False
-
-        if not self.cameras.start():
-            logger.warning("Failed to start cameras")
-            ok = False
-
-        if not self.hydraulics.connect():
-            logger.warning("Failed to connect hydraulics")
-            ok = False
-
-        if not self.storage.connect():
-            logger.warning("Failed to connect remote storage")
-            ok = False
+        for name, subsystem in self._subsystems.items():
+            # Prefer connect(); fall back to start() for camera-style APIs.
+            connector = getattr(subsystem, "connect", None) or getattr(subsystem, "start", None)
+            if connector is None:
+                continue
+            if not connector():
+                logger.warning("Failed to connect subsystem '%s'", name)
+                ok = False
 
         if ok:
             logger.info("All subsystems connected successfully")
         return ok
 
     def disconnect_all(self) -> None:
-        """Disconnect all subsystems."""
+        """Disconnect all registered subsystems."""
         logger.info("Disconnecting all subsystems...")
-        self.robot.disconnect()
-        self.cameras.stop()
-        self.hydraulics.disconnect()
-        self.storage.disconnect()
+        for name, subsystem in self._subsystems.items():
+            disconnector = getattr(subsystem, "disconnect", None) or getattr(subsystem, "stop", None)
+            if disconnector:
+                disconnector()
         self.is_running = False
         logger.info("All subsystems disconnected")
 
@@ -160,108 +166,18 @@ class FlumeLab:
             self.event_log.close()
 
     # ------------------------------------------------------------------
-    # High-level experiment helpers
-    # ------------------------------------------------------------------
-
-    def initialize_experiment(
-        self, experiment_config: Optional[Dict[str, Any]] = None
-    ) -> bool:
-        """Perform startup procedures (home robot, set pressure, etc.).
-
-        Args:
-            experiment_config: Optional experiment-specific overrides.
-
-        Returns:
-            True if initialization succeeded.
-        """
-        logger.info("Initializing experiment...")
-        try:
-            if not self.robot.home():
-                logger.error("Failed to home robot")
-                return False
-
-            if experiment_config and "hydraulics" in experiment_config:
-                pressure = experiment_config["hydraulics"].get("pressure_target")
-                if pressure:
-                    self.hydraulics.set_pressure(pressure)
-
-            if not self.hydraulics.start():
-                logger.error("Failed to start hydraulics")
-                return False
-
-            self.data_processor.clear_buffer()
-            self.is_running = True
-            logger.info("Experiment initialized successfully")
-            return True
-        except Exception as exc:
-            logger.error("Experiment initialization failed: %s", exc)
-            return False
-
-    def run_experiment(
-        self, experiment_config: Optional[Dict[str, Any]] = None
-    ) -> bool:
-        """Run a full experiment: connect, initialize, execute, clean up.
-
-        Args:
-            experiment_config: Dictionary with experiment parameters.
-
-        Returns:
-            True if experiment completed successfully.
-        """
-        logger.info("Starting experiment...")
-        try:
-            if not self.connect_all():
-                logger.error("Failed to connect to all systems")
-                return False
-
-            if not self.initialize_experiment(experiment_config):
-                logger.error("Failed to initialize experiment")
-                self.disconnect_all()
-                return False
-
-            # TODO: Implement main experiment loop using scheduler + clock.
-            logger.info("Experiment completed successfully")
-
-            self.data_processor.save_data("experiment_data.csv")
-
-            if self.storage.enabled:
-                output_path = self.data_processor.output_directory / "experiment_data.csv"
-                self.storage.upload_file(str(output_path), "experiments/experiment_data.csv")
-
-            return True
-        except Exception as exc:
-            logger.error("Experiment failed: %s", exc)
-            return False
-        finally:
-            self.disconnect_all()
-
-    # ------------------------------------------------------------------
     # Status / safety
     # ------------------------------------------------------------------
 
     def get_system_status(self) -> Dict[str, Any]:
-        """Return a snapshot of all subsystem states."""
+        """Return a snapshot of all subsystem states.
+
+        Each registered subsystem is queried via ``get_status()`` if available;
+        otherwise a minimal ``{'registered': True}`` placeholder is used.
+        The timing backbone is always included.
+        """
         wall, runtime = self.clock.now()
-        return {
-            "robot": {
-                "connected": self.robot.is_connected,
-                "position": self.robot.get_position(),
-            },
-            "cameras": {
-                "recording": self.cameras.is_recording,
-                "frames_captured": self.cameras.get_frame_count(),
-            },
-            "hydraulics": {
-                "active": self.hydraulics.is_active,
-                "status": self.hydraulics.get_status(),
-            },
-            "data": {
-                "buffer_size": self.data_processor.get_buffer_size(),
-            },
-            "storage": {
-                "enabled": self.storage.enabled,
-                "connected": self.storage.is_connected,
-            },
+        status: Dict[str, Any] = {
             "timing": {
                 "clock_running": self.clock.is_running,
                 "clock_paused": self.clock.is_paused,
@@ -269,13 +185,18 @@ class FlumeLab:
                 "wall_time": wall,
             },
         }
+        for name, subsystem in self._subsystems.items():
+            getter = getattr(subsystem, "get_status", None)
+            status[name] = getter() if getter else {"registered": True}
+        return status
 
     def emergency_stop(self) -> None:
-        """Emergency stop — immediately shut down all systems."""
+        """Emergency stop — immediately shut down all registered systems."""
         logger.warning("EMERGENCY STOP activated!")
-        self.robot.stop()
-        self.hydraulics.stop()
-        self.cameras.stop()
+        for subsystem in self._subsystems.values():
+            stopper = getattr(subsystem, "stop", None) or getattr(subsystem, "disconnect", None)
+            if stopper:
+                stopper()
         if self.clock.is_running and not self.clock.is_paused:
             self.clock.pause()
         self.disconnect_all()
