@@ -1,5 +1,13 @@
 """Hydraulics system control and monitoring subsystem."""
 
+import warnings
+
+warnings.warn(
+    "laguna.hydraulics is deprecated. Use laguna.weir, laguna.flow, and laguna.gauge instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 from typing import Optional, Dict, Any
 import logging
 
