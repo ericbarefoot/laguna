@@ -69,3 +69,6 @@ data/raw/
 data/processed/
 logs/
 *.log
+.claude/
+sandbox/
+experiment_events.csv
