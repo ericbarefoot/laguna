@@ -1,107 +1,77 @@
 """
 Example 3: Manual subsystem control
 
-This example demonstrates how to control individual subsystems
-without going through the main experiment workflow. Useful for:
-- Testing individual components
-- Calibration procedures
-- Troubleshooting
+Demonstrates controlling weir, flow, and gauge individually — useful for
+calibration, testing, or troubleshooting outside a full experiment run.
 """
 
 from laguna import FlumeLab
+from laguna.weir import SaflWeirController
+from laguna.flow import SaflFlowController
+from laguna.gauge import SaflWaterLevelSensor
 
 
-def test_robot():
-    """Test robot control independently."""
-    print("=== Testing Robot ===")
-    
+def test_weir():
+    print("=== Testing Weir ===")
     lab = FlumeLab()
-    
-    # Connect only the robot
-    if not lab.robot.connect():
-        print("Failed to connect to robot")
+    lab.add(SaflWeirController(lab.config.get("weir")))
+
+    if not lab.weir.connect():
+        print("Failed to connect to weir controller")
         return
-    
-    # Home the robot
-    print("Homing robot...")
-    lab.robot.home()
-    
-    # Move to a position
-    print("Moving to position (100, 100, 50)...")
-    lab.robot.move_to((100, 100, 50), speed=0.5)
-    
-    # Get current position
-    pos = lab.robot.get_position()
-    print(f"Current position: {pos}")
-    
-    # Return home and disconnect
-    lab.robot.home()
-    lab.robot.disconnect()
+
+    print("Homing weir...")
+    lab.weir.home()
+
+    print("Moving to 200 mm...")
+    lab.weir.set_elevation(200.0)
+
+    print(f"Weir status: {lab.weir.get_status()}")
+    lab.weir.disconnect()
     print("Done!\n")
 
 
-def test_camera():
-    """Test camera independently."""
-    print("=== Testing Camera ===")
-    
+def test_flow():
+    print("=== Testing Flow ===")
     lab = FlumeLab()
-    
-    # Start camera
-    if not lab.camera.start():
-        print("Failed to start camera")
+    lab.add(SaflFlowController(lab.config.get("flow")))
+
+    if not lab.flow.connect():
+        print("Failed to connect to flow controller")
         return
-    
-    print("Capturing 10 frames...")
-    for i in range(10):
-        frame = lab.camera.get_frame()
-        if frame is not None:
-            print(f"  Frame {i+1} captured")
-    
-    # Stop camera
-    total_frames = lab.camera.get_frame_count()
-    lab.camera.stop()
-    print(f"Total frames captured: {total_frames}")
+
+    lab.flow.qin = True
+    lab.flow.start()
+    lab.flow.set_flowrate(15.0)   # L/min
+
+    print(f"Flow status: {lab.flow.get_status()}")
+
+    lab.flow.stop()
+    lab.flow.disconnect()
     print("Done!\n")
 
 
-def test_hydraulics():
-    """Test hydraulics independently."""
-    print("=== Testing Hydraulics ===")
-    
+def test_gauge():
+    print("=== Testing Gauge ===")
     lab = FlumeLab()
-    
-    # Connect to hydraulics
-    if not lab.hydraulics.connect():
-        print("Failed to connect to hydraulics")
+    lab.add(SaflWaterLevelSensor(lab.config.get("gauge")))
+
+    if not lab.gauge.connect():
+        print("Failed to connect to gauge sensor")
         return
-    
-    # Start system
-    if not lab.hydraulics.start():
-        print("Failed to start hydraulics")
-        return
-    
-    # Set pressure
-    print("Setting pressure to 2000 Pa...")
-    lab.hydraulics.set_pressure(2000)
-    
-    # Get status
-    import time
-    time.sleep(1)  # Wait for system to settle
-    
-    status = lab.hydraulics.get_status()
-    print(f"Hydraulics status: {status}")
-    
-    # Stop and disconnect
-    lab.hydraulics.stop()
-    lab.hydraulics.disconnect()
+
+    elevation = lab.gauge.read_mm()
+    print(f"Water surface elevation: {elevation:.1f} mm")
+    print(f"Gauge status: {lab.gauge.get_status()}")
+
+    lab.gauge.disconnect()
     print("Done!\n")
 
 
 def main():
-    """Run all subsystem tests."""
-    test_robot()
-    test_camera()
-    test_hydraulics()
+    test_weir()
+    test_flow()
+    test_gauge()
 
 
 if __name__ == "__main__":

@@ -15,7 +15,9 @@ class TestConfig:
         
         assert "robot" in config.config_dict
         assert "camera" in config.config_dict
-        assert "hydraulics" in config.config_dict
+        assert "weir" in config.config_dict
+        assert "gauge" in config.config_dict
+        assert "flow" in config.config_dict
         assert "data" in config.config_dict
         assert "storage" in config.config_dict
     
