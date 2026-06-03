@@ -77,8 +77,10 @@ class CameraArray:
         sftp.close()
 
     def _log(self, hostname: str, msg: str) -> None:
-        ts = time.strftime("%H:%M:%S")
-        print(f"  [{hostname} {ts}] {msg}", flush=True)
+        now = time.time()
+        utc = time.strftime("%H:%M:%SZ", time.gmtime(now))
+        local = time.strftime("%H:%M:%S", time.localtime(now))
+        print(f"  [{hostname} {utc}/{local}] {msg}", flush=True)
 
     def _run_capture_on_host(
         self, hostname: str, target_time: float, timeout: float = 60.0
