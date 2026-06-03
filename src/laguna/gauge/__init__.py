@@ -23,7 +23,7 @@ class WaterLevelSensor(ABC):
 
     @abstractmethod
     def read_mm(self) -> float:
-        """Return water surface elevation in mm."""
+        """Return water surface elevation in mm (instantaneous reading)."""
         ...
 
     @abstractmethod
@@ -62,10 +62,19 @@ class SaflWaterLevelSensor(WaterLevelSensor):
         self._is_connected = False
 
     def read_mm(self) -> float:
+        """Read and return instantaneous water surface elevation in mm."""
         result = self._sensor.read()
         self._last_read = result
-        # Distance decreases as water rises, so elevation = offset - distance_cm * 10
+        # Distance decreases as water rises: elevation = offset - distance_cm * 10
         return self._offset_mm - result["distance_cm"] * 10.0
+
+    def read_mm_smoothed(self) -> float:
+        """Read and return elevation using the sensor's built-in FIFO moving average."""
+        self._sensor.read()
+        avg_list = getattr(self._sensor, "dist_cm_array_moving_avg", [])
+        if avg_list:
+            return self._offset_mm - avg_list[0] * 10.0
+        return float("nan")
 
     def get_status(self) -> Dict[str, Any]:
         elevation_mm = None

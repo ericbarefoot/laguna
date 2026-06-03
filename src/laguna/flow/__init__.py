@@ -40,6 +40,9 @@ class FlowController(ABC):
     @abstractmethod
     def stop(self) -> bool: ...
 
+    @abstractmethod
+    def clear_faults(self) -> bool: ...
+
     @property
     @abstractmethod
     def qin(self) -> bool: ...
@@ -61,7 +64,7 @@ class FlowController(ABC):
 
 
 class SaflFlowController(FlowController):
-    """Flow controller backed by a VFD pump and Teknic motor for solenoid IO.
+    """Flow controller backed by a Fuji VFD pump and Teknic motor for solenoid IO.
 
     NOTE: In production, the TeknicMotor instance should be shared with
     SaflWeirController rather than creating a separate connection to the same
@@ -123,6 +126,9 @@ class SaflFlowController(FlowController):
     def stop(self) -> bool:
         return self._vfd.stop()
 
+    def clear_faults(self) -> bool:
+        return self._vfd.clear_faults()
+
     @property
     def qin(self) -> bool:
         return self._qin_state
@@ -142,9 +148,16 @@ class SaflFlowController(FlowController):
         self._qaux_state = state
 
     def get_status(self) -> Dict[str, Any]:
-        return {
+        status: Dict[str, Any] = {
             "is_connected": self._is_connected,
             "flowrate_lpm": self._current_flowrate,
             "qin_open": self._qin_state,
             "qaux_open": self._qaux_state,
         }
+        if self._is_connected and self._vfd is not None:
+            vfd_state = self._vfd.poll_state()
+            status["vfd_state"] = vfd_state.get("state_message")
+            status["vfd_estop"] = vfd_state.get("e_stop")
+            self._vfd.poll_setpoint()
+            status["vfd_setpoint_hz"] = getattr(self._vfd, "setpoint", None)
+        return status

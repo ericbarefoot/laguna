@@ -32,6 +32,29 @@ class WeirController(ABC):
         ...
 
     @abstractmethod
+    def set_velocity(self, mm_per_sec: float) -> None:
+        """Set motor move speed in mm/s (applies to the next set_elevation call)."""
+        ...
+
+    @abstractmethod
+    def enable(self) -> None:
+        """Enable motor drive."""
+        ...
+
+    @abstractmethod
+    def disable(self) -> None:
+        """Disable motor drive (allows manual repositioning)."""
+        ...
+
+    @abstractmethod
+    def wait_for_move(self, timeout: float = 30.0) -> None:
+        """Block until the current move completes or timeout elapses."""
+        ...
+
+    @abstractmethod
+    def clear_faults(self) -> bool: ...
+
+    @abstractmethod
     def home(self) -> bool: ...
 
     @abstractmethod
@@ -42,7 +65,7 @@ class WeirController(ABC):
 
 
 class SaflWeirController(WeirController):
-    """Weir controller backed by a Teknic stepper motor."""
+    """Weir controller backed by a Teknic ClearCore stepper motor."""
 
     def __init__(self, config: Dict[str, Any]):
         self._port = config.get("port", "/dev/ttyUSB0")
@@ -78,6 +101,22 @@ class SaflWeirController(WeirController):
     def get_elevation(self) -> float:
         return self._motor.get_position() / self.steps_per_mm + self.home_offset_mm
 
+    def set_velocity(self, mm_per_sec: float) -> None:
+        self._motor.set_velocity(mm_per_sec * self.steps_per_mm)
+
+    def enable(self) -> None:
+        self._motor.enable()
+
+    def disable(self) -> None:
+        self._motor.disable()
+
+    def wait_for_move(self, timeout: float = 30.0) -> None:
+        self._motor.wait_for_HLFB(timeout)
+
+    def clear_faults(self) -> bool:
+        self._motor.clear_faults()
+        return True
+
     def home(self) -> bool:
         return self._motor.home()
 
@@ -85,7 +124,10 @@ class SaflWeirController(WeirController):
         self._motor.stop()
 
     def get_status(self) -> Dict[str, Any]:
-        raw_steps = self._motor.get_position() if self._is_connected else None
+        if not self._is_connected:
+            return {"is_connected": False, "elevation_mm": None, "raw_steps": None}
+        motor_status = self._motor.poll_status()
+        raw_steps = motor_status.get("position")
         elevation_mm = (
             raw_steps / self.steps_per_mm + self.home_offset_mm
             if raw_steps is not None
@@ -95,4 +137,5 @@ class SaflWeirController(WeirController):
             "is_connected": self._is_connected,
             "elevation_mm": elevation_mm,
             "raw_steps": raw_steps,
+            "motor": motor_status,
         }
