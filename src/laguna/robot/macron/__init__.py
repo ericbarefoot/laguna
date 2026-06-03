@@ -9,7 +9,7 @@ from .connection import (
     find_rs232_port,
     assert_controller_present,
 )
-from .commands import MMCCommands, Axis, AxisState, GroupState, IOMap
+from .commands import MMCCommands, Axis, AxisState, GroupState, IOMap, X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS, ALL_AXES
 from .homing import HomingConfig, HomingResult, HomingProcedure, AxisHomingConfig
 from .fences import (
     BoxFence,
@@ -36,6 +36,11 @@ __all__ = [
     "AxisState",
     "GroupState",
     "IOMap",
+    "X_AXIS",
+    "Y_AXIS",
+    "Z_AXIS",
+    "THETA_AXIS",
+    "ALL_AXES",
     # homing
     "AxisHomingConfig",
     "HomingConfig",

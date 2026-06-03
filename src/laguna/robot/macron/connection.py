@@ -71,6 +71,10 @@ class EthernetConnection(SnapConnection):
         port: int = DEFAULT_TCP_PORT,
         timeout: float = DEFAULT_TIMEOUT,
     ):
+        if not host:
+            raise ValueError("host must be a non-empty string")
+        if not (1 <= port <= 65535):
+            raise ValueError(f"port must be 1–65535, got {port!r}")
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -134,6 +138,11 @@ class RS232Connection(SnapConnection):
         baudrate: int = DEFAULT_BAUDRATE,
         timeout: float = DEFAULT_TIMEOUT,
     ):
+        if not port:
+            raise ValueError(
+                "port must be a non-empty string (e.g. '/dev/ttyUSB0'). "
+                "Use find_rs232_port() to discover the correct port automatically."
+            )
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
