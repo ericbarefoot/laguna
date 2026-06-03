@@ -61,10 +61,18 @@ Laguna uses a **modular subsystem architecture** where each major hardware/funct
 - Methods: `start()`, `stop()`, `get_frame()`, `start_recording()`, `stop_recording()`
 - Handles frame format conversion and optional compression
 
-### `src/laguna/hydraulics/`
-- `HydraulicsSystem`: Pressure and flow control
-- Methods: `connect()`, `disconnect()`, `start()`, `stop()`, `set_pressure()`, `get_pressure()`, `get_flow_rate()`, `get_status()`
-- Serial communication for sensor/actuator control
+### `src/laguna/weir/`
+- `WeirController` (ABC) / `SaflWeirController`: Tailgate elevation via Teknic ClearCore stepper motor
+- Methods: `connect()`, `disconnect()`, `set_elevation(mm)`, `get_elevation()`, `set_velocity(mm_per_sec)`, `enable()`, `disable()`, `wait_for_move(timeout)`, `home()`, `stop()`, `clear_faults()`, `get_status()`
+
+### `src/laguna/flow/`
+- `FlowController` (ABC) / `SaflFlowController`: Pump flow via Fuji VFD, solenoid valves via motor IO pins
+- Methods: `connect()`, `disconnect()`, `set_flowrate(lpm)`, `get_flowrate()`, `start()`, `stop()`, `clear_faults()`, `get_status()`
+- Properties: `qin`, `qaux` (solenoid open/close)
+
+### `src/laguna/gauge/`
+- `WaterLevelSensor` (ABC) / `SaflWaterLevelSensor`: Water surface elevation via Massa ultrasonic sensor
+- Methods: `connect()`, `disconnect()`, `read_mm()`, `read_mm_smoothed()`, `get_status()`
 
 ### `src/laguna/data/`
 - `DataProcessor`: Data aggregation, processing, and packaging
