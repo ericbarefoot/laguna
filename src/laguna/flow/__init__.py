@@ -110,10 +110,9 @@ class SaflFlowController(FlowController):
         self._is_connected = False
 
     def set_flowrate(self, lpm: float) -> bool:
-        result = self._vfd.set_freq_from_flowrate(lpm, self.C0, self.C1, self.C2)
-        if result:
-            self._current_flowrate = lpm
-        return result
+        self._vfd.set_freq_from_flowrate(lpm, self.C0, self.C1, self.C2)
+        self._current_flowrate = lpm
+        return True
 
     def get_flowrate(self) -> float:
         return self._current_flowrate
