@@ -84,3 +84,4 @@ captures/
 *.raw
 experiment_checkpoint.json
 experiment_events.csv
+.claude/
