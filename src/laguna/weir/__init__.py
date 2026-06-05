@@ -109,7 +109,7 @@ class SaflWeirController(WeirController):
         self._is_connected = False
 
     def set_elevation(self, mm: float) -> None:
-        self._motor.set_absoulute_position(mm)
+        self._motor.set_absolute_position(mm)
 
     def go_to_elevation(self, mm: float) -> bool:
         return self._motor.move_to_position(mm)
