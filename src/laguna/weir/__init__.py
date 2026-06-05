@@ -22,7 +22,12 @@ class WeirController(ABC):
     def disconnect(self) -> None: ...
 
     @abstractmethod
-    def set_elevation(self, mm: float) -> bool:
+    def set_elevation(self, mm: float) -> None:
+        """Reset the current position register to mm without moving the weir."""
+        ...
+
+    @abstractmethod
+    def go_to_elevation(self, mm: float) -> bool:
         """Move weir to target elevation in mm."""
         ...
 
@@ -30,6 +35,34 @@ class WeirController(ABC):
     def get_elevation(self) -> float:
         """Return current weir elevation in mm."""
         ...
+
+    @abstractmethod
+    def set_velocity(self, mm_per_sec: float) -> None:
+        """Set motor move speed in mm/s (applies to the next go_to_elevation call)."""
+        ...
+
+    @abstractmethod
+    def get_velocity(self) -> float:
+        """Return current velocity setpoint in mm/s."""
+        ...
+
+    @abstractmethod
+    def enable(self) -> None:
+        """Enable motor drive."""
+        ...
+
+    @abstractmethod
+    def disable(self) -> None:
+        """Disable motor drive (allows manual repositioning)."""
+        ...
+
+    @abstractmethod
+    def wait_for_move(self, timeout: float = 30.0) -> None:
+        """Block until the current move completes or timeout elapses."""
+        ...
+
+    @abstractmethod
+    def clear_faults(self) -> bool: ...
 
     @abstractmethod
     def home(self) -> bool: ...
@@ -42,13 +75,17 @@ class WeirController(ABC):
 
 
 class SaflWeirController(WeirController):
-    """Weir controller backed by a Teknic stepper motor."""
+    """Weir controller backed by a Teknic ClearCore stepper motor.
+
+    The ClearCore firmware handles all unit conversion internally (configured
+    on its SD card), so positions and velocities are passed through in mm and
+    mm/s respectively with no scaling applied here.
+    """
 
     def __init__(self, config: Dict[str, Any]):
         self._port = config.get("port", "/dev/ttyUSB0")
         self._baudrate = config.get("baudrate", 9600)
-        self.steps_per_mm = config.get("steps_per_mm", 1000.0)
-        self.home_offset_mm = config.get("home_offset_mm", 0.0)
+        self._home_offset_mm = config.get("home_offset_mm", 0.0)
         self._motor = None
         self._is_connected = False
 
@@ -71,28 +108,47 @@ class SaflWeirController(WeirController):
             self._motor.disconnect()
         self._is_connected = False
 
-    def set_elevation(self, mm: float) -> bool:
-        steps = int((mm - self.home_offset_mm) * self.steps_per_mm)
-        return self._motor.move_to_position(steps)
+    def set_elevation(self, mm: float) -> None:
+        self._motor.set_absoulute_position(mm)
+
+    def go_to_elevation(self, mm: float) -> bool:
+        return self._motor.move_to_position(mm)
 
     def get_elevation(self) -> float:
-        return self._motor.get_position() / self.steps_per_mm + self.home_offset_mm
+        return self._motor.get_position()
+
+    def set_velocity(self, mm_per_sec: float) -> None:
+        self._motor.set_velocity(mm_per_sec)
+
+    def get_velocity(self) -> float:
+        status = self._motor.poll_status()
+        return status.get("VelSetPoint", float("nan"))
+
+    def enable(self) -> None:
+        self._motor.enable()
+
+    def disable(self) -> None:
+        self._motor.disable()
+
+    def wait_for_move(self, timeout: float = 30.0) -> None:
+        self._motor.wait_for_HLFB(timeout)
+
+    def clear_faults(self) -> bool:
+        self._motor.clear_faults()
+        return True
 
     def home(self) -> bool:
-        return self._motor.home()
+        return self._motor.find_home(home_position_mm=self._home_offset_mm)
 
     def stop(self) -> None:
         self._motor.stop()
 
     def get_status(self) -> Dict[str, Any]:
-        raw_steps = self._motor.get_position() if self._is_connected else None
-        elevation_mm = (
-            raw_steps / self.steps_per_mm + self.home_offset_mm
-            if raw_steps is not None
-            else None
-        )
+        if not self._is_connected:
+            return {"is_connected": False, "elevation_mm": None}
+        motor_status = self._motor.poll_status()
         return {
             "is_connected": self._is_connected,
-            "elevation_mm": elevation_mm,
-            "raw_steps": raw_steps,
+            "elevation_mm": motor_status.get("position"),
+            "motor": motor_status,
         }
