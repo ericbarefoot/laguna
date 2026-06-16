@@ -42,6 +42,8 @@ class Config:
                 "protocol": "modbus",
                 "timeout": 5.0,
             },
+            # Legacy single-camera config — still supported for backwards compatibility.
+            # Prefer the 'cameras' list for new experiments.
             "camera": {
                 "device_id": 0,
                 "fps": 30,
@@ -75,6 +77,10 @@ class Config:
             "storage": {
                 "enabled": False,
                 "type": "local",  # local, s3, sftp
+            },
+            "timing": {
+                "checkpoint_file": "./experiment_checkpoint.json",
+                "event_log": "./experiment_events.csv",
             },
         }
     

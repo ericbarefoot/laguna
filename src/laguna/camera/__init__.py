@@ -1,138 +1,196 @@
-"""Camera acquisition subsystem for real-time video capture and frame processing."""
+"""Camera subsystem — manages local and networked Pi cameras uniformly.
 
-from typing import Optional, Tuple, Dict, Any
+Public API:
+    CameraManager     — façade over one or more cameras defined in config
+    CameraArray       — networked Pi camera array (also usable standalone)
+    CaptureResult     — result dataclass from a network capture
+    LocalCamera       — single locally-attached camera via OpenCV
+    CameraAcquisition — backwards-compatibility alias for LocalCamera
+"""
+
 import logging
+import threading
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from .local import LocalCamera, CameraAcquisition
+from .network import CameraArray, CaptureResult, _resolve_passphrase, DEFAULT_LEAD_TIME
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "CameraManager",
+    "CameraArray",
+    "CaptureResult",
+    "LocalCamera",
+    "CameraAcquisition",
+]
 
-class CameraAcquisition:
-    """Interface for camera-based data acquisition.
-    
-    Handles video capture, frame processing, and optional compression/format conversion.
-    
-    Attributes:
-        fps: Frames per second
-        resolution: Video resolution (width, height)
-        is_recording: Boolean indicating recording status
+
+class CameraManager:
+    """Façade that manages one or more cameras defined in a config list.
+
+    Config format (list of camera dicts):
+
+        cameras:
+          - name: pi_array
+            type: network
+            hosts: [antares.laguna, sirius.laguna]
+            ssh_user: pi
+            ssh_key: ~/.ssh/id_rsa
+            lead_time: 5.0
+            output_dir: ./captures
+          - name: side_view
+            type: local
+            device_id: 0
+            fps: 30
+
+    trigger_capture() fires all network cameras concurrently and collects
+    local frames, returning a flat list of CaptureResult objects.
     """
-    
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize camera acquisition system.
-        
-        Args:
-            config: Configuration dictionary with keys:
-                - device_id: Camera device ID (default 0)
-                - fps: Frames per second
-                - resolution: Tuple of (width, height)
-                - capture_format: Format for captured frames (BGR, RGB, GRAY)
-        """
-        self.config = config
-        self.device_id = config.get("device_id", 0)
-        self.fps = config.get("fps", 30)
-        self.resolution = config.get("resolution", (1920, 1080))
-        self.capture_format = config.get("capture_format", "BGR")
-        
-        self.camera = None
-        self.is_recording = False
-        self.frame_count = 0
-        
-        logger.info(f"Camera acquisition initialized (device {self.device_id})")
-    
+
+    subsystem_name = "cameras"
+
+    def __init__(self, configs: List[Dict[str, Any]]) -> None:
+        self._network: List[CameraArray] = []
+        self._local: List[LocalCamera] = []
+        self._lead_times: Dict[int, float] = {}
+        self._output_dirs: Dict[int, Path] = {}
+
+        for cfg in configs:
+            cam_type = cfg.get("type", "local")
+            if cam_type == "network":
+                passphrase = _resolve_passphrase(cfg.get("ssh_passphrase"))
+                array = CameraArray(
+                    hosts=cfg.get("hosts", []),
+                    ssh_user=cfg.get("ssh_user", "pi"),
+                    ssh_key=cfg.get("ssh_key"),
+                    ssh_passphrase=passphrase,
+                )
+                idx = len(self._network)
+                self._lead_times[idx] = cfg.get("lead_time", DEFAULT_LEAD_TIME)
+                self._output_dirs[idx] = Path(cfg.get("output_dir", "./captures"))
+                self._network.append(array)
+                logger.info(
+                    "CameraManager: registered network array '%s' (%d hosts)",
+                    cfg.get("name", f"network_{idx}"),
+                    len(array.hosts),
+                )
+            elif cam_type == "local":
+                self._local.append(LocalCamera(cfg))
+            else:
+                logger.warning("CameraManager: unknown camera type '%s', skipping", cam_type)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     def start(self) -> bool:
-        """Initialize and start camera capture.
-        
-        Returns:
-            True if camera started successfully, False otherwise
-        """
-        try:
-            # TODO: Implement actual camera initialization using OpenCV
-            # import cv2
-            # self.camera = cv2.VideoCapture(self.device_id)
-            # Set camera properties (fps, resolution)
-            
-            self.is_recording = True
-            self.frame_count = 0
-            logger.info(f"Camera started (FPS: {self.fps}, Resolution: {self.resolution})")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to start camera: {e}")
-            return False
-    
+        """Start all local cameras. Network cameras need no persistent connection."""
+        ok = True
+        for cam in self._local:
+            if not cam.start():
+                ok = False
+        return ok
+
     def stop(self) -> None:
-        """Stop camera capture and cleanup."""
-        if self.is_recording:
-            # TODO: Implement actual camera release
-            # if self.camera:
-            #     self.camera.release()
-            
-            self.is_recording = False
-            logger.info(f"Camera stopped (frames captured: {self.frame_count})")
-    
-    def get_frame(self) -> Optional[Any]:
-        """Capture and return a single frame.
-        
-        Returns:
-            Frame data (numpy array) or None if capture failed
-        """
-        if not self.is_recording:
-            logger.warning("Camera not recording, cannot get frame")
-            return None
-        
-        try:
-            # TODO: Implement actual frame capture and format conversion
-            # ret, frame = self.camera.read()
-            # if ret:
-            #     self.frame_count += 1
-            #     return self._convert_format(frame)
-            
-            self.frame_count += 1
-            return None
-        except Exception as e:
-            logger.error(f"Failed to capture frame: {e}")
-            return None
-    
-    def start_recording(self, output_file: str) -> bool:
-        """Start recording video to file.
-        
+        """Stop all local cameras."""
+        for cam in self._local:
+            cam.stop()
+
+    # ------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------
+
+    def trigger_capture(
+        self, lead_time: Optional[float] = None
+    ) -> List[CaptureResult]:
+        """Trigger all network cameras concurrently, then capture local frames.
+
         Args:
-            output_file: Path to output video file
-            
+            lead_time: Override the per-array lead_time from config.
+
         Returns:
-            True if recording started successfully
+            Flat list of CaptureResult — one entry per Pi for network arrays,
+            one stub entry per local camera.
         """
-        try:
-            # TODO: Implement video writer initialization
-            # fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            # self.video_writer = cv2.VideoWriter(...)
-            
-            logger.info(f"Recording started to {output_file}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to start recording: {e}")
-            return False
-    
-    def stop_recording(self) -> None:
-        """Stop recording video."""
-        # TODO: Implement video writer release
-        logger.info("Recording stopped")
-    
+        all_results: List[Optional[List[CaptureResult]]] = [None] * len(self._network)
+
+        def _network_worker(idx: int, array: CameraArray) -> None:
+            lt = lead_time if lead_time is not None else self._lead_times.get(idx, DEFAULT_LEAD_TIME)
+            all_results[idx] = array.trigger_capture(lead_time=lt)
+
+        threads = [
+            threading.Thread(target=_network_worker, args=(i, arr), daemon=True)
+            for i, arr in enumerate(self._network)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        flat: List[CaptureResult] = []
+        for result_list in all_results:
+            if result_list:
+                flat.extend(result_list)
+
+        for cam in self._local:
+            frame = cam.get_frame()
+            flat.append(
+                CaptureResult(
+                    hostname=cam.name,
+                    success=frame is not None or cam.is_recording,
+                    filename=None,
+                )
+            )
+
+        return flat
+
+    def fetch_images(
+        self,
+        results: List[CaptureResult],
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, Path]:
+        """SFTP-fetch images from all network arrays."""
+        combined: Dict[str, Path] = {}
+        for idx, array in enumerate(self._network):
+            dest = Path(output_dir) if output_dir else self._output_dirs.get(idx, Path("./captures"))
+            combined.update(array.fetch_images(results, dest))
+        return combined
+
+    def report_simultaneity(self, results: List[CaptureResult]) -> List[dict]:
+        """Report timing spread for each network array separately."""
+        reports = []
+        for array in self._network:
+            relevant = [r for r in results if r.hostname in array.hosts]
+            if relevant:
+                reports.append(array.report_simultaneity(relevant))
+        return reports
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    @property
+    def is_recording(self) -> bool:
+        return any(c.is_recording for c in self._local)
+
     def get_frame_count(self) -> int:
-        """Get number of frames captured.
-        
+        return sum(c.get_frame_count() for c in self._local)
+
+    def get_status(self) -> dict:
+        """Return a status snapshot for this subsystem.
+
         Returns:
-            Total frame count
+            dict with at minimum 'subsystem' and 'num_cameras', plus
+            counts of network vs local cameras, recording state, and
+            total frames captured so far.
         """
-        return self.frame_count
-    
-    def _convert_format(self, frame: Any) -> Any:
-        """Convert frame to desired format.
-        
-        Args:
-            frame: Input frame
-            
-        Returns:
-            Converted frame
-        """
-        # TODO: Implement format conversion (BGR, RGB, GRAY)
-        return frame
+        return {
+            "subsystem": self.subsystem_name,
+            "num_cameras": len(self._network) + len(self._local),
+            "num_network_arrays": len(self._network),
+            "num_local_cameras": len(self._local),
+            "is_recording": self.is_recording,
+            "frames_captured": self.get_frame_count(),
+        }

@@ -69,6 +69,19 @@ data/raw/
 data/processed/
 logs/
 *.log
-.claude/
+
+# Sandbox (development scripts, not part of the package)
 sandbox/
+
+# Captured images and experiment output
+captures/
+*.jpg
+*.jpeg
+*.png
+*.tiff
+*.tif
+*.bmp
+*.raw
+experiment_checkpoint.json
 experiment_events.csv
+.claude/
