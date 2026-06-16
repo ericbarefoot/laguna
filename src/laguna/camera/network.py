@@ -21,6 +21,8 @@ from typing import Dict, List, Optional
 
 import paramiko
 
+from laguna.camera._log import utc_local_ts
+
 # Agent script lives alongside this file in the package.
 AGENT_SCRIPT = Path(__file__).parent / "agent.py"
 REMOTE_AGENT_PATH = "/tmp/laguna_camera_agent.py"
@@ -77,9 +79,7 @@ class CameraArray:
         sftp.close()
 
     def _log(self, hostname: str, msg: str) -> None:
-        now = time.time()
-        utc = time.strftime("%H:%M:%SZ", time.gmtime(now))
-        local = time.strftime("%H:%M:%S", time.localtime(now))
+        utc, local = utc_local_ts()
         print(f"  [{hostname} {utc}/{local}] {msg}", flush=True)
 
     def _run_capture_on_host(

@@ -15,12 +15,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from laguna.camera._log import utc_local_ts
+
 
 def _log(msg: str) -> None:
     """Write a timestamped progress line to stderr so the coordinator can stream it."""
-    now = time.time()
-    utc = time.strftime("%H:%M:%S", time.gmtime(now)) + f".{int(now % 1 * 1000):03d}Z"
-    local = time.strftime("%H:%M:%S", time.localtime(now))
+    utc, local = utc_local_ts()
     print(f"[agent {utc}/{local}] {msg}", file=sys.stderr, flush=True)
 
 
