@@ -23,7 +23,7 @@ class WeirController(ABC):
 
     @abstractmethod
     def set_elevation(self, mm: float) -> None:
-        """Reset the current position register to mm without moving the weir."""
+        """Move weir to absolute elevation in mm."""
         ...
 
     @abstractmethod
@@ -104,43 +104,59 @@ class SaflWeirController(WeirController):
             return False
 
     def disconnect(self) -> None:
-        if self._motor and self._is_connected:
+        if self._motor is not None:
             self._motor.disconnect()
+        self._motor = None
         self._is_connected = False
 
+    def _require_connected(self) -> None:
+        if not self._is_connected:
+            raise RuntimeError(f"{self.__class__.__name__} is not connected")
+
     def set_elevation(self, mm: float) -> None:
+        self._require_connected()
         self._motor.set_absolute_position(mm)
 
     def go_to_elevation(self, mm: float) -> bool:
+        self._require_connected()
         return self._motor.move_to_position(mm)
 
     def get_elevation(self) -> float:
+        self._require_connected()
         return self._motor.get_position()
 
     def set_velocity(self, mm_per_sec: float) -> None:
+        self._require_connected()
         self._motor.set_velocity(mm_per_sec)
 
     def get_velocity(self) -> float:
+        self._require_connected()
         status = self._motor.poll_status()
         return status.get("VelSetPoint", float("nan"))
 
     def enable(self) -> None:
+        self._require_connected()
         self._motor.enable()
 
     def disable(self) -> None:
+        self._require_connected()
         self._motor.disable()
 
     def wait_for_move(self, timeout: float = 30.0) -> None:
+        self._require_connected()
         self._motor.wait_for_HLFB(timeout)
 
     def clear_faults(self) -> bool:
+        self._require_connected()
         self._motor.clear_faults()
         return True
 
     def home(self) -> bool:
+        self._require_connected()
         return self._motor.find_home(home_position_mm=self._home_offset_mm)
 
     def stop(self) -> None:
+        self._require_connected()
         self._motor.stop()
 
     def get_status(self) -> Dict[str, Any]:

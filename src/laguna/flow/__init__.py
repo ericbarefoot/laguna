@@ -106,13 +106,20 @@ class SaflFlowController(FlowController):
             return False
 
     def disconnect(self) -> None:
-        if self._vfd and self._is_connected:
+        if self._vfd is not None:
             self._vfd.disconnect()
-        if self._motor and self._is_connected:
+        if self._motor is not None:
             self._motor.disconnect()
+        self._vfd = None
+        self._motor = None
         self._is_connected = False
 
+    def _require_connected(self) -> None:
+        if not self._is_connected:
+            raise RuntimeError(f"{self.__class__.__name__} is not connected")
+
     def set_flowrate(self, lpm: float) -> bool:
+        self._require_connected()
         self._vfd.set_freq_from_flowrate(lpm, self.C0, self.C1, self.C2)
         self._current_flowrate = lpm
         return True
@@ -121,12 +128,15 @@ class SaflFlowController(FlowController):
         return self._current_flowrate
 
     def start(self) -> bool:
+        self._require_connected()
         return self._vfd.start()
 
     def stop(self) -> bool:
+        self._require_connected()
         return self._vfd.stop()
 
     def clear_faults(self) -> bool:
+        self._require_connected()
         return self._vfd.clear_faults()
 
     @property
@@ -135,6 +145,7 @@ class SaflFlowController(FlowController):
 
     @qin.setter
     def qin(self, state: bool) -> None:
+        self._require_connected()
         self._motor.set_io(0, state)
         self._qin_state = state
 
@@ -144,6 +155,7 @@ class SaflFlowController(FlowController):
 
     @qaux.setter
     def qaux(self, state: bool) -> None:
+        self._require_connected()
         self._motor.set_io(1, state)
         self._qaux_state = state
 
