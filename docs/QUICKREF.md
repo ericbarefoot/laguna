@@ -22,9 +22,13 @@ lab.run_experiment()
 ### With Configuration
 ```python
 from laguna import FlumeLab
+from laguna.weir import SaflWeirController
+from laguna.flow import SaflFlowController
 
 lab = FlumeLab(config_file="config/my_experiment.yaml")
-lab.run_experiment({"hydraulics": {"pressure_target": 1000}})
+lab.add(SaflWeirController(lab.config.get("weir")))
+lab.add(SaflFlowController(lab.config.get("flow")))
+lab.connect_all()
 ```
 
 ### Manual Control
@@ -54,8 +58,17 @@ camera:
   fps: 30
   resolution: [1920, 1080]
 
-hydraulics:
-  port: "/dev/ttyUSB1"
+weir:
+  port: "/dev/ttyUSB0"
+  steps_per_mm: 1000.0
+
+flow:
+  vfd_port: "/dev/ttyUSB1"
+  motor_port: "/dev/ttyUSB0"
+
+gauge:
+  port: "/dev/ttyUSB2"
+  offset_mm: 0.0
 
 data:
   output_directory: "./data/"
@@ -84,10 +97,19 @@ lab.robot.get_position()
 lab.camera.start()
 frame = lab.camera.get_frame()
 
-# Hydraulics
-lab.hydraulics.start()
-lab.hydraulics.set_pressure(pressure_pa)
-status = lab.hydraulics.get_status()
+# Weir
+lab.weir.set_elevation(200.0)       # mm
+lab.weir.set_velocity(5.0)          # mm/s
+lab.weir.wait_for_move()
+
+# Flow
+lab.flow.start()
+lab.flow.set_flowrate(20.0)         # L/min
+lab.flow.qin = True                 # open solenoid
+
+# Gauge
+elevation = lab.gauge.read_mm()
+elevation_smooth = lab.gauge.read_mm_smoothed()
 
 # Data
 lab.data_processor.add_data_point({"temp": 25.5})
@@ -124,7 +146,9 @@ laguna/
 │   ├── config.py           ← Configuration management
 │   ├── robot/              ← Robot control subsystem
 │   ├── camera/             ← Camera acquisition subsystem
-│   ├── hydraulics/         ← Hydraulics control subsystem
+│   ├── weir/               ← Weir elevation control
+│   ├── flow/               ← Pump flow and solenoid control
+│   ├── gauge/              ← Water level sensing
 │   ├── data/               ← Data processing subsystem
 │   └── storage/            ← Remote storage interface
 ├── tests/                  ← Unit tests
@@ -167,9 +191,7 @@ For each subsystem, the TODO sections show what needs implementation:
    - Implement actual OpenCV camera initialization
    - Implement `get_frame()` with format conversion
 
-3. **Hydraulics** (`src/laguna/hydraulics/__init__.py`):
-   - Implement serial communication to controller
-   - Implement pressure/flow reading and control
+3. **Weir / Flow / Gauge** — wired to `safl_ocean_hardware`; see `src/laguna/weir/`, `flow/`, `gauge/`
 
 4. **Data processing** (`src/laguna/data/__init__.py`):
    - Implement actual HDF5/CSV export

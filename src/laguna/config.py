@@ -50,12 +50,25 @@ class Config:
                 "resolution": (1920, 1080),
                 "capture_format": "BGR",
             },
-            # List of camera configs (local or network).  Takes precedence over 'camera'.
-            "cameras": [],
-            "hydraulics": {
-                "port": "/dev/ttyUSB1",
+            "weir": {
+                "port": "/dev/ttyUSB0",
                 "baudrate": 9600,
-                "poll_interval": 0.1,
+                "steps_per_mm": 1000.0,
+                "home_offset_mm": 0.0,
+            },
+            "gauge": {
+                "port": "/dev/ttyUSB2",
+                "sensor_ids": [0],
+                "offset_mm": 0.0,
+            },
+            "flow": {
+                "vfd_port": "/dev/ttyUSB1",
+                "vfd_slave_id": 1,
+                "motor_port": "/dev/ttyUSB0",
+                "motor_baudrate": 9600,
+                "C0": 4.902,
+                "C1": 58.49,
+                "C2": 0.08956,
             },
             "data": {
                 "output_directory": "./data/",

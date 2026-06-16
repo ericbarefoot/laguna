@@ -4,29 +4,48 @@ import pytest
 from laguna import FlumeLab
 
 
+class FakeSubsystem:
+    subsystem_name = "fake"
+
+    def connect(self):
+        return True
+
+    def disconnect(self):
+        pass
+
+    def get_status(self):
+        return {"ok": True}
+
+
 class TestFlumeLab:
-    """Test cases for FlumeLab class."""
-    
     @pytest.fixture
     def lab(self):
-        """Create a FlumeLab instance for testing."""
         return FlumeLab()
-    
+
     def test_initialization(self, lab):
-        """Test FlumeLab initialization."""
-        assert lab.robot is not None
-        assert lab.camera is not None
-        assert lab.hydraulics is not None
-        assert lab.data_processor is not None
-        assert lab.storage is not None
         assert not lab.is_running
-    
-    def test_get_system_status(self, lab):
-        """Test getting system status."""
+        assert lab._subsystems == {}
+
+    def test_add_subsystem(self, lab):
+        sub = FakeSubsystem()
+        lab.add(sub)
+        assert lab.fake is sub
+        assert "fake" in lab._subsystems
+
+    def test_add_returns_self_for_chaining(self, lab):
+        sub = FakeSubsystem()
+        result = lab.add(sub)
+        assert result is lab
+
+    def test_add_requires_subsystem_name(self, lab):
+        with pytest.raises(AttributeError):
+            lab.add(object())
+
+    def test_get_system_status_is_empty_with_no_subsystems(self, lab):
+        assert lab.get_system_status() == {}
+
+    def test_get_system_status_includes_registered_subsystems(self, lab):
+        lab.add(FakeSubsystem())
         status = lab.get_system_status()
-        
-        assert "robot" in status
-        assert "camera" in status
-        assert "hydraulics" in status
-        assert "data" in status
-        assert "storage" in status
+        assert "fake" in status
+        assert status["fake"] == {"ok": True}

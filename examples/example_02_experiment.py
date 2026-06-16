@@ -1,44 +1,40 @@
 """
 Example 2: Simple experiment workflow
 
-This example shows how to:
-- Load custom configuration
-- Initialize an experiment
-- Run a simple experimental procedure
-- Save the results
+This example shows how to run a timed experiment with the weir and flow
+subsystems connected and a schedule driving setpoints.
 """
 
 from laguna import FlumeLab
+from laguna.weir import SaflWeirController
+from laguna.flow import SaflFlowController
 
 
 def main():
-    """Run a simple experiment."""
-    
-    # Initialize with custom configuration file
-    # lab = FlumeLab(config_file="config/my_experiment.yaml")
-    
-    # Or use default configuration
-    lab = FlumeLab()
-    
-    # Define experiment parameters
-    experiment_config = {
-        "robot": {
-            "start_position": (0, 0, 0),
-        },
-        "camera": {
-            "fps": 30,
-        },
-        "hydraulics": {
-            "pressure_target": 1000,  # Pascals
-        }
-    }
-    
-    # Run the experiment
-    print("Starting experiment...")
-    if lab.run_experiment(experiment_config):
-        print("Experiment completed successfully!")
-    else:
-        print("Experiment failed!")
+    lab = FlumeLab(config_file="config/example_config.yaml")
+
+    lab.add(SaflWeirController(lab.config.get("weir")))
+    lab.add(SaflFlowController(lab.config.get("flow")))
+
+    if not lab.connect_all():
+        print("One or more subsystems failed to connect — aborting.")
+        return
+
+    with lab.experiment() as clock:
+        print("Experiment started.")
+
+        lab.weir.home()
+        lab.weir.set_elevation(150.0)   # mm
+
+        lab.flow.start()
+        lab.flow.set_flowrate(20.0)     # L/min
+
+        clock.wait_until(60.0)          # run for 60 s
+
+        lab.flow.stop()
+
+    lab.disconnect_all()
+    print("Experiment complete.")
 
 
 if __name__ == "__main__":

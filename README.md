@@ -1,6 +1,6 @@
 # Laguna - Robotic Flume Control System
 
-Software suite for controlling robotic systems, acquiring camera data, managing hydraulic systems, and processing experimental data from hydraulic flume experiments.
+Software suite for controlling robotic systems, acquiring camera data, managing water flow hardware, and processing experimental data from hydraulic flume experiments.
 
 ## Overview
 
@@ -37,12 +37,13 @@ from laguna import FlumeLab
 # Initialize the system with configuration
 lab = FlumeLab(config_file="config/experiment.yaml")
 
-# Run an experiment
-lab.run_experiment(experiment_config={
-    "robot": {"start_position": (0, 0, 0)},
-    "camera": {"fps": 30},
-    "hydraulics": {"pressure_target": 1000}
-})
+from laguna.weir import SaflWeirController
+from laguna.flow import SaflFlowController
+
+# Attach hardware subsystems and run
+lab.add(SaflWeirController(lab.config.get("weir")))
+lab.add(SaflFlowController(lab.config.get("flow")))
+lab.connect_all()
 ```
 
 ## Project Structure
@@ -54,7 +55,9 @@ laguna/
 │   ├── config.py        # Configuration management
 │   ├── robot/           # Robot control subsystem
 │   ├── camera/          # Camera acquisition subsystem
-│   ├── hydraulics/      # Hydraulics control subsystem
+│   ├── weir/            # Weir (tailgate) elevation control
+│   ├── flow/            # Pump flow and solenoid control
+│   ├── gauge/           # Water level sensing
 │   ├── data/            # Data processing subsystem
 │   └── storage/         # Remote storage interface
 ├── tests/               # Unit and integration tests

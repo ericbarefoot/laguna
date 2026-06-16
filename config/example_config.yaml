@@ -35,10 +35,25 @@ camera:
   resolution: [1920, 1080]
   capture_format: "BGR"
 
-hydraulics:
-  port: "/dev/ttyUSB1"
+weir:
+  port: "/dev/ttyUSB0"          # Serial port for Teknic ClearCore motor
   baudrate: 9600
-  poll_interval: 0.1            # Seconds between status polls
+  steps_per_mm: 1000.0          # Motor steps per mm of weir travel
+  home_offset_mm: 0.0           # Elevation at the home position (mm)
+
+gauge:
+  port: "/dev/ttyUSB2"          # Serial port for Massa ultrasonic sensor
+  sensor_ids: [0]               # List of sensor IDs to poll
+  offset_mm: 0.0                # Sensor mounting offset (mm)
+
+flow:
+  vfd_port: "/dev/ttyUSB1"      # Serial port for Fuji VFD
+  vfd_slave_id: 1               # Modbus slave ID
+  motor_port: "/dev/ttyUSB0"    # Shared with weir controller
+  motor_baudrate: 9600
+  C0: 4.902                     # Flowrate-to-frequency calibration coefficients
+  C1: 58.49                     # freq = C2*Q^2 + C1*Q + C0  (Hz, L/min)
+  C2: 0.08956
 
 data:
   output_directory: "./data/"

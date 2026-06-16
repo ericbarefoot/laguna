@@ -1,5 +1,8 @@
-"""Core orchestrator module that combines all subsystems."""
+"""Core orchestrator module for FlumeLab.
 
+FlumeLab uses an opt-in model: instantiate subsystems separately and attach them
+with lab.add(subsystem). This avoids hardcoding hardware assumptions in the core.
+"""
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
 import logging
@@ -200,3 +203,19 @@ class FlumeLab:
         if self.clock.is_running and not self.clock.is_paused:
             self.clock.pause()
         self.disconnect_all()
+
+    def open_ocean_control_gui(self, gui_script_path: str = None) -> None:
+        """Launch the OceanControl GUI as a subprocess."""
+        import subprocess
+        import sys
+
+        path = gui_script_path or self.config.get("ocean_control", {}).get(
+            "gui_path",
+            "/home/eric/Desktop/safl-ocean-control/OceanControl/Python Controls/SAFL_OceanControl.py",
+        )
+        path = Path(path)
+        if not path.exists():
+            logger.warning(f"OceanControl GUI not found at {path} — skipping launch")
+            return
+        logger.info(f"Launching OceanControl GUI: {path}")
+        subprocess.Popen([sys.executable, str(path)], cwd=str(path.parent))

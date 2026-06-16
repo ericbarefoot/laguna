@@ -29,6 +29,9 @@ dependencies = [
     "numpy>=1.21",            # For numerical operations
     "opencv-python>=4.5",     # For camera operations
     "pyyaml>=6.0",            # For YAML configuration files
+    "scipy>=1.7",             # For schedule interpolation
+    "pandas>=1.3",            # For schedule data loading
+    "openpyxl>=3.0",          # For Excel schedule files
 ]
 
 [project.optional-dependencies]
