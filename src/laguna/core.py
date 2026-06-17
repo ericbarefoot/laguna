@@ -4,8 +4,10 @@ FlumeLab uses an opt-in model: instantiate subsystems separately and attach them
 with lab.add(subsystem). This avoids hardcoding hardware assumptions in the core.
 """
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 import logging
+import threading
 
 from .config import Config
 from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
@@ -192,6 +194,32 @@ class FlumeLab:
             getter = getattr(subsystem, "get_status", None)
             status[name] = getter() if getter else {"registered": True}
         return status
+
+    def stop(self) -> None:
+        """Pause the experiment: stop scheduler loop, pause clock, and stop weir.
+
+        Unlike disconnect_all(), this does NOT close the event log or disconnect
+        hardware — the experiment can be resumed with resume() or a fresh run().
+        """
+        logger.info("Stopping experiment (pausing clock and scheduler)...")
+        self.scheduler.stop()
+        weir = self._subsystems.get("weir")
+        if weir and hasattr(weir, "stop"):
+            weir.stop()
+
+    def resume(self, remaining_s: float) -> threading.Thread:
+        """Resume after stop(): restart scheduler loop in background thread.
+
+        Useful for REPL-driven interactive experiments.
+
+        Args:
+            remaining_s: Duration to run the scheduler, in experiment-time seconds.
+
+        Returns:
+            The scheduler thread, so caller can .join() it if desired.
+        """
+        logger.info("Resuming experiment for %.1f more seconds...", remaining_s)
+        return self.scheduler.run_async(remaining_s)
 
     def emergency_stop(self) -> None:
         """Emergency stop — immediately shut down all registered systems."""

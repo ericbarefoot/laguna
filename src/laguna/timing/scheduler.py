@@ -118,6 +118,18 @@ class Scheduler:
         if self._clock.is_running and not self._clock.is_paused:
             self._clock.pause()
 
+    def run_async(self, duration: float) -> threading.Thread:
+        """Run the scheduler in a background daemon thread.
+
+        Returns the thread so the caller can join() it if needed.
+        Call stop() from another thread to interrupt the run.
+        """
+        t = threading.Thread(
+            target=self.run, args=(duration,), daemon=True, name="scheduler-main"
+        )
+        t.start()
+        return t
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
