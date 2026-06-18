@@ -64,6 +64,13 @@ class DslrCameraSubsystem:
             True if both cameras connected successfully, False otherwise.
         """
         try:
+            from .gvfs import release_gphoto_usb, reset_usb_cameras
+
+            # Level 1: kill gvfsd-gphoto2 so it can't re-claim cameras
+            released = release_gphoto_usb()
+            if released:
+                logger.info("Released %d gvfsd-gphoto2 process(es)", released)
+
             # Lazy import — avoids hard dependency on gphoto2/libgphoto2 at startup
             if self.dualcam_path:
                 dualcam_path_str = str(self.dualcam_path)
@@ -75,6 +82,20 @@ class DslrCameraSubsystem:
 
             logger.info("Loading DSLR config from %s", self.config_path)
             self._camera_manager = CameraManager.from_yaml(str(self.config_path))
+            connect_results = self._camera_manager.connect_all()
+            logger.info("Camera connection results (attempt 1): %s", connect_results)
+
+            if not any(connect_results.values()):
+                logger.warning(
+                    "No cameras connected after gvfs release. "
+                    "If cameras have a stale PTP session, call dslr.usb_reset() then reconnect."
+                )
+
+            if not any(connect_results.values()):
+                logger.error("No cameras connected after USB reset")
+                return False
+
+            self._camera_manager.apply_settings_all()
             self._is_connected = True
             logger.info("DSLR cameras connected successfully")
             return True
@@ -92,13 +113,25 @@ class DslrCameraSubsystem:
             logger.error("Failed to connect DSLR cameras: %s", e)
             return False
 
+    def usb_reset(self) -> list:
+        """Level-2 recovery: USB bus-reset all Canon cameras and re-detect ports.
+
+        Use this when connect() fails with a stale PTP session error (-1) that
+        survives a gvfs release. After calling this, call connect() again —
+        cameras will have new USB device numbers.
+
+        Returns the list of device paths that were reset.
+        """
+        from .gvfs import reset_usb_cameras, release_gphoto_usb
+        reset_devs = reset_usb_cameras()
+        release_gphoto_usb()
+        return reset_devs
+
     def disconnect(self) -> None:
         """Disconnect all cameras."""
         if self._camera_manager:
             try:
-                for camera in self._camera_manager.cameras.values():
-                    if hasattr(camera, "disconnect"):
-                        camera.disconnect()
+                self._camera_manager.disconnect_all()
                 logger.info("DSLR cameras disconnected")
             except Exception as e:
                 logger.warning("Error disconnecting DSLR cameras: %s", e)

@@ -70,7 +70,7 @@ class SaflWaterLevelSensor(WaterLevelSensor):
 
     def read_mm_smoothed(self) -> float:
         """Read and return elevation using the sensor's built-in FIFO moving average."""
-        self._sensor.read()
+        self._last_read = self._sensor.read()
         avg_list = getattr(self._sensor, "dist_cm_array_moving_avg", [])
         if avg_list:
             return self._offset_mm - avg_list[0] * 10.0
