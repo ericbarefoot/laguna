@@ -56,43 +56,88 @@ class DslrCameraSubsystem:
         self._is_connected = False
 
     def connect(self) -> bool:
-        """Load YAML config and connect to both cameras.
+        """Load YAML config and connect to cameras.
 
-        Lazy-imports dualcam on first connect so import errors are clear.
+        Two-level recovery:
+          Level 1 — kill gvfsd-gphoto2, connect with YAML ports.
+          Level 2 — re-detect current ports (they change on every power cycle),
+                    persist them to YAML, reload a fresh CameraManager, retry.
+
+        Canon DSLRs maintain PTP session state through USB unplug/replug — only
+        a full power cycle resets it. USB reset (USBDEVFS_RESET ioctl) is NOT
+        used here because these cameras interpret it as a disconnect and drop off
+        the USB bus entirely.
+
+        Keep the connection alive for the duration of the experiment — capture_all()
+        does not disconnect between captures, so connect() only needs to be called
+        once per session. Power-cycle the cameras before each new session.
 
         Returns:
-            True if both cameras connected successfully, False otherwise.
+            True if at least one camera connected, False otherwise.
         """
         try:
-            from .gvfs import release_gphoto_usb, reset_usb_cameras
+            from .gvfs import release_gphoto_usb, detect_camera_ports
 
-            # Level 1: kill gvfsd-gphoto2 so it can't re-claim cameras
-            released = release_gphoto_usb()
-            if released:
-                logger.info("Released %d gvfsd-gphoto2 process(es)", released)
-
-            # Lazy import — avoids hard dependency on gphoto2/libgphoto2 at startup
             if self.dualcam_path:
                 dualcam_path_str = str(self.dualcam_path)
                 if dualcam_path_str not in sys.path:
                     sys.path.insert(0, dualcam_path_str)
-                    logger.info("Added dualcam-timelapse to sys.path: %s", dualcam_path_str)
 
             from dualcam import CameraManager
+
+            # --- Level 1: kill gvfsd-gphoto2, connect with YAML ports -------
+            released = release_gphoto_usb()
+            if released:
+                logger.info("Released %d gvfsd-gphoto2 process(es)", released)
 
             logger.info("Loading DSLR config from %s", self.config_path)
             self._camera_manager = CameraManager.from_yaml(str(self.config_path))
             connect_results = self._camera_manager.connect_all()
-            logger.info("Camera connection results (attempt 1): %s", connect_results)
+            logger.info("DSLR connection (level 1): %s", connect_results)
 
             if not any(connect_results.values()):
-                logger.warning(
-                    "No cameras connected after gvfs release. "
-                    "If cameras have a stale PTP session, call dslr.usb_reset() then reconnect."
+                # --- Level 2: re-detect ports, fresh manager, retry ----------
+                # Ports change on every power cycle. A failed init() also leaves
+                # a poisoned gp.Context on the shared CameraManager. Canon cameras
+                # also need a settling period after a PTP session ends before they
+                # accept a new OpenSession. Fix: wait, re-detect ports, persist to
+                # YAML, reload a fresh manager (new gp.Context) and retry.
+                import time as _time
+                logger.info(
+                    "Level 1 failed — waiting 15 s for PTP session to settle, "
+                    "then re-detecting ports"
                 )
+                _time.sleep(15)
+                release_gphoto_usb()
+
+                new_ports = detect_camera_ports()
+                camera_names = list(self._camera_manager._cameras.keys())
+
+                if not new_ports:
+                    logger.error(
+                        "No Canon cameras visible on USB. "
+                        "Power-cycle the cameras (physical power off/on) and call connect() again. "
+                        "USB unplug/replug alone does not reset Canon PTP state."
+                    )
+                    return False
+
+                for i, name in enumerate(camera_names):
+                    if i < len(new_ports):
+                        logger.info("  %s -> %s", name, new_ports[i])
+                    else:
+                        logger.warning("  %s -> no port found", name)
+
+                self._persist_ports(camera_names, new_ports)
+                self._camera_manager = CameraManager.from_yaml(str(self.config_path))
+
+                connect_results = self._camera_manager.connect_all()
+                logger.info("DSLR connection (level 2): %s", connect_results)
 
             if not any(connect_results.values()):
-                logger.error("No cameras connected after USB reset")
+                logger.error(
+                    "No cameras connected after port re-detection. "
+                    "Power-cycle the cameras (physical power off/on) and call connect() again."
+                )
                 return False
 
             self._camera_manager.apply_settings_all()
@@ -113,12 +158,28 @@ class DslrCameraSubsystem:
             logger.error("Failed to connect DSLR cameras: %s", e)
             return False
 
-    def usb_reset(self) -> list:
-        """Level-2 recovery: USB bus-reset all Canon cameras and re-detect ports.
+    def _persist_ports(self, camera_names: list, new_ports: list) -> None:
+        """Write updated USB port assignments back to the YAML config file."""
+        import yaml
+        try:
+            with open(self.config_path) as f:
+                config = yaml.safe_load(f)
+            cameras_cfg = config.get("cameras", {})
+            for i, name in enumerate(camera_names):
+                if i < len(new_ports) and name in cameras_cfg:
+                    cameras_cfg[name]["port"] = new_ports[i]
+            with open(self.config_path, "w") as f:
+                yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+            logger.info("Updated port assignments saved to %s", self.config_path)
+        except Exception as e:
+            logger.warning("Could not persist new ports to YAML: %s", e)
 
-        Use this when connect() fails with a stale PTP session error (-1) that
-        survives a gvfs release. After calling this, call connect() again —
-        cameras will have new USB device numbers.
+    def usb_reset(self) -> list:
+        """Explicit USB bus-reset for Canon cameras (use with caution).
+
+        Canon cameras often drop off USB entirely when reset via USBDEVFS_RESET
+        ioctl and require a full power cycle to recover. This method is provided
+        for diagnostic use only — do not call it from automated code.
 
         Returns the list of device paths that were reset.
         """
@@ -145,8 +206,7 @@ class DslrCameraSubsystem:
         """Trigger both cameras to capture simultaneously.
 
         Wraps dualcam.CameraManager.capture_all_parallel(), which uses ThreadPoolExecutor
-        to fire cameras concurrently. This method is thread-safe and suitable for
-        scheduling from the experiment scheduler.
+        to fire cameras concurrently. Cameras remain connected after capture.
 
         Returns:
             Dict mapping camera name to output Path, or None if capture failed.
@@ -165,14 +225,10 @@ class DslrCameraSubsystem:
             return {}
 
     def get_status(self) -> Dict[str, Any]:
-        """Return status snapshot of DSLR subsystem.
-
-        Returns:
-            Dict with subsystem name, connection state, and per-camera info.
-        """
+        """Return status snapshot of DSLR subsystem."""
         return {
             "subsystem": self.subsystem_name,
             "is_connected": self._is_connected,
             "config_path": str(self.config_path),
-            "num_cameras": len(self._camera_manager.cameras) if self._camera_manager else 0,
+            "num_cameras": len(self._camera_manager._cameras) if self._camera_manager else 0,
         }

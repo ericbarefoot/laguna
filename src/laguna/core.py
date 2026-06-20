@@ -256,11 +256,11 @@ class FlumeLab:
                     if sub in ("flume_lab", "scheduler"):
                         continue
                     event_counts[(sub, evt)] = event_counts.get((sub, evt), 0) + 1
-                    if sub == "pi_cameras" and evt == "capture":
+                    if sub in ("pi_cameras", "dslr_cameras") and evt == "capture":
                         result = row.get("result", "")
                         for part in result.split():
                             if part.startswith("file="):
-                                capture_paths.append(part[len("file="):])
+                                capture_paths.append((sub, part[len("file="):]))
         except Exception:
             pass
 
@@ -295,13 +295,17 @@ class FlumeLab:
                 lines.append(f"    {sub:<16} {evt:<26} {count:>4}×")
 
         if capture_paths:
-            # Derive the capture directory from the stored paths
             from pathlib import Path as _Path
-            dirs = {str(_Path(p).parent) for p in capture_paths if "/" in p or "\\" in p}
+            by_sub: Dict[str, list] = {}
+            for sub, p in capture_paths:
+                by_sub.setdefault(sub, []).append(p)
             lines.append("")
-            lines.append(f"  Pi captures   {len(capture_paths)} images")
-            for d in sorted(dirs):
-                lines.append(f"    {d}/")
+            lines.append("  Captures")
+            for sub, paths in sorted(by_sub.items()):
+                dirs = {str(_Path(p).parent) for p in paths if "/" in p or "\\" in p}
+                lines.append(f"    {sub:<16} {len(paths)} images")
+                for d in sorted(dirs):
+                    lines.append(f"      {d}/")
 
         lines += [sep, ""]
         print("\n".join(lines), flush=True)

@@ -24,18 +24,35 @@ CANON_VENDOR_ID = "04a9"         # Canon Inc.
 
 
 def release_gphoto_usb() -> int:
-    """Stop gvfsd-gphoto2 processes owned by the current user.
+    """Release Canon cameras from gvfs and stop gvfsd-gphoto2.
 
-    GNOME's gvfs helper often claims Canon cameras and blocks gphoto2 with
-    "Could not claim the USB device". Returns the number of processes stopped.
+    If gvfsd-gphoto2 is simply killed with SIGTERM, it exits without calling
+    camera.exit(), which leaves the camera in a dangling PTP session and causes
+    the next gphoto2 connection to fail with [-105] or [-1].
+
+    This function first asks gvfs to unmount gphoto2 mounts cleanly via ``gio``
+    (which triggers a proper camera.exit()), then kills any remaining process.
+    A short settle wait lets the camera close its PTP session before the caller
+    attempts to open a new one.
+
+    Returns the number of gvfsd-gphoto2 processes that were stopped.
     """
+    # Step 1: clean unmount via gio so gvfsd calls camera.exit() before dying
+    try:
+        subprocess.run(
+            ["gio", "mount", "-u", "gphoto2://"],
+            capture_output=True, check=False, timeout=5,
+        )
+        logger.debug("gio unmount of gphoto2:// requested")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Step 2: kill any surviving gvfsd-gphoto2 processes
     uid = os.getuid()
     try:
         result = subprocess.run(
             ["pgrep", "-u", str(uid), "-f", GVFS_GPHOTO2_PROCESS],
-            capture_output=True,
-            text=True,
-            check=False,
+            capture_output=True, text=True, check=False,
         )
     except FileNotFoundError:
         logger.warning("pgrep not found; skipping gvfs release")
@@ -52,10 +69,12 @@ def release_gphoto_usb() -> int:
             os.kill(int(pid), signal.SIGTERM)
             stopped += 1
             logger.info("Stopped %s (pid %s)", GVFS_GPHOTO2_PROCESS, pid)
-        except ProcessLookupError:
-            pass
-        except PermissionError as exc:
+        except (ProcessLookupError, PermissionError) as exc:
             logger.warning("Could not stop pid %s: %s", pid, exc)
+
+    # Step 3: brief settle so the camera closes its PTP session
+    if stopped:
+        time.sleep(2)
 
     return stopped
 
