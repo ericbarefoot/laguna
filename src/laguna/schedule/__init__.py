@@ -13,7 +13,7 @@ except ImportError as _e:
         "Install them with: pip install numpy scipy pandas"
     ) from _e
 
-REQUIRED_COLUMNS = ["time_s", "weir_elevation_mm", "pump_flow_lpm", "qin_open", "qaux_open"]
+REQUIRED_COLUMNS = ["time_s"]
 
 
 class ExperimentSchedule:

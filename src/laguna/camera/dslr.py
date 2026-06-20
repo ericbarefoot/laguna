@@ -54,6 +54,52 @@ class DslrCameraSubsystem:
         self.dualcam_path = Path(dualcam_path) if dualcam_path else None
         self._camera_manager = None
         self._is_connected = False
+        self._main_yaml_path: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, config: dict, main_yaml_path: str) -> "DslrCameraSubsystem":
+        """Construct from the dslr_cameras: section of the main experiment YAML.
+
+        Writes a derived camera-only YAML alongside the main config for use by
+        CameraManager.from_yaml(). Port assignments detected at runtime are
+        persisted back to both the derived file and the main YAML.
+
+        Args:
+            config: The dslr_cameras: dict from experiment_config.yaml.
+            main_yaml_path: Absolute or relative path to experiment_config.yaml.
+        """
+        import yaml as _yaml
+
+        main_path = Path(main_yaml_path).resolve()
+        main_dir = main_path.parent
+
+        # Resolve relative output_dir values relative to the main YAML location
+        cameras_raw = config.get("cameras", {})
+        cameras_resolved: Dict[str, Any] = {}
+        for cam_name, cam_cfg in cameras_raw.items():
+            resolved = dict(cam_cfg)
+            if "output_dir" in resolved:
+                out = Path(resolved["output_dir"])
+                if not out.is_absolute():
+                    out = (main_dir / out).resolve()
+                resolved["output_dir"] = str(out)
+            cameras_resolved[cam_name] = resolved
+
+        derived_path = main_dir / "_dslr_cameras.yaml"
+        with open(derived_path, "w") as f:
+            _yaml.dump(
+                {"cameras": cameras_resolved},
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+            )
+
+        instance = cls(
+            config_path=str(derived_path),
+            dualcam_path=config.get("dualcam_path"),
+        )
+        instance._main_yaml_path = str(main_path)
+        return instance
 
     def connect(self) -> bool:
         """Load YAML config and connect to cameras.
@@ -159,20 +205,36 @@ class DslrCameraSubsystem:
             return False
 
     def _persist_ports(self, camera_names: list, new_ports: list) -> None:
-        """Write updated USB port assignments back to the YAML config file."""
+        """Write updated USB port assignments back to the YAML config file(s)."""
         import yaml
+
+        def _update_cameras_cfg(cameras_cfg: dict) -> None:
+            for i, cam_name in enumerate(camera_names):
+                if i < len(new_ports) and cam_name in cameras_cfg:
+                    cameras_cfg[cam_name]["port"] = new_ports[i]
+
         try:
             with open(self.config_path) as f:
                 config = yaml.safe_load(f)
-            cameras_cfg = config.get("cameras", {})
-            for i, name in enumerate(camera_names):
-                if i < len(new_ports) and name in cameras_cfg:
-                    cameras_cfg[name]["port"] = new_ports[i]
+            _update_cameras_cfg(config.get("cameras", {}))
             with open(self.config_path, "w") as f:
                 yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
             logger.info("Updated port assignments saved to %s", self.config_path)
         except Exception as e:
-            logger.warning("Could not persist new ports to YAML: %s", e)
+            logger.warning("Could not persist new ports to %s: %s", self.config_path, e)
+
+        if self._main_yaml_path:
+            try:
+                with open(self._main_yaml_path) as f:
+                    main_config = yaml.safe_load(f)
+                _update_cameras_cfg(
+                    main_config.get("dslr_cameras", {}).get("cameras", {})
+                )
+                with open(self._main_yaml_path, "w") as f:
+                    yaml.dump(main_config, f, default_flow_style=False, allow_unicode=True)
+                logger.info("Updated port assignments saved to %s", self._main_yaml_path)
+            except Exception as e:
+                logger.warning("Could not persist new ports to %s: %s", self._main_yaml_path, e)
 
     def usb_reset(self) -> list:
         """Explicit USB bus-reset for Canon cameras (use with caution).
