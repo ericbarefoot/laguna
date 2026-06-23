@@ -6,6 +6,7 @@ Public API:
     CaptureResult     — result dataclass from a network capture
     LocalCamera       — single locally-attached camera via OpenCV
     CameraAcquisition — backwards-compatibility alias for LocalCamera
+    DslrCameraSubsystem — DSLR camera wrapper for dualcam-timelapse
 """
 
 import logging
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from .local import LocalCamera, CameraAcquisition
 from .network import CameraArray, CaptureResult, _resolve_passphrase, DEFAULT_LEAD_TIME
+from .dslr import DslrCameraSubsystem
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,7 @@ __all__ = [
     "CaptureResult",
     "LocalCamera",
     "CameraAcquisition",
+    "DslrCameraSubsystem",
 ]
 
 

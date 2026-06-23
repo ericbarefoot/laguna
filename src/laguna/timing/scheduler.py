@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Any
 
 from .clock import ExperimentClock
 from .event_log import EventLog
@@ -74,11 +74,15 @@ class Scheduler:
     # Execution
     # ------------------------------------------------------------------
 
-    def run(self, duration: float) -> None:
+    def run(self, duration: float, on_complete: Optional[Callable[[], Any]] = None) -> None:
         """Block for `duration` runtime seconds, firing registered actions as due.
 
         Resumes the clock if it was paused (e.g. after a previous stop() call).
         Returns when duration expires or stop() is called.
+
+        Args:
+            on_complete: Optional callback invoked only when the duration expires
+                         naturally (not when stop() is called externally).
         """
         self._stop_event.clear()
         if self._clock.is_running and self._clock.is_paused:
@@ -108,6 +112,11 @@ class Scheduler:
 
             time.sleep(self._POLL)
 
+        _natural = not self._stop_event.is_set()
+        self.stop()
+        if _natural and on_complete is not None:
+            on_complete()
+
     def stop(self) -> None:
         """Interrupt run() and pause the experiment clock.
 
@@ -116,7 +125,21 @@ class Scheduler:
         """
         self._stop_event.set()
         if self._clock.is_running and not self._clock.is_paused:
+            if self._event_log:
+                self._event_log.log(self._clock.elapsed(), "scheduler", "stop", "ok")
             self._clock.pause()
+
+    def run_async(self, duration: float) -> threading.Thread:
+        """Run the scheduler in a background daemon thread.
+
+        Returns the thread so the caller can join() it if needed.
+        Call stop() from another thread to interrupt the run.
+        """
+        t = threading.Thread(
+            target=self.run, args=(duration,), daemon=True, name="scheduler-main"
+        )
+        t.start()
+        return t
 
     # ------------------------------------------------------------------
     # Internal

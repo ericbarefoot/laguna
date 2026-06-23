@@ -1,79 +1,67 @@
-# Example configuration file for Laguna experiments
-# Copy this to your_experiment.yaml and modify for your specific setup
-
-robot:
-  port: "/dev/ttyUSB0"          # Serial port for robot controller
-  baudrate: 9600
-  protocol: "modbus"            # or "ascii"
-  timeout: 5.0
-
-# Camera list — supports local (USB/CSI) and network (Pi) cameras.
-# 'cameras' takes precedence over the legacy 'camera' key below.
-cameras:
-  - name: pi_array
-    type: network
-    hosts:
-      - antares.laguna
-      - sirius.laguna
-    ssh_user: ucrs
-    ssh_key: /home/eric/.ssh/id_ed25519
-    # ssh_passphrase is read from ~/.config/laguna/ssh_passphrase at runtime
-    lead_time: 5.0
-    output_dir: ./captures
-
-  # Uncomment to add a local USB camera alongside the Pi array:
-  # - name: side_view
-  #   type: local
-  #   device_id: 0
-  #   fps: 30
-  #   resolution: [1920, 1080]
-
-# Legacy single-camera config — still accepted if 'cameras' list is empty.
-camera:
-  device_id: 0
-  fps: 30
-  resolution: [1920, 1080]
-  capture_format: "BGR"
-
-weir:
-  port: "/dev/ttyUSB0"          # Serial port for Teknic ClearCore motor
-  baudrate: 9600
-  steps_per_mm: 1000.0          # Motor steps per mm of weir travel
-  home_offset_mm: 0.0           # Elevation at the home position (mm)
-
-gauge:
-  port: "/dev/ttyUSB2"          # Serial port for Massa ultrasonic sensor
-  sensor_ids: [0]               # List of sensor IDs to poll
-  offset_mm: 0.0                # Sensor mounting offset (mm)
-
-flow:
-  vfd_port: "/dev/ttyUSB1"      # Serial port for Fuji VFD
-  vfd_slave_id: 1               # Modbus slave ID
-  motor_port: "/dev/ttyUSB0"    # Shared with weir controller
-  motor_baudrate: 9600
-  C0: 4.902                     # Flowrate-to-frequency calibration coefficients
-  C1: 58.49                     # freq = C2*Q^2 + C1*Q + C0  (Hz, L/min)
-  C2: 0.08956
-
-data:
-  output_directory: "./data/"
-  compression: "gzip"           # or "none"
-
-storage:
-  enabled: false
-  type: "local"                 # local, s3, or sftp
-  # For S3:
-  # bucket: "my-bucket"
-  # region: "us-east-1"
-  # credentials: "~/.aws/credentials"
-
-  # For SFTP:
-  # host: "remote.server.edu"
-  # port: 22
-  # username: "labuser"
-  # key_file: "~/.ssh/id_rsa"
-  # remote_path: "/data/experiments"
+# Example configuration file for Laguna experiments.
+# Copy and adapt for your setup. Omit a section entirely to disable that subsystem.
 
 timing:
-  checkpoint_file: "./experiment_checkpoint.json"
-  event_log: "./experiment_events.csv"
+  checkpoint_file: ./experiment_checkpoint.json
+  event_log: ./experiment_events.csv
+
+gauge:
+  port: /dev/ttyUSB2          # Massa M-5000 ultrasonic sensor
+  sensor_ids: [0]
+  offset_mm: 0.0
+  interval_s: 5               # read every 5 s
+
+weir:
+  port: /dev/ttyUSB1          # Teknic ClearCore motor controller
+  baudrate: 9600
+  home_offset_mm: 0.0
+  # Scheduling (choose one):
+  interval_s: 20              # poll status every 20 s (read-only, no motor motion)
+  # use_schedule: true        # follow schedule CSV (calls go_to_elevation); requires --schedule
+
+# Flow controller (Fuji VFD pump + solenoid valves). Omit section to disable.
+# flow:
+#   vfd_port: /dev/ttyUSB3
+#   vfd_slave_id: 1
+#   motor_port: /dev/ttyUSB1  # shared serial port with weir
+#   motor_baudrate: 9600
+#   C0: 4.902                 # flowrate-to-frequency calibration: Hz = C2*Q^2 + C1*Q + C0
+#   C1: 58.49
+#   C2: 0.08956
+#   # Scheduling (choose one):
+#   # interval_s: 20          # poll status every 20 s (read-only)
+#   # use_schedule: true      # follow schedule CSV (pump_flow_lpm, qin_open, qaux_open columns)
+
+pi_cameras:
+  hosts:
+    - pi1.local               # SSH hostnames or IPs of Pi camera nodes
+    - pi2.local
+  ssh_user: ucrs
+  ssh_key: ~/.ssh/id_ed25519
+  lead_time: 5.0
+  output_dir: ./captures/pi
+  # Scheduling (choose one):
+  interval_s: 30              # capture every 30 s
+  # trigger_at: [60, 120, 180]   # capture at these specific runtime seconds
+  # use_schedule: true            # fire at schedule CSV time_s rows;
+  #                               # add a pi_cameras column (1/0) to filter which rows trigger
+
+dslr_cameras:
+  dualcam_path: /path/to/dualcam-timelapse  # path to dualcam-timelapse repo
+  # Scheduling (choose one):
+  interval_s: 20
+  # trigger_at: [20, 40, 60]
+  # use_schedule: true
+  cameras:
+    Camera1:
+      port: usb:001,001       # auto-detected if wrong; updated in-place after connect
+      iso: "1600"
+      aperture: "5.6"
+      shutter: "1/125"
+      output_dir: ./captures/Camera1
+    Camera2:
+      port: usb:001,002
+      iso: "1600"
+      aperture: "5.6"
+      shutter: "1/125"
+      output_dir: ./captures/Camera2

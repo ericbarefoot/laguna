@@ -12,6 +12,7 @@ Standalone CLI usage (same as the sandbox script):
 """
 
 import json
+import logging
 import math
 import threading
 import time
@@ -20,6 +21,26 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import paramiko
+
+logger = logging.getLogger(__name__)
+
+
+def assess_spread(spread_ms: float) -> str:
+    """Return a quality label for inter-camera capture spread.
+
+    Thresholds:
+        EXCELLENT  < 20 ms
+        GOOD       < 50 ms
+        MARGINAL   < 200 ms
+        POOR       >= 200 ms  — likely an NTP sync problem
+    """
+    if spread_ms < 20:
+        return "EXCELLENT"
+    if spread_ms < 50:
+        return "GOOD"
+    if spread_ms < 200:
+        return "MARGINAL"
+    return "POOR — check NTP sync"
 
 # Agent script lives alongside this file in the package.
 AGENT_SCRIPT = Path(__file__).parent / "agent.py"
@@ -47,6 +68,8 @@ class CaptureResult:
 
 class CameraArray:
     """Manages a set of networked Raspberry Pi cameras for synchronised capture."""
+
+    subsystem_name = "pi_cameras"
 
     def __init__(
         self,
@@ -77,8 +100,7 @@ class CameraArray:
         sftp.close()
 
     def _log(self, hostname: str, msg: str) -> None:
-        ts = time.strftime("%H:%M:%S")
-        print(f"  [{hostname} {ts}] {msg}", flush=True)
+        logger.debug("[%s] %s", hostname, msg)
 
     def _run_capture_on_host(
         self, hostname: str, target_time: float, timeout: float = 60.0
@@ -178,6 +200,23 @@ class CameraArray:
             latency_ms=data.get("latency_ms"),
         )
 
+    def connect(self) -> bool:
+        """No persistent connection needed — SSH is opened per capture."""
+        return True
+
+    def disconnect(self) -> None:
+        """No persistent connection to close."""
+        pass
+
+    def get_status(self) -> Dict[str, Any]:
+        """Return configured state. Does not make SSH connections."""
+        return {
+            "subsystem": self.subsystem_name,
+            "hosts": self.hosts,
+            "ssh_user": self.ssh_user,
+            "ssh_key": self.ssh_key,
+        }
+
     def check_connectivity(self) -> Dict[str, bool]:
         """SSH into each host and check that it responds."""
         results: Dict[str, bool] = {}
@@ -225,13 +264,11 @@ class CameraArray:
                 rtt = t_after - t_before
                 offset = remote_time - (t_before + rtt / 2)
                 offsets[hostname] = offset
-                print(
-                    f"  clock sync  {hostname}: offset={offset:+.3f}s  RTT={rtt*1000:.0f}ms",
-                    flush=True,
-                )
+                logger.debug("clock sync  %s: offset=%+.3fs  RTT=%dms",
+                             hostname, offset, rtt * 1000)
             except Exception as exc:
                 offsets[hostname] = float("nan")
-                print(f"  clock sync  {hostname}: FAILED ({exc}), assuming offset=0", flush=True)
+                logger.debug("clock sync  %s: FAILED (%s), assuming offset=0", hostname, exc)
         return offsets
 
     def trigger_capture(self, lead_time: float = DEFAULT_LEAD_TIME) -> List[CaptureResult]:
@@ -240,11 +277,11 @@ class CameraArray:
         Measures per-host clock offsets then adjusts each camera's target
         timestamp so they all fire at the same wall-clock moment.
         """
-        print("Measuring clock offsets before trigger...", flush=True)
+        logger.debug("Measuring clock offsets before trigger...")
         offsets = self._measure_offsets()
 
         pc_target = time.time() + lead_time
-        print(f"PC target set: T+{lead_time:.1f}s from now ({pc_target:.3f})", flush=True)
+        logger.debug("PC target set: T+%.1fs from now (%.3f)", lead_time, pc_target)
 
         results: List[Optional[CaptureResult]] = [None] * len(self.hosts)
 
@@ -339,15 +376,8 @@ class CameraArray:
             times = [r.capture_time_mid_pc for r in successful if r.capture_time_mid_pc is not None]
             if len(times) >= 2:
                 spread_ms = (max(times) - min(times)) * 1000
+                assessment = assess_spread(spread_ms)
                 summary["spread_ms"] = spread_ms
-                if spread_ms < 20:
-                    assessment = "EXCELLENT (<20ms)"
-                elif spread_ms < 50:
-                    assessment = "GOOD (<50ms)"
-                elif spread_ms < 200:
-                    assessment = "MARGINAL (<200ms)"
-                else:
-                    assessment = "POOR (>200ms) — check NTP sync"
                 summary["assessment"] = assessment
                 print(f"\n  Spread between cameras: {spread_ms:.1f} ms — {assessment}")
             else:

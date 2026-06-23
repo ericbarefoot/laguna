@@ -4,8 +4,11 @@ FlumeLab uses an opt-in model: instantiate subsystems separately and attach them
 with lab.add(subsystem). This avoids hardcoding hardware assumptions in the core.
 """
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 import logging
+import threading
+import time
 
 from .config import Config
 from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
@@ -52,6 +55,8 @@ class FlumeLab:
         # Registry for opt-in hardware subsystems
         self._subsystems: Dict[str, Any] = {}
 
+        self._duration: Optional[float] = None   # set by start(), used by resume()
+        self._start_wall: Optional[float] = None  # wall time of lab.start()
         self.is_running = False
         logger.info("FlumeLab timing backbone ready — add subsystems via lab.add()")
 
@@ -182,7 +187,7 @@ class FlumeLab:
         wall, runtime = self.clock.now()
         status: Dict[str, Any] = {
             "timing": {
-                "clock_running": self.clock.is_running,
+                "clock_running": self.clock.is_running and not self.clock.is_paused,
                 "clock_paused": self.clock.is_paused,
                 "runtime_s": runtime,
                 "wall_time": wall,
@@ -192,6 +197,154 @@ class FlumeLab:
             getter = getattr(subsystem, "get_status", None)
             status[name] = getter() if getter else {"registered": True}
         return status
+
+    def start(self, duration: float) -> threading.Thread:
+        """Start the experiment clock and scheduler in a background thread.
+
+        Intended for interactive / REPL use after main_interactive() returns.
+        Nothing runs until this is called.
+
+        Args:
+            duration: How long to run the scheduler, in experiment-time seconds.
+                      Stored so that resume() with no arguments continues for
+                      the remaining time.
+
+        Returns:
+            The scheduler thread (daemon). Call lab.stop() to pause early.
+        """
+        self._duration = duration
+        self._start_wall = time.time()
+        self.clock.start()
+        self.event_log.log(0.0, "flume_lab", "experiment_start")
+        thread = threading.Thread(
+            target=self.scheduler.run,
+            args=(duration,),
+            kwargs={"on_complete": self.print_summary},
+            daemon=True,
+            name="scheduler-main",
+        )
+        thread.start()
+        logger.info("Experiment started for %.0f seconds.", duration)
+        logger.info("  lab.stop()          — pause")
+        logger.info("  lab.resume(N)       — resume for N more seconds")
+        logger.info("  lab.disconnect_all() — clean shutdown when finished")
+        return thread
+
+    def print_summary(self) -> None:
+        """Print a summary of the completed experiment to stdout.
+
+        Called automatically when the scheduled duration expires. Can also be
+        called manually at any point during or after an experiment.
+        """
+        import csv as _csv
+        from datetime import datetime
+
+        runtime = self.clock.elapsed()
+        start_str = (
+            datetime.fromtimestamp(self._start_wall).strftime("%Y-%m-%d %H:%M:%S")
+            if self._start_wall else "unknown"
+        )
+
+        # Parse the event log for counts and capture paths
+        event_counts: Dict[tuple, int] = {}
+        capture_paths: list = []
+        try:
+            with open(self.event_log._path, newline="") as f:
+                for row in _csv.DictReader(f):
+                    sub = row.get("subsystem", "")
+                    evt = row.get("event_type", "")
+                    if sub in ("flume_lab", "scheduler"):
+                        continue
+                    event_counts[(sub, evt)] = event_counts.get((sub, evt), 0) + 1
+                    if sub in ("pi_cameras", "dslr_cameras") and evt == "capture":
+                        result = row.get("result", "")
+                        for part in result.split():
+                            if part.startswith("file="):
+                                capture_paths.append((sub, part[len("file="):]))
+        except Exception:
+            pass
+
+        sep = "=" * 52
+        lines = [
+            "",
+            sep,
+            "  Experiment Complete",
+            sep,
+            f"  Started   {start_str}",
+            f"  Runtime   {runtime:.1f} s  ({runtime / 60:.1f} min)",
+            f"  Log       {self.event_log._path}",
+            "",
+            "  Subsystems",
+        ]
+
+        for name, subsystem in self._subsystems.items():
+            getter = getattr(subsystem, "get_status", None)
+            connected = "?"
+            detail = ""
+            if getter:
+                st = getter()
+                connected = "connected" if st.get("is_connected", True) else "not connected"
+                if name == "pi_cameras" and "hosts" in st:
+                    detail = f"  ({', '.join(st['hosts'])})"
+            lines.append(f"    {name:<14} {connected}{detail}")
+
+        if event_counts:
+            lines.append("")
+            lines.append("  Events")
+            for (sub, evt), count in sorted(event_counts.items()):
+                lines.append(f"    {sub:<16} {evt:<26} {count:>4}×")
+
+        if capture_paths:
+            from pathlib import Path as _Path
+            by_sub: Dict[str, list] = {}
+            for sub, p in capture_paths:
+                by_sub.setdefault(sub, []).append(p)
+            lines.append("")
+            lines.append("  Captures")
+            for sub, paths in sorted(by_sub.items()):
+                dirs = {str(_Path(p).parent) for p in paths if "/" in p or "\\" in p}
+                lines.append(f"    {sub:<16} {len(paths)} images")
+                for d in sorted(dirs):
+                    lines.append(f"      {d}/")
+
+        lines += [sep, ""]
+        print("\n".join(lines), flush=True)
+
+    def stop(self) -> None:
+        """Pause the experiment: stop scheduler loop, pause clock, and stop weir.
+
+        Unlike disconnect_all(), this does NOT close the event log or disconnect
+        hardware — the experiment can be resumed with resume() or a fresh run().
+        """
+        logger.info("Stopping experiment (pausing clock and scheduler)...")
+        self.event_log.log(self.clock.elapsed(), "flume_lab", "experiment_pause")
+        self.scheduler.stop()
+        weir = self._subsystems.get("weir")
+        if weir and hasattr(weir, "stop"):
+            weir.stop()
+
+    def resume(self, remaining_s: Optional[float] = None) -> threading.Thread:
+        """Resume after stop(): restart scheduler loop in background thread.
+
+        Args:
+            remaining_s: How long to run, in experiment-time seconds. If omitted,
+                         uses the time remaining from the original lab.start() call
+                         (i.e. start_duration − elapsed_runtime).
+
+        Returns:
+            The scheduler thread, so caller can .join() it if desired.
+        """
+        if remaining_s is None:
+            if self._duration is None:
+                raise RuntimeError("No duration stored — call lab.start(duration) before resume()")
+            remaining_s = max(0.0, self._duration - self.clock.elapsed())
+            logger.info(
+                "Resuming for %.1f remaining seconds (%.1fs elapsed of %.1fs total)",
+                remaining_s, self.clock.elapsed(), self._duration,
+            )
+        else:
+            logger.info("Resuming experiment for %.1f more seconds...", remaining_s)
+        return self.scheduler.run_async(remaining_s)
 
     def emergency_stop(self) -> None:
         """Emergency stop — immediately shut down all registered systems."""
