@@ -228,15 +228,18 @@ def setup_run(
 
     def _log_gauge():
         try:
+            gauge.connect()
             elev_mm = gauge.read_mm()
             logger.info("Water level: %.2f mm", elev_mm)
             lab.event_log.log(lab.clock.elapsed(), "gauge", "read_mm",
                               f"elevation_mm={elev_mm:.2f}")
         except Exception as e:
             logger.error("Gauge read failed: %s", e)
+            raise
 
     def _log_weir_status():
         try:
+            weir.connect()
             status = weir.get_status()
             motor = status.get("motor", {})
             elev = status.get("elevation_mm")
@@ -248,10 +251,12 @@ def setup_run(
                               f"fault={motor.get('MotorInFault')}")
         except Exception as e:
             logger.error("Weir status query failed: %s", e)
+            raise
 
     def _make_update_weir(t_s: float) -> Callable:
         def _update_weir():
             try:
+                weir.connect()
                 target_mm = exp_schedule.weir_elevation(t_s)
                 logger.info("Weir -> %.2f mm  (t=%.0f s)", target_mm, t_s)
                 weir.go_to_elevation(target_mm)
@@ -259,6 +264,7 @@ def setup_run(
                                   f"target_mm={target_mm:.2f}")
             except Exception as e:
                 logger.error("Weir update failed: %s", e)
+                raise
         return _update_weir
 
     def _log_flow_status():
@@ -271,6 +277,7 @@ def setup_run(
                               f"flowrate_lpm={status.get('flowrate_lpm', 0):.2f}")
         except Exception as e:
             logger.error("Flow status query failed: %s", e)
+            raise
 
     def _make_update_flow(t_s: float) -> Callable:
         def _update_flow():
@@ -288,6 +295,7 @@ def setup_run(
                                   f"flowrate_lpm={lpm:.2f} qin={qin} qaux={qaux}")
             except Exception as e:
                 logger.error("Flow update failed: %s", e)
+                raise
         return _update_flow
 
     def _capture_pi():
@@ -318,6 +326,7 @@ def setup_run(
                                   f"failed={failed}")
         except Exception as e:
             logger.error("Pi camera capture failed: %s", e)
+            raise
 
     def _capture_dslr():
         try:
@@ -334,6 +343,7 @@ def setup_run(
                                       f"camera={cam_name}")
         except Exception as e:
             logger.error("DSLR capture failed: %s", e)
+            raise
 
     # ------------------------------------------------------------------ #
     # Register scheduled actions                                           #
