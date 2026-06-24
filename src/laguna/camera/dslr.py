@@ -40,36 +40,35 @@ class DslrCameraSubsystem:
 
     def __init__(
         self,
-        config_path: str,
+        config_path: Optional[str] = None,
         dualcam_path: Optional[str] = None,
     ) -> None:
         """Initialize DSLR subsystem.
 
         Args:
             config_path: Path to dualcam YAML config (cameras.yaml).
+                         Not required when constructed via from_dict().
             dualcam_path: Optional path to dualcam-timelapse repo root.
                          If provided, added to sys.path before import.
         """
-        self.config_path = Path(config_path)
+        self.config_path = Path(config_path) if config_path else None
         self.dualcam_path = Path(dualcam_path) if dualcam_path else None
         self._camera_manager = None
         self._is_connected = False
         self._main_yaml_path: Optional[str] = None
+        self._config: Optional[dict] = None
 
     @classmethod
     def from_dict(cls, config: dict, main_yaml_path: str) -> "DslrCameraSubsystem":
         """Construct from the dslr_cameras: section of the main experiment YAML.
 
-        Writes a derived camera-only YAML alongside the main config for use by
-        CameraManager.from_yaml(). Port assignments detected at runtime are
-        persisted back to both the derived file and the main YAML.
+        Resolves relative output_dir paths and stores the config in memory.
+        Port assignments detected at runtime are persisted back to the main YAML.
 
         Args:
             config: The dslr_cameras: dict from experiment_config.yaml.
             main_yaml_path: Absolute or relative path to experiment_config.yaml.
         """
-        import yaml as _yaml
-
         main_path = Path(main_yaml_path).resolve()
         main_dir = main_path.parent
 
@@ -85,19 +84,8 @@ class DslrCameraSubsystem:
                 resolved["output_dir"] = str(out)
             cameras_resolved[cam_name] = resolved
 
-        derived_path = main_dir / "_dslr_cameras.yaml"
-        with open(derived_path, "w") as f:
-            _yaml.dump(
-                {"cameras": cameras_resolved},
-                f,
-                default_flow_style=False,
-                allow_unicode=True,
-            )
-
-        instance = cls(
-            config_path=str(derived_path),
-            dualcam_path=config.get("dualcam_path"),
-        )
+        instance = cls(dualcam_path=config.get("dualcam_path"))
+        instance._config = {"cameras": cameras_resolved}
         instance._main_yaml_path = str(main_path)
         return instance
 
@@ -136,8 +124,11 @@ class DslrCameraSubsystem:
             if released:
                 logger.info("Released %d gvfsd-gphoto2 process(es)", released)
 
-            logger.info("Loading DSLR config from %s", self.config_path)
-            self._camera_manager = CameraManager.from_yaml(str(self.config_path))
+            if self._config is not None:
+                self._camera_manager = CameraManager.from_config(self._config)
+            else:
+                logger.info("Loading DSLR config from %s", self.config_path)
+                self._camera_manager = CameraManager.from_yaml(str(self.config_path))
             connect_results = self._camera_manager.connect_all()
             logger.info("DSLR connection (level 1): %s", connect_results)
 
@@ -174,7 +165,10 @@ class DslrCameraSubsystem:
                         logger.warning("  %s -> no port found", name)
 
                 self._persist_ports(camera_names, new_ports)
-                self._camera_manager = CameraManager.from_yaml(str(self.config_path))
+                if self._config is not None:
+                    self._camera_manager = CameraManager.from_config(self._config)
+                else:
+                    self._camera_manager = CameraManager.from_yaml(str(self.config_path))
 
                 connect_results = self._camera_manager.connect_all()
                 logger.info("DSLR connection (level 2): %s", connect_results)
@@ -205,7 +199,7 @@ class DslrCameraSubsystem:
             return False
 
     def _persist_ports(self, camera_names: list, new_ports: list) -> None:
-        """Write updated USB port assignments back to the YAML config file(s)."""
+        """Persist updated USB port assignments to in-memory config and main YAML."""
         import yaml
 
         def _update_cameras_cfg(cameras_cfg: dict) -> None:
@@ -213,15 +207,18 @@ class DslrCameraSubsystem:
                 if i < len(new_ports) and cam_name in cameras_cfg:
                     cameras_cfg[cam_name]["port"] = new_ports[i]
 
-        try:
-            with open(self.config_path) as f:
-                config = yaml.safe_load(f)
-            _update_cameras_cfg(config.get("cameras", {}))
-            with open(self.config_path, "w") as f:
-                yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-            logger.info("Updated port assignments saved to %s", self.config_path)
-        except Exception as e:
-            logger.warning("Could not persist new ports to %s: %s", self.config_path, e)
+        if self._config is not None:
+            _update_cameras_cfg(self._config.get("cameras", {}))
+        elif self.config_path is not None:
+            try:
+                with open(self.config_path) as f:
+                    config = yaml.safe_load(f)
+                _update_cameras_cfg(config.get("cameras", {}))
+                with open(self.config_path, "w") as f:
+                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+                logger.info("Updated port assignments saved to %s", self.config_path)
+            except Exception as e:
+                logger.warning("Could not persist new ports to %s: %s", self.config_path, e)
 
         if self._main_yaml_path:
             try:
@@ -291,6 +288,6 @@ class DslrCameraSubsystem:
         return {
             "subsystem": self.subsystem_name,
             "is_connected": self._is_connected,
-            "config_path": str(self.config_path),
+            "config_path": str(self.config_path) if self.config_path else None,
             "num_cameras": len(self._camera_manager._cameras) if self._camera_manager else 0,
         }
