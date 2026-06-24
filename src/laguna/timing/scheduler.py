@@ -146,15 +146,13 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _fire(self, action: Callable, subsystem: str, name: str, runtime_s: float) -> None:
-        """Dispatch action in a daemon thread and log the firing."""
+        """Dispatch action in a daemon thread; log only on failure."""
         def _run():
             try:
                 action()
-                result = "ok"
             except Exception as exc:
-                result = f"error: {exc}"
                 logger.warning("Scheduled action %s/%s failed: %s", subsystem, name, exc)
-            if self._event_log:
-                self._event_log.log(runtime_s, subsystem, name, result)
+                if self._event_log:
+                    self._event_log.log(runtime_s, subsystem, name, f"error: {exc}")
 
         threading.Thread(target=_run, daemon=True, name=f"sched-{subsystem}-{name}").start()
