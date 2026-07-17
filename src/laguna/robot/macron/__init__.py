@@ -36,6 +36,14 @@ from .fences import (
     CheckedTrajectory,
     TrajectoryChecker,
 )
+from .gcode import (
+    GCodeError,
+    GCodeExecutionAborted,
+    GCodeExecutor,
+    GCodeMove,
+    GCodeParser,
+    GCodeProgram,
+)
 
 __all__ = [
     # connection
@@ -75,4 +83,11 @@ __all__ = [
     "FenceViolation",
     "CheckedTrajectory",
     "TrajectoryChecker",
+    # gcode
+    "GCodeError",
+    "GCodeExecutionAborted",
+    "GCodeExecutor",
+    "GCodeMove",
+    "GCodeParser",
+    "GCodeProgram",
 ]
