@@ -20,8 +20,8 @@ BASE_CONFIG = {
     "axes": [
         {"name": "X", "index": 1},
         {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
-        {"name": "Z", "index": 5, "brake_status_input": 1},
-        {"name": "Theta", "index": 6, "limit_input": 2},
+        {"name": "Z", "index": 5},
+        {"name": "Theta", "index": 6},
     ],
     "homing": {"speed_mm_s": 10.0, "standoff_mm": 5.0, "order": ["Z", "X", "Y"]},
     "fences": [{"type": "box", "name": "bed", "x": [0, 500], "y": [0, 300], "z": [0, 5]}],
@@ -76,8 +76,11 @@ class TestFromConfigAxesAndIOMap:
         io_map = controller._io_map
         assert io_map.y_brake_output == 4
         assert io_map.y_brake_status_input == 8
-        assert io_map.z_brake_status_input == 1
-        assert io_map.theta_limit_input == 2
+        # z_brake_status_input / theta_limit_input live on the responder's
+        # own input bank — unreachable via ASCII, so they stay None even
+        # when unconfigured in the axes list (see IOMap docstring).
+        assert io_map.z_brake_status_input is None
+        assert io_map.theta_limit_input is None
 
     def test_missing_axes_falls_back_to_default_four(self):
         cfg = dict(BASE_CONFIG)

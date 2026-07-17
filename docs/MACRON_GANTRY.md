@@ -5,12 +5,15 @@ node — see "Axis model" below) robotic gantry, controlled through a
 Modusystems OEM-2T rev D PLC over an ASCII text protocol. Lives at
 `src/laguna/robot/macron/`.
 
-**Status as of 2026-07-16: M0-M3 complete and merged onto `feat-macron-api`
-(rebased on `develop`). All hardware-free work is done and tested (182/184
-suite passing — 2 pre-existing failures in `test_core.py` unrelated to this
-work). M4 (read-only hardware verification) is blocked on the controller not
-currently running a program with the ASCII interpreter active — see "Current
-status" below.**
+**Status as of 2026-07-17: M0-M3 complete on `feat-macron-api` (rebased on
+`develop`), all hardware-free work tested. M4 (read-only hardware
+verification) is UNBLOCKED and passed a first read-only pass against real
+hardware — see "Current status" below. Digital IO channel assignments were
+substantially corrected on 2026-07-17 (see "Digital IO" below) — the axis
+mapping (X=1/Y=2/Z=5/Theta=6) and the commander-native `INB`/`SOB` table
+were both confirmed via a combination of vendor developer conversation, live
+hardware queries, and decoding the `.dsm` project files' Named-IO
+declarations.**
 
 ## Topology
 
@@ -104,38 +107,80 @@ the older vendor demo file and not-yet-updated `oem2t.py` on the Pi).
 
 ## Digital IO — read this before touching brakes or limit switches
 
-**The `.dsm` project files are stale for IO wiring.** All of `XXHome`,
-`XXLim`, `YHome`, `YLim`, `Zhome`, `ZLim`, `Y_Brake`, `Z_Brake` (outputs), and
-`Y_Brake_Status` are declared in every `.dsm` file as **IsoIO** expansion-
-board channels — but that board is **not physically installed** (`ISI`/`ISO`
-commands fail with error 263). The user has since **physically rewired all
-of these onto the controller's native `INB`/`SOB` bus** (also fixing a 24V
-pull-up wiring issue from an earlier attempt), but the project files were
-never updated to reflect the rewire.
+**Correction (2026-07-17): these are NOT IsoIO channels.** Earlier notes
+here called `XXHome`/`XXLim`/`YHome`/`YLim`/`Zhome`/`ZLim`/`Y_Brake`/
+`Z_Brake`/`Y_Brake_Status` "IsoIO expansion-board channels declared stale in
+the `.dsm` files" — that was a misreading. The IsoIO board genuinely isn't
+installed (`ISI`/`ISO` commands still fail with error 263), but the `.dsm`
+files' own `TNamedIO` records for these signals use `Type=1` (plain digital
+input) with `ModuleNumber=16` ($10) — and the vendor's own runtime
+(`standard.inc`) treats `ModuleNumber=16` as the **local/commander native**
+input bus, not an IsoIO designation. So these were commander-native
+`INB`/`SOB` channels all along; decoded directly from the `.dsm`'s Named-IO
+block declarations (`eab-2026-07-16.dsm` and `eab-2026-07-17.dsm` agree
+exactly) and cross-checked against a live `INB 1-8` read on 2026-07-17
+(values `1,1,1,0,1,1,0,0` — consistent with the table below). Not yet
+physically toggle-tested switch-by-switch.
 
-**Only two native channels are currently confirmed** (from
-`eab-2026-07-16.dsm`, treated as authoritative over `600011-00-eab4.dsm`
-where they disagree on a few polarity flags):
-- `Z_Brake_Status` = `INB 1`
-- `TLim` = `INB 2`
+**Commander native IO** (all `ModuleNumber=16` in the `.dsm`):
 
-Everything else needs physical probing (toggle each switch/output, diff
-`INB`/`SOB` snapshots — the pattern in the user's own
+| Channel | Signal |
+|---|---|
+| `INB 1` | `XXHome` (X home switch) |
+| `INB 2` | `XXLim` (X limit switch) |
+| `INB 3` | `YHome` |
+| `INB 4` | `YLim` |
+| `INB 5` | `Zhome` |
+| `INB 6` | `ZLim` |
+| `INB 7` | *(unused/spare in the `.dsm`)* |
+| `INB 8` | `Y_Brake_Status` |
+| `SOB 4` | `Y_Brake` (output) |
+| `SOB 5` | `Z_Brake` (output) |
+
+**Two signals are the exception — and this matters.** `Z_Brake_Status` and
+`TLim` (Theta's limit switch) both have `ModuleNumber=1` in the `.dsm`, not
+`16` — per the vendor's own local/remote rule, they live on the
+**responder's own input bank** (index 1 and 2 there), not the commander's.
+The Z brake's *output* (`SOB 5`) is still on the commander — only the brake
+*status input* and the Theta limit switch are responder-side.
+
+Worse: **there is no ASCII text command that reaches the responder's own
+inputs at all.** Traced directly in the interpreter's dispatch code: `INB`
+is a flat, non-scoped call straight into the local `InputBit()` function,
+with no axis/node prefix anywhere in the grammar. The only path to a remote
+node's IO in this firmware family is the GUI-configured Named IO block
+feature (which resolves `ModuleNumber` internally on the controller itself)
+or the separate, vendor-encrypted Binary Commands node protocol used for
+responder axis motion — neither is reachable from the ASCII RS232 interpreter
+this driver talks to. `IOMap.z_brake_status_input` / `theta_limit_input`
+therefore default to `None` and are treated as **architecturally
+unimplemented, not just unprobed**: `brake_is_disengaged()` raises
+`NotImplementedError` (not the usual `ValueError`) if asked to use them.
+Getting a real reading on either would need a different mechanism — Named
+IO config via the Snap2Motion IDE, or a from-scratch Binary Commands client
+— not something to build without deciding it's worth the added complexity.
+
+Everything else in the table above still needs physical toggle-testing
+(diff `INB`/`SOB` snapshots — the pattern in the user's own
 `~/modusystems_dev/status_snapshot.py` on the Pi is the validated tool for
-this) before `IOMap` can be filled in. `IOMap` in `commands.py` defaults
-every unconfirmed field to `None`; brake-control methods
-(`disengage_brake`/`engage_brake`/`brake_is_disengaged`) raise `ValueError`
-if asked to use a channel that isn't set, rather than silently doing nothing
-or guessing.
+this) to fully confirm, though the live `INB 1-8` read today is a strong
+cross-check. Brake-control methods (`disengage_brake`/`engage_brake`) still
+raise `ValueError` (not `NotImplementedError`) if a channel is explicitly
+unset — that's the "not yet probed/configured" case, distinct from the
+responder's structural unreachability.
 
 **Homing is explicitly deprioritized** — the user does not plan to run it
 soon ("we will not run homing anyway"). `HomingProcedure`'s architecture is
 sound and fully unit-tested, just not a near-term verification priority.
 
-**Also real, not hypothetical**: `X` and `Y` currently have uninitialized
-software position limits (`PLT`/`NLT` ≈ ±822,536,056) — soft-limit
-protection is **not active** on those two axes right now.
-`MMCCommands.validate_soft_limits()` detects and raises on this.
+**Soft limits, updated 2026-07-17**: earlier notes here said X/Y had
+uninitialized software position limits (`PLT`/`NLT` ≈ ±822,536,056). A live
+read today showed real, sane values instead (`A1 PLT=122`, `A2 PLT=80`,
+`A5 PLT=24`) — so soft-limit protection does appear to be configured on
+X/Y/Z now. These values are from an unhomed position, though, and haven't
+been validated as correct for the actual travel envelope — treat them as
+"present" not "verified correct." `MMCCommands.validate_soft_limits()` still
+exists to catch the old garbage-value failure mode if it recurs.
 
 ## Safety model (defense in depth, multiple independent layers)
 
@@ -194,21 +239,24 @@ lab.add(gantry)  # subsystem_name = "gantry" -> lab.gantry
 
 **M0-M3 done** (branch/protocol fixes, G-code, Pi bridge, config — all
 hardware-free, all tested). See `feat-macron-api` branch commit history for
-the milestone-by-milestone breakdown (5 commits: rebase, M1, M2, M3, and a
-`SafeModeConnection` safety fix made just before the first hardware
-attempt).
+the milestone-by-milestone breakdown.
 
-**M4 (read-only hardware verification) is blocked**, not by our code: a
-`WHT` query times out through three independent paths (our new bridge code,
-a raw socket bypassing everything, and the user's own `oem2t.py` running
-*locally on the Pi* talking directly to the serial port with zero laguna
-code involved). The USB-serial adapter itself is healthy (`dmesg`/`lsusb`
-clean, no disconnects). The user's diagnosis: the controller may not
-currently be running a program with the `AsciiCommands`/`MonitorCommPort`
-component active — this needs the Snap2Motion Windows IDE connected
-directly to check/load/run the right program. This is not something
-reachable from the Pi (`serial_bridge.py` only forwards raw bytes) or from
-this codebase.
+**M4 (read-only hardware verification) is UNBLOCKED as of 2026-07-17.** The
+prior day's timeout (controller likely not running a program with the ASCII
+interpreter active) resolved itself — a raw connectivity test (`1234\r` →
+`0 1234.000 >`) succeeded, and the full read-only pass ran clean:
+- `WHT` → `0.000`
+- `INB 1-8` → real values (`1,1,1,0,1,1,0,0`, now decoded — see "Digital IO"
+  above); `INB 9-16` → error 31 (`ParameterOutOfRangeEscapeCode`, confirmed
+  in the vendor's `standard.inc`) — a real hardware limit (each board has
+  only 8 native inputs), not a bug.
+- `A1`/`A2`/`A5 ACP`/`PLT`/`NLT` all returned sane values; `A6` (Theta)
+  `PLT`/`NLT` timed out, expected since it's a rotary axis with no position
+  limits.
+
+Not yet done: physically toggling switches/brakes to confirm the decoded
+`INB`/`SOB` table above, and Stage 3 (actual motion) — both still gated on
+explicit authorization in a future conversation.
 
 ### Resuming after a Pi reboot or session gap
 
@@ -233,15 +281,21 @@ conn.send("WHT")  # should return "0", not time out
 
 ### Remaining open items (not blockers for M0-M3, tracked for later)
 
-1. Native `INB`/`SOB` channels for X/Y/Z home+limit switches and both brake
-   outputs — unknown, need physical probing (toggle + diff snapshots).
-2. `MTT` (motor type) observed as `16` on this hardware in addition to the
+1. The commander native `INB`/`SOB` table (see "Digital IO" above) is
+   decoded from the `.dsm` files' Named-IO declarations and cross-checked
+   against one live `INB 1-8` read — still needs physical toggle-testing
+   switch-by-switch to fully confirm.
+2. `Z_Brake_Status`/`TLim` are confirmed to live on the responder's own
+   input bank with no ASCII-reachable path from here (see "Digital IO"
+   above) — resolving this for real would need either the Snap2Motion IDE's
+   Named IO config or a from-scratch Binary Commands protocol client;
+   not planned unless it's decided to be worth building.
+3. `MTT` (motor type) observed as `16` on this hardware in addition to the
    documented `0`=stepper/`8`=servo — meaning unknown, treated as opaque.
-3. Names/roles for Responder-node axes 5-8 — unknown.
 4. Two files referenced in the user's own code comments
    (`python_package_plan.md`, `oem2t_protocol_reference.md`) were not found
    anywhere searched on the Pi — may exist elsewhere.
 5. Minor polarity-flag disagreements between `eab-2026-07-16.dsm` and
-   `600011-00-eab4.dsm` on a few home/limit inputs — the former is treated
-   as authoritative per the user, worth a physical sanity check during
-   probing.
+   `600011-00-eab4.dsm` on a few home/limit inputs — the former (and its
+   2026-07-17 successor, which agrees with it exactly) is treated as
+   authoritative per the user, worth a physical sanity check during probing.

@@ -161,11 +161,11 @@ class TestHomeAxisBrakeHandling:
         assert "SOB 4 1" in conn.sent
 
     def test_raises_if_brake_channel_not_configured(self):
-        # Default IOMap has y_brake_output=None (unprobed on this hardware).
         conn = FakeSnapConnection({})
         cmd = MMCCommands(conn)
         config = HomingConfig(homing_speed=10.0, standoff_distance=5.0)
-        proc = HomingProcedure(cmd, config)  # default IOMap
+        io_map = IOMap(y_brake_output=None)  # explicitly unset
+        proc = HomingProcedure(cmd, config, io_map=io_map)
         with pytest.raises(ValueError):
             proc.home_axis(Y_AXIS)
 

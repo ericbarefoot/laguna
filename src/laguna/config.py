@@ -96,9 +96,9 @@ class Config:
                 "safe_mode": True,
                 "axes": [
                     {"name": "X", "index": 1},
-                    {"name": "Y", "index": 2, "brake_output": None, "brake_status_input": None},
-                    {"name": "Z", "index": 5, "brake_output": None, "brake_status_input": 1},
-                    {"name": "Theta", "index": 6, "limit_input": 2},
+                    {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+                    {"name": "Z", "index": 5, "brake_output": 5},
+                    {"name": "Theta", "index": 6},
                 ],
                 "homing": {
                     "speed_mm_s": 10.0,

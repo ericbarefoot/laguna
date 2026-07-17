@@ -117,37 +117,62 @@ class GroupState:
 class IOMap:
     """Digital IO channel mapping for brakes and home/limit switches.
 
-    The vendor's Snap2Motion project files (both the older demo program and
-    the current production/jog-test files) declare these signals as IsoIO
-    expansion-board channels — but that board is not physically installed
-    on this machine (ISI/ISO commands fail with error 263). The user has
-    since physically rewired all of these signals onto the controller's
-    native INB/SOB bus instead; the project files were never updated to
-    reflect this, so do NOT reuse any IsoIO channel number from a .dsm file
-    here.
+    Earlier notes on this integration called these "IsoIO expansion-board
+    channels" per the vendor's .dsm project files. That characterization was
+    a misreading: the IsoIO board genuinely isn't installed on this machine
+    (ISI/ISO commands fail with error 263), but the .dsm's own TNamedIO
+    records for these signals use Type=1 (plain digital input) with
+    ModuleNumber=16 ($10) — the vendor's own runtime (standard.inc) treats
+    ModuleNumber=16 as the LOCAL/commander native input bus, not an IsoIO
+    designation. So most of these were never IsoIO channels at all; they're
+    commander-native INB/SOB reads, decoded directly from the .dsm's
+    Named-IO block declarations (eab-2026-07-16.dsm and eab-2026-07-17.dsm
+    agree exactly) and cross-checked against a live INB 1-8 read on
+    2026-07-17 (values 1,1,1,0,1,1,0,0 — consistent with this table). Not
+    yet physically toggle-tested switch-by-switch.
 
-    Only two channels are currently confirmed, both native, both from
-    eab-2026-07-16.dsm (treated as authoritative over the vendor demo file
-    and 600011-00-eab4.dsm where they disagree):
-      - z_brake_status_input = INB 1
-      - theta_limit_input    = INB 2
-    Every other field defaults to None and must be physically probed
-    (toggle each switch/output, diff INB/SOB snapshots) before use — see
-    sandbox/probe_gantry.py. Brake-control methods below raise ValueError
-    if asked to use a channel that hasn't been set.
+    Commander native IO decode (ModuleNumber=16 in both .dsm files):
+      - x_home_input         = INB 1  (XXHome)
+      - x_limit_input        = INB 2  (XXLim)
+      - y_home_input         = INB 3  (YHome)
+      - y_limit_input        = INB 4  (YLim)
+      - z_home_input         = INB 5  (Zhome)
+      - z_limit_input        = INB 6  (ZLim)
+      - (INB 7 unused/spare in the .dsm)
+      - y_brake_status_input = INB 8  (Y_Brake_Status)
+      - y_brake_output       = SOB 4  (Y_Brake)
+      - z_brake_output       = SOB 5  (Z_Brake)
+
+    Two signals are the exception: Z_Brake_Status and TLim (Theta's limit
+    switch) both have ModuleNumber=1 in the .dsm, not 16 — per the vendor's
+    own local/remote rule, that means they live on the RESPONDER's own
+    input bank (index 1 and 2 there), not the commander's — even though the
+    output side of the Z brake (SOB 5) is still on the commander. Worse:
+    there is no ASCII text command that reaches the responder's own inputs
+    at all — confirmed by tracing the interpreter's dispatch code, INB is a
+    flat, non-scoped call straight into the local InputBit() function with
+    no axis/node prefix in the grammar. The only path to a remote node's IO
+    in this firmware family is the GUI-configured Named IO block feature
+    (which resolves ModuleNumber internally on the controller) or the
+    separate, vendor-encrypted Binary Commands node protocol used for
+    responder axis motion — neither is reachable from here. So
+    z_brake_status_input and theta_limit_input default to None and are
+    architecturally unimplemented, not just unprobed: brake_is_disengaged()
+    raises NotImplementedError (not the usual ValueError) if asked to use
+    them, until some other path to read the responder's IO is built.
     """
-    y_brake_output: Optional[int] = None
-    z_brake_output: Optional[int] = None
-    y_brake_status_input: Optional[int] = None
-    z_brake_status_input: Optional[int] = 1   # INB 1 — confirmed (eab-2026-07-16.dsm)
+    y_brake_output: Optional[int] = 4    # SOB 4 — confirmed (eab-2026-07-16/17.dsm)
+    z_brake_output: Optional[int] = 5    # SOB 5 — confirmed (eab-2026-07-16/17.dsm)
+    y_brake_status_input: Optional[int] = 8   # INB 8 — confirmed (eab-2026-07-16/17.dsm)
+    z_brake_status_input: Optional[int] = None  # on responder — unreachable via ASCII, see above
 
-    x_home_input: Optional[int] = None
-    x_limit_input: Optional[int] = None
-    y_home_input: Optional[int] = None
-    y_limit_input: Optional[int] = None
-    z_home_input: Optional[int] = None
-    z_limit_input: Optional[int] = None
-    theta_limit_input: Optional[int] = 2      # INB 2 — confirmed (eab-2026-07-16.dsm)
+    x_home_input: Optional[int] = 1      # INB 1 — confirmed (eab-2026-07-16/17.dsm)
+    x_limit_input: Optional[int] = 2     # INB 2 — confirmed (eab-2026-07-16/17.dsm)
+    y_home_input: Optional[int] = 3      # INB 3 — confirmed (eab-2026-07-16/17.dsm)
+    y_limit_input: Optional[int] = 4     # INB 4 — confirmed (eab-2026-07-16/17.dsm)
+    z_home_input: Optional[int] = 5      # INB 5 — confirmed (eab-2026-07-16/17.dsm)
+    z_limit_input: Optional[int] = 6     # INB 6 — confirmed (eab-2026-07-16/17.dsm)
+    theta_limit_input: Optional[int] = None  # on responder — unreachable via ASCII, see above
 
     # Capture sources for the hardware capture-latch homing mechanism (SCS).
     # Homing is currently deprioritized — left unset until needed.
@@ -569,8 +594,14 @@ class MMCCommands:
             return self.read_input_bit(io_map.y_brake_status_input)
         elif axis == Z_AXIS:
             if io_map.z_brake_status_input is None:
-                raise ValueError(
-                    "io_map.z_brake_status_input is not set — probe the native INB channel first"
+                raise NotImplementedError(
+                    "Z brake status lives on the responder node's own input bank "
+                    "(TNamedIO ModuleNumber=1, index 1 in eab-2026-07-16/17.dsm) and "
+                    "is not reachable via the plain ASCII INB command from the "
+                    "commander — there is no node-scoped addressing in this "
+                    "firmware's ASCII grammar. Needs Named IO GUI config or the "
+                    "Binary Commands node protocol to expose this value; see "
+                    "docs/MACRON_GANTRY.md."
                 )
             return self.read_input_bit(io_map.z_brake_status_input)
         return True  # axes without brakes are always "free"

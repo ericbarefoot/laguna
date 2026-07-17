@@ -119,35 +119,42 @@ class TestValidateSoftLimits:
 
 
 class TestIOMapGatedBrakeHelpers:
-    def test_disengage_brake_raises_when_channel_unset(self):
+    def test_disengage_brake_sends_correct_command_using_default_channel(self):
+        # y_brake_output=4 (SOB 4) is confirmed (eab-2026-07-16/17.dsm) and
+        # is IOMap's default — should work with zero configuration.
+        conn = FakeSnapConnection({"SOB 4 1": "0"})
+        cmd = MMCCommands(conn)
+        io_map = IOMap()
+        cmd.disengage_brake(Y_AXIS, io_map)
+        assert conn.sent == ["SOB 4 1"]
+
+    def test_disengage_brake_raises_when_channel_explicitly_unset(self):
         conn = FakeSnapConnection({})
         cmd = MMCCommands(conn)
-        io_map = IOMap()  # y_brake_output defaults to None — not yet probed
+        io_map = IOMap(y_brake_output=None)
         with pytest.raises(ValueError):
             cmd.disengage_brake(Y_AXIS, io_map)
         assert conn.sent == []  # never reached the wire
 
-    def test_disengage_brake_sends_correct_command_once_configured(self):
-        conn = FakeSnapConnection({"SOB 4 1": "0"})
-        cmd = MMCCommands(conn)
-        io_map = IOMap(y_brake_output=4)
-        cmd.disengage_brake(Y_AXIS, io_map)
-        assert conn.sent == ["SOB 4 1"]
-
-    def test_brake_is_disengaged_uses_confirmed_z_status_channel(self):
-        # z_brake_status_input=1 (INB 1) is confirmed by eab-2026-07-16.dsm
+    def test_brake_is_disengaged_uses_confirmed_y_status_channel(self):
+        # y_brake_status_input=8 (INB 8) is confirmed by eab-2026-07-16/17.dsm
         # and is IOMap's default — should work with zero configuration.
-        conn = FakeSnapConnection({"INB 1": "1"})
+        conn = FakeSnapConnection({"INB 8": "1"})
         cmd = MMCCommands(conn)
         io_map = IOMap()
-        assert cmd.brake_is_disengaged(Z_AXIS, io_map) is True
+        assert cmd.brake_is_disengaged(Y_AXIS, io_map) is True
 
-    def test_brake_is_disengaged_raises_for_unconfigured_y(self):
+    def test_brake_is_disengaged_raises_not_implemented_for_z(self):
+        # z_brake_status_input lives on the responder's own input bank
+        # (TNamedIO ModuleNumber=1) and has no ASCII addressing path from
+        # here — this is an architectural gap, not a "not yet probed" one,
+        # so it must raise NotImplementedError rather than ValueError.
         conn = FakeSnapConnection({})
         cmd = MMCCommands(conn)
-        io_map = IOMap()  # y_brake_status_input defaults to None
-        with pytest.raises(ValueError):
-            cmd.brake_is_disengaged(Y_AXIS, io_map)
+        io_map = IOMap()  # z_brake_status_input defaults to None
+        with pytest.raises(NotImplementedError):
+            cmd.brake_is_disengaged(Z_AXIS, io_map)
+        assert conn.sent == []  # never reached the wire
 
     def test_non_brake_axis_always_reports_free(self):
         conn = FakeSnapConnection({})

@@ -160,9 +160,13 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None):
         registry.add(fence)
     checker = TrajectoryChecker(registry)
     homing_config = HomingConfig(poll_interval_s=0.001, timeout_s=1.0, backoff_timeout_s=1.0)
-    # y_brake_output/z_brake_output are unset by default on this hardware
-    # (unprobed); tests that exercise Y/Z homing must supply them via IOMap.
-    io_map = IOMap(y_brake_output=4, z_brake_output=5, y_brake_status_input=8)
+    # z_brake_status_input defaults to None (unreachable via ASCII on real
+    # hardware — it lives on the responder's own input bank). Stand in a
+    # test-only channel here so homing tests can exercise the full
+    # brake-confirm flow; this is not a claim about real reachability.
+    io_map = IOMap(
+        y_brake_output=4, z_brake_output=5, y_brake_status_input=8, z_brake_status_input=1
+    )
     homing = HomingProcedure(cmd, homing_config, io_map=io_map)
     executor = GCodeExecutor(
         cmd, checker, homing=homing, axes=(X_AXIS, Y_AXIS, Z_AXIS),
