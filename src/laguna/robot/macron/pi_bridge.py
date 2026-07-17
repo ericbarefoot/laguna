@@ -92,6 +92,39 @@ def check_safe_mode(cmd: str) -> None:
         )
 
 
+class SafeModeConnection(SnapConnection):
+    """Wraps any SnapConnection with the same client-side query-only allowlist gate.
+
+    PiGantryConnection has this gate built in; RS232Connection and
+    EthernetConnection do not (they're deliberately dumb passthroughs — the
+    gate belongs to the driver, not the transport). This wrapper lets any
+    transport (e.g. RS232Connection pointed at the raw socket_bridge) get
+    the same "impossible to send anything but a read-only query while
+    safe_mode is True" guarantee, checked here before any byte reaches the
+    inner connection. Intended for M4-style read-only hardware verification
+    against transports that aren't PiGantryConnection.
+    """
+
+    def __init__(self, inner: SnapConnection, safe_mode: bool = True):
+        self._inner = inner
+        self.safe_mode = safe_mode
+
+    def connect(self) -> None:
+        self._inner.connect()
+
+    def disconnect(self) -> None:
+        self._inner.disconnect()
+
+    @property
+    def is_connected(self) -> bool:
+        return self._inner.is_connected
+
+    def send(self, command: str) -> str:
+        if self.safe_mode:
+            check_safe_mode(command)  # raises before touching the inner connection
+        return self._inner.send(command)
+
+
 class PiGantryConnection(SnapConnection):
     """SSH-bridged persistent transport, talking to gantry_agent.py on a remote Pi.
 

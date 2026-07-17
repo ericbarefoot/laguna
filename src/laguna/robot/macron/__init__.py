@@ -44,7 +44,7 @@ from .gcode import (
     GCodeParser,
     GCodeProgram,
 )
-from .pi_bridge import PiGantryConnection, SAFE_COMMANDS, check_safe_mode
+from .pi_bridge import PiGantryConnection, SAFE_COMMANDS, SafeModeConnection, check_safe_mode
 from .controller import GantryController
 
 __all__ = [
@@ -95,6 +95,7 @@ __all__ = [
     # pi_bridge
     "PiGantryConnection",
     "SAFE_COMMANDS",
+    "SafeModeConnection",
     "check_safe_mode",
     # controller
     "GantryController",

@@ -11,7 +11,13 @@ import json
 import pytest
 
 from laguna.robot.macron.connection import COMM_TIMEOUT_CODE, SnapMotionError
-from laguna.robot.macron.pi_bridge import PiGantryConnection, check_safe_mode, parse_command
+from laguna.robot.macron.pi_bridge import (
+    PiGantryConnection,
+    SafeModeConnection,
+    check_safe_mode,
+    parse_command,
+)
+from tests.macron_fixtures import FakeSnapConnection
 
 
 class _FakeChannel:
@@ -204,6 +210,34 @@ class TestIsConnected:
     def test_false_when_never_connected(self):
         conn = PiGantryConnection(host="red", ssh_user="oak", remote_serial_device="/dev/x")
         assert conn.is_connected is False
+
+
+class TestSafeModeConnection:
+    def test_blocks_unsafe_command_before_reaching_inner_connection(self):
+        inner = FakeSnapConnection({})
+        wrapped = SafeModeConnection(inner, safe_mode=True)
+        with pytest.raises(SnapMotionError):
+            wrapped.send("A1 BMT 100")
+        assert inner.sent == []
+
+    def test_allows_safe_command_through_to_inner_connection(self):
+        inner = FakeSnapConnection({"A1 ACP": "5.000"})
+        wrapped = SafeModeConnection(inner, safe_mode=True)
+        assert wrapped.send("A1 ACP") == "5.000"
+        assert inner.sent == ["A1 ACP"]
+
+    def test_safe_mode_false_passes_everything_through(self):
+        inner = FakeSnapConnection({"A1 BMT 100": "1.000"})
+        wrapped = SafeModeConnection(inner, safe_mode=False)
+        assert wrapped.send("A1 BMT 100") == "1.000"
+
+    def test_delegates_connect_disconnect_is_connected(self):
+        inner = FakeSnapConnection({})
+        wrapped = SafeModeConnection(inner)
+        wrapped.connect()
+        assert wrapped.is_connected is True
+        wrapped.disconnect()
+        assert wrapped.is_connected is False
 
 
 class TestDisconnect:
