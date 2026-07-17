@@ -73,15 +73,30 @@ avoid drift.
 
 ## Axis model
 
-**8 axes are physically real**, not 3-4:
+**8 axis slots are physically real**, not 4, split across two PLC nodes —
+confirmed via direct conversation with the Snap2Motion vendor's developers
+and via live hardware queries on 2026-07-17 (`A5`/`A6 ACP` both returned
+real position values; `A1`/`A2`/`A5 PLT` all returned sane real soft-limit
+numbers rather than the old ±8.2e8 "uninitialized" garbage seen previously).
+`A6 PLT`/`A6 NLT` timing out (comm error 600) is expected — Theta is a
+rotary axis with no position limits, not a bug.
 
 | Axis | Index | Notes |
 |---|---|---|
-| X | 1 | local |
-| Y | 2 | local, electromagnetic brake |
-| Z | 3 | local, electromagnetic brake |
-| Theta | 4 | local, rotary |
-| Axis5-8 | 5-8 | on a second, physically-present networked "Responder" PLC node (`DistributedAxis[5..8]` in `600011-00-eab4.dsm`). Same ASCII grammar, just higher axis numbers. **Names/roles unknown** — nothing in any `.dsm` file names them. Ask the user before building anything axis-5-8-specific. |
+| X | 1 | commander (local controller) |
+| Y | 2 | commander, electromagnetic brake |
+| — (encoder) | 3 | commander, internal encoder slot — not exposed/commandable |
+| — (encoder) | 4 | commander, internal encoder slot — not exposed/commandable |
+| Z | 5 | responder (second networked PLC node), electromagnetic brake |
+| Theta | 6 | responder, rotary |
+| — (encoder) | 7 | responder, internal encoder slot — not exposed/commandable |
+| — (encoder) | 8 | responder, internal encoder slot — not exposed/commandable |
+
+The commander (local controller) drives slots 1-4; the responder (second
+networked PLC node) drives slots 5-8, addressed transparently through the
+same ASCII grammar. Slots 3/4/7/8 are internal encoder-only slots on their
+respective nodes, not exposed/commandable motion axes, so the driver does
+not model them as `Axis` objects or send `A3`/`A4`/`A7`/`A8` commands.
 
 Naming: plain `X`/`Y`/`Z`/`Theta` (matches the user's own current project
 files `eab-2026-07-16.dsm` / `600011-00-eab4.dsm`), not `XXPrime` (only in

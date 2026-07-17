@@ -19,12 +19,7 @@ from .commands import (
     Y_AXIS,
     Z_AXIS,
     THETA_AXIS,
-    AXIS_5,
-    AXIS_6,
-    AXIS_7,
-    AXIS_8,
     ALL_AXES,
-    RESPONDER_AXES,
 )
 from .homing import HomingConfig, HomingResult, HomingProcedure, AxisHomingConfig
 from .fences import (
@@ -66,12 +61,7 @@ __all__ = [
     "Y_AXIS",
     "Z_AXIS",
     "THETA_AXIS",
-    "AXIS_5",
-    "AXIS_6",
-    "AXIS_7",
-    "AXIS_8",
     "ALL_AXES",
-    "RESPONDER_AXES",
     # homing
     "AxisHomingConfig",
     "HomingConfig",

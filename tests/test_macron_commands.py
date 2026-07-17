@@ -9,11 +9,8 @@ import pytest
 
 from laguna.robot.macron.commands import (
     ALL_AXES,
-    AXIS_5,
-    AXIS_8,
     IOMap,
     MMCCommands,
-    RESPONDER_AXES,
     THETA_AXIS,
     X_AXIS,
     Y_AXIS,
@@ -67,23 +64,23 @@ class TestTokenFormat:
         cmd.group_begin_move_to(10, 20, 30)
         assert conn.sent == ["C1 BMT 10 20 30"]
 
-    def test_theta_axis_index_four(self):
-        conn = FakeSnapConnection({"A4 ACP": "0"})
+    def test_z_axis_index_five(self):
+        conn = FakeSnapConnection({"A5 ACP": "0"})
+        cmd = MMCCommands(conn)
+        cmd.get_actual_position(Z_AXIS)
+        assert conn.sent == ["A5 ACP"]
+
+    def test_theta_axis_index_six(self):
+        conn = FakeSnapConnection({"A6 ACP": "0"})
         cmd = MMCCommands(conn)
         cmd.get_actual_position(THETA_AXIS)
-        assert conn.sent == ["A4 ACP"]
+        assert conn.sent == ["A6 ACP"]
 
-    def test_responder_axes_five_through_eight(self):
-        conn = FakeSnapConnection({"A5 ACP": "1", "A8 ACP": "2"})
-        cmd = MMCCommands(conn)
-        assert cmd.get_actual_position(AXIS_5) == 1.0
-        assert cmd.get_actual_position(AXIS_8) == 2.0
-        assert conn.sent == ["A5 ACP", "A8 ACP"]
-        assert RESPONDER_AXES == (AXIS_5, RESPONDER_AXES[1], RESPONDER_AXES[2], AXIS_8)
-
-    def test_responder_axes_not_in_all_axes_default(self):
-        # ALL_AXES stays the local 4-axis default; Responder axes are opt-in.
-        assert AXIS_5 not in ALL_AXES
+    def test_all_axes_is_the_four_commandable_motion_axes(self):
+        # X/Y (commander) + Z/Theta (responder) — the only exposed/commandable
+        # motion axes; slots 3/4/7/8 are internal encoder-only slots on their
+        # respective nodes and are not modeled as Axis objects at all.
+        assert ALL_AXES == (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
         assert len(ALL_AXES) == 4
 
 
@@ -93,8 +90,8 @@ class TestValidateSoftLimits:
             {
                 "A1 NLT": "-1000", "A1 PLT": "1000",
                 "A2 NLT": "-500", "A2 PLT": "500",
-                "A3 NLT": "-100", "A3 PLT": "100",
-                "A4 NLT": "-50", "A4 PLT": "50",
+                "A5 NLT": "-100", "A5 PLT": "100",
+                "A6 NLT": "-50", "A6 PLT": "50",
             }
         )
         cmd = MMCCommands(conn)
@@ -109,8 +106,8 @@ class TestValidateSoftLimits:
             {
                 "A1 NLT": "-822536056", "A1 PLT": "822536056",
                 "A2 NLT": "-822536056", "A2 PLT": "822536056",
-                "A3 NLT": "-500000", "A3 PLT": "500000",
-                "A4 NLT": "-500000", "A4 PLT": "500000",
+                "A5 NLT": "-500000", "A5 PLT": "500000",
+                "A6 NLT": "-500000", "A6 PLT": "500000",
             }
         )
         cmd = MMCCommands(conn)

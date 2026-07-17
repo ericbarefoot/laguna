@@ -14,10 +14,6 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from .commands import (
-    AXIS_5,
-    AXIS_6,
-    AXIS_7,
-    AXIS_8,
     Axis,
     IOMap,
     MMCCommands,
@@ -39,10 +35,6 @@ _NAMED_AXES = {
     "Y": Y_AXIS,
     "Z": Z_AXIS,
     "Theta": THETA_AXIS,
-    "Axis5": AXIS_5,
-    "Axis6": AXIS_6,
-    "Axis7": AXIS_7,
-    "Axis8": AXIS_8,
 }
 
 
@@ -68,7 +60,7 @@ def _axis_index_by_name(axes_cfg: List[Dict[str, Any]], name: str) -> Optional[i
 
 def _lookup_axis(axes_cfg: List[Dict[str, Any]], name: str) -> Optional[Axis]:
     """Resolve an axis by name: prefer an explicit axes_cfg entry, falling
-    back to the known named-axis singletons (X/Y/Z/Theta/Axis5-8) so that
+    back to the known named-axis singletons (X/Y/Z/Theta) so that
     homing.order / gcode axis selection still works even when the config
     omits the axes: list entirely (using the all-default axis set)."""
     index = _axis_index_by_name(axes_cfg, name)

@@ -57,12 +57,14 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
   group_index: 1
   safe_mode: true              # client-side query-only allowlist enforced — do not disable
                                 # without explicit authorization to command motion
-  axes:                        # 8 axes are physically present (4 local + 4 on a networked
-                                # "Responder" node); only the local 4 are wired up by default here
+  axes:                        # 8 axis slots are physically present, split across two PLC nodes:
+                                # commander (1-4: X, Y, encoder, encoder) and responder (5-8: Z,
+                                # Theta, encoder, encoder). Slots 3/4/7/8 are encoder-only, not
+                                # exposed/commandable motion axes.
     - {name: X, index: 1}
     - {name: Y, index: 2, brake_output: null, brake_status_input: null}   # brake channel: TBD, needs physical probe
-    - {name: Z, index: 3, brake_output: null, brake_status_input: 1}      # INB 1 confirmed
-    - {name: Theta, index: 4, limit_input: 2}                            # INB 2 confirmed
+    - {name: Z, index: 5, brake_output: null, brake_status_input: 1}      # INB 1 confirmed
+    - {name: Theta, index: 6, limit_input: 2}                            # INB 2 confirmed
   homing:                      # deprioritized — not currently used, but the driver supports it
     speed_mm_s: 10.0
     standoff_mm: 5.0

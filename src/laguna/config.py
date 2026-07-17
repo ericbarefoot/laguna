@@ -97,8 +97,8 @@ class Config:
                 "axes": [
                     {"name": "X", "index": 1},
                     {"name": "Y", "index": 2, "brake_output": None, "brake_status_input": None},
-                    {"name": "Z", "index": 3, "brake_output": None, "brake_status_input": 1},
-                    {"name": "Theta", "index": 4, "limit_input": 2},
+                    {"name": "Z", "index": 5, "brake_output": None, "brake_status_input": 1},
+                    {"name": "Theta", "index": 6, "limit_input": 2},
                 ],
                 "homing": {
                     "speed_mm_s": 10.0,

@@ -174,11 +174,11 @@ class TestHomeAll:
     def test_stops_at_first_failure(self):
         # Z is first in the default home order; make it fail immediately.
         responses = {
-            "A3 AIC": "0",
-            "A3 CAB": "0",
-            "A3 JOG -10": "-10",
-            "A3 CAT": "0",  # never trips -> timeout
-            "A3 ABT": "0",
+            "A5 AIC": "0",
+            "A5 CAB": "0",
+            "A5 JOG -10": "-10",
+            "A5 CAT": "0",  # never trips -> timeout
+            "A5 ABT": "0",
         }
         conn = FakeSnapConnection(responses)
         cmd = MMCCommands(conn)

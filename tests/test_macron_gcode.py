@@ -197,7 +197,7 @@ class TestExecutorTypeGuard:
 class TestExecutorLinearMoves:
     def test_executes_group_init_then_moves(self):
         responses = {
-            "C1 INI 1 2 3": "0",
+            "C1 INI 1 2 5": "0",
             "C1 SPD 20": "20",
             "C1 BMT 10 0 0": "0",
             "C1 MIF": "1",
@@ -205,7 +205,7 @@ class TestExecutorLinearMoves:
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 F1200")
         executor.execute(trajectory)
-        assert conn.sent == ["C1 INI 1 2 3", "C1 SPD 20", "C1 BMT 10 0 0", "C1 MIF"]
+        assert conn.sent == ["C1 INI 1 2 5", "C1 SPD 20", "C1 BMT 10 0 0", "C1 MIF"]
 
     def test_polls_until_move_finished(self):
         calls = {"n": 0}
@@ -215,7 +215,7 @@ class TestExecutorLinearMoves:
             return "1" if calls["n"] >= 3 else "0"
 
         responses = {
-            "C1 INI 1 2 3": "0",
+            "C1 INI 1 2 5": "0",
             "C1 BMT 5 0 0": "0",
             "C1 MIF": mif_response,
         }
@@ -231,7 +231,7 @@ class TestExecutorLinearMoves:
         assert conn.sent == []
 
     def test_confirm_cb_can_abort_before_sending(self):
-        executor, conn = _make_executor({"C1 INI 1 2 3": "0"}, confirm_cb=lambda move: False)
+        executor, conn = _make_executor({"C1 INI 1 2 5": "0"}, confirm_cb=lambda move: False)
         trajectory = executor.plan("G1 X10")
         with pytest.raises(GCodeExecutionAborted):
             executor.execute(trajectory)
@@ -240,7 +240,7 @@ class TestExecutorLinearMoves:
     def test_confirm_cb_receives_the_move(self):
         seen = []
         executor, conn = _make_executor(
-            {"C1 INI 1 2 3": "0", "C1 BMT 10 0 0": "0", "C1 MIF": "1"},
+            {"C1 INI 1 2 5": "0", "C1 BMT 10 0 0": "0", "C1 MIF": "1"},
             confirm_cb=lambda move: seen.append(move) or True,
         )
         trajectory = executor.plan("G1 X10")
@@ -254,9 +254,9 @@ class TestExecutorHomeDwellPause:
         responses = {
             "SOB 5 1": "0", "INB 1": "1",  # Z brake disengage + status confirm
             "SOB 4 1": "0", "INB 8": "1",  # Y brake disengage + status confirm
-            "A3 AIC": "0", "A3 CAB": "0", "A3 JOG -10": "-10", "A3 CAT": "1",
-            "A3 BST": "0", "A3 MIF": "1", "A3 CAP": "0", "A3 ACP": "0", "A3 ACP 0": "0",
-            "A3 MVT 5": "5",
+            "A5 AIC": "0", "A5 CAB": "0", "A5 JOG -10": "-10", "A5 CAT": "1",
+            "A5 BST": "0", "A5 MIF": "1", "A5 CAP": "0", "A5 ACP": "0", "A5 ACP 0": "0",
+            "A5 MVT 5": "5",
             "A1 AIC": "0", "A1 CAB": "0", "A1 JOG -10": "-10", "A1 CAT": "1",
             "A1 BST": "0", "A1 MIF": "1", "A1 CAP": "0", "A1 ACP": "0", "A1 ACP 0": "0",
             "A1 MVT 5": "5",
@@ -267,7 +267,7 @@ class TestExecutorHomeDwellPause:
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G28")
         executor.execute(trajectory)
-        assert "A3 JOG -10" in conn.sent  # Z (home_order default starts with Z)
+        assert "A5 JOG -10" in conn.sent  # Z (home_order default starts with Z)
 
     def test_g4_dwell_sleeps(self, monkeypatch):
         slept = []

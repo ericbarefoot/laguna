@@ -20,8 +20,8 @@ BASE_CONFIG = {
     "axes": [
         {"name": "X", "index": 1},
         {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
-        {"name": "Z", "index": 3, "brake_status_input": 1},
-        {"name": "Theta", "index": 4, "limit_input": 2},
+        {"name": "Z", "index": 5, "brake_status_input": 1},
+        {"name": "Theta", "index": 6, "limit_input": 2},
     ],
     "homing": {"speed_mm_s": 10.0, "standoff_mm": 5.0, "order": ["Z", "X", "Y"]},
     "fences": [{"type": "box", "name": "bed", "x": [0, 500], "y": [0, 300], "z": [0, 5]}],
@@ -146,20 +146,20 @@ class TestSubsystemInterface:
         assert "positions" not in status
 
     def test_get_status_when_connected_reads_all_axis_positions(self):
-        responses = {"A1 ACP": "1.000", "A2 ACP": "2.000", "A3 ACP": "3.000", "A4 ACP": "4.000"}
+        responses = {"A1 ACP": "1.000", "A2 ACP": "2.000", "A5 ACP": "5.000", "A6 ACP": "6.000"}
         controller, _conn = self._make_controller(responses)
         controller.connect()
         status = controller.get_status()
-        assert status["positions"] == {"X": 1.0, "Y": 2.0, "Z": 3.0, "Theta": 4.0}
+        assert status["positions"] == {"X": 1.0, "Y": 2.0, "Z": 5.0, "Theta": 6.0}
 
     def test_stop_aborts_all_axes(self):
-        responses = {f"A{i} ABT": "0" for i in (1, 2, 3, 4)}
-        responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 3, 4)})
+        responses = {f"A{i} ABT": "0" for i in (1, 2, 5, 6)}
+        responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)})
         controller, conn = self._make_controller(responses)
         controller.connect()
         controller.stop()
         assert "A1 ABT" in conn.sent
-        assert "A3 ABT" in conn.sent
+        assert "A5 ABT" in conn.sent
 
     def test_stop_never_raises_even_on_errors(self):
         controller, _conn = self._make_controller({})  # every command hits an unscripted response

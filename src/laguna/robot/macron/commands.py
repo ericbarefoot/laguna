@@ -17,10 +17,13 @@ Positions and velocities are in whatever user units the controller is
 configured for. If CountsPerUserUnit is set to the correct belt-pitch
 conversion on the controller, commands are effectively in mm and mm/s.
 
-This machine has 8 real axes, not 4: the local controller drives X(1)/Y(2)/
-Z(3)/Theta(4), and a second networked "Responder" PLC node adds 4 more
-(5-8), addressed transparently through the same grammar. Names/roles for
-axes 5-8 are not yet known — see AXIS_5..AXIS_8 below.
+This machine has 8 physical axis slots split across two PLC nodes,
+addressed transparently through the same grammar:
+  - Commander (local controller), slots 1-4: X(1), Y(2), encoder(3), encoder(4)
+  - Responder (second networked PLC node), slots 5-8: Z(5), Theta(6), encoder(7), encoder(8)
+Axes 3/4/7/8 are internal encoder-only slots, not exposed/commandable motion
+axes — confirmed via the vendor's developers and live hardware queries — so
+this module does not model them as Axis objects or send A3/A4/A7/A8 commands.
 """
 
 from __future__ import annotations
@@ -58,29 +61,20 @@ class Axis:
         return AXIS_TOKEN_FMT.format(n=self.index)
 
 
-# Local controller axes, matching the user's current project files
-# (eab-2026-07-16.dsm, 600011-00-eab4.dsm): X=1, Y=2, Z=3, Theta=4.
+# X/Y are on the commander (local controller); Z/Theta are on the
+# responder (second networked PLC node), addressed transparently through
+# the same ASCII grammar. Confirmed via the vendor's developers and live
+# hardware queries on 2026-07-17 (A5/A6 ACP returned real position values;
+# A1/A2/A5 PLT returned sane soft-limit numbers rather than uninitialized
+# garbage). Slots 3/4/7/8 are internal encoder-only slots on their
+# respective nodes — not exposed/commandable motion axes — so they are not
+# modeled as Axis objects here.
 X_AXIS = Axis("X", 1)
 Y_AXIS = Axis("Y", 2)
-Z_AXIS = Axis("Z", 3)
-THETA_AXIS = Axis("Theta", 4)
-
-# Axes 5-8 live on a second, physically-present networked "Responder" PLC
-# node (DistributedAxis[5..8] in 600011-00-eab4.dsm) but are addressed
-# through the exact same ASCII grammar as the local axes. Their real-world
-# names/roles are not yet known — rename these once the user identifies
-# what they drive. Not included in ALL_AXES (the local group's default) so
-# existing startup/shutdown/group behavior is unaffected until then.
-AXIS_5 = Axis("Axis5", 5)
-AXIS_6 = Axis("Axis6", 6)
-AXIS_7 = Axis("Axis7", 7)
-AXIS_8 = Axis("Axis8", 8)
+Z_AXIS = Axis("Z", 5)
+THETA_AXIS = Axis("Theta", 6)
 
 ALL_AXES = (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
-RESPONDER_AXES = (AXIS_5, AXIS_6, AXIS_7, AXIS_8)
-
-# A coordinated group (C<n>INI) can span at most 6 axes, so the local 4-axis
-# group and the 4 Responder axes cannot be combined into a single group.
 
 
 # ---------------------------------------------------------------------------
