@@ -82,6 +82,31 @@ class Config:
                 "checkpoint_file": "./experiment_checkpoint.json",
                 "event_log": "./experiment_events.csv",
             },
+            "gantry": {
+                "transport": "socket_bridge",  # socket_bridge | pi_agent | ethernet | rs232
+                "host": "red.dyn.ucr.edu",
+                "bridge_port": 9700,  # serial_bridge.py's TCP port on the Pi
+                "ssh_user": "oak",  # for the pi_agent transport
+                "ssh_key": "~/.ssh/id_ed25519",
+                "remote_serial_device": (
+                    "/dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0"
+                ),
+                "remote_baud": 9600,
+                "group_index": 1,
+                "safe_mode": True,
+                "axes": [
+                    {"name": "X", "index": 1},
+                    {"name": "Y", "index": 2, "brake_output": None, "brake_status_input": None},
+                    {"name": "Z", "index": 3, "brake_output": None, "brake_status_input": 1},
+                    {"name": "Theta", "index": 4, "limit_input": 2},
+                ],
+                "homing": {
+                    "speed_mm_s": 10.0,
+                    "standoff_mm": 5.0,
+                    "order": ["Z", "X", "Y"],
+                },
+                "fences": [],
+            },
         }
     
     def load_from_file(self, config_file: str) -> None:

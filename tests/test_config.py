@@ -20,7 +20,19 @@ class TestConfig:
         assert "flow" in config.config_dict
         assert "data" in config.config_dict
         assert "storage" in config.config_dict
-    
+        assert "gantry" in config.config_dict
+
+    def test_gantry_defaults(self):
+        """Test default gantry configuration matches the real hardware's confirmed IO."""
+        config = Config()
+        gantry_config = config.get("gantry")
+
+        assert gantry_config["transport"] == "socket_bridge"
+        assert gantry_config["host"] == "red.dyn.ucr.edu"
+        assert len(gantry_config["axes"]) == 4
+        axis_names = [a["name"] for a in gantry_config["axes"]]
+        assert axis_names == ["X", "Y", "Z", "Theta"]
+
     def test_get_subsystem(self):
         """Test retrieving subsystem configuration."""
         config = Config()
