@@ -117,11 +117,18 @@ class HomingProcedure:
         self._cmd.begin_stop(axis)
         self._wait_for_move_finished(axis, cfg.backoff_timeout_s)
 
-        # Zero at the hardware-latched position, not at current (post-decel) position
+        # Zero at the hardware-latched position (CAP), not at the current
+        # (post-decel) position. A controlled stop travels some distance
+        # past the trip point before actually stopping, so setting ACP to a
+        # flat 0.0 here would zero at wherever we happen to have stopped —
+        # not at the trip point. Instead, compute how far we've travelled
+        # past the trip point (current - trip) and zero relative to that,
+        # so the trip point itself lands exactly on 0 in the new frame.
         trip_pos = self._cmd.get_capture_position(axis)
-        self._cmd.set_actual_position(axis, 0.0)
+        current_pos = self._cmd.get_actual_position(axis)
+        self._cmd.set_actual_position(axis, current_pos - trip_pos)
         logger.info(
-            "Axis %s: limit switch tripped at %.4f (hardware latch), zeroed",
+            "Axis %s: limit switch tripped at %.4f (hardware latch), zeroed relative to trip point",
             axis.name, trip_pos,
         )
 

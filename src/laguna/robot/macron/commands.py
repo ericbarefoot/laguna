@@ -1,16 +1,26 @@
 """Typed ASCII command interface for the Snap2Motion MMC/OEM controller.
 
-Command token format (NEEDS HARDWARE VERIFICATION):
-  Single-axis: X[N] CMD [params...]   e.g. "X[1] ACP" to read axis 1 position
-  Group:       G[N] CMD [params...]   e.g. "G[1] BMT 100.0 200.0 5.0"
+Command token format (verified against the vendor's shipped ASCII-interpreter
+source, extracted from the compiled help/reference DSM, and independently
+against hardware-tested code already deployed on the lab's bridge Pi):
+
+  Single-axis: A<N> CMD [params...]   e.g. "A1 ACP" to read axis 1 position
+  Group:       C<N> CMD [params...]   e.g. "C1 BMT 100.0 200.0 5.0"
   Global:      CMD [params...]        e.g. "INB 3" to read input bit 3
 
-The exact prefix characters ('X', 'G') must be confirmed on hardware. Change
-AXIS_TOKEN_FMT and GROUP_TOKEN_FMT below if the controller uses different syntax.
+Whitespace between the axis/group prefix and the command, and between
+parameters, is optional (the firmware's tokenizer recognizes a fixed
+grammar rather than splitting on delimiters) — this module always emits a
+single space for readability.
 
-Positions and velocities are in whatever user units the controller is configured
-for. If CountsPerUserUnit is set to the correct belt-pitch conversion on the
-controller, commands are effectively in mm and mm/s.
+Positions and velocities are in whatever user units the controller is
+configured for. If CountsPerUserUnit is set to the correct belt-pitch
+conversion on the controller, commands are effectively in mm and mm/s.
+
+This machine has 8 real axes, not 4: the local controller drives X(1)/Y(2)/
+Z(3)/Theta(4), and a second networked "Responder" PLC node adds 4 more
+(5-8), addressed transparently through the same grammar. Names/roles for
+axes 5-8 are not yet known — see AXIS_5..AXIS_8 below.
 """
 
 from __future__ import annotations
@@ -24,10 +34,14 @@ from .connection import SnapConnection, SnapMotionError
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Token format — adjust these if hardware verification reveals different syntax
+# Token format — confirmed against the vendor's ASCII interpreter source
 # ---------------------------------------------------------------------------
-AXIS_TOKEN_FMT = "X[{n}]"   # single-axis commands
-GROUP_TOKEN_FMT = "G[{n}]"  # coordinated-group commands
+AXIS_TOKEN_FMT = "A{n}"   # single-axis commands
+GROUP_TOKEN_FMT = "C{n}"  # coordinated-group commands
+
+# Uninitialized/garbage software limits observed on this hardware are large
+# (~±8.2e8); anything beyond this threshold is treated as "not really set".
+GARBAGE_LIMIT_THRESHOLD = 1e6
 
 
 # ---------------------------------------------------------------------------
@@ -44,14 +58,29 @@ class Axis:
         return AXIS_TOKEN_FMT.format(n=self.index)
 
 
-# Default axis map matching the UCR demo program (XXPrime=1, Y=2, Z=3, Theta=4).
-# Override in config if the controller uses different indices.
+# Local controller axes, matching the user's current project files
+# (eab-2026-07-16.dsm, 600011-00-eab4.dsm): X=1, Y=2, Z=3, Theta=4.
 X_AXIS = Axis("X", 1)
 Y_AXIS = Axis("Y", 2)
 Z_AXIS = Axis("Z", 3)
 THETA_AXIS = Axis("Theta", 4)
 
+# Axes 5-8 live on a second, physically-present networked "Responder" PLC
+# node (DistributedAxis[5..8] in 600011-00-eab4.dsm) but are addressed
+# through the exact same ASCII grammar as the local axes. Their real-world
+# names/roles are not yet known — rename these once the user identifies
+# what they drive. Not included in ALL_AXES (the local group's default) so
+# existing startup/shutdown/group behavior is unaffected until then.
+AXIS_5 = Axis("Axis5", 5)
+AXIS_6 = Axis("Axis6", 6)
+AXIS_7 = Axis("Axis7", 7)
+AXIS_8 = Axis("Axis8", 8)
+
 ALL_AXES = (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
+RESPONDER_AXES = (AXIS_5, AXIS_6, AXIS_7, AXIS_8)
+
+# A coordinated group (C<n>INI) can span at most 6 axes, so the local 4-axis
+# group and the 4 Responder axes cannot be combined into a single group.
 
 
 # ---------------------------------------------------------------------------
@@ -92,20 +121,45 @@ class GroupState:
 
 @dataclass
 class IOMap:
-    """Digital IO pin mapping for brakes and limit switches.
+    """Digital IO channel mapping for brakes and home/limit switches.
 
-    Indices come from the TNamedIO definitions in the UCR program.
-    Verify against the Modusystems wiring diagram — the channel 16 IO
-    indices in Snap2Motion may or may not map 1:1 to INB/SOB indices.
+    The vendor's Snap2Motion project files (both the older demo program and
+    the current production/jog-test files) declare these signals as IsoIO
+    expansion-board channels — but that board is not physically installed
+    on this machine (ISI/ISO commands fail with error 263). The user has
+    since physically rewired all of these signals onto the controller's
+    native INB/SOB bus instead; the project files were never updated to
+    reflect this, so do NOT reuse any IsoIO channel number from a .dsm file
+    here.
+
+    Only two channels are currently confirmed, both native, both from
+    eab-2026-07-16.dsm (treated as authoritative over the vendor demo file
+    and 600011-00-eab4.dsm where they disagree):
+      - z_brake_status_input = INB 1
+      - theta_limit_input    = INB 2
+    Every other field defaults to None and must be physically probed
+    (toggle each switch/output, diff INB/SOB snapshots) before use — see
+    sandbox/probe_gantry.py. Brake-control methods below raise ValueError
+    if asked to use a channel that hasn't been set.
     """
-    y_brake_output: int = 4          # SOB index for Y electromagnetic brake
-    z_brake_output: int = 5          # SOB index for Z electromagnetic brake
-    y_brake_status_input: int = 8    # INB index for Y brake engaged/disengaged feedback
-    z_brake_status_input: int = 1    # INB index for Z brake engaged/disengaged feedback
-    # Limit switch capture sources — set via SCS command before arming capture
-    x_limit_capture_source: int = 1  # UNVERIFIED — needs wiring diagram
-    y_limit_capture_source: int = 2  # UNVERIFIED
-    z_limit_capture_source: int = 3  # UNVERIFIED
+    y_brake_output: Optional[int] = None
+    z_brake_output: Optional[int] = None
+    y_brake_status_input: Optional[int] = None
+    z_brake_status_input: Optional[int] = 1   # INB 1 — confirmed (eab-2026-07-16.dsm)
+
+    x_home_input: Optional[int] = None
+    x_limit_input: Optional[int] = None
+    y_home_input: Optional[int] = None
+    y_limit_input: Optional[int] = None
+    z_home_input: Optional[int] = None
+    z_limit_input: Optional[int] = None
+    theta_limit_input: Optional[int] = 2      # INB 2 — confirmed (eab-2026-07-16.dsm)
+
+    # Capture sources for the hardware capture-latch homing mechanism (SCS).
+    # Homing is currently deprioritized — left unset until needed.
+    x_limit_capture_source: Optional[int] = None
+    y_limit_capture_source: Optional[int] = None
+    z_limit_capture_source: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +284,36 @@ class MMCCommands:
     def get_positive_limit(self, axis: Axis) -> float:
         return self._send(f"{self._ax(axis)} PLT")
 
+    def validate_soft_limits(
+        self, axes: tuple[Axis, ...] = ALL_AXES
+    ) -> dict[str, tuple[float, float]]:
+        """Read PLT/NLT for each axis and flag any that look uninitialized/garbage.
+
+        Returns {axis_name: (negative_limit, positive_limit)} for every axis
+        checked. Raises SnapMotionError(0) naming any axes whose limits
+        exceed GARBAGE_LIMIT_THRESHOLD in magnitude — on this hardware, X
+        and Y are known to currently have uninitialized limits (~±8.2e8),
+        meaning software position limiting is NOT active for them. Callers
+        that need to guarantee soft-limit protection before allowing motion
+        should catch this and refuse to proceed rather than ignore it.
+        """
+        results: dict[str, tuple[float, float]] = {}
+        bad: list[str] = []
+        for axis in axes:
+            neg = self.get_negative_limit(axis)
+            pos = self.get_positive_limit(axis)
+            results[axis.name] = (neg, pos)
+            if abs(neg) > GARBAGE_LIMIT_THRESHOLD or abs(pos) > GARBAGE_LIMIT_THRESHOLD:
+                bad.append(axis.name)
+        if bad:
+            raise SnapMotionError(
+                0,
+                f"Uninitialized/garbage software position limits on axes: {', '.join(bad)}. "
+                "Soft-limit protection is NOT active for these axes until PLT/NLT are set "
+                "to real values.",
+            )
+        return results
+
     # ------------------------------------------------------------------
     # Single-axis motion
     # ------------------------------------------------------------------
@@ -280,9 +364,14 @@ class MMCCommands:
     def init_group(self, *axis_indices: int) -> None:
         """Initialize the coordinated group with specified axis indices (INI).
 
-        Call once after connecting if the group hasn't been initialized in firmware.
-        e.g. init_group(1, 2, 3) sets up a 3-axis XYZ group.
+        Call once after connecting if the group hasn't been initialized in
+        firmware. e.g. init_group(1, 2, 3) sets up a 3-axis XYZ group. A
+        group can hold at most 6 axes.
         """
+        if len(axis_indices) > 6:
+            raise ValueError(
+                f"A coordinated group can hold at most 6 axes, got {len(axis_indices)}"
+            )
         indices = " ".join(str(i) for i in axis_indices)
         self._send(f"{self._gx()} INI {indices}")
 
@@ -400,15 +489,17 @@ class MMCCommands:
     # ------------------------------------------------------------------
 
     def read_input_bit(self, index: int) -> bool:
-        """Read digital input by index 1–48 (INB). No axis prefix required.
+        """Read native digital input by index (INB). No axis prefix required.
 
-        Used for: limit switch status, brake status, external sensors.
-        Index mapping depends on controller wiring — see IOMap for defaults.
+        Used for: limit switch status, brake status, external sensors. This
+        hardware's native input bus has only 8 bits (INB 9+ raises error 31,
+        despite generic docs allowing up to 48) — index mapping depends on
+        controller wiring, see IOMap for the confirmed/unconfirmed channels.
         """
         return bool(self._send(f"INB {index}"))
 
     def set_output_bit(self, index: int, state: bool) -> None:
-        """Set digital output by index 1–12 (SOB).
+        """Set native digital output by index (SOB).
 
         Used for: brake engagement/disengagement, indicator lights.
         """
@@ -416,11 +507,22 @@ class MMCCommands:
         self._send(f"SOB {index} {val}")
 
     def read_iso_input(self, index: int) -> bool:
-        """Read isolated IO input by index 1–18 (ISI). Uses IsoIO expansion module."""
+        """Read isolated IO input by index 1–18 (ISI). Uses IsoIO expansion module.
+
+        This machine does not have the IsoIO board installed — calling this
+        will raise SnapMotionError(263). Kept for other Snap2Motion hardware
+        that does have the board; not used elsewhere in this codebase for
+        this machine's brakes/limit switches (those are wired to native
+        INB/SOB — see IOMap).
+        """
         return bool(self._send(f"ISI {index}"))
 
     def set_iso_output(self, index: int, state: bool) -> None:
-        """Set isolated IO output by index 1–8 (ISO)."""
+        """Set isolated IO output by index 1–8 (ISO).
+
+        This machine does not have the IsoIO board installed — calling this
+        will raise SnapMotionError(263). See read_iso_input.
+        """
         val = 1 if state else 0
         self._send(f"ISO {index} {val}")
 
@@ -431,25 +533,51 @@ class MMCCommands:
     def disengage_brake(self, axis: Axis, io_map: IOMap) -> None:
         """Disengage the electromagnetic brake on Y or Z axis.
 
-        Brake output ON = brake disengaged (spring-return design: power releases brake).
+        Brake output ON = brake disengaged (spring-return design: power
+        releases brake). Raises ValueError if the relevant IOMap channel
+        hasn't been set yet (physical probing required — see IOMap).
         """
-        if axis is Y_AXIS:
+        if axis == Y_AXIS:
+            if io_map.y_brake_output is None:
+                raise ValueError("io_map.y_brake_output is not set — probe the native SOB channel first")
             self.set_output_bit(io_map.y_brake_output, True)
-        elif axis is Z_AXIS:
+        elif axis == Z_AXIS:
+            if io_map.z_brake_output is None:
+                raise ValueError("io_map.z_brake_output is not set — probe the native SOB channel first")
             self.set_output_bit(io_map.z_brake_output, True)
 
     def engage_brake(self, axis: Axis, io_map: IOMap) -> None:
-        """Engage the electromagnetic brake on Y or Z axis."""
-        if axis is Y_AXIS:
+        """Engage the electromagnetic brake on Y or Z axis.
+
+        Raises ValueError if the relevant IOMap channel hasn't been set yet.
+        """
+        if axis == Y_AXIS:
+            if io_map.y_brake_output is None:
+                raise ValueError("io_map.y_brake_output is not set — probe the native SOB channel first")
             self.set_output_bit(io_map.y_brake_output, False)
-        elif axis is Z_AXIS:
+        elif axis == Z_AXIS:
+            if io_map.z_brake_output is None:
+                raise ValueError("io_map.z_brake_output is not set — probe the native SOB channel first")
             self.set_output_bit(io_map.z_brake_output, False)
 
     def brake_is_disengaged(self, axis: Axis, io_map: IOMap) -> bool:
-        """Read brake feedback status. True = brake is currently disengaged (released)."""
-        if axis is Y_AXIS:
+        """Read brake feedback status. True = brake is currently disengaged (released).
+
+        Raises ValueError if the relevant IOMap channel hasn't been set yet
+        (this is currently the case for Y — only Z's status input is
+        confirmed on this hardware).
+        """
+        if axis == Y_AXIS:
+            if io_map.y_brake_status_input is None:
+                raise ValueError(
+                    "io_map.y_brake_status_input is not set — probe the native INB channel first"
+                )
             return self.read_input_bit(io_map.y_brake_status_input)
-        elif axis is Z_AXIS:
+        elif axis == Z_AXIS:
+            if io_map.z_brake_status_input is None:
+                raise ValueError(
+                    "io_map.z_brake_status_input is not set — probe the native INB channel first"
+                )
             return self.read_input_bit(io_map.z_brake_status_input)
         return True  # axes without brakes are always "free"
 
@@ -502,7 +630,7 @@ class MMCCommands:
             for axis in (Y_AXIS, Z_AXIS):
                 try:
                     self.engage_brake(axis, io_map)
-                except SnapMotionError:
+                except (SnapMotionError, ValueError):
                     pass
         for axis in axes:
             try:

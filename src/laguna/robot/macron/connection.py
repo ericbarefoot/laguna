@@ -1,11 +1,26 @@
 """Transport layer for Snap2Motion ASCII command interface.
 
-Supports persistent TCP/IP (Ethernet) and RS232 connections.
-The firmware uses a polling loop (EthernetPoll + yield), so the socket
-stays open between commands — we hold it for the session lifetime.
+Supports persistent TCP/IP (Ethernet) and RS232 connections, plus RS232 over
+a raw TCP passthrough bridge via pyserial's socket:// URL scheme (see
+RS232Connection).  The firmware uses a polling loop (EthernetPoll + yield),
+so the socket/serial link stays open between commands — we hold it for the
+session lifetime.
+
+Wire format (verified against the vendor's shipped ASCII-interpreter source
+and independently against hardware-tested code on the lab's bridge Pi):
+
+  - Commands are submitted terminated by CR (``\\r``); LF is ignored by the
+    firmware, so CRLF works too.
+  - Responses terminate at a literal ``>`` prompt character, not CRLF.
+  - Success responses look like ``"0 <value> >"`` (value formatted to 3
+    decimal places). Error responses look like ``"<escape_code> >"`` — note
+    the absence of the leading ``"0 "``. The only reliable way to
+    distinguish success from error is checking whether the first
+    whitespace/comma-delimited token equals the literal string ``"0"``.
 """
 
 from abc import ABC, abstractmethod
+import re
 import socket
 import threading
 import logging
@@ -18,7 +33,12 @@ DEFAULT_TCP_PORT = 23
 DEFAULT_BAUDRATE = 9600
 DEFAULT_TIMEOUT = 5.0
 
-_CRLF = b"\r\n"
+_PROMPT = b">"
+
+# Firmware comm-timeout / "no character arrived" escape code (see standard.inc
+# and the ASCII interpreter's GetCharacter timeout handling). Used whenever a
+# transport gives up waiting for a '>' terminated response.
+COMM_TIMEOUT_CODE = 600
 
 
 class SnapMotionError(Exception):
@@ -31,7 +51,7 @@ class SnapMotionError(Exception):
 
 
 class SnapConnection(ABC):
-    """Unified send/receive interface over Ethernet or RS232."""
+    """Unified send/receive interface over Ethernet, RS232, or a socket-bridged RS232 link."""
 
     @abstractmethod
     def connect(self) -> None:
@@ -45,11 +65,13 @@ class SnapConnection(ABC):
 
     @abstractmethod
     def send(self, command: str) -> str:
-        """Send one ASCII command and return the response value string.
+        """Send one ASCII command and return the response value token as a string.
 
-        Appends CRLF, blocks until the controller echoes back a CRLF-terminated
-        response, and returns the stripped value string. Raises SnapMotionError if
-        the response looks like a firmware escape code.
+        Appends CR, blocks until the controller responds with a ``>``-terminated
+        reply, and returns the success value token (e.g. ``"12.345"`` or ``"0"``
+        for value-less acknowledgements). Raises SnapMotionError with the
+        firmware's escape code if the response is an error envelope, or with
+        code COMM_TIMEOUT_CODE (600) if no ``>`` arrives before the deadline.
         """
         ...
 
@@ -107,22 +129,29 @@ class EthernetConnection(SnapConnection):
             if self._socket is None:
                 raise SnapMotionError(0, "Not connected")
             try:
-                self._socket.sendall((command + "\r\n").encode("ascii"))
-                return _parse_response(self._recv_line())
+                self._socket.sendall((command + "\r").encode("ascii"))
+                return _parse_response(self._read_until_prompt())
             except socket.timeout:
-                raise SnapMotionError(0, f"Timeout waiting for response to: {command!r}")
+                raise SnapMotionError(
+                    COMM_TIMEOUT_CODE, f"Timeout waiting for response to: {command!r}"
+                )
             except OSError as exc:
                 raise SnapMotionError(0, f"Socket error: {exc}") from exc
 
-    def _recv_line(self) -> str:
+    def _read_until_prompt(self) -> str:
         buf = b""
-        while True:
-            chunk = self._socket.recv(512)
+        deadline = time.monotonic() + self.timeout
+        while _PROMPT not in buf:
+            if time.monotonic() > deadline:
+                raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for '>' prompt")
+            try:
+                chunk = self._socket.recv(512)
+            except socket.timeout:
+                raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for '>' prompt")
             if not chunk:
                 raise SnapMotionError(0, "Controller closed connection")
             buf += chunk
-            if _CRLF in buf:
-                return buf.split(_CRLF, 1)[0].decode("ascii").strip()
+        return buf.decode("ascii", errors="replace")
 
 
 class RS232Connection(SnapConnection):
@@ -130,6 +159,15 @@ class RS232Connection(SnapConnection):
 
     Baud rates supported by the firmware: 9600, 19200, 38400, 57600, 115200.
     Requires pyserial: pip install pyserial
+
+    ``port`` may be a plain device path (e.g. ``"/dev/ttyUSB0"``) or any URL
+    pyserial's ``serial_for_url()`` understands — most usefully
+    ``"socket://<host>:<port>"``, which lets this class transparently talk to
+    a raw TCP↔serial passthrough bridge on a remote host (e.g. a Raspberry Pi
+    sitting next to the controller) with no protocol-aware code on either
+    side of that bridge. Plain ``serial.Serial()`` does *not* dispatch URL
+    schemes — only ``serial_for_url()`` does — so this class always goes
+    through ``serial_for_url()``, which handles both cases correctly.
     """
 
     def __init__(
@@ -140,8 +178,9 @@ class RS232Connection(SnapConnection):
     ):
         if not port:
             raise ValueError(
-                "port must be a non-empty string (e.g. '/dev/ttyUSB0'). "
-                "Use find_rs232_port() to discover the correct port automatically."
+                "port must be a non-empty string (e.g. '/dev/ttyUSB0' or "
+                "'socket://host:port'). Use find_rs232_port() to discover a "
+                "local port automatically."
             )
         self.port = port
         self.baudrate = baudrate
@@ -156,7 +195,7 @@ class RS232Connection(SnapConnection):
             raise ImportError(
                 "pyserial is required for RS232 connections: pip install pyserial"
             ) from exc
-        self._serial = serial.Serial(
+        self._serial = serial.serial_for_url(
             self.port,
             baudrate=self.baudrate,
             bytesize=8,
@@ -187,44 +226,63 @@ class RS232Connection(SnapConnection):
             if not self.is_connected:
                 raise SnapMotionError(0, "Not connected")
             try:
-                self._serial.write((command + "\r\n").encode("ascii"))
-                raw = self._serial.readline()
+                self._serial.write((command + "\r").encode("ascii"))
+                raw = self._read_until_prompt()
+            except SnapMotionError:
+                raise
             except Exception as exc:
                 raise SnapMotionError(0, f"Serial error: {exc}") from exc
-            if not raw:
-                raise SnapMotionError(600, f"Timeout waiting for response to: {command!r}")
-            return _parse_response(raw.decode("ascii").strip())
+            return _parse_response(raw)
+
+    def _read_until_prompt(self) -> str:
+        buf = b""
+        deadline = time.monotonic() + self.timeout
+        while _PROMPT not in buf:
+            if time.monotonic() > deadline:
+                raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for '>' prompt")
+            chunk = self._serial.read(1)
+            if not chunk:
+                # pyserial's own per-read timeout elapsed with nothing received.
+                raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for '>' prompt")
+            buf += chunk
+        return buf.decode("ascii", errors="replace")
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-# Firmware escape codes are positive integers >= 600 (based on ec_DataNotPresent=1005,
-# GetCharacter timeout=600, etc.). Normal numeric responses are floats like "1.0",
-# "0.0", or integer-looking strings like "3".
-_ERROR_CODE_THRESHOLD = 600
+_TOKEN_SPLIT = re.compile(r"[,\s]+")
 
 
 def _parse_response(raw: str) -> str:
-    """Return raw if it is a valid numeric response; raise SnapMotionError otherwise.
+    """Parse a raw ``>``-terminated response into its success value token.
 
-    The firmware always echoes a double-precision value. Error conditions raise
-    integer escape codes. We detect errors by checking if the response is a bare
-    integer >= the error threshold.
+    Response envelope (see module docstring): success is ``"0 <value> >"``,
+    error is ``"<escape_code> >"``. Any text before the last line (e.g. a
+    telnet-echoed command, or a banner) is discarded — only the last
+    non-empty line before the prompt is meaningful.
+
+    Raises SnapMotionError(<code>) for an error envelope, or
+    SnapMotionError(0) if the response is empty/unparseable.
     """
-    if not raw:
-        raise SnapMotionError(0, "Empty response from controller")
+    payload = raw.split(">", 1)[0]
+    lines = [line for line in re.split(r"[\r\n]+", payload) if line.strip()]
+    if not lines:
+        raise SnapMotionError(0, f"Empty response: {raw!r}")
+    last = lines[-1]
+    tokens = [t for t in _TOKEN_SPLIT.split(last.strip()) if t]
+    if not tokens:
+        raise SnapMotionError(0, f"Empty response: {raw!r}")
+
+    if tokens[0] == "0":
+        return tokens[1] if len(tokens) > 1 else "0"
+
     try:
-        value = float(raw)
-        # Escape codes are positive integers; normal positions/booleans can also
-        # be small integers (0.0, 1.0). We only flag values that are large whole
-        # numbers — firmware escape codes are all >= 600.
-        if value == int(value) and int(value) >= _ERROR_CODE_THRESHOLD:
-            raise SnapMotionError(int(value))
-        return raw
+        code = int(float(tokens[0]))
     except ValueError:
         raise SnapMotionError(0, f"Unparseable response: {raw!r}")
+    raise SnapMotionError(code)
 
 
 # ---------------------------------------------------------------------------
