@@ -49,7 +49,7 @@ except ImportError:
 # Kept in sync by hand with pi_bridge.py's SAFE_COMMANDS — see module
 # docstring for why this can't just be a shared import.
 SAFE_COMMANDS = {
-    "WHT": 0, "UHD": 0, "UTP": 0,
+    "WHT": 0, "UHD": 0, "UTP": 1,
     "INB": 1, "ISI": 1, "ALI": 1,
     "ACP": 0, "ENP": 0, "COP": 0, "DEP": 0,
     "SPD": 0, "ACL": 0, "DCL": 0, "NLT": 0, "PLT": 0,

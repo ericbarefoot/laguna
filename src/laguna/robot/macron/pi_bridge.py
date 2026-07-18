@@ -50,7 +50,7 @@ READY_TIMEOUT = 10.0
 # BEFORE any byte reaches the wire whenever safe_mode is True. See module
 # docstring — gantry_agent.py enforces an identical table independently.
 SAFE_COMMANDS = {
-    "WHT": 0, "UHD": 0, "UTP": 0,
+    "WHT": 0, "UHD": 0, "UTP": 1,
     "INB": 1, "ISI": 1, "ALI": 1,
     "ACP": 0, "ENP": 0, "COP": 0, "DEP": 0,
     "SPD": 0, "ACL": 0, "DCL": 0, "NLT": 0, "PLT": 0,
