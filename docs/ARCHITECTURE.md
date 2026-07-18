@@ -50,11 +50,16 @@ Laguna uses a **modular subsystem architecture** where each major hardware/funct
 - Supports dot notation for nested values
 
 ### `src/laguna/robot/`
-- `RobotController`: Main interface for robot positioning
+- `RobotController`: Original scaffold interface for robot positioning
 - Supports multiple protocols via abstract `ProtocolHandler`:
   - `ModbusProtocol`: Modbus RTU/TCP communication
   - `AsciiProtocol`: ASCII serial commands
 - Methods: `connect()`, `disconnect()`, `move_to()`, `home()`, `get_position()`, `stop()`
+- `src/laguna/robot/macron/` is a separate, current, hardware-verified driver
+  for the Modusystems OEM-2T gantry (`GantryController`, ASCII protocol over
+  a Pi-bridged serial connection). It does not use `RobotController`/
+  `ProtocolHandler` above — see [`GANTRY_GUIDE.md`](GANTRY_GUIDE.md) (usage)
+  and [`MACRON_GANTRY.md`](MACRON_GANTRY.md) (protocol/IO reference).
 
 ### `src/laguna/camera/`
 - `CameraAcquisition`: Real-time video capture interface
@@ -87,6 +92,74 @@ Laguna uses a **modular subsystem architecture** where each major hardware/funct
   - `SFTPBackend`: Remote SSH/SFTP storage
   - `LocalBackend`: Local filesystem
 - Methods: `connect()`, `disconnect()`, `upload_file()`, `download_file()`, `list_files()`
+
+## Non-Blocking Execution: Scheduler, Threading, and the Experiment Lifecycle
+
+The timing backbone (`ExperimentClock`, `Scheduler`, `EventLog`) is always
+present on a `FlumeLab`, independent of which hardware subsystems are
+registered. `Scheduler.run(duration)` blocks the calling thread while it
+polls (every 50 ms) for due actions — but a bare blocking call freezes a
+REPL for the whole run, so `Scheduler` and `FlumeLab` both offer
+background-thread variants:
+
+- `Scheduler.run_async(duration)` — spawns `run()` on a daemon thread and
+  returns the `Thread` immediately.
+- `FlumeLab.start(duration)` — the usual entry point. Starts the clock,
+  logs `experiment_start`, and runs the scheduler loop on a background
+  thread, leaving the caller (REPL, notebook, or `run_blocking()` in
+  `laguna.experiment.runner`) free.
+
+Each *scheduled* action (`scheduler.repeat()` / `scheduler.at()`) also fires
+in its own daemon thread (`Scheduler._fire`), so a slow gauge read or camera
+capture never blocks the 50 ms polling loop or other scheduled actions.
+Failures in a scheduled action are caught and logged (`result="error:
+<exception>"`) rather than killing the loop.
+
+### Pause / resume, not stop / restart
+
+`FlumeLab.stop()` pauses rather than tears down: it sets the scheduler's
+stop event (the polling loop exits on its next iteration), pauses the clock
+(elapsed runtime is preserved, not reset), and stops the weir's
+in-progress move if a weir subsystem is registered. It deliberately does
+**not** disconnect hardware or close the event log, so `FlumeLab.resume
+(remaining_s=None)` can restart the scheduler loop and continue
+mid-experiment — called with no argument, it computes the remaining time
+itself from the duration originally passed to `start()`.
+`FlumeLab.emergency_stop()` is the harder stop: it calls `stop()`/
+`disconnect()` on every registered subsystem, pauses the clock, and
+disconnects everything via `disconnect_all()`.
+
+`experiments/weir_gauge_camera_experiment.py`, via
+`laguna.experiment.runner.run_blocking()`, wraps the same `start()`/
+`stop()`/`resume()` calls in `SIGUSR1`/`SIGUSR2` signal handlers (pause/
+resume from another terminal) plus a first-Ctrl+C-pauses,
+second-Ctrl+C-stops convention — useful for long unattended runs on a lab
+machine where you may not want to keep a REPL open.
+
+**Why it's built this way:** early versions of the experiment script only
+had `scheduler.run()`, which blocked the foreground for the entire
+experiment — there was no way to check status or intervene without killing
+the process. Non-blocking `start()`/`stop()`/`resume()` let an operator
+call `lab.get_system_status()` or pause the weir mid-run from a second
+terminal or notebook cell, without losing elapsed time or disconnecting
+hardware.
+
+### Event log
+
+Every `FlumeLab` writes an append-only, thread-safe CSV (`timing.event_log`
+in config, default `./experiment_events.csv`) via `EventLog.log()`, flushed
+on every row:
+
+```csv
+wall_time_iso,wall_time_unix,runtime_s,subsystem,event_type,result,notes
+2026-07-18T00:00:00+00:00,1752796800.000000,0.000,flume_lab,experiment_start,ok,
+2026-07-18T00:00:05+00:00,1752796805.000000,5.000,gauge,log_level,ok,elevation_mm=987.50
+2026-07-18T00:00:10+00:00,1752796810.000000,10.000,weir,update_elevation,ok,target_mm=99.50
+```
+
+Scheduled-action failures are logged automatically by the scheduler;
+subsystems are otherwise responsible for logging their own events via
+`lab.event_log.log(runtime_s, subsystem, event_type, result="ok", notes="")`.
 
 ## Design Patterns
 
