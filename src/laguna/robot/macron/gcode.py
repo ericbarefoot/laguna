@@ -66,12 +66,18 @@ _WORD_RE = re.compile(r"([A-Za-z])\s*([+-]?[0-9]*\.?[0-9]+)")
 
 
 def _strip_comments(line: str) -> str:
+    """Remove `(...)` and `;`-to-end-of-line G-code comments, and trailing/leading whitespace."""
     line = _COMMENT_PAREN.sub(" ", line)
     line = _COMMENT_SEMI.sub("", line)
     return line.strip()
 
 
 def _parse_words(line: str) -> Dict[str, float]:
+    """Split a comment-stripped G-code line into {letter: value} words, e.g. {'G': 1, 'X': 10.0}.
+
+    Letters are uppercased; a line with the same letter repeated keeps only
+    the last occurrence (dict construction overwrites earlier keys).
+    """
     return {letter.upper(): float(number) for letter, number in _WORD_RE.findall(line)}
 
 
@@ -186,11 +192,40 @@ class GCodeParser:
     """Parses the G-code subset documented in the module docstring."""
 
     def __init__(self) -> None:
+        """Create a parser with fresh state (absolute mode, no feed rate set).
+
+        A GCodeParser instance is stateful across the lines of a single
+        parse() call (distance mode, current position, last feed rate),
+        but that state is reset at the start of every parse() call, so a
+        single instance can safely be reused for multiple programs.
+        """
         self._absolute = True
         self._position: Point3D = (0.0, 0.0, 0.0)
         self._feed_mm_s: Optional[float] = None
 
     def parse(self, text: str, start: Point3D = (0.0, 0.0, 0.0)) -> GCodeProgram:
+        """Parse a multi-line G-code program into a GCodeProgram of resolved moves.
+
+        Resets parser state (absolute mode, feed rate) before parsing, then
+        processes the text line by line, tracking position/mode as it goes
+        so that relative moves, unspecified axes, and carried-over feed
+        rates all resolve correctly.
+
+        Args:
+            text: Raw G-code source, one instruction per line.
+            start: Starting XYZ position moves are resolved relative/
+                absolute to (default origin).
+
+        Returns:
+            A GCodeProgram containing one GCodeMove per resolved motion/
+            control instruction (arcs expand into multiple LINEAR moves).
+
+        Raises:
+            GCodeError: If any line uses an unsupported G/M code, or a
+                supported code with invalid/missing parameters. The error
+                is re-raised with the offending line number and text
+                prepended.
+        """
         self._absolute = True
         self._position = start
         self._feed_mm_s = None
@@ -211,6 +246,22 @@ class GCodeParser:
     # -- dispatch --------------------------------------------------------
 
     def _handle_line(self, words: Dict[str, float], raw_line: str) -> List[GCodeMove]:
+        """Dispatch one line's parsed words to the matching `_g<N>`/`_m<N>` handler method.
+
+        Args:
+            words: Parsed {letter: value} words for the line (from
+                _parse_words). A "G" or "M" word selects the handler; a
+                line with neither produces no moves.
+            raw_line: Original line text, threaded through into any
+                resulting GCodeMove.source_line / error message.
+
+        Returns:
+            Zero or more GCodeMove objects produced by the handler.
+
+        Raises:
+            GCodeError: If the line specifies a G/M code with no matching
+                `_g<N>`/`_m<N>` method (i.e. an unsupported code).
+        """
         if "G" in words:
             code = int(words["G"])
             handler = getattr(self, f"_g{code}", None)
@@ -228,6 +279,13 @@ class GCodeParser:
     # -- shared helpers ----------------------------------------------------
 
     def _resolve_target(self, words: Dict[str, float]) -> Point3D:
+        """Resolve a move's target XYZ from the current position, distance mode, and given words.
+
+        In absolute mode (G90), an axis word gives its new coordinate
+        directly; any axis not mentioned in `words` stays at its current
+        value. In relative mode (G91), an axis word is a delta added to
+        the current position; an omitted axis contributes zero.
+        """
         x, y, z = self._position
         if self._absolute:
             x = words.get("X", x)
@@ -240,6 +298,14 @@ class GCodeParser:
         return (x, y, z)
 
     def _resolve_feed(self, words: Dict[str, float]) -> Optional[float]:
+        """Update and return the parser's carried-over feed rate in mm/s.
+
+        G-code feed rate (F word) is conventionally mm/min; this converts
+        to mm/s on the way in. If `words` has no F word, the previously
+        set feed rate (from an earlier line) is returned unchanged — feed
+        rate persists across moves until explicitly overridden, per
+        standard G-code semantics.
+        """
         if "F" in words:
             self._feed_mm_s = words["F"] / 60.0  # G-code feed rate is mm/min
         return self._feed_mm_s
@@ -247,24 +313,43 @@ class GCodeParser:
     # -- G-codes -------------------------------------------------------
 
     def _g0(self, words, raw_line):
+        """G0 (rapid move) — treated identically to G1; see module docstring."""
         return self._linear_move(words, raw_line)
 
     def _g1(self, words, raw_line):
+        """G1 (linear move) — resolve target/feed and emit a single LINEAR move."""
         return self._linear_move(words, raw_line)
 
     def _linear_move(self, words: Dict[str, float], raw_line: str) -> List[GCodeMove]:
+        """Shared G0/G1 implementation: resolve target and feed, advance position, emit one move."""
         target = self._resolve_target(words)
         feed = self._resolve_feed(words)
         self._position = target
         return [GCodeMove(kind="LINEAR", target=target, feed_mm_s=feed, source_line=raw_line)]
 
     def _g2(self, words, raw_line):
+        """G2 (clockwise arc) — tessellate and emit as a series of LINEAR moves."""
         return self._arc_move(words, raw_line, clockwise=True)
 
     def _g3(self, words, raw_line):
+        """G3 (counter-clockwise arc) — tessellate and emit as a series of LINEAR moves."""
         return self._arc_move(words, raw_line, clockwise=False)
 
     def _arc_move(self, words: Dict[str, float], raw_line: str, clockwise: bool) -> List[GCodeMove]:
+        """Shared G2/G3 implementation.
+
+        Resolves the arc's end point and center (from I/J offsets or an R
+        radius via _radius_to_ij), tessellates it into short line segments
+        (see _tessellate_arc / module docstring for why arcs are never sent
+        as a single vendor ARC command), and emits one LINEAR GCodeMove per
+        segment, all sharing this line's feed rate.
+
+        Raises:
+            GCodeError: If neither I/J nor R is given, or if the R form's
+                radius can't reach the requested end point (see
+                _radius_to_ij), or if the resolved center gives a
+                zero-radius arc (see _tessellate_arc).
+        """
         start = self._position
         end = self._resolve_target(words)
         feed = self._resolve_feed(words)
@@ -282,6 +367,7 @@ class GCodeParser:
         ]
 
     def _g4(self, words, raw_line):
+        """G4 (dwell) — P is milliseconds (RepRap convention), S is seconds; defaults to 0."""
         if "P" in words:
             seconds = words["P"] / 1000.0  # P is milliseconds (RepRap convention)
         elif "S" in words:
@@ -291,31 +377,46 @@ class GCodeParser:
         return [GCodeMove(kind="DWELL", dwell_s=seconds, source_line=raw_line)]
 
     def _g20(self, words, raw_line):
+        """G20 (inch units) — unsupported; this driver only ever operates in mm."""
         raise GCodeError("G20 (inch units) is not supported — this driver assumes mm (G21)")
 
     def _g21(self, words, raw_line):
+        """G21 (millimeter units) — accepted as a no-op; mm is the only unit this driver uses."""
         return []  # mm is the only unit supported; nothing to resolve
 
     def _g28(self, words, raw_line):
+        """G28 (home) — emit a HOME move targeting the conventional origin.
+
+        No per-axis selection is supported: this always homes everything
+        HomingProcedure.home_all() is configured for. The (0, 0, 0) target
+        is only a pre-flight-checking convention (see
+        GCodeProgram.to_waypoints) — the actual post-home position is
+        whatever HomingProcedure finds on hardware.
+        """
         return [GCodeMove(kind="HOME", target=(0.0, 0.0, 0.0), source_line=raw_line)]
 
     def _g90(self, words, raw_line):
+        """G90 (absolute distance mode) — subsequent axis words are absolute coordinates."""
         self._absolute = True
         return []
 
     def _g91(self, words, raw_line):
+        """G91 (relative distance mode) — subsequent axis words are deltas from the current position."""
         self._absolute = False
         return []
 
     # -- M-codes -------------------------------------------------------
 
     def _m0(self, words, raw_line):
+        """M0 (unconditional program pause) — emit a PAUSE move handled via confirm_cb at execute time."""
         return [GCodeMove(kind="PAUSE", source_line=raw_line)]
 
     def _m1(self, words, raw_line):
+        """M1 (optional program pause) — treated identically to M0 here; see GCodeExecutor._execute_pause."""
         return [GCodeMove(kind="PAUSE", source_line=raw_line)]
 
     def _m114(self, words, raw_line):
+        """M114 (position query) — accepted as a no-op; read live position via MMCCommands directly."""
         return []  # position query — no motion; read state via MMCCommands directly
 
 
@@ -346,6 +447,31 @@ class GCodeExecutor:
         confirm_cb: Optional[Callable[[GCodeMove], bool]] = None,
         dry_run: bool = False,
     ):
+        """Configure an executor bound to a specific command interface, fence checker, and axis mapping.
+
+        Args:
+            cmd: Live MMCCommands wrapper the executor sends group moves
+                and homing/IO commands through.
+            checker: TrajectoryChecker used by plan() to fence-check the
+                waypoints a parsed program would visit.
+            homing: HomingProcedure driving G28. Required only if the
+                program being executed actually contains a G28 — omitting
+                it is fine for programs with no homing move.
+            axes: The three Cartesian axes driven by group moves, in
+                (X, Y, Z) order. Must have exactly 3 elements.
+            group_index: Coordinated-group index (the `C<N>` in the ASCII
+                protocol) used for all group moves this executor issues.
+            confirm_cb: Optional callback invoked before each LINEAR/HOME/
+                PAUSE move; returning falsy raises GCodeExecutionAborted
+                and stops execution. If None, all moves proceed
+                unconfirmed.
+            dry_run: If True, execute() logs what it would send instead of
+                calling into `cmd`/`homing` at all — no hardware I/O
+                occurs.
+
+        Raises:
+            ValueError: If `axes` does not have exactly 3 elements.
+        """
         if len(axes) != 3:
             raise ValueError("GCodeExecutor drives exactly 3 Cartesian axes (X, Y, Z)")
         self._cmd = cmd
@@ -407,11 +533,18 @@ class GCodeExecutor:
     # -- internal execution steps --------------------------------------
 
     def _confirm(self, move: GCodeMove) -> bool:
+        """Ask `confirm_cb` (if configured) whether `move` should proceed; default to True if unset."""
         if self._confirm_cb is None:
             return True
         return bool(self._confirm_cb(move))
 
     def _init_group(self) -> None:
+        """Initialize the coordinated group (`C<group_index> INI <axis indices>`) before any LINEAR moves.
+
+        Called once per execute() call, only if the program contains at
+        least one LINEAR move — dwell/pause/home-only programs never touch
+        the group.
+        """
         indices = [axis.index for axis in self._axes]
         if self._dry_run:
             logger.info("[dry-run] C%d INI %s", self._group_index, " ".join(str(i) for i in indices))
@@ -419,6 +552,17 @@ class GCodeExecutor:
         self._cmd.init_group(*indices)
 
     def _execute_linear(self, move: GCodeMove) -> None:
+        """Run one LINEAR move: confirm, optionally set group speed, command the move, and block until it finishes.
+
+        This blocks the caller — it polls hardware via
+        _poll_group_move_finished() before returning. Updates
+        `_current_pos` regardless of dry-run.
+
+        Raises:
+            GCodeExecutionAborted: If confirm_cb rejects this move.
+            SnapMotionError: If the move doesn't finish within the poll
+                timeout (propagated from _poll_group_move_finished).
+        """
         if not self._confirm(move):
             raise GCodeExecutionAborted(f"aborted by confirm_cb: {move.source_line!r}")
         if self._dry_run:
@@ -432,6 +576,7 @@ class GCodeExecutor:
         self._current_pos = move.target
 
     def _describe_linear(self, move: GCodeMove) -> str:
+        """Render the ASCII commands _execute_linear would send, for dry-run logging."""
         parts = []
         if move.feed_mm_s is not None:
             parts.append(f"C{self._group_index} SPD {move.feed_mm_s:.6g}")
@@ -440,6 +585,17 @@ class GCodeExecutor:
         return "; ".join(parts)
 
     def _poll_group_move_finished(self, timeout_s: float = 30.0, poll_interval_s: float = 0.05) -> None:
+        """Block until the group's move-finished flag is set, aborting the move on timeout.
+
+        Args:
+            timeout_s: Maximum seconds to wait before aborting (default 30).
+            poll_interval_s: Sleep between polls (default 0.05s).
+
+        Raises:
+            SnapMotionError: If the move hasn't finished within
+                `timeout_s`. The in-progress group move is aborted
+                (`group_abort()`) before raising.
+        """
         deadline = time.monotonic() + timeout_s
         while not self._cmd.group_move_is_finished():
             if time.monotonic() > deadline:
@@ -448,6 +604,17 @@ class GCodeExecutor:
             time.sleep(poll_interval_s)
 
     def _execute_home(self, move: GCodeMove) -> None:
+        """Run a G28 HOME move: confirm, then delegate to HomingProcedure.home_all().
+
+        This blocks the caller for as long as home_all() takes. On success,
+        `_current_pos` is set to the move's target (the conventional
+        origin from GCodeParser._g28), not read back from hardware.
+
+        Raises:
+            GCodeExecutionAborted: If confirm_cb rejects this move.
+            GCodeError: If no HomingProcedure was configured, or if
+                home_all() reports failure.
+        """
         if not self._confirm(move):
             raise GCodeExecutionAborted(f"aborted by confirm_cb: {move.source_line!r}")
         if self._dry_run:
@@ -461,11 +628,27 @@ class GCodeExecutor:
         self._current_pos = move.target if move.target is not None else (0.0, 0.0, 0.0)
 
     def _execute_dwell(self, move: GCodeMove) -> None:
+        """Run a G4 DWELL move by sleeping for `move.dwell_s` seconds (0 if unset).
+
+        This is not confirmed via confirm_cb — dwells are treated as
+        harmless and always proceed.
+        """
         if self._dry_run:
             logger.info("[dry-run] dwell %.3fs", move.dwell_s or 0.0)
             return
         time.sleep(move.dwell_s or 0.0)
 
     def _execute_pause(self, move: GCodeMove) -> None:
+        """Run an M0/M1 PAUSE move: entirely delegated to confirm_cb.
+
+        There is no hardware command for a "pause" — this move exists only
+        so confirm_cb gets a chance to block execution (e.g. to prompt an
+        operator) before continuing to the next move.
+
+        Raises:
+            GCodeExecutionAborted: If confirm_cb is set and rejects this
+                pause. If no confirm_cb is configured, the pause is a
+                silent no-op and execution continues immediately.
+        """
         if not self._confirm(move):
             raise GCodeExecutionAborted(f"paused/aborted by confirm_cb: {move.source_line!r}")

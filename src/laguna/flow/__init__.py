@@ -18,13 +18,29 @@ except ImportError:
 
 
 class FlowController(ABC):
+    """Abstract interface for pump flow rate and inlet/aux valve control.
+
+    Concrete implementations drive whatever VFD/pump hardware and solenoid
+    valves are physically deployed, exposing flow rate in L/min regardless
+    of the underlying protocol.
+    """
+
     subsystem_name = "flow"
 
     @abstractmethod
-    def connect(self) -> bool: ...
+    def connect(self) -> bool:
+        """Open the hardware connection(s).
+
+        Returns:
+            True if all required connections were established, False
+            otherwise.
+        """
+        ...
 
     @abstractmethod
-    def disconnect(self) -> None: ...
+    def disconnect(self) -> None:
+        """Close the hardware connection(s) and release any held resources."""
+        ...
 
     @abstractmethod
     def set_flowrate(self, lpm: float) -> bool:
@@ -32,20 +48,46 @@ class FlowController(ABC):
         ...
 
     @abstractmethod
-    def get_flowrate(self) -> float: ...
+    def get_flowrate(self) -> float:
+        """Return the most recently commanded flow rate in L/min.
+
+        This is the setpoint last sent via set_flowrate(), not a live
+        measurement from a flow sensor.
+        """
+        ...
 
     @abstractmethod
-    def start(self) -> bool: ...
+    def start(self) -> bool:
+        """Start the pump at its current flow rate setpoint.
+
+        Returns:
+            True if the start command was sent successfully.
+        """
+        ...
 
     @abstractmethod
-    def stop(self) -> bool: ...
+    def stop(self) -> bool:
+        """Stop the pump.
+
+        Returns:
+            True if the stop command was sent successfully.
+        """
+        ...
 
     @abstractmethod
-    def clear_faults(self) -> bool: ...
+    def clear_faults(self) -> bool:
+        """Clear any latched VFD fault/alarm state.
+
+        Returns:
+            True if faults were cleared successfully.
+        """
+        ...
 
     @property
     @abstractmethod
-    def qin(self) -> bool: ...
+    def qin(self) -> bool:
+        """Whether the inlet solenoid valve is currently commanded open."""
+        ...
 
     @qin.setter
     @abstractmethod
@@ -53,14 +95,23 @@ class FlowController(ABC):
 
     @property
     @abstractmethod
-    def qaux(self) -> bool: ...
+    def qaux(self) -> bool:
+        """Whether the auxiliary solenoid valve is currently commanded open."""
+        ...
 
     @qaux.setter
     @abstractmethod
     def qaux(self, state: bool) -> None: ...
 
     @abstractmethod
-    def get_status(self) -> Dict[str, Any]: ...
+    def get_status(self) -> Dict[str, Any]:
+        """Return a snapshot of pump/VFD status and valve states.
+
+        Returns:
+            Dictionary of status fields. Contents are backend-specific, but
+            always include at least `is_connected` and `flowrate_lpm`.
+        """
+        ...
 
 
 class SaflFlowController(FlowController):
@@ -73,6 +124,31 @@ class SaflFlowController(FlowController):
     """
 
     def __init__(self, config: Dict[str, Any]):
+        """Build the controller from a config dict; does not open a connection.
+
+        Args:
+            config: Subsystem configuration dictionary (see
+                Config._get_defaults()'s 'flow' section for the expected
+                shape). Recognized keys:
+                - vfd_port: Serial device for the Fuji VFD (Modbus RTU)
+                  (default '/dev/ttyUSB1').
+                - vfd_slave_id: Modbus slave address of the VFD (default 1).
+                - motor_port: Serial device for the Teknic ClearCore that
+                  drives the qin/qaux solenoid digital outputs
+                  (default '/dev/ttyUSB0').
+                - motor_baudrate: Baud rate for the ClearCore connection
+                  (default 9600).
+                - C0, C1, C2: Coefficients of the quadratic pump calibration
+                  curve `freq_hz = C2*Q^2 + C1*Q + C0` (Q in L/min) used by
+                  set_flowrate() to convert a requested flow rate into a VFD
+                  drive frequency. These are empirically fit per pump/
+                  plumbing configuration — they are not physical constants,
+                  just curve-fit coefficients for this specific installed
+                  pump. Defaults (4.902, 58.49, 0.08956) match the values in
+                  Config._get_defaults(); override per-installation as
+                  needed. The resulting frequency is clamped to [0, 60] Hz
+                  by the underlying VFD driver.
+        """
         self._vfd_port = config.get("vfd_port", "/dev/ttyUSB1")
         self._vfd_slave_id = config.get("vfd_slave_id", 1)
         self._motor_port = config.get("motor_port", "/dev/ttyUSB0")
@@ -89,6 +165,15 @@ class SaflFlowController(FlowController):
         self._qaux_state = False
 
     def connect(self) -> bool:
+        """Open connections to both the VFD (Modbus) and the ClearCore (serial).
+
+        Both connections must succeed for this to report success; if either
+        safl_ocean_hardware is missing or either device fails to connect,
+        `is_connected` is left False.
+
+        Returns:
+            True only if both the VFD and motor connections succeeded.
+        """
         if _VFD is None or _TeknicMotor is None:
             logger.warning(
                 "safl_ocean_hardware is not installed; SaflFlowController cannot connect"
@@ -106,6 +191,10 @@ class SaflFlowController(FlowController):
             return False
 
     def disconnect(self) -> None:
+        """Close both the VFD and motor connections, if open.
+
+        Safe to call when already disconnected.
+        """
         if self._vfd is not None:
             self._vfd.disconnect()
         if self._motor is not None:
@@ -115,51 +204,123 @@ class SaflFlowController(FlowController):
         self._is_connected = False
 
     def _require_connected(self) -> None:
+        """Raise RuntimeError if connect() hasn't succeeded yet."""
         if not self._is_connected:
             raise RuntimeError(f"{self.__class__.__name__} is not connected")
 
     def set_flowrate(self, lpm: float) -> bool:
+        """Set the pump's target flow rate.
+
+        Converts `lpm` to a VFD drive frequency using the quadratic
+        calibration curve `C2*Q^2 + C1*Q + C0` (see __init__ for details on
+        C0/C1/C2), clamps it to the VFD's [0, 60] Hz range, and writes it as
+        the new setpoint. This does not itself start the pump — call
+        start() to begin running at the new setpoint.
+
+        Returns:
+            True (the underlying driver does not report setpoint-write
+            failure separately from a communication exception).
+
+        Raises:
+            RuntimeError: If not connected.
+        """
         self._require_connected()
         self._vfd.set_freq_from_flowrate(lpm, self.C0, self.C1, self.C2)
         self._current_flowrate = lpm
         return True
 
     def get_flowrate(self) -> float:
+        """Return the most recently commanded flow rate in L/min.
+
+        This is a locally cached setpoint, not a live sensor measurement —
+        it is available even when disconnected, reflecting whatever was
+        last passed to set_flowrate().
+        """
         return self._current_flowrate
 
     def start(self) -> bool:
+        """Start the pump at its current VFD frequency setpoint.
+
+        Raises:
+            RuntimeError: If not connected.
+        """
         self._require_connected()
         return self._vfd.start()
 
     def stop(self) -> bool:
+        """Stop the pump.
+
+        Raises:
+            RuntimeError: If not connected.
+        """
         self._require_connected()
         return self._vfd.stop()
 
     def clear_faults(self) -> bool:
+        """Clear any latched VFD alarm state.
+
+        Raises:
+            RuntimeError: If not connected.
+        """
         self._require_connected()
         return self._vfd.clear_faults()
 
     @property
     def qin(self) -> bool:
+        """Whether the inlet solenoid valve is currently commanded open.
+
+        This reflects the last value written via the setter, not a live
+        hardware readback.
+        """
         return self._qin_state
 
     @qin.setter
     def qin(self, state: bool) -> None:
+        """Open (True) or close (False) the inlet solenoid valve.
+
+        Drives digital output channel 0 on the shared ClearCore controller.
+
+        Raises:
+            RuntimeError: If not connected.
+        """
         self._require_connected()
         self._motor.set_io(0, state)
         self._qin_state = state
 
     @property
     def qaux(self) -> bool:
+        """Whether the auxiliary solenoid valve is currently commanded open.
+
+        This reflects the last value written via the setter, not a live
+        hardware readback.
+        """
         return self._qaux_state
 
     @qaux.setter
     def qaux(self, state: bool) -> None:
+        """Open (True) or close (False) the auxiliary solenoid valve.
+
+        Drives digital output channel 1 on the shared ClearCore controller.
+
+        Raises:
+            RuntimeError: If not connected.
+        """
         self._require_connected()
         self._motor.set_io(1, state)
         self._qaux_state = state
 
     def get_status(self) -> Dict[str, Any]:
+        """Return connection state, flow setpoint, valve states, and raw VFD status.
+
+        When connected, this also polls the VFD over Modbus for its current
+        state message, e-stop flag, and drive frequency setpoint — so this
+        call is not free of hardware I/O like the qin/qaux property getters.
+
+        Returns:
+            Dict with `is_connected`, `flowrate_lpm`, `qin_open`, and
+            `qaux_open`; when connected, also includes `vfd_state`,
+            `vfd_estop`, and `vfd_setpoint_hz`.
+        """
         status: Dict[str, Any] = {
             "is_connected": self._is_connected,
             "flowrate_lpm": self._current_flowrate,
