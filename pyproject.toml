@@ -45,8 +45,9 @@ dev = [
     "mypy>=0.950",
 ]
 docs = [
-    "sphinx>=4.0",
-    "sphinx-rtd-theme>=1.0",
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.25",
 ]
 storage = [
     "boto3>=1.20",            # AWS S3 (paramiko for SFTP is now a core dependency)

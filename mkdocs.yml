@@ -8,25 +8,59 @@ theme:
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
   features:
     - navigation.instant
     - navigation.tracking
+    - navigation.top
+    - navigation.indexes
     - content.code.copy
     - toc.integrate
+    - search.suggest
+    - search.highlight
+
+extra_css:
+  - stylesheets/flume.css
 
 markdown_extensions:
   - fenced_code
   - tables
   - toc:
       permalink: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            merge_init_into_class: true
+            separate_signature: true
+            show_signature_annotations: true
+            docstring_section_style: table
+            members_order: source
+            filters: ["!^_"]
 
 nav:
   - Home: index.md
@@ -35,4 +69,25 @@ nav:
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
+  - Subsystems:
+      - Camera: subsystems/camera.md
+      - Weir: subsystems/weir.md
+      - Gauge: subsystems/gauge.md
+      - Flow: subsystems/flow.md
+      - Schedule: subsystems/schedule.md
+      - Timing: subsystems/timing.md
+      - Experiment runner: subsystems/experiment.md
+      - Data & storage: subsystems/data_storage.md
   - Camera USB setup: CAMERA_USB_SETUP.md
+  - Contributing: CONTRIBUTING.md
+  - API reference:
+      - Overview: reference/index.md
+      - Core & config: reference/core.md
+      - Macron gantry driver: reference/macron.md
+      - Camera: reference/camera.md
+      - Weir: reference/weir.md
+      - Gauge: reference/gauge.md
+      - Flow: reference/flow.md
+      - Schedule: reference/schedule.md
+      - Timing: reference/timing.md
+      - Experiment runner: reference/experiment.md
