@@ -69,6 +69,7 @@ nav:
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
+      - Rangefinder profiling brainstorm: RANGEFINDER_PROFILING.md
   - Subsystems:
       - Camera: subsystems/camera.md
       - Weir: subsystems/weir.md

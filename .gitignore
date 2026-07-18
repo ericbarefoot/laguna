@@ -73,6 +73,9 @@ logs/
 # Sandbox (development scripts, not part of the package)
 sandbox/
 
+# Experiments and their data (local only, not part of the package)
+experiments/
+
 # Captured images and experiment output
 captures/
 *.jpg
