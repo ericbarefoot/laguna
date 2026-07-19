@@ -98,6 +98,32 @@ columns (if present) gate which scheduled time points actually fire a
 capture — see [Schedule](schedule.md). If the CSV has no such column,
 capture fires at every `time_s` row.
 
+## Log format and file naming
+
+Camera agents run on distributed Raspberry Pi nodes that may be in different
+timezones. All timestamps are anchored to UTC so that logs and filenames from
+multiple hosts can be compared directly.
+
+**Log lines** (written by `agent.py` to stderr, streamed back to the coordinator):
+
+```
+[agent 14:23:45.123Z/10:23:45] Sleeping 4.997s until target_time...
+```
+
+The format is `HH:MM:SS.mmmZ` (UTC) followed by `/HH:MM:SS` (local time on that
+Pi). The shared helper `utc_local_ts()` in `camera/_log.py` produces both strings.
+
+**Image filenames** use ISO 8601 UTC derived from the scheduled `target_time`,
+not the wall-clock time of the actual shutter:
+
+```
+capture_20240115T142345123Z.jpg   # YYYYMMDDTHHMMSSfffZ
+```
+
+Using `target_time` (rather than capture-wall-clock) means filenames are
+consistent across the array even when individual Pis capture a few milliseconds
+early or late.
+
 ## Further reading
 
 - [API reference](../reference/camera.md) — generated from docstrings.

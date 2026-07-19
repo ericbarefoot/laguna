@@ -38,11 +38,12 @@ class TestFlumeLab:
         assert result is lab
 
     def test_add_requires_subsystem_name(self, lab):
-        with pytest.raises(AttributeError):
+        with pytest.raises(ValueError):
             lab.add(object())
 
-    def test_get_system_status_is_empty_with_no_subsystems(self, lab):
-        assert lab.get_system_status() == {}
+    def test_get_system_status_contains_only_timing_with_no_subsystems(self, lab):
+        status = lab.get_system_status()
+        assert list(status.keys()) == ["timing"]
 
     def test_get_system_status_includes_registered_subsystems(self, lab):
         lab.add(FakeSubsystem())
