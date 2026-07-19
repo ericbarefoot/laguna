@@ -85,3 +85,6 @@ captures/
 experiment_checkpoint.json
 experiment_events.csv
 .claude/
+
+# MkDocs build output (generated via `mkdocs build`, see mkdocs.yml)
+site/

@@ -32,6 +32,8 @@ dependencies = [
     "scipy>=1.7",             # For schedule interpolation
     "pandas>=1.3",            # For schedule data loading
     "openpyxl>=3.0",          # For Excel schedule files
+    "paramiko>=2.12",         # SSH/SFTP — camera.network and robot.macron.pi_bridge both
+                               # import this unconditionally, so it's a core dependency
 ]
 
 [project.optional-dependencies]
@@ -47,8 +49,7 @@ docs = [
     "sphinx-rtd-theme>=1.0",
 ]
 storage = [
-    "boto3>=1.20",            # AWS S3
-    "paramiko>=2.12",         # SSH/SFTP for remote storage
+    "boto3>=1.20",            # AWS S3 (paramiko for SFTP is now a core dependency)
 ]
 
 [tool.setuptools]

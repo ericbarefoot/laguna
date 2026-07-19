@@ -1,0 +1,38 @@
+site_name: laguna docs
+site_description: Hydraulic flume lab control framework — subsystem guides and architecture reference
+docs_dir: docs
+repo_url: https://github.com/ericbarefoot/laguna
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - content.code.copy
+    - toc.integrate
+
+markdown_extensions:
+  - fenced_code
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Architecture: ARCHITECTURE.md
+  - Quick reference: QUICKREF.md
+  - Gantry:
+      - Usage guide: GANTRY_GUIDE.md
+      - Technical reference: MACRON_GANTRY.md
+  - Camera USB setup: CAMERA_USB_SETUP.md
