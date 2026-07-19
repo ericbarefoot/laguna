@@ -34,6 +34,7 @@ dependencies = [
     "openpyxl>=3.0",          # For Excel schedule files
     "paramiko>=2.12",         # SSH/SFTP — camera.network and robot.macron.pi_bridge both
                                # import this unconditionally, so it's a core dependency
+    "paho-mqtt>=1.6",          # MQTT client — rangefinder/OD2000 data path via AL1342
 ]
 
 [project.optional-dependencies]

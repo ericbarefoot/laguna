@@ -1,15 +1,28 @@
 # Topographic Profiling with the SICK OD2000 Rangefinder
 
-**Status as of 2026-07-19: brainstorm/design only. No code exists yet, no
-hardware has been touched for this. Written after a serial-polling speed
-benchmark on the gantry's motion controller (see `MACRON_GANTRY.md` and
-`../experiments/gantry_polling_speed_test/`) found that controller capped at
-~3.48 Hz for safe position polling, and that attempting to pipeline reads for
-more speed caused the controller to hang (a physical power-cycle was
-required to recover). This document asks: can we build a topographic
-elevation profile — moving the gantry along one axis while a laser
-rangefinder takes distance readings — without depending on high-rate
-position feedback from that controller at all?**
+**Status as of 2026-07-18: Approach A is now implemented.** `scan_runner.py`
+(`src/laguna/pi/scan_runner.py`, deployed to Pi via SFTP) handles all BLC
+serial communication and MQTT subscription in one Pi-local clock domain.
+`TopographicProfiler` (`src/laguna/robot/macron/profiler.py`) orchestrates
+deployment from the laguna PC. See `docs/subsystems/rangefinder.md` for usage
+and `docs/MQTT_AL1342_SETUP.md` for the one-time hardware bring-up steps.
+
+**Open items resolved:** serial safety is maintained by releasing
+`gantry_agent.py` before the scan and reconnecting after. Clock correction is
+not needed because both BLC serial and MQTT run on the Pi's single local clock.
+
+**Open items remaining:** measure actual AL1342 MQTT publish rate on hardware;
+confirm PDIN byte layout; verify serial_bridge.py port-holding behavior;
+run commanded-vs-actual validation pass (compare predicted end position to
+ACP/ENP after a real move).
+
+---
+
+*Original brainstorm (retained for context):* written after a serial-polling
+speed benchmark found the controller capped at ~3.48 Hz for safe position
+polling, and that pipelining reads caused a hang requiring physical power-cycle.
+This document asked: can we build a topographic elevation profile without
+depending on high-rate position feedback from that controller at all?
 
 **Confirmed so far:** the scan is 1D, on an **X or Y** axis (a separate tool
 handles 2D scans, out of scope here); the profiling/fusion logic should run

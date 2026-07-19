@@ -107,6 +107,19 @@ class Config:
                 },
                 "fences": [],
             },
+            "mqtt": {
+                "broker_host": "red.lab",
+                "broker_port": 1883,
+                "client_id": "laguna",
+                "keepalive": 60,
+                "topics": [],
+                "qos": 0,
+            },
+            "rangefinder": {
+                "topic": "laguna/od2000",
+                "pdin_port": 1,       # IO-Link port the OD2000 is connected to (1-8)
+                "offset_mm": 0.0,     # physical mounting offset if needed
+            },
         }
     
     def load_from_file(self, config_file: str) -> None:
