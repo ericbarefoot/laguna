@@ -12,13 +12,16 @@ import importlib
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+from laguna.camera._log import utc_local_ts
 
 
 def _log(msg: str) -> None:
     """Write a timestamped progress line to stderr so the coordinator can stream it."""
-    ts = time.strftime("%H:%M:%S", time.localtime()) + f".{int(time.time() % 1 * 1000):03d}"
-    print(f"[agent {ts}] {msg}", file=sys.stderr, flush=True)
+    utc, local = utc_local_ts()
+    print(f"[agent {utc}/{local}] {msg}", file=sys.stderr, flush=True)
 
 
 def capture_at_time(target_time: float, output_dir: str = "/tmp/laguna_captures") -> dict:
@@ -51,7 +54,8 @@ def capture_at_time(target_time: float, output_dir: str = "/tmp/laguna_captures"
     cam = Camera()
     _log("Camera() initialized — calling take_photo()...")
 
-    filename = str(out / f"capture_{target_time:.3f}.jpg")
+    ts = datetime.fromtimestamp(target_time, tz=timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3] + "Z"
+    filename = str(out / f"capture_{ts}.jpg")
     t_before = time.time()
     cam.take_photo(filename)
     t_after = time.time()

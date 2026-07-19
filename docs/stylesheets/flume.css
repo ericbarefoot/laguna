@@ -1,0 +1,36 @@
+/*
+ * Flume Blue — custom skin for the laguna docs site.
+ * Blue-grey instrumentation-panel primary + amber gauge-needle accent.
+ * Applies on top of theme.palette.primary/accent: custom in mkdocs.yml,
+ * which is Material's documented hook for arbitrary colors:
+ * https://squidfunk.github.io/mkdocs-material/setup/changing-the-colors/#custom-colors
+ */
+
+[data-md-color-primary="custom"] {
+  --md-primary-fg-color: #37474f;
+  --md-primary-fg-color--light: #62727b;
+  --md-primary-fg-color--dark: #102027;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: #ffffff;
+}
+
+[data-md-color-scheme="slate"][data-md-color-primary="custom"] {
+  --md-primary-fg-color: #263238;
+  --md-primary-fg-color--light: #37474f;
+  --md-primary-fg-color--dark: #0d1417;
+}
+
+[data-md-color-accent="custom"] {
+  --md-accent-fg-color: #c9752a;
+  --md-accent-fg-color--transparent: #c9752a1a;
+  --md-accent-bg-color: #ffffff;
+  --md-accent-bg-color--light: #ffffff;
+}
+
+[data-md-color-scheme="slate"][data-md-color-accent="custom"] {
+  --md-accent-fg-color: #f0a860;
+  --md-accent-fg-color--transparent: #f0a8601a;
+}
+
+/* Typography set by fenced code / admonitions inherits the accent above
+   automatically since Material derives those colors from the same tokens. */

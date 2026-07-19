@@ -43,10 +43,12 @@ dev = [
     "black>=22.0",
     "flake8>=4.0",
     "mypy>=0.950",
+    "ruff>=0.4",
 ]
 docs = [
-    "sphinx>=4.0",
-    "sphinx-rtd-theme>=1.0",
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.25",
 ]
 storage = [
     "boto3>=1.20",            # AWS S3 (paramiko for SFTP is now a core dependency)
@@ -76,3 +78,15 @@ disallow_untyped_defs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=src/laguna --cov-report=html"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# "D" is pydocstyle — docstring presence/format checks, configured for the
+# Google convention this codebase already follows (Args/Returns/Raises).
+select = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

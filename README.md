@@ -1,118 +1,46 @@
-# Laguna - Robotic Flume Control System
+# Laguna
 
-Software suite for controlling robotic systems, acquiring camera data, managing water flow hardware, and processing experimental data from hydraulic flume experiments.
+Control software for robotic systems in hydraulic flume experiments.
 
-## Overview
-
-Laguna provides a modular Python framework for coordinating multiple subsystems:
-
-- **Robot Control**: ASCII serial and Modbus protocol support for robotic positioning
-- **Camera Acquisition**: Real-time video capture and frame processing
-- **Hydraulics Management**: Control and monitoring of hydraulic systems
-- **Data Processing**: Acquisition, processing, and packaging of experimental data
-- **Remote Storage**: Integration with cloud and remote storage solutions
-
-## Quick Start
-
-### Installation
-
-```bash
-# Clone the repository
-git clone <repo-url>
-cd laguna
-
-# Create a virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install in development mode
-pip install -e ".[dev]"
-```
-
-### Basic Usage
-
-```python
-from laguna import FlumeLab
-
-# Initialize the system with configuration
-lab = FlumeLab(config_file="config/experiment.yaml")
-
-from laguna.weir import SaflWeirController
-from laguna.flow import SaflFlowController
-
-# Attach hardware subsystems and run
-lab.add(SaflWeirController(lab.config.get("weir")))
-lab.add(SaflFlowController(lab.config.get("flow")))
-lab.connect_all()
-```
-
-## Project Structure
-
-```
-laguna/
-├── src/laguna/           # Main package
-│   ├── core.py          # Main FlumeLab orchestrator
-│   ├── config.py        # Configuration management
-│   ├── robot/           # Robot control subsystem
-│   ├── camera/          # Camera acquisition subsystem
-│   ├── weir/            # Weir (tailgate) elevation control
-│   ├── flow/            # Pump flow and solenoid control
-│   ├── gauge/           # Water level sensing
-│   ├── data/            # Data processing subsystem
-│   └── storage/         # Remote storage interface
-├── tests/               # Unit and integration tests
-├── examples/            # Example scripts and workflows
-├── docs/                # Documentation
-└── pyproject.toml       # Project configuration
-```
-
-## Subsystems
-
-### Robot Controller
-Provides high-level interface for robotic positioning through multiple protocols:
-- ASCII serial communication
-- Modbus RTU/TCP
-- Other industrial protocols
-
-### Camera Acquisition
-Real-time video capture and frame processing with optional compression and format conversion.
-
-### Hydraulics System
-Monitoring and control of hydraulic pressure, flow rates, and actuator positions.
-
-### Data Processing
-Aggregation, filtering, and packaging of data from multiple sensors and systems.
-
-### Remote Storage
-Interface for cloud storage (AWS S3, Google Cloud) and remote storage solutions (SSH/SFTP).
-
-## Development
-
-### Running Tests
-
-```bash
-pytest                          # Run all tests
-pytest --cov                   # Run with coverage report
-pytest tests/robot/            # Run specific test module
-```
-
-### Code Style
-
-This project uses Black for formatting and isort for import sorting:
-
-```bash
-black src/ tests/
-isort src/ tests/
-```
-
-## Configuration
-
-Configuration is managed through YAML files. Example files are provided in `config/examples/`.
+Laguna coordinates a set of opt-in hardware subsystems — weir elevation,
+water-level gauge, pump/flow, DSLR and Pi cameras, and the Modusystems
+gantry — under a shared clock, scheduler, and event log, via a central
+`FlumeLab` orchestrator.
 
 ## Documentation
 
-For detailed documentation, see the [docs](docs/) directory.
+This README is intentionally minimal. The real documentation lives in
+[`docs/`](docs/index.md) as an MkDocs + Material site — architecture,
+per-subsystem guides, the gantry driver reference, and an API reference
+generated from docstrings.
+
+```bash
+make docs-install   # pip install -e ".[docs]"
+make docs-serve      # http://127.0.0.1:8000, live-reloads as you edit docs/*.md
+```
+
+## Install
+
+```bash
+git clone <repo-url>
+cd laguna
+python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+## Run Your First Experiment
+
+```bash
+cp config/example_config.yaml config/my_experiment.yaml
+# edit ports/hosts for your hardware, then:
+python experiments/weir_gauge_camera_experiment.py \
+    --lab-config config/my_experiment.yaml --duration 30
+```
+
+See the [Quick reference](docs/QUICKREF.md) for interactive/REPL control,
+scheduling actuators against a CSV, and troubleshooting.
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT License — see [LICENSE](LICENSE) for details.
