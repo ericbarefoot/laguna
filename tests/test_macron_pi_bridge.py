@@ -7,6 +7,7 @@ RS232Connection's fake socket/serial objects.
 """
 
 import json
+import threading
 
 import pytest
 
@@ -54,6 +55,12 @@ class _FakeChannel:
 
 
 def _make_connection(**overrides):
+    """Build a PiGantryConnection wired to a fake channel, with the
+    background reader thread started manually (bypassing connect(), which
+    would try real paramiko/SFTP) — send()/start_scan() now get their
+    responses via that thread's dispatch, not by reading the channel
+    themselves, so it must be running for these tests to see any response.
+    """
     kwargs = dict(
         host="red.dyn.ucr.edu", ssh_user="oak", remote_serial_device="/dev/fake", timeout=1.0
     )
@@ -62,6 +69,9 @@ def _make_connection(**overrides):
     channel = _FakeChannel()
     conn._channel = channel
     conn._client = object()  # sentinel; not touched by send()/is_connected
+    conn._reader_stop.clear()
+    conn._reader_thread = threading.Thread(target=conn._reader_loop, daemon=True)
+    conn._reader_thread.start()
     return conn, channel
 
 
@@ -248,3 +258,164 @@ class TestDisconnect:
         assert len(channel.sent) == 1
         assert json.loads(channel.sent[0].decode("ascii")) == {"op": "close"}
         assert conn._channel is None
+
+
+# ---------------------------------------------------------------------------
+# Background reader dispatch — scan messages arrive asynchronously, not as
+# a reply to any one send()/start_scan() call, so they must be routed to a
+# dedicated queue rather than confused with an in-flight request's response.
+# ---------------------------------------------------------------------------
+
+
+class TestReaderDispatch:
+    def test_scan_done_routed_to_scan_result_queue_not_pending(self):
+        """A scan_done message must never be handed to a send()/start_scan()
+        caller waiting on a *different* id — it only belongs in
+        wait_for_scan_result(). On hardware: if this routing is wrong, a
+        scan's completion could be silently swallowed by an unrelated
+        interactive command's timeout-bound wait, or vice versa.
+        """
+        conn, channel = _make_connection()
+        channel.queue_line({"scan_done": True, "id": 7, "csv_path": "/tmp/x.csv", "samples": 10})
+        result = conn.wait_for_scan_result(timeout=2.0)
+        assert result["scan_done"] is True
+        assert result["csv_path"] == "/tmp/x.csv"
+
+    def test_scan_error_routed_to_scan_result_queue(self):
+        conn, channel = _make_connection()
+        channel.queue_line({"scan_error": "serial timeout", "id": 3})
+        result = conn.wait_for_scan_result(timeout=2.0)
+        assert result["scan_error"] == "serial timeout"
+
+    def test_id_matched_response_still_routes_to_the_right_send_call(self):
+        """Interleaving a scan_done with an ordinary id-matched response
+        must not confuse the two — each goes to its own destination.
+        """
+        conn, channel = _make_connection()
+        channel.queue_line({"scan_done": True, "id": 99, "samples": 1})
+        channel.queue_line({"id": 1, "raw": "0 42.000 >"})
+        result = conn.send("A1 ACP")
+        assert result == "42.000"
+        scan_result = conn.wait_for_scan_result(timeout=2.0)
+        assert scan_result["scan_done"] is True
+
+    def test_pong_and_scan_stop_ack_do_not_raise_or_hang(self):
+        """Housekeeping replies with no "id" must be silently absorbed by
+        the reader thread, not logged as unmatched forever or crash it.
+        """
+        conn, channel = _make_connection()
+        channel.queue_line({"pong": True})
+        channel.queue_line({"scan_stop_ack": True})
+        channel.queue_line({"id": 1, "raw": "0 1.000 >"})
+        result = conn.send("A1 ACP")
+        assert result == "1.000"
+
+
+# ---------------------------------------------------------------------------
+# Scan control API
+# ---------------------------------------------------------------------------
+
+
+class TestStartScan:
+    def test_happy_path_returns_ack(self):
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({
+            "id": 1, "scan_started": True,
+            "start_pos_mm": 100.0, "accel_mm_s2": 10.0, "decel_mm_s2": 10.0,
+        })
+        ack = conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        assert ack["scan_started"] is True
+        assert ack["start_pos_mm"] == 100.0
+        sent_payload = json.loads(channel.sent[0].decode("ascii"))
+        assert sent_payload["op"] == "scan_start"
+        assert sent_payload["axis"] == "A1"
+        assert sent_payload["al1342_host"] == "192.168.1.251"
+
+    def test_sets_is_scan_running_true_on_success(self):
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
+                             "accel_mm_s2": 1.0, "decel_mm_s2": 1.0})
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        assert conn.is_scan_running is True
+
+    def test_agent_rejection_raises_and_does_not_set_running(self):
+        """On hardware: agent rejects scan_start if it was launched without
+        --allow-motion, or if a scan is already in progress there.
+        """
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "error": "scan already in progress"})
+        with pytest.raises(SnapMotionError):
+            conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        assert conn.is_scan_running is False
+
+    def test_raises_immediately_if_already_running_client_side(self):
+        """If this PC-side object already believes a scan is running, don't
+        even send a second scan_start — fail fast client-side.
+        """
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
+                             "accel_mm_s2": 1.0, "decel_mm_s2": 1.0})
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        with pytest.raises(SnapMotionError):
+            conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out2.csv")
+
+    def test_timeout_waiting_for_ack(self):
+        conn, channel = _make_connection(safe_mode=False, timeout=0.05)
+        with pytest.raises(SnapMotionError) as exc_info:
+            conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        assert exc_info.value.code == COMM_TIMEOUT_CODE
+
+
+class TestStopScan:
+    def test_sends_scan_stop_op(self):
+        conn, channel = _make_connection()
+        conn.stop_scan()
+        assert len(channel.sent) == 1
+        assert json.loads(channel.sent[0].decode("ascii")) == {"op": "scan_stop"}
+
+
+class TestWaitForScanResult:
+    def test_timeout_raises(self):
+        conn, channel = _make_connection(timeout=1.0)
+        with pytest.raises(SnapMotionError) as exc_info:
+            conn.wait_for_scan_result(timeout=0.05)
+        assert exc_info.value.code == COMM_TIMEOUT_CODE
+
+    def test_clears_is_scan_running(self):
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
+                             "accel_mm_s2": 1.0, "decel_mm_s2": 1.0})
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        assert conn.is_scan_running is True
+        channel.queue_line({"scan_done": True, "id": 1, "samples": 5})
+        conn.wait_for_scan_result(timeout=2.0)
+        assert conn.is_scan_running is False
+
+
+class TestSendBlockedDuringScan:
+    def test_send_raises_while_scan_running(self):
+        """Interactive commands are refused client-side while a scan is
+        active — the agent-side serial lock would make interleaving safe,
+        but disallowing it here keeps behavior predictable (no jogging an
+        axis mid-scan). On hardware: if this check is bypassed, a manual
+        move command could race the scan's own BMT/MIF polling — still
+        safe at the wire (locked), but confusing and unsupported.
+        """
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
+                             "accel_mm_s2": 1.0, "decel_mm_s2": 1.0})
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        with pytest.raises(SnapMotionError, match="scan in progress"):
+            conn.send("A1 ACP")
+
+    def test_send_allowed_again_after_scan_completes(self):
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
+                             "accel_mm_s2": 1.0, "decel_mm_s2": 1.0})
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        channel.queue_line({"scan_done": True, "id": 1, "samples": 5})
+        conn.wait_for_scan_result(timeout=2.0)
+
+        channel.queue_line({"id": 2, "raw": "0 7.000 >"})
+        result = conn.send("A1 ACP")
+        assert result == "7.000"

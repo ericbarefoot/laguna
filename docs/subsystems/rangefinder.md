@@ -88,9 +88,22 @@ rangefinder.disconnect()
 
 ## Topographic profiling
 
-A `TopographicProfiler` scan pass runs entirely on the Pi. It deploys
-`scan_runner.py` via SFTP, triggers it, and retrieves the result CSV. The
-gantry serial port is released before the scan and reclaimed after.
+A `TopographicProfiler` scan runs entirely inside `gantry_agent.py` on the
+Pi — the same persistent, SSH-connected process that already handles
+interactive axis commands (`transport: pi_agent`, `PiGantryConnection`).
+There is no separate deployed script: `gantry_agent.py` is the sole owner
+of the BLC serial port for its whole session, and starting a scan
+(`start_scan()`) just launches a background thread inside it that runs the
+move, polls the OD2000 over HTTP, and writes the CSV — reusing the same
+locked serial connection as everything else. Call `profiler.stop()` at any
+time to cancel a scan in progress (sends `BST` on the scanning axis; the
+scan still finishes normally through the same completion path, just with
+fewer samples).
+
+**Requires the `pi_agent` transport** (`transport: pi_agent` in the
+`gantry:` config section) — the default `socket_bridge` transport talks to
+`serial_bridge.py`, a separate process that holds the serial port
+permanently and cannot participate in scanning. See `docs/MACRON_GANTRY.md`.
 
 ```python
 from laguna import FlumeLab
@@ -98,7 +111,7 @@ from laguna.robot.macron import GantryController
 from laguna.robot.macron.profiler import TopographicProfiler
 
 lab = FlumeLab("config/example_config.yaml")
-gantry = GantryController.from_config(lab.config.get("gantry"))
+gantry = GantryController.from_config(lab.config.get("gantry"))  # transport: pi_agent
 lab.add(gantry)
 lab.connect_all()
 
@@ -107,12 +120,13 @@ profiler = TopographicProfiler(
     pi_host="red.lab",
     pi_user="oak",
     pi_key="~/.ssh/id_ed25519",
-    serial_device="/dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0",
-    pdin_port=1,          # IO-Link port OD2000 is on
+    al1342_host="192.168.1.251",  # raw IP — the AL1342 has no DNS of its own
+    pdin_port=2,                   # IO-Link port OD2000 is on
     output_dir="./data/profiles",
 )
 
 result = profiler.scan(axis="A1", end_mm=500.0, feed_rate_mm_s=5.0)
+# profiler.stop() from another thread cancels a scan in progress
 
 print(result.metadata)
 print(result.df.head())

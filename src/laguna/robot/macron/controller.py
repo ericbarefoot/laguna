@@ -115,6 +115,17 @@ class GantryController:
             group_index=group_index,
         )
 
+    @property
+    def connection(self) -> SnapConnection:
+        """The underlying transport (PiGantryConnection, RS232Connection, etc.).
+
+        Exposed publicly so callers needing transport-specific capabilities
+        not part of the generic SnapConnection interface (e.g.
+        PiGantryConnection.start_scan/stop_scan/wait_for_scan_result, used
+        by TopographicProfiler) can reach them directly.
+        """
+        return self._connection
+
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "GantryController":
         """Build a GantryController from a laguna 'gantry:' config section."""

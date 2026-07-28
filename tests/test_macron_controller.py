@@ -130,6 +130,21 @@ class TestSubsystemInterface:
     def test_subsystem_name_is_gantry(self):
         assert GantryController.subsystem_name == "gantry"
 
+    def test_connection_property_exposes_the_underlying_transport(self):
+        """Regression test: TopographicProfiler.scan() calls
+        gantry.connection.start_scan(...) — this must be a real public
+        attribute, not just something a MagicMock-based test fixture
+        happens to tolerate. Caught on real hardware 2026-07-28: profiler
+        tests used MagicMock() for `gantry` and manually set
+        `gantry.connection = ...`, which silently worked even though
+        GantryController only ever stored the connection as the private
+        `_connection` — no test using a real GantryController instance
+        caught the gap until an actual scan script hit
+        AttributeError: 'GantryController' object has no attribute 'connection'.
+        """
+        controller, conn = self._make_controller()
+        assert controller.connection is conn
+
     def test_connect_reports_true_on_success(self):
         controller, conn = self._make_controller()
         assert controller.connect() is True

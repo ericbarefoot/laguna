@@ -35,16 +35,31 @@ is active:
    passthrough already running on the Pi (started manually — see "Resuming
    after a Pi reboot" below). No Pi-side `laguna` code needed. Requires
    `serial.serial_for_url()`, not plain `serial.Serial()` — the plain form
-   silently fails on `socket://` URLs.
+   silently fails on `socket://` URLs. **Does not support topographic
+   scanning** — see below.
 2. **`PiGantryConnection`** (`pi_bridge.py`) — persistent SSH+JSON-line
    transport. Deploys and drives `gantry_agent.py` (standalone, pyserial-only,
    no `laguna` install needed on the Pi) as a long-running process over one
    SSH channel, for lower per-command latency than a fresh SSH connect+exec
-   each time. Intended for eventual production use.
+   each time. **Required for `TopographicProfiler`** (`profiler.py`) —
+   `gantry_agent.py` is the sole owner of the BLC serial port for its whole
+   session and, since 2026-07-28, also runs full topographic scans on a
+   background thread with a live STOP path (`start_scan()`/`stop_scan()`/
+   `wait_for_scan_result()`), sharing the same serial connection as
+   interactive commands via a lock rather than taking turns with a separate
+   process. See `docs/subsystems/rangefinder.md`.
 
 Both transports (and `RS232Connection`/`EthernetConnection` generally) can be
 wrapped in **`SafeModeConnection`** to add the same query-only allowlist gate
 `PiGantryConnection` has natively — see "Safety model" below.
+
+**`serial_bridge.py` and `gantry_agent.py` must never run at the same time**
+— both try to own the same serial device, and `serial_bridge.py` opens it
+once at process start and never releases it (confirmed by reading its
+source on the Pi, 2026-07-28), so `gantry_agent.py` would fail to open the
+port if `serial_bridge.py` is already running. This was previously just a
+theoretical conflict; it's load-bearing now that scanning also depends on
+`gantry_agent.py` owning the port.
 
 ## Protocol
 
@@ -277,6 +292,19 @@ from laguna.robot.macron import RS232Connection, SafeModeConnection
 conn = SafeModeConnection(RS232Connection(port="socket://red.dyn.ucr.edu:9700"), safe_mode=True)
 conn.connect()
 conn.send("WHT")  # should return "0", not time out
+```
+
+**If you need `PiGantryConnection`/`TopographicProfiler` instead** (required
+for scanning): confirm `serial_bridge.py` is **not** running first (see
+above — the two cannot coexist), then just `connect()` as normal —
+`PiGantryConnection.connect()` SFTPs and launches `gantry_agent.py` itself,
+no manual Pi-side step needed, unlike `serial_bridge.py`:
+
+```python
+from laguna.robot.macron import GantryController
+gantry = GantryController.from_config(config.get("gantry"))  # transport: pi_agent
+gantry.connect()
+gantry.connection.send("WHT")  # should return "0"
 ```
 
 ### Remaining open items (not blockers for M0-M3, tracked for later)
