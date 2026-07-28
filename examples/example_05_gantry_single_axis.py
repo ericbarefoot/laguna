@@ -164,6 +164,14 @@ def get_position(conn: PiGantryConnection, axis: str) -> float:
         raise ValueError(f"{axis!r} is not a linear axis — use get_position_raw_units() for Theta")
     return units_to_mm(get_position_raw_units(conn, axis))
 
+def zero_axis(conn: PiGantryConnection, axis: str) -> None:
+    """Zero the current position of an axis (X/Y/Z/Theta) in the controller.
+
+    This is a relative zeroing — it does not move the axis, it just sets
+    the current ACP value to zero. Safe under safe_mode.
+    """
+    idx = AXES[axis]
+    conn.send(f"A{idx} ACP O")
 
 def get_all_positions(conn: PiGantryConnection) -> dict:
     """Read every axis: X/Y/Z in real mm, Theta in raw units (see docstring point 3)."""
