@@ -18,7 +18,12 @@ a failure on real hardware means the assumption is wrong):
 
 import pytest
 
-from laguna.rangefinder import RangefinderSubsystem, decode_od2000_pdin
+from laguna.rangefinder import (
+    RangefinderSubsystem,
+    decode_dp4200_wtt12l_analog_pdin,
+    decode_od2000_pdin,
+    decode_wtt12l_pdin,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -369,3 +374,109 @@ class TestRangefinderSubsystem:
         status = rf.get_status()
         assert abs(status["latest_distance_mm"] - 500.0) < 0.001
         assert status["sample_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# decode_wtt12l_pdin — pure function, no hardware needed
+#
+# Layout taken from SICK's official "Technical Information: Photoelectric
+# sensors, SICK Smart Sensors / IO-Link" (www.sick.com/8022709), table 6 —
+# NOT yet confirmed against physical WTT12L-A2523 hardware. If real readings
+# come back wrong, see docs/WTT12L_POWERPROX_SETUP.md Step 4 for the likely
+# culprits (byte order, Process data select mode, units).
+# ---------------------------------------------------------------------------
+
+
+def _encode_wtt12l_distance_mm(distance_mm: int, status_byte: int = 0x00) -> str:
+    """Helper: encode a distance_mm value to an 8-char WTT12L PDIN hex string."""
+    raw = distance_mm.to_bytes(2, byteorder="big", signed=False) + b"\x00" + bytes([status_byte])
+    return raw.hex().upper()
+
+
+class TestDecodeWtt12lPdin:
+    def test_zero_distance(self):
+        result = decode_wtt12l_pdin("00000000")
+        assert result["distance_mm"] == 0
+        assert result["ql1"] is False
+        assert result["ql2"] is False
+
+    def test_known_500mm(self):
+        """500 mm = 0x01F4, directly as mm (no nm/µm scaling, unlike the OD2000)."""
+        result = decode_wtt12l_pdin("01F40000")
+        assert result["distance_mm"] == 500
+
+    def test_roundtrip_900mm(self):
+        hex_str = _encode_wtt12l_distance_mm(900)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["distance_mm"] == 900
+
+    def test_ql1_only(self):
+        hex_str = _encode_wtt12l_distance_mm(300, status_byte=0x01)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["ql1"] is True
+        assert result["ql2"] is False
+
+    def test_ql2_only(self):
+        hex_str = _encode_wtt12l_distance_mm(300, status_byte=0x02)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["ql1"] is False
+        assert result["ql2"] is True
+
+    def test_both_ql_bits(self):
+        hex_str = _encode_wtt12l_distance_mm(300, status_byte=0x03)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["ql1"] is True
+        assert result["ql2"] is True
+
+
+# ---------------------------------------------------------------------------
+# decode_dp4200_wtt12l_analog_pdin — pure function, no hardware needed
+#
+# Confirmed on hardware 2026-07-28 against the WTT12L-A2523's analog output
+# (WTT12L native IO-Link process data never validated; see
+# decode_wtt12l_pdin's docstring). Two real readings anchor these tests:
+#   600 mm  -> pdin "2890FD01" -> channel1_raw 0x2890 = 10384 -> 10.384 mA
+#   1115 mm -> pdin "3F02FD01" -> channel1_raw 0x3F02 = 16130 -> 16.130 mA
+# Channel 2 (bytes 2-3) was constant "FD01" at both distances (unconnected
+# input) and is intentionally not decoded.
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeDp4200Wtt12lAnalogPdin:
+    def test_known_600mm_reading(self):
+        """Real hardware reading at 600 mm. Decoded value has ~20-30 mm of
+        slop (see function docstring) — this checks it's in the right
+        ballpark, not exact agreement."""
+        result = decode_dp4200_wtt12l_analog_pdin("2890FD01")
+        assert abs(result["current_ma"] - 10.384) < 0.001
+        assert abs(result["distance_mm"] - 600) < 50
+
+    def test_known_1115mm_reading(self):
+        """Real hardware reading at 1115 mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("3F02FD01")
+        assert abs(result["current_ma"] - 16.130) < 0.001
+        assert abs(result["distance_mm"] - 1115) < 50
+
+    def test_4ma_maps_to_near_mm(self):
+        """4 mA (0x0FA0 = 4000 uA) should decode to exactly near_mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("0FA0FD01")
+        assert abs(result["distance_mm"] - 100.0) < 0.001
+
+    def test_20ma_maps_to_far_mm(self):
+        """20 mA (0x4E20 = 20000 uA) should decode to exactly far_mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("4E20FD01")
+        assert abs(result["distance_mm"] - 1400.0) < 0.001
+
+    def test_custom_span(self):
+        """near_mm/far_mm are overridable if the sensor gets taught a
+        different span later."""
+        result = decode_dp4200_wtt12l_analog_pdin(
+            "0FA0FD01", near_mm=50.0, far_mm=2000.0
+        )
+        assert abs(result["distance_mm"] - 50.0) < 0.001
+
+    def test_channel2_not_in_result(self):
+        """Channel 2 (the unconnected input) should not leak into the
+        decoded dict — only current_ma and distance_mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("2890FD01")
+        assert set(result.keys()) == {"current_ma", "distance_mm"}
