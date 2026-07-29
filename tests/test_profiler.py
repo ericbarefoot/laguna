@@ -72,6 +72,14 @@ class TestProfilerConstruction:
         assert p._al1342_host == "192.168.1.251"
         assert p._output_dir == Path("/data")
 
+    def test_sensor_defaults_to_od2000(self):
+        p = self._make()
+        assert p._sensor == "od2000"
+
+    def test_sensor_stored_when_given(self):
+        p = self._make(sensor="wtt12l_powerprox")
+        assert p._sensor == "wtt12l_powerprox"
+
 
 # ---------------------------------------------------------------------------
 # Fake gantry connection + SFTP infrastructure for scan() tests
@@ -109,10 +117,12 @@ class FakeGantryConnection:
         self._result = result if result is not None else _make_result()
         self._raise_on_start = raise_on_start
 
-    def start_scan(self, axis, end_mm, feed_rate_mm_s, al1342_host, pdin_port, output):
+    def start_scan(self, axis, end_mm, feed_rate_mm_s, al1342_host, pdin_port, output,
+                    sensor="od2000"):
         self.start_scan_calls.append(
             {"axis": axis, "end_mm": end_mm, "feed_rate_mm_s": feed_rate_mm_s,
-             "al1342_host": al1342_host, "pdin_port": pdin_port, "output": output}
+             "al1342_host": al1342_host, "pdin_port": pdin_port, "output": output,
+             "sensor": sensor}
         )
         if self._raise_on_start is not None:
             raise self._raise_on_start
@@ -164,7 +174,7 @@ class FakeSSHClient:
         self.closed = True
 
 
-def _make_profiler(gantry_connection=None, output_dir="/tmp"):
+def _make_profiler(gantry_connection=None, output_dir="/tmp", sensor="od2000"):
     if gantry_connection is None:
         gantry_connection = FakeGantryConnection()
     gantry = MagicMock()
@@ -176,6 +186,7 @@ def _make_profiler(gantry_connection=None, output_dir="/tmp"):
         pdin_port=2,
         al1342_host="192.168.1.251",
         output_dir=output_dir,
+        sensor=sensor,
     )
     return profiler, gantry_connection
 
@@ -212,6 +223,14 @@ class TestProfilerScan:
         assert call["al1342_host"] == "192.168.1.251"
         assert call["pdin_port"] == 2
         assert call["output"].startswith("/tmp/profile_") and call["output"].endswith(".csv")
+        assert call["sensor"] == "od2000"
+
+    def test_sensor_passed_through_to_start_scan(self, tmp_path):
+        profiler, conn = _make_profiler(output_dir=str(tmp_path), sensor="wtt12l_powerprox")
+        fake_client = FakeSSHClient()
+        with patch("paramiko.SSHClient", return_value=fake_client):
+            profiler.scan(axis="A1", end_mm=500.0, feed_rate_mm_s=5.0)
+        assert conn.start_scan_calls[0]["sensor"] == "wtt12l_powerprox"
 
     def test_wait_timeout_scales_with_distance_and_feed_rate(self, tmp_path):
         """move_timeout = distance/feed_rate + 30s buffer. On hardware: if

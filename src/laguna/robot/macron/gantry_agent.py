@@ -25,7 +25,11 @@ Protocol (newline-delimited JSON on stdin/stdout, matching pi_bridge.py):
             {"op": "close"}
             {"id": N, "op": "scan_start", "axis": "A1", "end_mm": 500.0,
              "feed_rate_mm_s": 5.0, "al1342_host": "192.168.1.251",
-             "pdin_port": 2, "output": "/tmp/profile_....csv"}
+             "pdin_port": 2, "output": "/tmp/profile_....csv",
+             "sensor": "od2000"}                    ("sensor" optional, defaults to
+                                                       "od2000"; the other supported
+                                                       value is "wtt12l_powerprox" —
+                                                       see _decode_dp4200_wtt12l_pdin)
             {"op": "scan_stop"}
             {"op": "scan_status"}
   stdout <- {"ready": true}                      (once, at startup)
@@ -181,7 +185,13 @@ def _parse_blc_response(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OD2000 / AL1342 helpers — ported verbatim from the retired scan_runner.py
+# OD2000 / WTT12L PowerProx / AL1342 helpers — ported verbatim from the
+# retired scan_runner.py (OD2000 decode), plus the WTT12L PowerProx
+# analog-via-DP4200 decode added once the WTT12L's own native IO-Link
+# process data was found not to validate on this AL1342 — see
+# docs/WTT12L_POWERPROX_SETUP.md and laguna.rangefinder's
+# decode_dp4200_wtt12l_analog_pdin(), which this mirrors (duplicated here,
+# not imported, per this file's standalone-deployment constraint above).
 # ---------------------------------------------------------------------------
 
 
@@ -202,6 +212,47 @@ def _decode_pdin(hex_str: str, pdin_port: int) -> dict:
         "q1": bool(raw[5] & 0x01),
         "q2": bool(raw[5] & 0x02),
     }
+
+
+def _decode_dp4200_wtt12l_pdin(hex_str: str, pdin_port: int) -> dict:
+    """Decode a WTT12L-A2523 PowerProx reading taken via its analog output,
+    digitized by an ifm DP4200 IO-Link analog-input bridge plugged into
+    pdin_port in place of the WTT12L's own IO-Link connection (the WTT12L's
+    native process data never validated on this AL1342 — see
+    docs/WTT12L_POWERPROX_SETUP.md).
+
+    4 bytes (8 hex chars), big-endian, two 16-bit channel fields — channel 1
+    (bytes 0-1) confirmed on hardware to be current in uA from the WTT12L's
+    Qa analog output; channel 2 (bytes 2-3) confirmed constant regardless of
+    target distance (unconnected DP4200 input) and not decoded here.
+
+    Distance conversion assumes the sensor's un-taught default 4-20mA span
+    (100mm..1400mm) — unconfirmed against the sensor's actual teach
+    parameters, expect more slop than the OD2000's decode. pdin_port is
+    accepted only for call-signature symmetry with _decode_pdin (used
+    identically as a dict-dispatch target in _poll_pdin_loop/_run_scan) —
+    the WTT12L has no per-port-dependent decode step, unlike a real
+    multi-port-aware decoder might.
+    """
+    raw = bytes.fromhex(hex_str)
+    channel1_raw = int.from_bytes(raw[0:2], "big", signed=False)
+    current_ma = channel1_raw / 1000.0
+    near_mm, far_mm = 100.0, 1400.0
+    distance_mm = near_mm + (current_ma - 4.0) / 16.0 * (far_mm - near_mm)
+    return {
+        "current_ma": current_ma,
+        "distance_mm": distance_mm,
+    }
+
+
+# sensor name -> decode function, used by scan_start dispatch and
+# _poll_pdin_loop's decode_fn parameter. "od2000" stays the default
+# everywhere for backward compatibility with clients that don't send a
+# "sensor" field at all.
+SENSOR_DECODERS = {
+    "od2000": _decode_pdin,
+    "wtt12l_powerprox": _decode_dp4200_wtt12l_pdin,
+}
 
 
 def _extract_pdin_hex_from_getdata(resp: dict) -> str:
@@ -247,13 +298,19 @@ def _set_laser(al1342_host: str, pdin_port: int, on: bool) -> bool:
 
 
 def _poll_pdin_loop(al1342_host: str, pdin_path: str, out_queue: "queue.Queue[dict]",
-                     stop_event: threading.Event, pdin_port: int) -> None:
+                     stop_event: threading.Event, pdin_port: int,
+                     decode_fn=_decode_pdin) -> None:
     """Continuously poll pdin/getdata over a persistent HTTP connection.
 
     Confirmed on hardware: a fresh TCP connection per request (e.g. via
     urllib) chokes the AL1342's embedded HTTP server within a couple seconds
     of tight-loop polling. Reusing one http.client.HTTPConnection avoids
     this entirely and sustained ~380 Hz with zero errors over 5s.
+
+    decode_fn: which sensor's pdin decode to apply — _decode_pdin (OD2000,
+    default, matches every caller before the WTT12L PowerProx was added) or
+    _decode_dp4200_wtt12l_pdin. Both take (hex_str, pdin_port) and return a
+    dict; only the dict's key set differs downstream (see SENSOR_DECODERS).
     """
     payload = json.dumps({"code": "request", "cid": -1, "adr": pdin_path})
     headers = {"Content-Type": "application/json"}
@@ -267,7 +324,7 @@ def _poll_pdin_loop(al1342_host: str, pdin_path: str, out_queue: "queue.Queue[di
             hex_str = _extract_pdin_hex_from_getdata(data)
             if hex_str:
                 wall_time = time.time()
-                decoded = _decode_pdin(hex_str, pdin_port)
+                decoded = decode_fn(hex_str, pdin_port)
                 decoded["wall_time"] = wall_time
                 out_queue.put(decoded)
         except Exception as exc:
@@ -346,13 +403,22 @@ class ScanState:
         with self._lock:
             return self._thread is not None and self._thread.is_alive()
 
-    def start(self, target, args) -> bool:
-        """Start a new scan thread. Returns False if one is already running."""
+    def start(self, target, args, kwargs=None) -> bool:
+        """Start a new scan thread. Returns False if one is already running.
+
+        stop_event is always appended as the last positional arg (existing
+        behavior, unchanged) — kwargs is for anything that needs to be
+        keyword-only in target's signature instead (e.g. _run_scan's
+        `sensor`, which sits after stop_event and therefore can't be
+        positional without giving stop_event a default too).
+        """
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return False
             self._stop_event = threading.Event()
-            self._thread = threading.Thread(target=target, args=args + (self._stop_event,), daemon=True)
+            self._thread = threading.Thread(
+                target=target, args=args + (self._stop_event,), kwargs=kwargs or {}, daemon=True
+            )
             self._thread.start()
             return True
 
@@ -365,12 +431,21 @@ class ScanState:
 def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_rate_mm_s: float,
               al1342_host: str, pdin_port: int, output: str,
               start_pos_mm: float, accel_mm_s2: float, decel_mm_s2: float,
-              log_path: Path, stop_event: threading.Event) -> None:
-    """Background scan worker: runs the move, polls OD2000 over HTTP, fuses, writes CSV.
+              log_path: Path, stop_event: threading.Event, *, sensor: str = "od2000") -> None:
+    """Background scan worker: runs the move, polls the rangefinder over HTTP, fuses, writes CSV.
 
     All bridge.send() calls here go through the same lock as interactive
     commands (see SerialBridge), so this thread and the main stdin loop
     never interleave bytes on the wire even though they run concurrently.
+
+    sensor: "od2000" (default) or "wtt12l_powerprox" — selects both the
+    pdin decode (SENSOR_DECODERS) and whether laser on/off is attempted.
+    "wtt12l_powerprox" skips _set_laser() entirely: what's actually on
+    pdin_port in that configuration is a DP4200 analog-input bridge, not
+    the WTT12L itself, so an ISDU write there would target the DP4200's
+    own (irrelevant) parameter space rather than the sensor's laser — see
+    docs/WTT12L_POWERPROX_SETUP.md, "Consequence: no programmatic laser
+    control on this path".
     """
     ax = axis
     laser_was_turned_on = False
@@ -378,15 +453,23 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
     records = []
 
     try:
-        _set_laser(al1342_host, pdin_port, on=True)
-        laser_was_turned_on = True
+        # KeyError on an unknown sensor is caught by the except below and
+        # reported as a scan_error, same as any other setup failure here.
+        decode_fn = SENSOR_DECODERS[sensor]
+        control_laser = sensor == "od2000"
+
+        if control_laser:
+            _set_laser(al1342_host, pdin_port, on=True)
+            laser_was_turned_on = True
+        else:
+            _log(f"sensor={sensor!r} — skipping laser control (not available via this path)")
 
         pdin_path = f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/pdin/getdata"
         pdin_samples: "queue.Queue[dict]" = queue.Queue()
         poll_stop = threading.Event()
         poll_thread = threading.Thread(
             target=_poll_pdin_loop,
-            args=(al1342_host, pdin_path, pdin_samples, poll_stop, pdin_port),
+            args=(al1342_host, pdin_path, pdin_samples, poll_stop, pdin_port, decode_fn),
             daemon=True,
         )
 
@@ -451,17 +534,22 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
             "wall_time_unix": t,
             "wall_time_iso": wall_iso,
             "pos_mm": pos_mm,
-            "distance_nm": rec["distance_nm"],
+            "distance_nm": rec.get("distance_nm"),
             "distance_mm": rec["distance_mm"],
-            "q1": int(rec["q1"]),
-            "q2": int(rec["q2"]),
+            "q1": (int(rec["q1"]) if "q1" in rec else None),
+            "q2": (int(rec["q2"]) if "q2" in rec else None),
             "in_ramp": int(in_ramp),
+            "current_ma": rec.get("current_ma"),
         })
     csv_rows.sort(key=lambda r: r["wall_time_unix"])
 
     # ------------------------------------------------------------ write
+    # distance_nm/q1/q2 are OD2000-only, current_ma is wtt12l_powerprox-only
+    # (see SENSOR_DECODERS) — whichever the current sensor doesn't produce
+    # is written as an empty CSV field rather than a missing column, so a
+    # single fixed schema works for both.
     fieldnames = ["wall_time_unix", "wall_time_iso", "pos_mm",
-                  "distance_nm", "distance_mm", "q1", "q2", "in_ramp"]
+                  "distance_nm", "distance_mm", "q1", "q2", "in_ramp", "current_ma"]
     try:
         with open(output, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -492,6 +580,7 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
         "achieved_rate_hz": achieved_rate,
         "al1342_host": al1342_host,
         "pdin_port": pdin_port,
+        "sensor": sensor,
     }
     try:
         with open(sidecar_path, "w") as f:
@@ -579,9 +668,16 @@ def main() -> None:
             al1342_host = msg.get("al1342_host")
             pdin_port = msg.get("pdin_port")
             output = msg.get("output")
+            sensor = msg.get("sensor", "od2000")
             if None in (request_id, axis, end_mm, feed_rate_mm_s, al1342_host, pdin_port, output):
                 _log(f"Ignoring malformed scan_start: {raw_line!r}")
                 _emit({"id": request_id, "error": "scan_start missing required field(s)"})
+                continue
+
+            if sensor not in SENSOR_DECODERS:
+                _log(f"Rejecting scan_start: unknown sensor {sensor!r}")
+                _emit({"id": request_id,
+                       "error": f"unknown sensor {sensor!r} — must be one of {sorted(SENSOR_DECODERS)}"})
                 continue
 
             if safe_mode:
@@ -613,12 +709,13 @@ def main() -> None:
                 _run_scan,
                 (bridge, request_id, axis, end_mm, feed_rate_mm_s, al1342_host, pdin_port, output,
                  start_pos_mm, accel_mm_s2, decel_mm_s2, log_path),
+                kwargs={"sensor": sensor},
             )
             if not started:
                 _emit({"id": request_id, "error": "scan already in progress"})
                 continue
 
-            _audit(log_path, {"id": request_id, "op": "scan_start", "axis": axis, "end_mm": end_mm})
+            _audit(log_path, {"id": request_id, "op": "scan_start", "axis": axis, "end_mm": end_mm, "sensor": sensor})
             _emit({
                 "id": request_id,
                 "scan_started": True,

@@ -414,14 +414,23 @@ class PiGantryConnection(SnapConnection):
     def start_scan(
         self, axis: str, end_mm: float, feed_rate_mm_s: float,
         al1342_host: str, pdin_port: int, output: str,
+        sensor: str = "od2000",
     ) -> dict:
         """Start a topographic scan on the agent. Returns the ack dict
         ({"scan_started": True, "start_pos_mm": ..., "accel_mm_s2": ...,
         "decel_mm_s2": ...}). Raises SnapMotionError if the agent rejects it
-        (blocked by its own safe_mode, or a scan is already running) or on
-        timeout waiting for the ack. The scan itself then runs on the
-        agent's background thread — use wait_for_scan_result() to block for
-        completion, and stop_scan() to cancel it early.
+        (blocked by its own safe_mode, a scan is already running, or
+        `sensor` isn't one gantry_agent.py recognizes) or on timeout waiting
+        for the ack. The scan itself then runs on the agent's background
+        thread — use wait_for_scan_result() to block for completion, and
+        stop_scan() to cancel it early.
+
+        sensor: "od2000" (default) or "wtt12l_powerprox" — see
+        gantry_agent.py's SENSOR_DECODERS and
+        docs/WTT12L_POWERPROX_SETUP.md. Selects both the pdin decode and
+        whether the agent attempts laser on/off (skipped for
+        wtt12l_powerprox — see that doc's "no programmatic laser control
+        on this path").
         """
         if self._scan_running:
             raise SnapMotionError(0, "Scan already in progress")
@@ -442,6 +451,7 @@ class PiGantryConnection(SnapConnection):
                 "id": request_id, "op": "scan_start",
                 "axis": axis, "end_mm": end_mm, "feed_rate_mm_s": feed_rate_mm_s,
                 "al1342_host": al1342_host, "pdin_port": pdin_port, "output": output,
+                "sensor": sensor,
             })
             try:
                 self._write_line(payload)

@@ -331,6 +331,31 @@ class TestStartScan:
         assert sent_payload["axis"] == "A1"
         assert sent_payload["al1342_host"] == "192.168.1.251"
 
+    def test_sensor_defaults_to_od2000(self):
+        """Callers that don't pass sensor at all (every pre-existing call
+        site) must still send an explicit "od2000" — gantry_agent.py reads
+        msg.get("sensor", "od2000") but sending it explicitly here removes
+        any doubt about client/agent default drift."""
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({
+            "id": 1, "scan_started": True,
+            "start_pos_mm": 100.0, "accel_mm_s2": 10.0, "decel_mm_s2": 10.0,
+        })
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        sent_payload = json.loads(channel.sent[0].decode("ascii"))
+        assert sent_payload["sensor"] == "od2000"
+
+    def test_sensor_passed_through_when_given(self):
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({
+            "id": 1, "scan_started": True,
+            "start_pos_mm": 100.0, "accel_mm_s2": 10.0, "decel_mm_s2": 10.0,
+        })
+        conn.start_scan("A2", 200.0, 3.0, "192.168.1.251", 7, "/tmp/out.csv",
+                         sensor="wtt12l_powerprox")
+        sent_payload = json.loads(channel.sent[0].decode("ascii"))
+        assert sent_payload["sensor"] == "wtt12l_powerprox"
+
     def test_sets_is_scan_running_true_on_success(self):
         conn, channel = _make_connection(safe_mode=False)
         channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,

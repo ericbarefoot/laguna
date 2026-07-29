@@ -46,10 +46,17 @@ class TopographicProfiler:
             SFTP session that retrieves the result CSV.
         pi_user: SSH username on the Pi.
         pi_key: Path to SSH private key (optional).
-        pdin_port: IO-Link port number the OD2000 is on (1–8).
+        pdin_port: IO-Link port number the rangefinder (or, for
+            sensor="wtt12l_powerprox", the DP4200 bridge it's wired
+            through) is on (1–8).
         al1342_host: AL1342 IP address (raw IP, not hostname — the AL1342
             has no DNS resolution of its own; the Pi polls it directly).
         output_dir: Local directory where retrieved CSVs are saved.
+        sensor: "od2000" (default) or "wtt12l_powerprox" — passed through
+            to gantry_agent.py via start_scan(); see its SENSOR_DECODERS
+            and docs/WTT12L_POWERPROX_SETUP.md. Fixed for this profiler's
+            lifetime, same as pdin_port — construct a second
+            TopographicProfiler if you need to scan with both sensors.
     """
 
     def __init__(
@@ -61,6 +68,7 @@ class TopographicProfiler:
         pdin_port: int = 1,
         al1342_host: str = "",
         output_dir: str = "/tmp",
+        sensor: str = "od2000",
     ):
         if not al1342_host:
             raise ValueError("al1342_host must be specified")
@@ -71,6 +79,7 @@ class TopographicProfiler:
         self._pdin_port = pdin_port
         self._al1342_host = al1342_host
         self._output_dir = Path(output_dir)
+        self._sensor = sensor
 
     def scan(
         self,
@@ -108,9 +117,11 @@ class TopographicProfiler:
         local_csv = self._output_dir / f"profile_{timestamp}.csv"
         local_meta = self._output_dir / f"profile_{timestamp}_meta.json"
 
-        logger.info("Starting scan: %s -> %.3f mm at %.3f mm/s", axis, end_mm, feed_rate_mm_s)
+        logger.info("Starting scan: %s -> %.3f mm at %.3f mm/s (sensor=%s)",
+                    axis, end_mm, feed_rate_mm_s, self._sensor)
         ack = self._gantry.connection.start_scan(
             axis, end_mm, feed_rate_mm_s, self._al1342_host, self._pdin_port, remote_csv,
+            sensor=self._sensor,
         )
         start_pos_mm = ack.get("start_pos_mm", 0.0)
         logger.info(

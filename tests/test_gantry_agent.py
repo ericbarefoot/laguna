@@ -25,6 +25,7 @@ Hardware assumptions tested:
     (pipelined commands hung the BLC controller, requiring a power-cycle)
 """
 
+import csv
 import json
 import queue
 import threading
@@ -116,6 +117,51 @@ class TestDecodePdin:
     def test_extract_pdin_from_getdata_response(self):
         resp = {"cid": -1, "data": {"value": "0BEBC2000000"}, "code": 200}
         assert ga._extract_pdin_hex_from_getdata(resp) == "0BEBC2000000"
+
+
+# ---------------------------------------------------------------------------
+# WTT12L PowerProx (via DP4200 bridge) decode — mirrors
+# laguna.rangefinder.decode_dp4200_wtt12l_analog_pdin(), duplicated here
+# per this file's standalone-deployment constraint (see module docstring).
+# Hardware-confirmed readings from docs/WTT12L_POWERPROX_SETUP.md.
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeDp4200Wtt12lPdin:
+    def test_known_600mm_hardware_reading(self):
+        result = ga._decode_dp4200_wtt12l_pdin("2890FD01", pdin_port=7)
+        assert abs(result["current_ma"] - 10.384) < 0.001
+        assert abs(result["distance_mm"] - 600) < 50  # ~20-30mm slop expected, see decode docstring
+
+    def test_known_1115mm_hardware_reading(self):
+        result = ga._decode_dp4200_wtt12l_pdin("3F02FD01", pdin_port=7)
+        assert abs(result["current_ma"] - 16.130) < 0.001
+        assert abs(result["distance_mm"] - 1115) < 50
+
+    def test_channel2_ignored(self):
+        """Channel 2 (bytes 2-3) is confirmed dead/unconnected on hardware —
+        should not appear in the decoded dict at all."""
+        result = ga._decode_dp4200_wtt12l_pdin("2890FD01", pdin_port=7)
+        assert set(result.keys()) == {"current_ma", "distance_mm"}
+
+    def test_pdin_port_accepted_but_unused(self):
+        """pdin_port only exists for call-signature symmetry with
+        _decode_pdin (both are used interchangeably via SENSOR_DECODERS) —
+        changing it should not change the decode."""
+        a = ga._decode_dp4200_wtt12l_pdin("2890FD01", pdin_port=1)
+        b = ga._decode_dp4200_wtt12l_pdin("2890FD01", pdin_port=7)
+        assert a == b
+
+
+class TestSensorDecoders:
+    def test_registry_has_both_sensors(self):
+        assert set(ga.SENSOR_DECODERS) == {"od2000", "wtt12l_powerprox"}
+
+    def test_od2000_maps_to_decode_pdin(self):
+        assert ga.SENSOR_DECODERS["od2000"] is ga._decode_pdin
+
+    def test_wtt12l_powerprox_maps_to_dp4200_decode(self):
+        assert ga.SENSOR_DECODERS["wtt12l_powerprox"] is ga._decode_dp4200_wtt12l_pdin
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +502,40 @@ class TestScanState:
         state = ga.ScanState()
         assert state.is_running() is False
 
+    def test_kwargs_passed_to_target(self):
+        """The mechanism _run_scan's keyword-only `sensor` param relies on
+        — kwargs given to start() must reach target alongside the
+        positionally-appended stop_event."""
+        received = {}
+        done = threading.Event()
+
+        def target(a, b, stop_event, *, sensor="default"):
+            received["a"] = a
+            received["b"] = b
+            received["stop_event"] = stop_event
+            received["sensor"] = sensor
+            done.set()
+
+        state = ga.ScanState()
+        state.start(target, (1, 2), kwargs={"sensor": "wtt12l_powerprox"})
+        assert done.wait(timeout=2.0)
+        assert received["a"] == 1
+        assert received["b"] == 2
+        assert isinstance(received["stop_event"], threading.Event)
+        assert received["sensor"] == "wtt12l_powerprox"
+
+    def test_kwargs_optional(self):
+        """start() without kwargs (the pre-existing call shape, still used
+        by every test below this one) must keep working unchanged."""
+        done = threading.Event()
+
+        def target(stop_event):
+            done.set()
+
+        state = ga.ScanState()
+        assert state.start(target, ()) is True
+        assert done.wait(timeout=2.0)
+
     def test_start_launches_thread_and_reports_running(self):
         state = ga.ScanState()
         started_event = threading.Event()
@@ -551,7 +631,7 @@ def no_network(monkeypatch):
     """
     monkeypatch.setattr(ga, "_set_laser", lambda *a, **kw: True)
 
-    def fake_poll(al1342_host, pdin_path, out_queue, stop_event, pdin_port):
+    def fake_poll(al1342_host, pdin_path, out_queue, stop_event, pdin_port, decode_fn=None):
         stop_event.wait(timeout=2.0)  # just idle until told to stop, like a slow/empty poll
 
     monkeypatch.setattr(ga, "_poll_pdin_loop", fake_poll)
@@ -634,3 +714,125 @@ class TestRunScan:
                      tmp_path / "audit.log", stop_event)
 
         assert laser_calls == [True, False]
+
+
+# ---------------------------------------------------------------------------
+# _run_scan with sensor="wtt12l_powerprox" — the DP4200-bridge path added
+# alongside the default OD2000 path
+# ---------------------------------------------------------------------------
+
+
+class TestRunScanWtt12lPowerprox:
+    def test_laser_control_skipped(self, tmp_path, monkeypatch):
+        """DP4200 is what's actually on pdin_port in this configuration —
+        _set_laser() must not be called at all (see _run_scan docstring)."""
+        laser_calls = []
+        monkeypatch.setattr(ga, "_set_laser", lambda host, port, on: laser_calls.append(on))
+        monkeypatch.setattr(ga, "_emit", lambda obj: None)
+
+        def fake_poll(al1342_host, pdin_path, out_queue, stop_event, pdin_port, decode_fn=None):
+            stop_event.wait(timeout=2.0)
+
+        monkeypatch.setattr(ga, "_poll_pdin_loop", fake_poll)
+
+        bridge = _ScriptedBridge(mif_sequence=("1.000",))
+        stop_event = threading.Event()
+        ga._run_scan(bridge, 5, "A1", 500.0, 5.0, "192.168.1.251", 7,
+                     str(tmp_path / "profile.csv"), 100.0, 10.0, 10.0,
+                     tmp_path / "audit.log", stop_event, sensor="wtt12l_powerprox")
+
+        assert laser_calls == []
+
+    def test_decode_fn_passed_through_to_poll_loop(self, tmp_path, monkeypatch):
+        """The whole point of threading `sensor` through: _poll_pdin_loop
+        must receive _decode_dp4200_wtt12l_pdin, not the OD2000 default."""
+        monkeypatch.setattr(ga, "_set_laser", lambda *a, **kw: True)
+        monkeypatch.setattr(ga, "_emit", lambda obj: None)
+
+        received = {}
+
+        def fake_poll(al1342_host, pdin_path, out_queue, stop_event, pdin_port, decode_fn=None):
+            received["decode_fn"] = decode_fn
+            stop_event.wait(timeout=2.0)
+
+        monkeypatch.setattr(ga, "_poll_pdin_loop", fake_poll)
+
+        bridge = _ScriptedBridge(mif_sequence=("1.000",))
+        stop_event = threading.Event()
+        ga._run_scan(bridge, 6, "A1", 500.0, 5.0, "192.168.1.251", 7,
+                     str(tmp_path / "profile.csv"), 100.0, 10.0, 10.0,
+                     tmp_path / "audit.log", stop_event, sensor="wtt12l_powerprox")
+
+        assert received["decode_fn"] is ga._decode_dp4200_wtt12l_pdin
+
+    def test_csv_row_has_current_ma_not_od2000_fields(self, tmp_path, monkeypatch):
+        """A DP4200-sourced record has no distance_nm/q1/q2 — the CSV
+        writer must handle that (blank fields), not KeyError, and must
+        carry current_ma through."""
+        monkeypatch.setattr(ga, "_set_laser", lambda *a, **kw: True)
+        monkeypatch.setattr(ga, "_emit", lambda obj: None)
+
+        t_sample = [None]
+
+        def fake_poll(al1342_host, pdin_path, out_queue, stop_event, pdin_port, decode_fn=None):
+            t_sample[0] = time.time()
+            out_queue.put({"current_ma": 10.384, "distance_mm": 618.7, "wall_time": t_sample[0]})
+            stop_event.wait(timeout=2.0)
+
+        monkeypatch.setattr(ga, "_poll_pdin_loop", fake_poll)
+
+        bridge = _ScriptedBridge(mif_sequence=("1.000",))
+        output = str(tmp_path / "profile.csv")
+        stop_event = threading.Event()
+        ga._run_scan(bridge, 7, "A1", 500.0, 5.0, "192.168.1.251", 7, output,
+                     100.0, 10.0, 10.0, tmp_path / "audit.log", stop_event,
+                     sensor="wtt12l_powerprox")
+
+        with open(output, newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["current_ma"] == "10.384"
+        assert row["distance_mm"] == "618.7"
+        assert row["distance_nm"] == ""
+        assert row["q1"] == ""
+        assert row["q2"] == ""
+
+    def test_metadata_records_sensor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ga, "_set_laser", lambda *a, **kw: True)
+        monkeypatch.setattr(ga, "_emit", lambda obj: None)
+
+        def fake_poll(al1342_host, pdin_path, out_queue, stop_event, pdin_port, decode_fn=None):
+            stop_event.wait(timeout=2.0)
+
+        monkeypatch.setattr(ga, "_poll_pdin_loop", fake_poll)
+
+        bridge = _ScriptedBridge(mif_sequence=("1.000",))
+        output = str(tmp_path / "profile.csv")
+        stop_event = threading.Event()
+        ga._run_scan(bridge, 8, "A1", 500.0, 5.0, "192.168.1.251", 7, output,
+                     100.0, 10.0, 10.0, tmp_path / "audit.log", stop_event,
+                     sensor="wtt12l_powerprox")
+
+        with open(output.replace(".csv", "_meta.json")) as f:
+            meta = json.load(f)
+        assert meta["sensor"] == "wtt12l_powerprox"
+
+    def test_unknown_sensor_emits_scan_error(self, tmp_path, monkeypatch):
+        """A bad sensor value must be caught and reported as a scan_error
+        (KeyError from SENSOR_DECODERS[sensor], caught inside the try),
+        not crash the worker thread silently."""
+        laser_calls = []
+        monkeypatch.setattr(ga, "_set_laser", lambda host, port, on: laser_calls.append(on))
+        emitted = []
+        monkeypatch.setattr(ga, "_emit", lambda obj: emitted.append(obj))
+
+        bridge = _ScriptedBridge(mif_sequence=("1.000",))
+        stop_event = threading.Event()
+        ga._run_scan(bridge, 9, "A1", 500.0, 5.0, "192.168.1.251", 7,
+                     str(tmp_path / "profile.csv"), 100.0, 10.0, 10.0,
+                     tmp_path / "audit.log", stop_event, sensor="nonexistent_sensor")
+
+        assert laser_calls == []  # never got as far as turning it on
+        assert any("scan_error" in msg for msg in emitted)
+        assert not any("scan_done" in msg for msg in emitted)
