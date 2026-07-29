@@ -86,6 +86,8 @@ captures/
 *.bmp
 *.raw
 experiment_checkpoint.json
+# ...except documentation figures, which are deliberately committed
+!docs/images/*.png
 experiment_events.csv
 .claude/
 
