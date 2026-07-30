@@ -105,6 +105,28 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
 #   al1342_host: 192.168.1.251
 #   calibration_file: null      # fitted against current_ma, not distance_mm — see that script
 
+# LMI Gocator 2690 line-laser 3D scanner. Unlike the rangefinders above it is a
+# plain Ethernet device on the laguna PC's own network — no Pi, no IO-Link, no
+# MQTT. Encoderless: the gantry supplies constant-velocity motion and we
+# bracket the pass with a software trigger. See docs/subsystems/scanner.md.
+# gocator:
+#   ip: 192.168.1.10            # raw IP; the sensor's web UI is on port 80
+#   travel_speed_mm_s: 20.0     # MUST match the gantry feed rate used to scan —
+#                                # this is what scales the Y (travel) axis, since
+#                                # there is no encoder. Writes to sensor flash,
+#                                # so laguna only pushes it when it changes.
+#   frame_rate_hz: 500          # profile trigger rate; omit for the sensor's max.
+#                                # Y spacing = travel_speed / frame_rate
+#                                # (20 mm/s at 500 Hz = 0.04 mm between profiles)
+#   fixed_length_mm: 200.0      # surface length along travel; cover the scan distance
+#   exposure_us: null           # laser exposure; omit to leave the sensor's setting
+#   uniform_spacing: null       # true/false to force X resampling on/off; omit to
+#                                # leave as-is. Disabling it raises the max scan rate.
+#   output_dir: ./data/scans
+#   sdk_lib_dir: null           # dir holding libGoSdk.so/libkApi.so. Omit to use
+#                                # $LAGUNA_GOSDK_LIB_DIR or a conventional path —
+#                                # build them first with scripts/build_gosdk.sh
+
 dslr_cameras:
   dualcam_path: /path/to/dualcam-timelapse  # path to dualcam-timelapse repo
   # Scheduling (choose one):
