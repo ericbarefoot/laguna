@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .commands import (
     Axis,
+    AxisHandle,
     IOMap,
     MMCCommands,
     THETA_AXIS,
@@ -89,7 +90,8 @@ class GantryController:
         io_map: Optional[IOMap] = None,
         homing_config: Optional[HomingConfig] = None,
         fences: Optional[List[Fence]] = None,
-        gcode_axes: Tuple[Axis, Axis, Axis] = (X_AXIS, Y_AXIS, Z_AXIS),
+        gcode_axes: Tuple[Axis, Axis] = (X_AXIS, Y_AXIS),
+        gcode_z_axis: Axis = Z_AXIS,
         safe_mode: bool = True,
         mm_per_unit: float = 1.0,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
@@ -109,6 +111,25 @@ class GantryController:
             group_axes=gcode_axes,
         )
 
+        # Per-axis convenience handles — lab.gantry.axis("Y") always works;
+        # lab.gantry.y (etc.) is set dynamically below for whatever axes are
+        # actually configured. See AxisHandle in commands.py for what these
+        # wrap and how the safe_mode gate applies to their motion methods.
+        self._axis_handles: Dict[str, AxisHandle] = {}
+        for axis in self._axes:
+            handle = AxisHandle(
+                self.cmd, axis, is_safe_mode=lambda: self._safe_mode, io_map=self._io_map
+            )
+            self._axis_handles[axis.name] = handle
+            attr_name = axis.name.lower()
+            if hasattr(self, attr_name):
+                raise ValueError(
+                    f"Axis name {axis.name!r} collides with an existing "
+                    f"GantryController attribute ({attr_name!r}) — rename the "
+                    f"axis in config to expose it as lab.gantry.{attr_name}"
+                )
+            setattr(self, attr_name, handle)
+
         self.fence_registry = FenceRegistry()
         for fence in fences or []:
             self.fence_registry.add(fence)
@@ -121,6 +142,7 @@ class GantryController:
             self.checker,
             homing=self.homing,
             axes=gcode_axes,
+            z_axis=gcode_z_axis,
             group_index=group_index,
         )
 
@@ -134,6 +156,51 @@ class GantryController:
         by TopographicProfiler) can reach them directly.
         """
         return self._connection
+
+    def axis(self, name: str) -> AxisHandle:
+        """Return the AxisHandle for a configured axis by name (case-sensitive,
+        matches the 'name' field in config's gantry.axes list — e.g. "X",
+        "Y", "Z", "Theta"). Equivalent to the dynamic lab.gantry.<name.lower()>
+        attribute, but useful when the axis name is only known at runtime.
+        """
+        try:
+            return self._axis_handles[name]
+        except KeyError:
+            raise ValueError(
+                f"No axis named {name!r} configured on this gantry "
+                f"(configured: {list(self._axis_handles)})"
+            ) from None
+
+    def _resolve_axis_handle(self, axis: "Axis | AxisHandle | str") -> AxisHandle:
+        if isinstance(axis, AxisHandle):
+            return axis
+        if isinstance(axis, Axis):
+            return self.axis(axis.name)
+        if isinstance(axis, str):
+            return self.axis(axis)
+        raise TypeError(
+            f"axis must be an AxisHandle, Axis, or axis name string, got {type(axis).__name__}"
+        )
+
+    def engage_brake(self, axis: "Axis | AxisHandle | str") -> None:
+        """Engage the electromagnetic brake on the given axis (Y or Z only —
+        raises ValueError for axes without a brake). Accepts an axis name
+        ("Y"), an Axis object, or an AxisHandle (e.g. lab.gantry.y) — same
+        effect as lab.gantry.y.engage_brake(), just callable with the axis
+        as an argument instead. See AxisHandle.engage_brake in commands.py.
+        """
+        self._resolve_axis_handle(axis).engage_brake()
+
+    def disengage_brake(self, axis: "Axis | AxisHandle | str") -> None:
+        """Disengage the electromagnetic brake on the given axis (Y or Z
+        only — raises ValueError for axes without a brake). See
+        engage_brake() above for accepted `axis` forms."""
+        self._resolve_axis_handle(axis).disengage_brake()
+
+    def brake_is_disengaged(self, axis: "Axis | AxisHandle | str") -> bool:
+        """True if the given axis's brake is currently disengaged (released).
+        See engage_brake() above for accepted `axis` forms."""
+        return self._resolve_axis_handle(axis).brake_is_disengaged()
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "GantryController":
@@ -151,6 +218,7 @@ class GantryController:
         homing_config = _build_homing_config(config.get("homing") or {}, axes_cfg)
         fences = _build_fences(config.get("fences") or [])
         gcode_axes = _resolve_gcode_axes(axes_cfg)
+        gcode_z_axis = _lookup_axis(axes_cfg, "Z") or Z_AXIS
 
         return cls(
             connection=connection,
@@ -160,6 +228,7 @@ class GantryController:
             homing_config=homing_config,
             fences=fences,
             gcode_axes=gcode_axes,
+            gcode_z_axis=gcode_z_axis,
             safe_mode=config.get("safe_mode", True),
             # Temporary DSM-project workaround — see docs/GANTRY_UNIT_CALIBRATION.md.
             # Flip gantry.mm_per_acp_unit to 1.0 in config once fixed at the source;
@@ -316,18 +385,144 @@ class GantryController:
             theta_axis = axes_by_name["Theta"]
             if speed is not None:
                 self.cmd.set_speed(theta_axis, speed)
-            self.cmd.move_to(theta_axis, theta_value)
+            # begin_move_to (BMT) + poll, not the blocking MVT directly — a
+            # slow rotation could otherwise exceed the transport's fixed
+            # per-command read timeout and spuriously error (same reasoning
+            # as GCodeExecutor's Z leg / AxisHandle.move_to() — see either).
+            # Deliberately not routed through AxisHandle.move_to(): that
+            # adds its own client-side safe_mode check, which would be
+            # inconsistent with the Cartesian branch above (which has none
+            # — it relies entirely on the transport-level gate).
+            self.cmd.begin_move_to(theta_axis, theta_value)
+            self._poll_theta_move_finished(theta_axis)
 
+        return True
+
+    def _poll_theta_move_finished(
+        self, axis: Axis, timeout: float = 30.0, poll_interval: float = 0.05
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while not self.cmd.move_is_finished(axis):
+            if time.monotonic() > deadline:
+                self.cmd.abort(axis)
+                raise SnapMotionError(
+                    0, f"{axis.name} move did not finish within {timeout:.0f}s — aborted"
+                )
+            time.sleep(poll_interval)
+
+    def set_position(
+        self,
+        vector: Optional[List[float]] = None,
+        *,
+        X: Optional[float] = None,
+        Y: Optional[float] = None,
+        Z: Optional[float] = None,
+        Theta: Optional[float] = None,
+    ) -> bool:
+        """Redefine the controller's notion of current position for the given axes.
+
+        Mirrors laguna.weir.SaflWeirController.set_elevation() — this
+        recalibrates each given axis's position register (ACP) to the given
+        real-mm value without commanding any motion. Use it to re-reference
+        the gantry after it's been repositioned by other means (e.g.
+        manually) — this is currently the only way to (re-)establish a
+        position reference, since home() is temporarily disabled (see
+        HomingProcedure.home_all()). To actually move the gantry, use
+        move_to().
+
+        Both forms mirror move_to()'s shape — a full vector (one value per
+        configured axis, in self._axes order) or per-axis keywords — except
+        unlike move_to(), any axis *not* given here is left completely
+        untouched: there's no backfill, since there's no move/fence-checked
+        path to compute one for.
+
+        Args:
+            vector: Full-length position vector, or None to use keywords.
+            X, Y, Z, Theta: Per-axis new position values (real mm; Theta in
+                whatever unit that axis's raw-to-real conversion yields).
+
+        Returns:
+            True if every given axis's position register was set.
+
+        Raises:
+            ValueError: If vector's length doesn't match the configured
+                axes, an axis keyword names an axis not configured on this
+                gantry, or neither vector nor any keyword was given.
+        """
+        axes_by_name = {axis.name: axis for axis in self._axes}
+
+        if vector is not None:
+            if len(vector) != len(self._axes):
+                raise ValueError(
+                    f"set_position(vector=...) expects {len(self._axes)} values "
+                    f"(one per configured axis: {[a.name for a in self._axes]}), "
+                    f"got {len(vector)}"
+                )
+            target_by_name: Dict[str, float] = {
+                axis.name: value for axis, value in zip(self._axes, vector)
+            }
+        else:
+            target_by_name = {}
+            for name, value in (("X", X), ("Y", Y), ("Z", Z), ("Theta", Theta)):
+                if value is None:
+                    continue
+                if name not in axes_by_name:
+                    raise ValueError(f"Axis {name!r} is not configured on this gantry")
+                target_by_name[name] = value
+            if not target_by_name:
+                raise ValueError(
+                    "set_position() requires either vector=... or at least one of X=/Y=/Z=/Theta="
+                )
+
+        for name, value in target_by_name.items():
+            self.cmd.set_actual_position(axes_by_name[name], value)
         return True
 
     def home(self) -> bool:
         """Run the homing routine on all configured axes.
 
+        Temporarily disabled: physical obstructions currently block several
+        of the limit switches this routine depends on. Delegates to
+        HomingProcedure.home_all(), which raises NotImplementedError
+        unconditionally until that guard is removed. Use set_position() to
+        re-reference an axis manually in the meantime.
+
         Returns:
             True if homing completed successfully on every axis.
+
+        Raises:
+            NotImplementedError: Always, while homing is disabled.
         """
         result = self.homing.home_all()
         return result.success
+
+    def set_safe_mode(self, enabled: bool) -> bool:
+        """Enable or disable safe_mode, reconnecting the transport if needed
+        so the change actually takes effect.
+
+        Setting ``self.connection.safe_mode`` directly is not enough for the
+        pi_agent transport: gantry_agent.py enforces its own independent
+        safe-mode gate (deliberate defense-in-depth — see pi_bridge.py's
+        module docstring), fixed at process launch via the --allow-motion
+        flag baked into the SSH command in PiGantryConnection.connect().
+        An already-running agent keeps enforcing whatever it was launched
+        with, no matter what the client-side attribute says. This method
+        updates the flag and, if a PiGantryConnection is currently
+        connected, disconnects and reconnects so the agent relaunches with
+        the matching flag.
+
+        Returns:
+            True if the change took effect (including a successful
+            reconnect, if one was needed); False if a required reconnect
+            failed — check logs and call connect() again once resolved.
+        """
+        self._safe_mode = enabled
+        if hasattr(self._connection, "safe_mode"):
+            self._connection.safe_mode = enabled
+        if isinstance(self._connection, PiGantryConnection) and self._is_connected:
+            self.disconnect()
+            return self.connect()
+        return True
 
     def enable(self) -> None:
         """Enable motor drive on all configured axes."""
@@ -429,12 +624,16 @@ def _build_homing_config(homing_cfg: Dict[str, Any], axes_cfg: List[Dict[str, An
     return config
 
 
-def _resolve_gcode_axes(axes_cfg: List[Dict[str, Any]]) -> Tuple[Axis, Axis, Axis]:
-    """Pick the X/Y/Z axes by name for the GCodeExecutor (Cartesian-only)."""
-    resolved = [axis for axis in (_lookup_axis(axes_cfg, name) for name in ("X", "Y", "Z")) if axis]
-    if len(resolved) == 3:
+def _resolve_gcode_axes(axes_cfg: List[Dict[str, Any]]) -> Tuple[Axis, Axis]:
+    """Pick the X/Y axes by name for the GCodeExecutor's coordinated group.
+
+    Z is resolved separately (see gcode_z_axis in from_config) — it can't
+    be part of this group on this hardware, see GCodeExecutor/gcode.py.
+    """
+    resolved = [axis for axis in (_lookup_axis(axes_cfg, name) for name in ("X", "Y")) if axis]
+    if len(resolved) == 2:
         return tuple(resolved)
-    return (X_AXIS, Y_AXIS, Z_AXIS)
+    return (X_AXIS, Y_AXIS)
 
 
 def _build_fences(fence_configs: List[Dict[str, Any]]) -> List[Fence]:

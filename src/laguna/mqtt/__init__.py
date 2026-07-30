@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import uuid
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -41,7 +42,13 @@ class MqttSubscriber:
     ):
         self._host = config.get("broker_host", "red.lab")
         self._port = int(config.get("broker_port", 1883))
-        self._client_id = config.get("client_id", "laguna")
+        # Suffixed with a per-instance UUID so two subsystems built from the
+        # same config dict (e.g. two rangefinders sharing "mqtt" config)
+        # never collide on client ID — a broker disconnects the older client
+        # whenever a new connection reuses its ID, which sends both instances
+        # into an endless reconnect fight (see MQTT_AL1342_SETUP.md).
+        base_client_id = config.get("client_id", "laguna")
+        self._client_id = f"{base_client_id}-{uuid.uuid4().hex[:8]}"
         self._keepalive = int(config.get("keepalive", 60))
         self._initial_topics: List[str] = list(config.get("topics", []))
         self._qos = int(config.get("qos", 0))

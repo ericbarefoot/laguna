@@ -169,7 +169,7 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None):
     )
     homing = HomingProcedure(cmd, homing_config, io_map=io_map)
     executor = GCodeExecutor(
-        cmd, checker, homing=homing, axes=(X_AXIS, Y_AXIS, Z_AXIS),
+        cmd, checker, homing=homing, axes=(X_AXIS, Y_AXIS), z_axis=Z_AXIS,
         dry_run=dry_run, confirm_cb=confirm_cb,
     )
     return executor, conn
@@ -200,16 +200,19 @@ class TestExecutorTypeGuard:
 
 class TestExecutorLinearMoves:
     def test_executes_group_init_then_moves(self):
+        # X only -> Y/Z stay at the start position (0,0,0), so no Z leg;
+        # the coordinated group is X/Y only (see gcode.py's "Z/XY node
+        # split" note — Z can't join it on this hardware).
         responses = {
-            "C1 INI 1 2 5": "0",
+            "C1 INI 1 2": "0",
             "C1 SPD 20": "20",
-            "C1 BMT 10 0 0": "0",
+            "C1 BMT 10 0": "0",
             "C1 MIF": "1",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 F1200")
         executor.execute(trajectory)
-        assert conn.sent == ["C1 INI 1 2 5", "C1 SPD 20", "C1 BMT 10 0 0", "C1 MIF"]
+        assert conn.sent == ["C1 INI 1 2", "C1 SPD 20", "C1 BMT 10 0", "C1 MIF"]
 
     def test_polls_until_move_finished(self):
         calls = {"n": 0}
@@ -219,8 +222,8 @@ class TestExecutorLinearMoves:
             return "1" if calls["n"] >= 3 else "0"
 
         responses = {
-            "C1 INI 1 2 5": "0",
-            "C1 BMT 5 0 0": "0",
+            "C1 INI 1 2": "0",
+            "C1 BMT 5 0": "0",
             "C1 MIF": mif_response,
         }
         executor, conn = _make_executor(responses)
@@ -235,16 +238,19 @@ class TestExecutorLinearMoves:
         assert conn.sent == []
 
     def test_confirm_cb_can_abort_before_sending(self):
-        executor, conn = _make_executor({"C1 INI 1 2 5": "0"}, confirm_cb=lambda move: False)
+        # confirm_cb is checked before anything is sent — including group
+        # init, which is now lazy (only sent by the first XY-leg
+        # execution) rather than eager at the top of execute().
+        executor, conn = _make_executor({}, confirm_cb=lambda move: False)
         trajectory = executor.plan("G1 X10")
         with pytest.raises(GCodeExecutionAborted):
             executor.execute(trajectory)
-        assert "C1 BMT 10 0 0" not in conn.sent
+        assert conn.sent == []
 
     def test_confirm_cb_receives_the_move(self):
         seen = []
         executor, conn = _make_executor(
-            {"C1 INI 1 2 5": "0", "C1 BMT 10 0 0": "0", "C1 MIF": "1"},
+            {"C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 MIF": "1"},
             confirm_cb=lambda move: seen.append(move) or True,
         )
         trajectory = executor.plan("G1 X10")
@@ -253,25 +259,98 @@ class TestExecutorLinearMoves:
         assert seen[0].target == (10.0, 0.0, 0.0)
 
 
-class TestExecutorHomeDwellPause:
-    def test_g28_calls_home_all(self):
+class TestZXYNodeSplit:
+    """Z can't join the coordinated group on this hardware (confirmed: C1
+    INI 1 2 succeeds, C1 INI 1 2 5 fails with error 1010 — see gcode.py's
+    "Z/XY node split" note). A move touching both Z and X/Y is split into
+    a Z-only leg followed by an XY-only leg (Z-first) before fence-checking,
+    so the checked path matches what's actually executed.
+    """
+
+    def test_combined_move_splits_into_z_leg_then_xy_leg(self):
         responses = {
-            "SOB 5 1": "0", "INB 1": "1",  # Z brake disengage + status confirm
-            "SOB 4 1": "0", "INB 8": "1",  # Y brake disengage + status confirm
-            "A5 AIC": "0", "A5 CAB": "0", "A5 JOG -10": "-10", "A5 CAT": "1",
-            "A5 BST": "0", "A5 MIF": "1", "A5 CAP": "0", "A5 ACP": "0", "A5 ACP 0": "0",
-            "A5 MVT 5": "5",
-            "A1 AIC": "0", "A1 CAB": "0", "A1 JOG -10": "-10", "A1 CAT": "1",
-            "A1 BST": "0", "A1 MIF": "1", "A1 CAP": "0", "A1 ACP": "0", "A1 ACP 0": "0",
-            "A1 MVT 5": "5",
-            "A2 AIC": "0", "A2 CAB": "0", "A2 JOG -10": "-10", "A2 CAT": "1",
-            "A2 BST": "0", "A2 MIF": "1", "A2 CAP": "0", "A2 ACP": "0", "A2 ACP 0": "0",
-            "A2 MVT 5": "5",
+            "A5 SPD 10": "10",
+            "A5 BMT 5": "0",
+            "A5 MIF": "1",
+            "C1 INI 1 2": "0",
+            "C1 SPD 10": "10",
+            "C1 BMT 10 20": "0",
+            "C1 MIF": "1",
         }
         executor, conn = _make_executor(responses)
-        trajectory = executor.plan("G28")
+        trajectory = executor.plan("G1 X10 Y20 Z5 F600")
         executor.execute(trajectory)
-        assert "A5 JOG -10" in conn.sent  # Z (home_order default starts with Z)
+        # Z leg fully completes (SPD, BMT, MIF) before the XY group is
+        # even initialized — Z-first, per the gantry's use as a
+        # subtractive CNC / sensor-positioning rig.
+        assert conn.sent == [
+            "A5 SPD 10", "A5 BMT 5", "A5 MIF",
+            "C1 INI 1 2", "C1 SPD 10", "C1 BMT 10 20", "C1 MIF",
+        ]
+
+    def test_z_only_move_never_touches_group(self):
+        responses = {"A5 BMT 5": "0", "A5 MIF": "1"}
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 Z5")
+        executor.execute(trajectory)
+        assert conn.sent == ["A5 BMT 5", "A5 MIF"]
+        assert not any(cmd.startswith("C1") for cmd in conn.sent)
+
+    def test_group_init_sent_once_across_two_execute_calls(self):
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 BMT 10 0": "0",
+            "C1 BMT 20 0": "0",
+            "C1 MIF": "1",
+        }
+        executor, conn = _make_executor(responses)
+        executor.execute(executor.plan("G1 X10"))
+        executor.execute(executor.plan("G1 X20"))
+        assert conn.sent.count("C1 INI 1 2") == 1
+
+    def test_fence_check_reflects_the_actual_z_first_path_not_the_diagonal(self):
+        # A tall post directly above the start position (Z >= 3), not
+        # covering the endpoint's XY footprint. The nominal 3D diagonal
+        # from (0,0,0) to (10,10,5) leaves this XY footprint almost
+        # immediately (by t=0.1, x=y=1 already outside x/y in [-1,1]),
+        # while Z is still only 0.5 — so a diagonal-only check would call
+        # this safe. But the real Z-first execution climbs Z from 0 to 5
+        # while still sitting at the start XY (0,0) — squarely inside the
+        # post's footprint — so it must be flagged.
+        post = BoxFence("post_above_origin", -1, 1, -1, 1, 3, 10)
+        executor, conn = _make_executor({}, fences=[post])
+        with pytest.raises(FenceViolation):
+            executor.plan("G1 X10 Y10 Z5")
+        assert conn.sent == []
+
+    def test_split_path_avoids_a_hazard_the_diagonal_would_have_hit(self):
+        # A low obstacle midway along X (z in [0,3]), Y unchanged. The
+        # nominal diagonal from (0,0,0) to (10,0,5) passes through this
+        # box around t in [0.3,0.6] (x in [3,6], z in [1.5,3]) — a
+        # diagonal-only check would reject this move. The real Z-first
+        # execution climbs to Z=5 (clear of the box's z<=3) before ever
+        # moving in X, so the actual path never enters the box.
+        low_post = BoxFence("low_post", 3, 7, -1, 1, 0, 3)
+        executor, conn = _make_executor(
+            {"A5 BMT 5": "0", "A5 MIF": "1", "C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 MIF": "1"},
+            fences=[low_post],
+        )
+        trajectory = executor.plan("G1 X10 Z5")  # Y unspecified -> stays 0
+        executor.execute(trajectory)  # must not raise FenceViolation
+        assert conn.sent == ["A5 BMT 5", "A5 MIF", "C1 INI 1 2", "C1 BMT 10 0", "C1 MIF"]
+
+
+class TestExecutorHomeDwellPause:
+    def test_g28_raises_while_homing_is_disabled(self):
+        # G28 delegates to HomingProcedure.home_all(), which is temporarily
+        # gated off (physical obstructions block several limit switches on
+        # the real machine — see HomingProcedure.home_all()). Restore the
+        # full happy-path assertion here (checking the JOG/CAT/zero/standoff
+        # sequence) once that guard is removed.
+        executor, conn = _make_executor({})
+        trajectory = executor.plan("G28")
+        with pytest.raises(NotImplementedError):
+            executor.execute(trajectory)
 
     def test_g4_dwell_sleeps(self, monkeypatch):
         slept = []

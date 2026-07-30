@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -225,7 +226,7 @@ class PiGantryConnection(SnapConnection):
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kwargs: dict = {"username": self.ssh_user, "port": self.ssh_port, "timeout": self.timeout}
         if self.ssh_key:
-            kwargs["key_filename"] = self.ssh_key
+            kwargs["key_filename"] = os.path.expanduser(self.ssh_key)
         if self.ssh_passphrase:
             kwargs["passphrase"] = self.ssh_passphrase
         client.connect(self.host, **kwargs)

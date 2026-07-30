@@ -171,23 +171,21 @@ class TestHomeAxisBrakeHandling:
 
 
 class TestHomeAll:
-    def test_stops_at_first_failure(self):
-        # Z is first in the default home order; make it fail immediately.
-        responses = {
-            "A5 AIC": "0",
-            "A5 CAB": "0",
-            "A5 JOG -10": "-10",
-            "A5 CAT": "0",  # never trips -> timeout
-            "A5 ABT": "0",
-        }
-        conn = FakeSnapConnection(responses)
+    def test_home_all_raises_not_implemented_while_disabled(self):
+        # home_all() is temporarily gated off (physical obstructions block
+        # several limit switches on the real machine — see
+        # HomingProcedure.home_all()). This guard is expected to be removed
+        # once the obstructions are cleared and homing is re-verified safe;
+        # the "stops at first failure" behavior it currently shadows is
+        # still exercised via home_axis() directly (see TestHomeAxisHappyPath
+        # and friends) and should be restored here once home_all() is
+        # re-enabled.
+        conn = FakeSnapConnection({})
         cmd = MMCCommands(conn)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
             timeout_s=0.02, backoff_timeout_s=1.0,
         )
         proc = HomingProcedure(cmd, config)
-        result = proc.home_all()
-        assert result.success is False
-        assert result.axis_results == {}
-        assert result.error is not None
+        with pytest.raises(NotImplementedError):
+            proc.home_all()

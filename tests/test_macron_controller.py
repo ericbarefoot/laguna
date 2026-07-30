@@ -88,9 +88,14 @@ class TestFromConfigAxesAndIOMap:
         controller = GantryController.from_config(cfg)
         assert controller._axes == (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
 
-    def test_gcode_axes_default_to_xyz(self):
+    def test_gcode_axes_default_to_xy_group_with_separate_z(self):
+        # Z can't join the coordinated group on this hardware (confirmed:
+        # C1 INI 1 2 succeeds, C1 INI 1 2 5 fails with error 1010) — the
+        # group is X/Y only, and Z drives via a separate leg. See
+        # GCodeExecutor / gcode.py's "Z/XY node split" note.
         controller = GantryController.from_config(BASE_CONFIG)
-        assert controller.gcode._axes == (X_AXIS, Y_AXIS, Z_AXIS)
+        assert controller.gcode._axes == (X_AXIS, Y_AXIS)
+        assert controller.gcode._z_axis == Z_AXIS
 
 
 class TestFromConfigHomingAndFences:
@@ -193,15 +198,21 @@ class TestMoveTo:
 
     def test_vector_move_routes_through_fence_checked_gcode_path(self):
         # X=150mm, Y=0, Z=0 (raw 10 0 0 at mm_per_unit=15), Theta=0 (unconverted).
+        # Z is unchanged from the start position (0,0,0) -> no Z leg, and the
+        # coordinated group is X/Y only (Z can't join it on this hardware —
+        # see gcode.py's "Z/XY node split" note).
+        # Theta moves via begin_move_to (BMT) + poll (MIF), not the blocking
+        # MVT — see AxisHandle.move_to() in commands.py.
         responses = {
-            "C1 INI 1 2 5": "0",
-            "C1 BMT 10 0 0": "0",
+            "C1 INI 1 2": "0",
+            "C1 BMT 10 0": "0",
             "C1 MIF": "1",
-            "A6 MVT 0": "0",
+            "A6 BMT 0": "0",
+            "A6 MIF": "1",
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
-        assert conn.sent == ["C1 INI 1 2 5", "C1 BMT 10 0 0", "C1 MIF", "A6 MVT 0"]
+        assert conn.sent == ["C1 INI 1 2", "C1 BMT 10 0", "C1 MIF", "A6 BMT 0", "A6 MIF"]
 
     def test_vector_move_length_mismatch_raises(self):
         controller, _conn = self._make_controller({})
@@ -220,19 +231,22 @@ class TestMoveTo:
         # Only X given -> Y/Z backfilled via a live get_actual_position()
         # read, then the whole thing goes through the same coordinated
         # gcode path as the vector form (C1 INI/SPD/BMT/MIF), not a
-        # single-axis A1 MVT.
+        # single-axis A1 MVT. Z backfills to 0, matching the start position,
+        # so no Z leg is needed — the coordinated group is X/Y only (Z
+        # can't join it on this hardware, see gcode.py's "Z/XY node split"
+        # note).
         responses = {
             "A2 ACP": "0",  # Y backfill
             "A5 ACP": "0",  # Z backfill
-            "C1 INI 1 2 5": "0",
+            "C1 INI 1 2": "0",
             "C1 SPD 0.133333": "0.133333",
-            "C1 BMT 10 0 0": "0",
+            "C1 BMT 10 0": "0",
             "C1 MIF": "1",
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to(X=150.0, speed=2.0) is True
         assert conn.sent == [
-            "A2 ACP", "A5 ACP", "C1 INI 1 2 5", "C1 SPD 0.133333", "C1 BMT 10 0 0", "C1 MIF",
+            "A2 ACP", "A5 ACP", "C1 INI 1 2", "C1 SPD 0.133333", "C1 BMT 10 0", "C1 MIF",
         ]
 
     def test_keyword_move_is_fence_checked(self):
@@ -248,16 +262,63 @@ class TestMoveTo:
 
     def test_theta_only_keyword_move_does_not_touch_cartesian_axes(self):
         # A pure Theta move must not query, move, or otherwise touch X/Y/Z
-        # at all — no ACP reads, no C1 group commands.
-        controller, conn = self._make_controller({"A6 MVT 90": "90"})
+        # at all — no ACP reads, no C1 group commands. Moves via BMT + poll
+        # (MIF), not the blocking MVT — see AxisHandle.move_to().
+        controller, conn = self._make_controller({"A6 BMT 90": "90", "A6 MIF": "1"})
         assert controller.move_to(Theta=90.0) is True
-        assert conn.sent == ["A6 MVT 90"]
+        assert conn.sent == ["A6 BMT 90", "A6 MIF"]
 
     def test_keyword_move_of_unconfigured_axis_raises(self):
         conn = FakeSnapConnection({})
         controller = GantryController(connection=conn, axes=(X_AXIS, Y_AXIS))  # no Z configured
         with pytest.raises(ValueError):
             controller.move_to(Z=1.0)
+
+
+class TestSetPosition:
+    """set_position() mirrors laguna.weir.SaflWeirController.set_elevation()
+    — recalibrates position registers (ACP), commands no motion. Unlike
+    move_to(), it never backfills or fence-checks: only the given axes are
+    touched at all.
+    """
+
+    def _make_controller(self, responses=None, mm_per_unit=15.0):
+        conn = FakeSnapConnection(responses or {})
+        controller = GantryController(connection=conn, mm_per_unit=mm_per_unit)
+        return controller, conn
+
+    def test_vector_sets_every_configured_axis(self):
+        # X=150mm, Y=30mm, Z=45mm (raw 10, 2, 3 at mm_per_unit=15),
+        # Theta=90 (unconverted, rotary).
+        responses = {
+            "A1 ACP 10": "10", "A2 ACP 2": "2", "A5 ACP 3": "3", "A6 ACP 90": "90",
+        }
+        controller, conn = self._make_controller(responses)
+        assert controller.set_position([150.0, 30.0, 45.0, 90.0]) is True
+        assert conn.sent == ["A1 ACP 10", "A2 ACP 2", "A5 ACP 3", "A6 ACP 90"]
+
+    def test_vector_length_mismatch_raises(self):
+        controller, _conn = self._make_controller({})
+        with pytest.raises(ValueError):
+            controller.set_position([1.0, 2.0])
+
+    def test_keyword_only_touches_given_axes(self):
+        # Only Y given -> only A2 ACP is sent. No backfill reads (unlike
+        # move_to), no other axis touched at all.
+        controller, conn = self._make_controller({"A2 ACP 2": "2"})
+        assert controller.set_position(Y=30.0) is True
+        assert conn.sent == ["A2 ACP 2"]
+
+    def test_keyword_of_unconfigured_axis_raises(self):
+        conn = FakeSnapConnection({})
+        controller = GantryController(connection=conn, axes=(X_AXIS, Y_AXIS))  # no Z configured
+        with pytest.raises(ValueError):
+            controller.set_position(Z=1.0)
+
+    def test_no_vector_or_keywords_raises(self):
+        controller, _conn = self._make_controller({})
+        with pytest.raises(ValueError):
+            controller.set_position()
 
     def test_no_vector_or_keywords_raises(self):
         controller, _conn = self._make_controller({})
@@ -287,6 +348,15 @@ class TestHomeEnableDisableWaitForMove:
             lambda: HomingResult(success=False, axis_results={}, error="timeout"),
         )
         assert controller.home() is False
+
+    def test_home_raises_while_homing_is_disabled(self):
+        # Unmocked home_all() — homing is temporarily gated off (physical
+        # obstructions block several limit switches on the real machine —
+        # see HomingProcedure.home_all()), and home() must let that raise
+        # propagate rather than swallow it into a False return.
+        controller, _conn = self._make_controller({})
+        with pytest.raises(NotImplementedError):
+            controller.home()
 
     def test_enable_enables_motor_and_drive_on_every_axis(self):
         responses = {f"A{i} MTR 1": "1" for i in (1, 2, 5, 6)}

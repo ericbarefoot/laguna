@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -187,7 +188,7 @@ class TopographicProfiler:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         connect_kwargs: dict = {"username": self._pi_user, "port": 22}
         if self._pi_key:
-            connect_kwargs["key_filename"] = self._pi_key
+            connect_kwargs["key_filename"] = os.path.expanduser(self._pi_key)
         client.connect(self._pi_host, **connect_kwargs)
         try:
             sftp = client.open_sftp()

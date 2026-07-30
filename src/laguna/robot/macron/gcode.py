@@ -29,6 +29,26 @@ G2/G3 arcs are tessellated here into a sequence of short straight-line
 moves, each individually fence-checked and executed as an ordinary
 coordinated group move. This fully supports arc G-code without sending any
 command whose semantics aren't verified.
+
+Z/XY node split: confirmed on hardware that the coordinated-group command
+cannot include Z — `C1 INI 1 2` (X, Y — the commander) succeeds, `C1 INI 1
+2 5` (adding Z — the responder, a separate networked PLC node) fails with
+error 1010. So a LINEAR move that changes both Z and X/Y can't be sent as
+one simultaneous 3D move at all on this hardware; _split_cross_node_moves
+(run in GCodeExecutor.plan(), before fence-checking) splits any such move
+into a Z-only leg followed by an XY-only leg, Z-first. Z-first was chosen
+for this gantry's actual use (subtractive CNC / sensor positioning, not
+additive/layer deposition) — Z reaches its target (e.g. retracting/
+diving to a probe height) before XY travels, rather than the other way
+round. This means a G-code program authored for genuine simultaneous 3D
+motion (e.g. a helical G2/G3, or slicer layer-change lines combining an
+XY travel with a Z step) is only ever approximated here as a Z-then-XY
+zigzag, and the two legs' timing no longer reflects the original line's
+vector feed rate (each leg runs at the full nominal F, not a fraction of
+it) — this is a hard hardware limitation, not a bug to route around.
+Splitting happens before the fence check specifically so the checked
+waypoints match the path that is actually executed (an L-shaped path, not
+the nominal diagonal) — see _split_cross_node_moves.
 """
 
 from __future__ import annotations
@@ -117,6 +137,52 @@ class GCodeProgram:
                 pos = move.target if move.target is not None else pos
                 waypoints.append(pos)
         return waypoints
+
+
+# Tolerance for deciding whether a position actually changed. Needed
+# because mm values round-trip through raw controller units and back (see
+# MMCCommands._pos_to_raw/_pos_to_mm, formatted to 6 significant figures
+# on the wire) — exact float equality is too fragile against that
+# rounding noise to reliably tell "moved" from "reported the same spot
+# back with a rounding wobble."
+_POSITION_EPSILON_MM = 1e-3
+
+
+def _moved(a: float, b: float) -> bool:
+    return abs(a - b) > _POSITION_EPSILON_MM
+
+
+def _split_cross_node_moves(moves: List[GCodeMove], start: Point3D) -> List[GCodeMove]:
+    """Split any LINEAR move that changes both Z and X/Y into a Z-only leg
+    followed by an XY-only leg (Z-first) — see the module docstring's
+    "Z/XY node split" note for why this is necessary on this hardware.
+
+    Moves that only change Z, or only change X/Y (the overwhelming common
+    case — most G-code, including slicer output, only combines the two on
+    a layer-change-style line), pass through unchanged. HOME/DWELL/PAUSE
+    moves are untouched.
+    """
+    result: List[GCodeMove] = []
+    pos = start
+    for move in moves:
+        if move.kind != "LINEAR" or move.target is None:
+            result.append(move)
+            continue
+        tx, ty, tz = move.target
+        px, py, pz = pos
+        if _moved(tz, pz) and (_moved(tx, px) or _moved(ty, py)):
+            result.append(GCodeMove(
+                kind="LINEAR", target=(px, py, tz),
+                feed_mm_s=move.feed_mm_s, source_line=move.source_line,
+            ))
+            result.append(GCodeMove(
+                kind="LINEAR", target=(tx, ty, tz),
+                feed_mm_s=move.feed_mm_s, source_line=move.source_line,
+            ))
+        else:
+            result.append(move)
+        pos = move.target
+    return result
 
 
 def _radius_to_ij(start: Point3D, end: Point3D, radius: float, clockwise: bool) -> Tuple[float, float]:
@@ -429,12 +495,18 @@ class GCodeExecutor:
 
     plan() is the only way to obtain a CheckedTrajectory; execute() only
     accepts the exact CheckedTrajectory object plan() returned for the same
-    program (checked by identity), and drives motion via coordinated group
-    moves — never independent single-axis moves — so the straight-line
-    segments that were fence-checked are the ones actually followed.
+    program (checked by identity), so the straight-line segments that were
+    fence-checked are the ones actually followed.
 
-    Only X/Y/Z are driven (fences.py only checks XYZ spatially, and this
-    initial G-code subset has no rotary/Theta motion concept).
+    X/Y drive via the coordinated group (fences.py checks XYZ spatially,
+    and this G-code subset has no rotary/Theta motion concept); Z drives
+    via a separate single-axis command, never simultaneously with X/Y —
+    see the module docstring's "Z/XY node split" note for why (Z lives on
+    a different networked PLC node than X/Y, and this firmware's
+    coordinated-group feature can't span that boundary). plan() splits any
+    move that would need both into a Z-only leg followed by an XY-only
+    leg before fence-checking, so what gets checked matches what actually
+    runs.
     """
 
     def __init__(
@@ -442,7 +514,8 @@ class GCodeExecutor:
         cmd: MMCCommands,
         checker: TrajectoryChecker,
         homing: Optional[HomingProcedure] = None,
-        axes: Tuple[Axis, Axis, Axis] = (X_AXIS, Y_AXIS, Z_AXIS),
+        axes: Tuple[Axis, Axis] = (X_AXIS, Y_AXIS),
+        z_axis: Axis = Z_AXIS,
         group_index: int = 1,
         confirm_cb: Optional[Callable[[GCodeMove], bool]] = None,
         dry_run: bool = False,
@@ -457,8 +530,12 @@ class GCodeExecutor:
             homing: HomingProcedure driving G28. Required only if the
                 program being executed actually contains a G28 — omitting
                 it is fine for programs with no homing move.
-            axes: The three Cartesian axes driven by group moves, in
-                (X, Y, Z) order. Must have exactly 3 elements.
+            axes: The two coordinated-group axes, in (X, Y) order — must
+                have exactly 2 elements. Confirmed on hardware that Z
+                cannot be part of this group (see module docstring).
+            z_axis: The axis driven as a separate single-axis leg whenever
+                a move changes Z (see module docstring's "Z/XY node split"
+                note).
             group_index: Coordinated-group index (the `C<N>` in the ASCII
                 protocol) used for all group moves this executor issues.
             confirm_cb: Optional callback invoked before each LINEAR/HOME/
@@ -470,29 +547,37 @@ class GCodeExecutor:
                 occurs.
 
         Raises:
-            ValueError: If `axes` does not have exactly 3 elements.
+            ValueError: If `axes` does not have exactly 2 elements.
         """
-        if len(axes) != 3:
-            raise ValueError("GCodeExecutor drives exactly 3 Cartesian axes (X, Y, Z)")
+        if len(axes) != 2:
+            raise ValueError(
+                "GCodeExecutor's coordinated group covers exactly 2 axes (X, Y) — "
+                "Z moves separately as its own leg, see module docstring"
+            )
         self._cmd = cmd
         self._checker = checker
         self._homing = homing
         self._axes = axes
+        self._z_axis = z_axis
         self._group_index = group_index
         self._confirm_cb = confirm_cb
         self._dry_run = dry_run
         self._current_pos: Point3D = (0.0, 0.0, 0.0)
         self._pending_program: Optional[GCodeProgram] = None
         self._pending_trajectory: Optional[CheckedTrajectory] = None
+        self._group_initialized = False
 
     def plan(self, text: str) -> CheckedTrajectory:
-        """Parse G-code and fence-check the resulting trajectory.
+        """Parse G-code, split any move that would need simultaneous Z+XY
+        motion into a Z-only leg followed by an XY-only leg (see module
+        docstring's "Z/XY node split" note), and fence-check the result.
 
         Raises FenceViolation if any segment enters an exclusion zone. The
         returned CheckedTrajectory must be passed to execute() unmodified —
         it is the only object execute() will accept.
         """
         program = GCodeParser().parse(text, start=self._current_pos)
+        program.moves = _split_cross_node_moves(program.moves, self._current_pos)
         waypoints = program.to_waypoints(self._current_pos)
         trajectory = self._checker.check_and_wrap(waypoints)
         self._pending_program = program
@@ -511,9 +596,6 @@ class GCodeExecutor:
                 "returned by the most recent plan() call"
             )
         program = self._pending_program
-
-        if any(move.kind == "LINEAR" for move in program.moves):
-            self._init_group()
 
         for move in program.moves:
             if move.kind == "LINEAR":
@@ -539,50 +621,103 @@ class GCodeExecutor:
         return bool(self._confirm_cb(move))
 
     def _init_group(self) -> None:
-        """Initialize the coordinated group (`C<group_index> INI <axis indices>`) before any LINEAR moves.
+        """Initialize the coordinated (X, Y) group (`C<group_index> INI <axis indices>`).
 
-        Called once per execute() call, only if the program contains at
-        least one LINEAR move — dwell/pause/home-only programs never touch
-        the group.
+        Sent at most once per GCodeExecutor instance, lazily on the first
+        XY-leg execution — MMCCommands.init_group's own docstring says
+        "call once after connecting"; re-sending it on every move (the
+        previous behavior here) contradicted that contract. Programs that
+        only ever move Z never touch the group at all.
         """
+        if self._group_initialized:
+            return
         indices = [axis.index for axis in self._axes]
         if self._dry_run:
             logger.info("[dry-run] C%d INI %s", self._group_index, " ".join(str(i) for i in indices))
+            self._group_initialized = True
             return
         self._cmd.init_group(*indices)
+        self._group_initialized = True
 
     def _execute_linear(self, move: GCodeMove) -> None:
-        """Run one LINEAR move: confirm, optionally set group speed, command the move, and block until it finishes.
-
-        This blocks the caller — it polls hardware via
-        _poll_group_move_finished() before returning. Updates
-        `_current_pos` regardless of dry-run.
+        """Run one LINEAR move: confirm, then dispatch to the Z-only or
+        XY-only leg depending on whether this move's Z differs from the
+        position before it (see _split_cross_node_moves — after splitting,
+        a single LINEAR move never changes both). Updates `_current_pos`
+        regardless of dry-run.
 
         Raises:
             GCodeExecutionAborted: If confirm_cb rejects this move.
             SnapMotionError: If the move doesn't finish within the poll
-                timeout (propagated from _poll_group_move_finished).
+                timeout.
         """
         if not self._confirm(move):
             raise GCodeExecutionAborted(f"aborted by confirm_cb: {move.source_line!r}")
+
+        target_z = move.target[2]
+        _, _, current_z = self._current_pos
+        is_z_leg = _moved(target_z, current_z)
+
         if self._dry_run:
-            logger.info("[dry-run] %s", self._describe_linear(move))
+            logger.info("[dry-run] %s", self._describe_linear(move, is_z_leg))
             self._current_pos = move.target
             return
-        if move.feed_mm_s is not None:
-            self._cmd.group_set_speed(move.feed_mm_s)
-        self._cmd.group_begin_move_to(*move.target)
-        self._poll_group_move_finished()
+
+        if is_z_leg:
+            self._execute_z_leg(move)
+        else:
+            self._execute_xy_leg(move)
         self._current_pos = move.target
 
-    def _describe_linear(self, move: GCodeMove) -> str:
+    def _execute_z_leg(self, move: GCodeMove) -> None:
+        """Move Z alone via a single-axis command. Z can't be part of the
+        coordinated group on this hardware (see module docstring) — this
+        is the only way Z ever moves."""
+        if move.feed_mm_s is not None:
+            self._cmd.set_speed(self._z_axis, move.feed_mm_s)
+        self._cmd.begin_move_to(self._z_axis, move.target[2])
+        self._poll_axis_move_finished(self._z_axis)
+
+    def _execute_xy_leg(self, move: GCodeMove) -> None:
+        """Move X/Y via the coordinated group (Z already at its target — see _split_cross_node_moves)."""
+        self._init_group()
+        if move.feed_mm_s is not None:
+            self._cmd.group_set_speed(move.feed_mm_s)
+        self._cmd.group_begin_move_to(move.target[0], move.target[1])
+        self._poll_group_move_finished()
+
+    def _describe_linear(self, move: GCodeMove, is_z_leg: bool) -> str:
         """Render the ASCII commands _execute_linear would send, for dry-run logging."""
         parts = []
-        if move.feed_mm_s is not None:
-            parts.append(f"C{self._group_index} SPD {move.feed_mm_s:.6g}")
-        fmt_pos = " ".join(f"{v:.6g}" for v in move.target)
-        parts.append(f"C{self._group_index} BMT {fmt_pos}")
+        if is_z_leg:
+            if move.feed_mm_s is not None:
+                parts.append(f"{self._z_axis.token()} SPD {move.feed_mm_s:.6g}")
+            parts.append(f"{self._z_axis.token()} BMT {move.target[2]:.6g}")
+        else:
+            if move.feed_mm_s is not None:
+                parts.append(f"C{self._group_index} SPD {move.feed_mm_s:.6g}")
+            fmt_pos = " ".join(f"{v:.6g}" for v in move.target[:2])
+            parts.append(f"C{self._group_index} BMT {fmt_pos}")
         return "; ".join(parts)
+
+    def _poll_axis_move_finished(
+        self, axis: Axis, timeout_s: float = 30.0, poll_interval_s: float = 0.05
+    ) -> None:
+        """Block until the given axis's move-finished flag is set, aborting the move on timeout.
+
+        Raises:
+            SnapMotionError: If the move hasn't finished within
+                `timeout_s`. The in-progress move is aborted (`abort()`)
+                before raising.
+        """
+        deadline = time.monotonic() + timeout_s
+        while not self._cmd.move_is_finished(axis):
+            if time.monotonic() > deadline:
+                self._cmd.abort(axis)
+                raise SnapMotionError(
+                    0, f"{axis.name} move did not finish within {timeout_s:.0f}s — aborted"
+                )
+            time.sleep(poll_interval_s)
 
     def _poll_group_move_finished(self, timeout_s: float = 30.0, poll_interval_s: float = 0.05) -> None:
         """Block until the group's move-finished flag is set, aborting the move on timeout.

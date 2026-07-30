@@ -73,6 +73,9 @@ logs/
 # Sandbox (development scripts, not part of the package)
 sandbox/
 
+# Personal/team notes (incident reports, scratch write-ups) — not part of the package
+notes/
+
 # Experiments and their data (local only, not part of the package)
 experiments/
 
