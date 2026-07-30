@@ -66,6 +66,10 @@ class FakeGo:
         self.fixed_length = 0.0
         self.length_limit_min = 1.0
         self.length_limit_max = 5000.0
+        # Mirrors the real 2690's live-queried ceiling (~443 Hz at stock
+        # FOV/exposure), not the datasheet headline rate.
+        self.frame_rate_limit_min = 0.001
+        self.frame_rate_limit_max = 443.127
         #: Datasets to serve from GoSystem_ReceiveData, one per call.
         self.datasets: list = []
         self._dataset_index = 0
@@ -143,6 +147,12 @@ class FakeGo:
 
     def GoSurfaceGenerationFixedLength_LengthLimitMax(self, surface):
         return self.length_limit_max
+
+    def GoSetup_FrameRateLimitMin(self, setup):
+        return self.frame_rate_limit_min
+
+    def GoSetup_FrameRateLimitMax(self, setup):
+        return self.frame_rate_limit_max
 
     # -- data channel ----------------------------------------------------
 
@@ -298,7 +308,7 @@ def scanner(monkeypatch):
         {
             "ip": "192.168.1.10",
             "travel_speed_mm_s": 20.0,
-            "frame_rate_hz": 500.0,
+            "frame_rate_hz": 400.0,
             "fixed_length_mm": 200.0,
             "output_dir": "/tmp/laguna_test_scans",
         }
@@ -410,12 +420,18 @@ class TestConfigure:
 
     def test_frame_rate_disables_max_rate_first(self, scanner):
         """A specific frame rate requires leaving max-frame-rate mode."""
-        scanner.configure(frame_rate_hz=750.0)
+        scanner.configure(frame_rate_hz=300.0)
         names = scanner._fake.call_names()
         assert names.index("GoSetup_EnableMaxFrameRate") < names.index(
             "GoSetup_SetFrameRate"
         )
-        assert scanner._fake.go.frame_rate == pytest.approx(750.0)
+        assert scanner._fake.go.frame_rate == pytest.approx(300.0)
+
+    def test_frame_rate_above_sensor_limit_rejected(self, scanner):
+        """The real ceiling is FOV/exposure-dependent (~443 Hz here), not the
+        datasheet's headline 10 kHz — reject before the scan, not during."""
+        with pytest.raises(ValueError, match="outside the sensor's current supported"):
+            scanner.configure(frame_rate_hz=5000.0)
 
     def test_flush_pushes_config_last(self, scanner):
         """GoSensor_Flush must come after the setters that need pushing."""
@@ -528,30 +544,57 @@ class TestScanLifecycle:
 # ---------------------------------------------------------------------------
 
 
-class FakeAxis:
-    def __init__(self, name):
+class FakeAxisHandle:
+    """Stand-in for macron.commands.AxisHandle (gantry.axis("X")).
+
+    Mirrors the real one's safe_mode gating on motion-starting calls, which
+    is the whole reason the scanner drives axes through AxisHandle rather
+    than the ungated raw `gantry.cmd` path.
+    """
+
+    def __init__(self, name, calls, safe_mode=False):
         self.name = name
+        self._calls = calls
+        self._safe_mode = safe_mode
 
-
-class FakeCmd:
-    def __init__(self):
-        self.calls = []
-
-    def get_actual_position(self, axis):
+    def get_position(self):
         return 0.0
 
-    def set_speed(self, axis, value):
-        self.calls.append(("set_speed", axis.name, value))
+    def set_speed(self, value):
+        self._calls.append(("set_speed", self.name, value))
         return value
 
-    def begin_move_to(self, axis, position):
-        self.calls.append(("begin_move_to", axis.name, position))
+    def begin_move_to(self, position):
+        if self._safe_mode:
+            raise RuntimeError(
+                f"begin_move_to blocked by safe_mode (axis={self.name!r})"
+            )
+        self._calls.append(("begin_move_to", self.name, position))
 
 
 class FakeGantry:
-    def __init__(self):
-        self._axes = [FakeAxis("X"), FakeAxis("Y")]
-        self.cmd = FakeCmd()
+    def __init__(self, safe_mode=False):
+        self.calls: list = []
+        self._handles = {
+            name: FakeAxisHandle(name, self.calls, safe_mode) for name in ("X", "Y")
+        }
+
+    def axis(self, name):
+        try:
+            return self._handles[name]
+        except KeyError:
+            raise KeyError(
+                f"Axis {name!r} is not configured (configured: {list(self._handles)})"
+            ) from None
+
+    # Present but never used by the scanner — its presence would let an
+    # accidental regression to the ungated path go unnoticed, so it raises.
+    @property
+    def cmd(self):
+        raise AssertionError(
+            "scan_with_gantry must drive axes via gantry.axis(...) (AxisHandle), "
+            "not the ungated gantry.cmd path — see AxisHandle's safe_mode gate"
+        )
 
 
 class TestScanWithGantry:
@@ -562,7 +605,7 @@ class TestScanWithGantry:
         scan = scanner.scan_with_gantry(
             gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
         )
-        assert [c[0] for c in gantry.cmd.calls] == ["set_speed", "begin_move_to"]
+        assert [c[0] for c in gantry.calls] == ["set_speed", "begin_move_to"]
         names = scanner._fake.call_names()
         assert names.index("GoSystem_Start") < names.index("GoSensor_Trigger")
         assert scan.metadata["gantry_axis"] == "X"
@@ -576,14 +619,25 @@ class TestScanWithGantry:
             gantry, axis="X", end_mm=200.0, feed_rate_mm_s=7.5, settle_s=0.0
         )
         assert scanner._fake.go.travel_speed == pytest.approx(7.5)
-        assert gantry.cmd.calls[0] == ("set_speed", "X", 7.5)
+        assert gantry.calls[0] == ("set_speed", "X", 7.5)
 
     def test_unknown_axis_rejected(self, scanner):
         gantry = FakeGantry()
-        with pytest.raises(ValueError, match="not configured on this gantry"):
+        with pytest.raises(KeyError, match="not configured"):
             scanner.scan_with_gantry(
                 gantry, axis="Q", end_mm=10.0, feed_rate_mm_s=5.0
             )
+
+    def test_safe_mode_blocks_the_move(self, scanner):
+        """The scanner must not be a way around the gantry's safe_mode gate."""
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(safe_mode=True)
+        with pytest.raises(RuntimeError, match="safe_mode"):
+            scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+            )
+        # And acquisition is left stopped, not running.
+        assert scanner.get_status()["is_running"] is False
 
     def test_stops_acquisition_when_scan_fails(self, scanner):
         scanner._fake.go.datasets = []
@@ -734,28 +788,56 @@ class TestSurfaceScan:
 
 
 class TestFindLibDir:
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        """Keep these tests hermetic — a real SDK install must not leak in."""
+        monkeypatch.delenv("LAGUNA_GOSDK_LIB_DIR", raising=False)
+        monkeypatch.delenv("LAGUNA_GOSDK_DIR", raising=False)
+
+    def _install(self, path):
+        """Create `path` (if needed) holding both required libraries."""
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "libGoSdk.so").touch()
+        (path / "libkApi.so").touch()
+        return path
+
     def test_explicit_dir_wins(self, tmp_path):
-        (tmp_path / "libGoSdk.so").touch()
-        (tmp_path / "libkApi.so").touch()
-        assert g.find_lib_dir(str(tmp_path)) == tmp_path
+        assert g.find_lib_dir(str(self._install(tmp_path))) == tmp_path
 
     def test_env_var_used(self, tmp_path, monkeypatch):
-        (tmp_path / "libGoSdk.so").touch()
-        (tmp_path / "libkApi.so").touch()
-        monkeypatch.setenv("LAGUNA_GOSDK_LIB_DIR", str(tmp_path))
+        monkeypatch.setenv("LAGUNA_GOSDK_LIB_DIR", str(self._install(tmp_path)))
         assert g.find_lib_dir() == tmp_path
+
+    def test_sdk_root_env_var_appends_lib_subdir(self, tmp_path, monkeypatch):
+        lib_dir = self._install(tmp_path / g._DEFAULT_LIB_SUBDIR)
+        monkeypatch.setenv("LAGUNA_GOSDK_DIR", str(tmp_path))
+        assert g.find_lib_dir() == lib_dir
 
     def test_partial_install_not_accepted(self, tmp_path, monkeypatch):
         """libGoSdk.so alone isn't enough — kApi is required too."""
         (tmp_path / "libGoSdk.so").touch()
         monkeypatch.setenv("LAGUNA_GOSDK_LIB_DIR", str(tmp_path))
-        monkeypatch.delenv("LAGUNA_GOSDK_DIR", raising=False)
-        with pytest.raises(FileNotFoundError, match="build_gosdk.sh"):
+        # A real install elsewhere must not rescue an explicitly-set bad path.
+        monkeypatch.setattr(g, "_DEFAULT_SDK_DIRS", (str(self._install(tmp_path / "real")),))
+        with pytest.raises(FileNotFoundError, match="set explicitly"):
             g.find_lib_dir()
 
+    def test_explicit_bad_path_does_not_fall_back_to_defaults(self, tmp_path, monkeypatch):
+        """Silently loading a different SDK build than the one asked for is a trap."""
+        root = tmp_path / "root"
+        self._install(root / g._DEFAULT_LIB_SUBDIR)
+        monkeypatch.setattr(g, "_DEFAULT_SDK_DIRS", (str(root),))
+        with pytest.raises(FileNotFoundError, match="no default locations were searched"):
+            g.find_lib_dir(str(tmp_path / "does-not-exist"))
+
+    def test_defaults_searched_when_nothing_explicit(self, tmp_path, monkeypatch):
+        """_DEFAULT_SDK_DIRS entries are SDK roots — the lib subdir is appended."""
+        root = tmp_path / "root"
+        lib_dir = self._install(root / g._DEFAULT_LIB_SUBDIR)
+        monkeypatch.setattr(g, "_DEFAULT_SDK_DIRS", (str(tmp_path / "nope"), str(root)))
+        assert g.find_lib_dir() == lib_dir
+
     def test_error_names_the_build_script(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("LAGUNA_GOSDK_LIB_DIR", raising=False)
-        monkeypatch.delenv("LAGUNA_GOSDK_DIR", raising=False)
         monkeypatch.setattr(g, "_DEFAULT_SDK_DIRS", (str(tmp_path / "nope"),))
         with pytest.raises(FileNotFoundError, match="scripts/build_gosdk.sh"):
             g.find_lib_dir()
