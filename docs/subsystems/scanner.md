@@ -40,8 +40,25 @@ eyeballing settings and running alignment.
 
 Don't plan around the datasheet's 10 kHz headline: read live on 2026-07-30,
 this unit's `GoSetup_FrameRateLimitMax` was **443.127 Hz** at its configured
-FOV/exposure/uniform-spacing. `configure()` validates `frame_rate_hz` against
-that live limit and raises rather than letting an over-range value through.
+FOV/exposure/uniform-spacing.
+
+**The ceiling is dynamic, and that's a trap.** With max-frame-rate mode
+enabled it read 443.127 Hz; after `configure()` disabled that mode and set an
+explicit rate, the same accessor read **221.563 Hz** — exactly half, with
+exposure unchanged. So a rate can pass validation at write time and still
+leave the sensor holding a rate it cannot deliver.
+
+This matters because `Y spacing = travel_speed / frame_rate`. A sensor
+quietly running slower than commanded produces a scan that is *distorted
+along travel*, not one that obviously fails. `configure()` therefore
+re-checks after flushing: it raises if the configured rate exceeds the
+post-flush ceiling, and if the sensor reports a different rate than
+requested, it believes the sensor and uses that value for bookkeeping.
+
+Practical guidance: **keep `frame_rate_hz` at or below ~220 Hz** on this unit
+at stock settings, or omit it entirely to let the sensor run at its own
+maximum. Verify with `get_status()["sensor_frame_rate_max_hz"]` after
+configuring, not before.
 
 Settings read off the sensor the same day (its state before laguna touched
 anything): Surface mode, Time trigger, Fixed-Length generation, start trigger
@@ -252,10 +269,16 @@ python -m pytest tests/test_gocator_scanner.py -q
 
 ## Verified against hardware (2026-07-30)
 
-The read path is confirmed working end-to-end from Python against the real
-sensor — SDK loads, all bound symbols resolve, discovery finds the unit,
-`GoSensor_Connect` succeeds, and every settings accessor returns sane values
-(the table above was read this way). Clean disconnect too.
+Confirmed working from Python against the real sensor: SDK loads, all bound
+symbols resolve, discovery finds the unit, connect/disconnect are clean, every
+settings accessor returns sane values, and **`configure()`'s write path
+applies the full recipe and persists it** — read back afterwards as
+`surface` / `time` / `fixed_length` / `software`, with travel speed, fixed
+length and frame rate all landing as set.
+
+Still unverified: `GoSensor_Trigger()` and everything downstream of it (the
+receive path, message-type handling, point-cloud conversion) — nothing has
+produced an actual surface yet.
 
 **Discovery needs UDP broadcast** (port 3220). `GoSystem_FindSensorByIpAddress`
 searches the *discovered* list, so it returns `kERROR_NOT_FOUND` (-999) on a
@@ -269,10 +292,15 @@ see -999, check broadcast reachability before suspecting the IP.
   the SDK is implemented but untested. No SDK sample calls `_Trigger()`, so
   this is the highest-risk assumption in the module. If it doesn't work,
   check what the web UI actually sends.
-- **Nothing has yet *written* to the sensor from laguna** — the hardware
-  verification above was strictly read-only, so `configure()`'s write path
-  (including the `GoTransform_SetSpeed` flash write and the `SEQUENTIAL` →
-  `SOFTWARE` start-trigger change) is still unexercised.
+- **Why the frame-rate ceiling halves** when max-frame-rate mode is disabled
+  is not understood — only that it does, reproducibly, with exposure
+  unchanged. If high Y density matters, this is worth pinning down (try
+  varying exposure, FOV, and uniform spacing and watching
+  `sensor_frame_rate_max_hz`).
+- **Travel speed writes to flash on every change.** `configure()` skips the
+  write when the value is unchanged, but scanning at many different feed
+  rates means many flash writes. Fine at experiment cadence; worth knowing
+  before scripting a sweep over hundreds of speeds.
 - **Confirm which message type the sensor emits** with this configuration
   (`UNIFORM_SURFACE` vs `SURFACE_POINT_CLOUD`). Both paths are implemented;
   only one will exercise on hardware.

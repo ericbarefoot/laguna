@@ -47,6 +47,23 @@ logger = logging.getLogger(__name__)
 #: pass an explicit timeout derived from distance/feed rate.
 DEFAULT_RECEIVE_TIMEOUT_S = 20.0
 
+# Enum value -> label, so get_status() reads as words rather than magic ints.
+_SCAN_MODES = {0: "video", 1: "range", 2: "profile", 3: "surface"}
+_TRIGGER_SOURCES = {0: "time", 1: "encoder", 2: "input", 3: "software"}
+_GENERATION_TYPES = {
+    0: "continuous",
+    1: "fixed_length",
+    2: "variable_length",
+    3: "rotational",
+}
+_START_TRIGGERS = {0: "sequential", 1: "digital", 2: "software"}
+
+
+def _name(mapping: Dict[int, str], value: Any) -> str:
+    """Label an SDK enum value, falling back to the raw number if unknown."""
+    key = int(value)
+    return mapping.get(key, f"unknown({key})")
+
 
 class GocatorScanner:
     """Gocator 2690 surface scanner, shaped as a FlumeLab subsystem.
@@ -203,6 +220,7 @@ class GocatorScanner:
             try:
                 setup = self._lib.handle("GoSensor_Setup", self._sensor)
                 transform = self._lib.handle("GoSensor_Transform", self._sensor)
+                surface = self._lib.handle("GoSetup_SurfaceGeneration", setup)
                 status.update(
                     {
                         "sensor_travel_speed_mm_s": float(
@@ -211,10 +229,30 @@ class GocatorScanner:
                         "sensor_frame_rate_hz": float(
                             self._lib.go.GoSetup_FrameRate(setup)
                         ),
-                        "sensor_trigger_source": int(
-                            self._lib.go.GoSetup_TriggerSource(setup)
+                        "sensor_frame_rate_max_hz": float(
+                            self._lib.go.GoSetup_FrameRateLimitMax(setup)
                         ),
-                        "sensor_scan_mode": int(self._lib.go.GoSetup_ScanMode(setup)),
+                        "sensor_scan_mode": _name(
+                            _SCAN_MODES, self._lib.go.GoSetup_ScanMode(setup)
+                        ),
+                        "sensor_trigger_source": _name(
+                            _TRIGGER_SOURCES, self._lib.go.GoSetup_TriggerSource(setup)
+                        ),
+                        # The two settings that actually define the encoderless
+                        # recipe — worth seeing at a glance, not just inferring.
+                        "sensor_surface_generation": _name(
+                            _GENERATION_TYPES,
+                            self._lib.go.GoSurfaceGeneration_GenerationType(surface),
+                        ),
+                        "sensor_start_trigger": _name(
+                            _START_TRIGGERS,
+                            self._lib.go.GoSurfaceGenerationFixedLength_StartTrigger(
+                                surface
+                            ),
+                        ),
+                        "sensor_fixed_length_mm": float(
+                            self._lib.go.GoSurfaceGenerationFixedLength_Length(surface)
+                        ),
                     }
                 )
             except GoSdkError as e:
@@ -353,6 +391,37 @@ class GocatorScanner:
             self._travel_speed_mm_s = float(speed)
 
         lib.call("GoSensor_Flush", self._sensor)
+
+        # Re-check the frame rate *after* flushing. The sensor's reported
+        # ceiling is dynamic — observed on hardware 2026-07-30 dropping from
+        # 443.127 Hz to 221.563 Hz once max-frame-rate mode was disabled — so
+        # the pre-write check above can pass and still leave the sensor holding
+        # an unachievable rate. That matters because Y spacing is
+        # travel_speed / frame_rate: if the sensor silently runs slower than we
+        # asked, the travel axis is scaled wrong and the scan is quietly
+        # distorted rather than obviously broken.
+        if self._frame_rate_hz:
+            achieved = float(lib.go.GoSetup_FrameRate(setup))
+            ceiling = float(lib.go.GoSetup_FrameRateLimitMax(setup))
+            if ceiling > 0 and self._frame_rate_hz > ceiling + 1e-6:
+                raise ValueError(
+                    f"Sensor reports a maximum frame rate of {ceiling:.3f} Hz "
+                    f"after applying this configuration, but frame_rate_hz is "
+                    f"{self._frame_rate_hz:.3f} Hz. The sensor cannot deliver "
+                    "that rate, so Y spacing (travel_speed / frame_rate) would "
+                    f"be wrong. Set frame_rate_hz <= {ceiling:.3f}, or reduce "
+                    "exposure / field of view / disable uniform spacing to "
+                    "raise the ceiling. Note this ceiling is dynamic — it "
+                    "depends on the rest of the configuration."
+                )
+            if abs(achieved - self._frame_rate_hz) > 1e-3:
+                logger.warning(
+                    "Sensor accepted frame rate %.3f Hz but reports %.3f Hz; "
+                    "using the reported value for Y-spacing bookkeeping.",
+                    self._frame_rate_hz,
+                    achieved,
+                )
+                self._frame_rate_hz = achieved
 
         applied = {
             "travel_speed_mm_s": self._travel_speed_mm_s,
