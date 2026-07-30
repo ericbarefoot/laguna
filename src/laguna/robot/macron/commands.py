@@ -29,7 +29,7 @@ this module does not model them as Axis objects or send A3/A4/A7/A8 commands.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 import logging
 import time
 
@@ -84,7 +84,14 @@ ALL_AXES = (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
 
 @dataclass
 class AxisState:
-    """Snapshot of a single axis's status."""
+    """Snapshot of a single axis's status.
+
+    Each field is queried independently by read_axis_state() — if one
+    query fails (e.g. SnapMotionError from a stalled or faulted axis), its
+    field keeps this dataclass's default value and the error is recorded
+    under that field's name in `errors`, rather than losing every other
+    field's value to a single failing query.
+    """
     actual_position: float = 0.0       # ACP — stepper/commanded tracker
     commanded_position: float = 0.0    # COP — last commanded setpoint
     destination_position: float = 0.0  # DEP — target of current move
@@ -100,6 +107,7 @@ class AxisState:
     capture_has_tripped: bool = False  # CAT — latch flag (cleared by ArmCapture)
     negative_limit: float = 0.0        # NLT — software negative travel limit
     positive_limit: float = 0.0        # PLT — software positive travel limit
+    errors: Dict[str, str] = field(default_factory=dict)  # field name -> error message, if that query failed
 
 
 @dataclass
@@ -720,24 +728,38 @@ class MMCCommands:
     # ------------------------------------------------------------------
 
     def read_axis_state(self, axis: Axis) -> AxisState:
-        """Read all readable axis properties in one batch of queries."""
-        return AxisState(
-            actual_position=self.get_actual_position(axis),
-            commanded_position=self.get_commanded_position(axis),
-            destination_position=self.get_destination_position(axis),
-            encoder_position=self.get_encoder_position(axis),
-            speed=self.get_speed(axis),
-            accel=self.get_accel(axis),
-            decel=self.get_decel(axis),
-            motor_on=self.get_motor(axis),
-            enabled=self.get_enable(axis),
-            move_is_finished=self.move_is_finished(axis),
-            capture_bit=self.get_capture_bit(axis),
-            capture_position=self.get_capture_position(axis),
-            capture_has_tripped=self.capture_has_tripped(axis),
-            negative_limit=self.get_negative_limit(axis),
-            positive_limit=self.get_positive_limit(axis),
-        )
+        """Read all readable axis properties in one batch of queries.
+
+        Each query is issued and caught independently — a single failing
+        query (e.g. a stalled/faulted axis erroring on one specific
+        register) does not lose the rest; that field keeps its default
+        and the failure is recorded in the returned AxisState.errors
+        dict, keyed by field name.
+        """
+        state = AxisState()
+        queries: Dict[str, Callable[[], Any]] = {
+            "actual_position": lambda: self.get_actual_position(axis),
+            "commanded_position": lambda: self.get_commanded_position(axis),
+            "destination_position": lambda: self.get_destination_position(axis),
+            "encoder_position": lambda: self.get_encoder_position(axis),
+            "speed": lambda: self.get_speed(axis),
+            "accel": lambda: self.get_accel(axis),
+            "decel": lambda: self.get_decel(axis),
+            "motor_on": lambda: self.get_motor(axis),
+            "enabled": lambda: self.get_enable(axis),
+            "move_is_finished": lambda: self.move_is_finished(axis),
+            "capture_bit": lambda: self.get_capture_bit(axis),
+            "capture_position": lambda: self.get_capture_position(axis),
+            "capture_has_tripped": lambda: self.capture_has_tripped(axis),
+            "negative_limit": lambda: self.get_negative_limit(axis),
+            "positive_limit": lambda: self.get_positive_limit(axis),
+        }
+        for field_name, query in queries.items():
+            try:
+                setattr(state, field_name, query())
+            except SnapMotionError as exc:
+                state.errors[field_name] = str(exc)
+        return state
 
     # ------------------------------------------------------------------
     # Startup sequence
@@ -860,6 +882,14 @@ class AxisHandle:
     def disable(self) -> None:
         self._cmd.set_enable(self._axis, False)
         self._cmd.set_motor(self._axis, False)
+
+    def get_motor(self) -> bool:
+        """True if this axis's motor drive (MTR) is currently on."""
+        return self._cmd.get_motor(self._axis)
+
+    def get_enable(self) -> bool:
+        """True if this axis is currently enabled (ENA)."""
+        return self._cmd.get_enable(self._axis)
 
     # -- motion (safe_mode-gated) -------------------------------------
 

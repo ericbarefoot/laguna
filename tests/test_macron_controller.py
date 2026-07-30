@@ -155,6 +155,69 @@ class TestSubsystemInterface:
         assert controller.connect() is True
         assert conn.is_connected is True
 
+    def test_connect_enables_and_releases_brakes_on_y_and_z_when_safe_mode_false(self):
+        # Enable-then-release, per axis, strictly in that order (see
+        # _release_brakes_on_connect's docstring): motor torque must be
+        # holding before a fail-safe brake like Z's is released.
+        responses = {
+            "A2 MTR 1": "1", "A2 ENA 1": "1", "SOB 4 1": "0",
+            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",
+        }
+        conn = FakeSnapConnection(responses)
+        controller = GantryController(connection=conn, safe_mode=False)
+        assert controller.connect() is True
+        assert conn.sent == [
+            "A2 MTR 1", "A2 ENA 1", "SOB 4 1",
+            "A5 MTR 1", "A5 ENA 1", "SOB 5 1",
+        ]
+
+    def test_connect_does_not_touch_x_or_theta_on_brake_release(self):
+        # X/Theta have no brake at all -- confirm connect() never touches them.
+        responses = {
+            "A2 MTR 1": "1", "A2 ENA 1": "1", "SOB 4 1": "0",
+            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",
+        }
+        conn = FakeSnapConnection(responses)
+        controller = GantryController(connection=conn, safe_mode=False)
+        controller.connect()
+        assert not any(cmd.startswith("A1 ") for cmd in conn.sent)  # X
+        assert not any(cmd.startswith("A6 ") for cmd in conn.sent)  # Theta
+
+    def test_connect_does_not_touch_brakes_when_safe_mode_true(self):
+        # safe_mode=True (the default) must leave the connection exactly as
+        # found — MTR/SOB are both output-setting commands safe_mode is
+        # supposed to block; any attempt here would hit FakeSnapConnection's
+        # "no scripted response" assertion since responses is empty.
+        conn = FakeSnapConnection({})
+        controller = GantryController(connection=conn, safe_mode=True)
+        assert controller.connect() is True
+        assert conn.sent == []
+
+    def test_connect_skips_brake_release_if_channel_unconfigured_without_raising(self):
+        from laguna.robot.macron.commands import IOMap
+
+        responses = {
+            "A2 MTR 1": "1", "A2 ENA 1": "1",
+            "A5 MTR 1": "1", "A5 ENA 1": "1",
+        }
+        conn = FakeSnapConnection(responses)
+        io_map = IOMap(y_brake_output=None, z_brake_output=None)
+        controller = GantryController(connection=conn, safe_mode=False, io_map=io_map)
+        assert controller.connect() is True  # must not raise despite unconfigured channels
+
+    def test_connect_continues_to_next_axis_if_enable_fails(self):
+        from laguna.robot.macron.connection import SnapMotionError
+
+        responses = {
+            "A2 MTR 1": SnapMotionError(99),  # Y fails to enable
+            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",  # Z still processed
+        }
+        conn = FakeSnapConnection(responses)
+        controller = GantryController(connection=conn, safe_mode=False)
+        assert controller.connect() is True  # connect() itself still succeeds
+        assert "SOB 4 1" not in conn.sent  # Y's brake was never touched — enable failed first
+        assert "SOB 5 1" in conn.sent
+
     def test_disconnect_clears_connected_state(self):
         controller, conn = self._make_controller()
         controller.connect()
@@ -274,6 +337,11 @@ class TestMoveTo:
         with pytest.raises(ValueError):
             controller.move_to(Z=1.0)
 
+    def test_no_vector_or_keywords_raises(self):
+        controller, _conn = self._make_controller({})
+        with pytest.raises(ValueError):
+            controller.move_to()
+
 
 class TestSetPosition:
     """set_position() mirrors laguna.weir.SaflWeirController.set_elevation()
@@ -319,11 +387,6 @@ class TestSetPosition:
         controller, _conn = self._make_controller({})
         with pytest.raises(ValueError):
             controller.set_position()
-
-    def test_no_vector_or_keywords_raises(self):
-        controller, _conn = self._make_controller({})
-        with pytest.raises(ValueError):
-            controller.move_to()
 
 
 class TestHomeEnableDisableWaitForMove:
@@ -389,3 +452,87 @@ class TestHomeEnableDisableWaitForMove:
         controller, _conn = self._make_controller({"C1 MIF": "0"})
         with pytest.raises(TimeoutError):
             controller.wait_for_move(timeout=0.05)
+
+
+class TestSetSafeModeBrakeSync:
+    """set_safe_mode() keeps Y/Z's brakes in sync with the transition:
+    turning safe_mode off releases them (motor enabled first, brake
+    released second); turning it back on re-engages them. See
+    _enable_and_release_brakes()/_engage_brakes() in controller.py.
+    """
+
+    def _make_controller(self, responses=None, safe_mode=True):
+        conn = FakeSnapConnection(responses or {})
+        controller = GantryController(connection=conn, safe_mode=safe_mode)
+        controller._is_connected = True  # simulate an already-connected gantry
+        return controller, conn
+
+    def test_turning_safe_mode_off_enables_and_releases_brakes(self):
+        responses = {
+            "A2 MTR 1": "1", "A2 ENA 1": "1", "SOB 4 1": "0",
+            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",
+        }
+        controller, conn = self._make_controller(responses, safe_mode=True)
+        assert controller.set_safe_mode(False) is True
+        assert conn.sent == [
+            "A2 MTR 1", "A2 ENA 1", "SOB 4 1",
+            "A5 MTR 1", "A5 ENA 1", "SOB 5 1",
+        ]
+
+    def test_turning_safe_mode_on_engages_brakes(self):
+        responses = {"SOB 4 0": "0", "SOB 5 0": "0"}
+        controller, conn = self._make_controller(responses, safe_mode=False)
+        assert controller.set_safe_mode(True) is True
+        assert conn.sent == ["SOB 4 0", "SOB 5 0"]
+
+    def test_no_op_when_not_connected(self):
+        conn = FakeSnapConnection({})  # any brake/enable command would raise (unscripted)
+        controller = GantryController(connection=conn, safe_mode=True)
+        assert controller.set_safe_mode(False) is True
+        assert conn.sent == []
+        assert controller._safe_mode is False
+
+    def test_pi_gantry_connection_engages_brakes_after_reconnect_when_turning_on(self, monkeypatch):
+        from laguna.robot.macron.pi_bridge import PiGantryConnection
+
+        conn = PiGantryConnection(host="fake", ssh_user="oak", remote_serial_device="/dev/fake")
+        controller = GantryController(connection=conn, safe_mode=False)
+        controller._is_connected = True
+        monkeypatch.setattr(controller, "disconnect", lambda: None)
+        monkeypatch.setattr(controller, "connect", lambda: True)
+        engaged = []
+        monkeypatch.setattr(controller, "_engage_brakes", lambda: engaged.append(True))
+
+        assert controller.set_safe_mode(True) is True
+        assert engaged == [True]
+
+    def test_pi_gantry_connection_does_not_engage_brakes_when_turning_off(self, monkeypatch):
+        # connect() itself releases brakes when safe_mode is already False
+        # (tested separately in TestSubsystemInterface) — set_safe_mode()
+        # must not also call _engage_brakes() in this direction.
+        from laguna.robot.macron.pi_bridge import PiGantryConnection
+
+        conn = PiGantryConnection(host="fake", ssh_user="oak", remote_serial_device="/dev/fake")
+        controller = GantryController(connection=conn, safe_mode=True)
+        controller._is_connected = True
+        monkeypatch.setattr(controller, "disconnect", lambda: None)
+        monkeypatch.setattr(controller, "connect", lambda: True)
+        engaged = []
+        monkeypatch.setattr(controller, "_engage_brakes", lambda: engaged.append(True))
+
+        assert controller.set_safe_mode(False) is True
+        assert engaged == []
+
+    def test_pi_gantry_connection_reconnect_failure_propagates_false(self, monkeypatch):
+        from laguna.robot.macron.pi_bridge import PiGantryConnection
+
+        conn = PiGantryConnection(host="fake", ssh_user="oak", remote_serial_device="/dev/fake")
+        controller = GantryController(connection=conn, safe_mode=True)
+        controller._is_connected = True
+        monkeypatch.setattr(controller, "disconnect", lambda: None)
+        monkeypatch.setattr(controller, "connect", lambda: False)
+        engaged = []
+        monkeypatch.setattr(controller, "_engage_brakes", lambda: engaged.append(True))
+
+        assert controller.set_safe_mode(False) is False
+        assert engaged == []  # never reached — reconnect failed first

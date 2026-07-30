@@ -246,11 +246,78 @@ class GantryController:
         try:
             self._connection.connect()
             self._is_connected = self._connection.is_connected
-            return self._is_connected
         except Exception as exc:
             logger.error("Failed to connect gantry: %s", exc)
             self._is_connected = False
             return False
+
+        if self._is_connected and not self._safe_mode:
+            self._enable_and_release_brakes()
+        return self._is_connected
+
+    def _enable_and_release_brakes(self) -> None:
+        """Enable each brake-equipped axis's motor, then release its brake.
+
+        Once the motor is enabled, its own torque holds the axis in place,
+        so a still-engaged brake serves no purpose — and worse, it's a
+        hazard: the next motion command would stall directly against it
+        (this is exactly what corrupted Y's encoder feedback on
+        2026-07-30, requiring a power-cycle to recover).
+
+        Enable-then-release, strictly in that order, and never the
+        reverse: Z's brake is a fail-safe, spring-engaged design (SOB ON =
+        released) — releasing it before the motor is actually holding
+        torque would let a loaded Z axis drop under gravity (see IOMap's
+        docstring in commands.py).
+
+        Called by connect() (only when safe_mode is already False) and by
+        set_safe_mode(False) (transitioning safe_mode off) — see
+        _engage_brakes() for the mirror-image transition back to
+        safe_mode=True. Callers are responsible for the safe_mode check:
+        this method always sends MTR/SOB, which are both output-setting
+        commands safe_mode's "no motion, no output-setting commands"
+        guarantee must hold for (see SAFE_COMMANDS in pi_bridge.py).
+        """
+        for axis in self._axes:
+            if axis not in (Y_AXIS, Z_AXIS):
+                continue
+            handle = self._axis_handles[axis.name]
+            try:
+                handle.enable()
+            except SnapMotionError as exc:
+                logger.warning("Could not enable %s: %s", axis.name, exc)
+                continue
+            try:
+                handle.disengage_brake()
+            except ValueError as exc:
+                logger.info("Not releasing %s's brake: %s", axis.name, exc)
+            except SnapMotionError as exc:
+                logger.warning("Could not disengage %s's brake: %s", axis.name, exc)
+            else:
+                logger.info("%s: motor enabled, brake disengaged", axis.name)
+
+    def _engage_brakes(self) -> None:
+        """Re-engage each brake-equipped axis's brake.
+
+        Mirrors _enable_and_release_brakes() for the transition back to
+        safe_mode=True — see set_safe_mode(). Only engages the brake;
+        deliberately doesn't disable the motor, since disengage/engage is
+        the only thing that was asked for here and safe_mode's own gate
+        (both client- and, for the pi_agent transport, agent-side) is what
+        actually blocks further motion commands from this point on.
+        """
+        for axis in self._axes:
+            if axis not in (Y_AXIS, Z_AXIS):
+                continue
+            handle = self._axis_handles[axis.name]
+            try:
+                handle.engage_brake()
+            except ValueError as exc:
+                logger.info("Not engaging %s's brake: %s", axis.name, exc)
+            except SnapMotionError as exc:
+                logger.warning("Could not engage %s's brake: %s", axis.name, exc)
+            else:
+                logger.info("%s: brake engaged", axis.name)
 
     def disconnect(self) -> None:
         self._connection.disconnect()
@@ -498,7 +565,8 @@ class GantryController:
 
     def set_safe_mode(self, enabled: bool) -> bool:
         """Enable or disable safe_mode, reconnecting the transport if needed
-        so the change actually takes effect.
+        so the change actually takes effect, and syncing Y/Z's brakes to
+        match.
 
         Setting ``self.connection.safe_mode`` directly is not enough for the
         pi_agent transport: gantry_agent.py enforces its own independent
@@ -511,6 +579,16 @@ class GantryController:
         connected, disconnects and reconnects so the agent relaunches with
         the matching flag.
 
+        Brakes follow the same transition, same reasoning as connect()'s
+        automatic release (see _enable_and_release_brakes()): turning
+        safe_mode off means motion is now possible, so Y/Z release (motor
+        enabled first, brake released second — never leave an axis with
+        neither holding it); turning safe_mode back on re-engages them,
+        since safe_mode's own gate is about to block further motion
+        commands from holding the axis via motor torque alone. No-op if
+        not currently connected — connect() will apply the release side of
+        this itself, using whatever safe_mode is set to by then.
+
         Returns:
             True if the change took effect (including a successful
             reconnect, if one was needed); False if a required reconnect
@@ -521,7 +599,19 @@ class GantryController:
             self._connection.safe_mode = enabled
         if isinstance(self._connection, PiGantryConnection) and self._is_connected:
             self.disconnect()
-            return self.connect()
+            if not self.connect():
+                return False
+            # connect() already released brakes if enabled=False (it checks
+            # self._safe_mode itself); it never engages, so that direction
+            # still needs an explicit call here.
+            if enabled:
+                self._engage_brakes()
+            return True
+        if self._is_connected:
+            if enabled:
+                self._engage_brakes()
+            else:
+                self._enable_and_release_brakes()
         return True
 
     def enable(self) -> None:

@@ -220,3 +220,56 @@ class TestAxisHandleMotion:
         with pytest.raises(SnapMotionError):
             handle.move_to(10.0, timeout=0.02)
         assert "A1 ABT" in conn.sent
+
+    def test_get_motor_and_get_enable_delegate_to_the_bound_axis(self):
+        conn = FakeSnapConnection({"A1 MTR": "1", "A1 ENA": "0"})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
+        assert handle.get_motor() is True
+        assert handle.get_enable() is False
+
+
+class TestReadAxisState:
+    """MMCCommands.read_axis_state() (AxisHandle.state()) queries each
+    field independently — a single failing query (e.g. a stalled/faulted
+    axis erroring on one register) must not lose the rest.
+    """
+
+    _ALL_OK_RESPONSES = {
+        "A2 ACP": "10", "A2 COP": "10", "A2 DEP": "10", "A2 ENP": "10",
+        "A2 SPD": "5", "A2 ACL": "100", "A2 DCL": "100",
+        "A2 MTR": "1", "A2 ENA": "1", "A2 MIF": "1",
+        "A2 CAB": "0", "A2 CAP": "0", "A2 CAT": "0",
+        "A2 NLT": "0", "A2 PLT": "0",
+    }
+
+    def test_all_fields_populated_when_every_query_succeeds(self):
+        conn = FakeSnapConnection(self._ALL_OK_RESPONSES)
+        cmd = MMCCommands(conn)
+        state = cmd.read_axis_state(Y_AXIS)
+        assert state.actual_position == 10.0
+        assert state.motor_on is True
+        assert state.errors == {}
+
+    def test_one_failing_query_is_recorded_without_losing_the_others(self):
+        # A stalled/faulted axis might error on one specific register (e.g.
+        # the encoder, ENP) while everything else still reads fine.
+        responses = dict(self._ALL_OK_RESPONSES)
+        responses["A2 ENP"] = SnapMotionError(33)
+        conn = FakeSnapConnection(responses)
+        cmd = MMCCommands(conn)
+        state = cmd.read_axis_state(Y_AXIS)
+        assert state.actual_position == 10.0  # unaffected
+        assert state.motor_on is True          # unaffected
+        assert state.encoder_position == 0.0   # kept at the dataclass default
+        assert "encoder_position" in state.errors
+        assert "33" in state.errors["encoder_position"]
+
+    def test_axis_handle_state_surfaces_the_same_errors_dict(self):
+        responses = dict(self._ALL_OK_RESPONSES)
+        responses["A2 ENP"] = SnapMotionError(33)
+        conn = FakeSnapConnection(responses)
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, Y_AXIS, is_safe_mode=lambda: True)
+        state = handle.state()
+        assert "encoder_position" in state.errors
