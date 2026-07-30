@@ -158,6 +158,20 @@ lab.gocator.save_scan(scan, formats=("npz", "ply"))
 lab.disconnect_all()
 ```
 
+### Gantry prerequisites
+
+Two things must be true before a scan pass can move anything:
+
+- **Transport.** Use `transport: pi_agent`. It launches `gantry_agent.py`
+  over SSH itself, so there's no manual Pi-side step. `socket_bridge` needs
+  `serial_bridge.py` already running on the Pi — started by hand, not a
+  systemd service, doesn't survive a reboot — and gives
+  `Connection refused` on port 9700 when it isn't. The two cannot run at
+  once; they fight over the same serial device. See `docs/MACRON_GANTRY.md`.
+- **`safe_mode: false`.** Every motion command is gated by it, so a scan
+  cannot run with it on. `example_08` checks both up front and fails with
+  an explanation rather than partway through a pass.
+
 `scan_with_gantry()` drives the axis through its `AxisHandle`
 (`gantry.axis("X")`) rather than `gantry.move_to()`, because the trigger must
 fire *while* the axis is mid-move and `move_to()` blocks until the move
