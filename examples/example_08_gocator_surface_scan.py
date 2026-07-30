@@ -104,10 +104,42 @@ def main() -> int:
             logger.info("--dry-run given; not moving the gantry or scanning.")
             return 0
 
-        gantry = GantryController.from_config(lab.config.get("gantry"))
+        gantry_config = lab.config.get("gantry")
+        transport = gantry_config.get("transport", "socket_bridge")
+
+        gantry = GantryController.from_config(gantry_config)
         lab.add(gantry)
         if not gantry.connect():
-            logger.error("Could not connect to the gantry.")
+            logger.error("Could not connect to the gantry (transport=%s).", transport)
+            if transport == "socket_bridge":
+                logger.error(
+                    "socket_bridge needs serial_bridge.py already running on %s:%s. "
+                    "It is started by hand and does not survive a Pi reboot. Either "
+                    "start it, or switch to 'transport: pi_agent', which launches "
+                    "gantry_agent.py over SSH itself — the two cannot run at the "
+                    "same time. See docs/MACRON_GANTRY.md.",
+                    gantry_config.get("host"),
+                    gantry_config.get("bridge_port", 9700),
+                )
+            else:
+                logger.error(
+                    "Check SSH reachability of %s as user %r, and that "
+                    "serial_bridge.py is NOT holding the serial port.",
+                    gantry_config.get("host"),
+                    gantry_config.get("ssh_user", "oak"),
+                )
+            return 1
+
+        # Fail fast rather than partway through a move: safe_mode gates every
+        # motion command, so the scan cannot work with it on.
+        if gantry.get_status().get("safe_mode", True):
+            logger.error(
+                "Gantry safe_mode is enabled — motion commands are blocked, so "
+                "the scan pass cannot run. This is a deliberate guard: enable "
+                "motion only when you have authorization and the work envelope "
+                "is clear, via gantry.set_safe_mode(False) or 'safe_mode: false' "
+                "in the gantry config."
+            )
             return 1
 
         logger.info(
