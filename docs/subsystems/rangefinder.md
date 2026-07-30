@@ -59,15 +59,20 @@ what matters.
 
 ## Quick start (monitoring)
 
+`OD2000Rangefinder`/`WTT12LRangefinder` (both subclasses of the shared
+`RangefinderSubsystem`) follow the same `connect()`/`disconnect()`/
+`get_status()` subsystem shape as `laguna.weir`, so they attach to
+`FlumeLab` the same way (`lab.add(...)` → `lab.od2000`/`lab.wtt12l`):
+
 ```python
 from laguna.config import Config
 from laguna.mqtt import MqttSubscriber
-from laguna.rangefinder import RangefinderSubsystem
+from laguna.rangefinder import OD2000Rangefinder
 
 config = Config("config/example_config.yaml")
 
 mqtt_sub = MqttSubscriber(config.get("mqtt"))
-rangefinder = RangefinderSubsystem(config.get("rangefinder"), mqtt_sub)
+rangefinder = OD2000Rangefinder(config.get("od2000"), mqtt_sub)
 
 rangefinder.connect()        # connects to MQTT broker, subscribes to od2000 topic
 
@@ -81,6 +86,21 @@ time.sleep(1.0)
 sample = rangefinder.get_latest_sample()   # (wall_time, distance_mm)
 print(rangefinder.get_status())
 
+rangefinder.disconnect()
+```
+
+### On-demand reads (no MQTT)
+
+For a one-off interactive read — mirroring `weir.get_elevation()`'s
+synchronous shape — `activate()`/`read_mm()` poll the AL1342 directly over
+HTTP instead of the MQTT stream. Requires `al1342_host` in config
+(the AL1342 has no DNS of its own):
+
+```python
+rangefinder.connect()
+rangefinder.activate()          # turns the OD2000's laser on (no-op for WTT12L)
+print(rangefinder.read_mm())    # single on-demand HTTP read, offset_mm/calibration applied
+rangefinder.deactivate()
 rangefinder.disconnect()
 ```
 

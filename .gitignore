@@ -93,3 +93,6 @@ experiment_events.csv
 
 # MkDocs build output (generated via `mkdocs build`, see mkdocs.yml)
 site/
+
+# Jupyter autosave checkpoints
+.ipynb_checkpoints/

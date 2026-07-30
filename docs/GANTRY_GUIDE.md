@@ -185,8 +185,12 @@ Four independent layers, all active by default:
         hardware
 ```
 
-**No motion has ever been sent to this hardware from this codebase.**
-Every verification so far has been read-only queries.
+**Update, 2026-07-28: motion has since been verified on real hardware** —
+moves, brake engage/disengage, STOP, and a full topographic scan all ran
+successfully (see `docs/MACRON_GANTRY.md`, `docs/RANGEFINDER_PROFILING.md`).
+The safe-mode staging model below is still the right way to approach any
+*new* motion path (a fresh axis, a new script) before trusting it, even
+though the basic move/stop/scan path is now confirmed working.
 
 ## G-code (dry-run example)
 
