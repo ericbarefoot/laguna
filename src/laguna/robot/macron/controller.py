@@ -345,11 +345,40 @@ class GantryController:
 
         Called by FlumeLab.emergency_stop() for every registered subsystem
         that has a stop() method — this is the gantry's emergency-stop path.
+        Hard stop: zero decel ramp (ABT), brakes engaged, motors disabled —
+        moving again afterward needs an explicit enable()/disengage_brake()
+        (or another connect()/set_safe_mode(False), which do both). For a
+        gentler stop that leaves the gantry ready to move immediately, use
+        soft_stop() instead.
         """
         try:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry shutdown: %s", exc)
+
+    def soft_stop(self) -> None:
+        """Decelerate every configured axis to a stop (BST), using each
+        axis's own configured accel/decel ramp — no abrupt zero-ramp abort.
+
+        Unlike stop(), this only stops motion: brakes are left exactly as
+        they were (not engaged) and motors are left enabled, so the gantry
+        is immediately ready for another move_to() afterward — no
+        enable()/disengage_brake() needed first. Use this for an ordinary
+        "cancel the current move" rather than an emergency; use stop() when
+        you actually want the machine locked down.
+
+        Non-blocking, like stop() — returns as soon as the stop commands
+        are sent, not once the axes have actually finished decelerating.
+        Call wait_for_move() afterward if you need to block until they have.
+
+        Never raises; a failure on one axis is logged and doesn't stop the
+        rest from being sent their own stop command.
+        """
+        for axis in self._axes:
+            try:
+                self.cmd.begin_stop(axis)
+            except SnapMotionError as exc:
+                logger.warning("Could not decelerate-stop %s: %s", axis.name, exc)
 
     # ------------------------------------------------------------------
     # Simple verbs (mirrors laguna.weir.SaflWeirController's shape) —

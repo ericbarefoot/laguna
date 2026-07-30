@@ -252,6 +252,34 @@ class TestSubsystemInterface:
         controller.connect()
         controller.stop()  # must not propagate
 
+    def test_soft_stop_sends_bst_to_every_axis(self):
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        controller, conn = self._make_controller(responses)
+        controller.connect()
+        controller.soft_stop()
+        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+
+    def test_soft_stop_does_not_touch_brakes_or_motor(self):
+        # Unlike stop(): no SOB (brake), no MTR (motor disable) commands.
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        controller, conn = self._make_controller(responses)
+        controller.connect()
+        controller.soft_stop()
+        assert not any(cmd.startswith("SOB") for cmd in conn.sent)
+        assert not any("MTR" in cmd for cmd in conn.sent)
+
+    def test_soft_stop_continues_past_a_failing_axis(self):
+        from laguna.robot.macron.connection import SnapMotionError
+
+        responses = {
+            "A1 BST": SnapMotionError(99),
+            "A2 BST": "0", "A5 BST": "0", "A6 BST": "0",
+        }
+        controller, conn = self._make_controller(responses)
+        controller.connect()
+        controller.soft_stop()  # must not raise
+        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+
 
 class TestMoveTo:
     def _make_controller(self, responses=None, mm_per_unit=15.0):
