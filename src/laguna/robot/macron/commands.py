@@ -29,7 +29,7 @@ this module does not model them as Axis objects or send A3/A4/A7/A8 commands.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 import logging
 
 from .connection import SnapConnection, SnapMotionError
@@ -192,13 +192,49 @@ class MMCCommands:
     Methods that can both set and get follow the firmware convention: pass a
     value to set, omit it (or pass None) to read the current value.
 
-    All position/velocity values are in controller user units (assumed mm / mm/s
-    if CountsPerUserUnit is correctly configured on the controller).
+    All position/velocity values are in real mm / mm/s — this class converts
+    to/from the controller's raw ACP user units internally via mm_per_unit
+    and coordinate_offset_mm (see docs/GANTRY_UNIT_CALIBRATION.md: on this
+    hardware 1 raw unit = 15mm on X/Y/Z, not 1mm, until that's fixed at the
+    Snap2Motion/DSM source). This is deliberately the single choke point for
+    that conversion — every position/velocity-reading or -writing method
+    below applies it, so callers never see raw units. Theta (rotary) is
+    exempt — it has its own separate, already-correct conversion, unrelated
+    to this finding.
     """
 
-    def __init__(self, connection: SnapConnection, group_index: int = 1):
+    def __init__(
+        self,
+        connection: SnapConnection,
+        group_index: int = 1,
+        mm_per_unit: float = 1.0,
+        coordinate_offset_mm: Optional[Dict[str, float]] = None,
+        group_axes: tuple[Axis, ...] = (X_AXIS, Y_AXIS, Z_AXIS),
+    ):
+        """
+        Args:
+            connection: Transport to send formatted ASCII commands over.
+            group_index: Coordinated-group index (the `C<N>` prefix).
+            mm_per_unit: Real mm per raw controller (ACP) unit, applied to
+                every linear-axis (X/Y/Z) position/velocity value. Defaults
+                to 1.0 (no conversion) — pass the value from
+                config's `gantry.mm_per_acp_unit` to apply the
+                docs/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
+                Theta.
+            coordinate_offset_mm: Optional {axis_name: offset_mm} real-mm
+                translation from the gantry's raw zero to a real-world
+                origin, applied to position (not velocity/delta) values for
+                linear axes. Axes not present in the dict get 0.0.
+            group_axes: The axes coordinated-group commands' positional
+                arguments map to, in order — must match how the group was
+                configured (e.g. via GCodeExecutor/GantryController). Used
+                only to look up per-axis mm_per_unit/offset for group moves.
+        """
         self._conn = connection
         self._group = group_index
+        self._mm_per_unit = mm_per_unit
+        self._offset = coordinate_offset_mm or {}
+        self._group_axes = group_axes
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -219,6 +255,44 @@ class MMCCommands:
 
     def _fmt_params(self, *values: float) -> str:
         return " ".join(f"{v:.6g}" for v in values)
+
+    # ------------------------------------------------------------------
+    # Unit conversion — real mm <-> raw controller units (linear axes only)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_linear(axis: Axis) -> bool:
+        return axis.name != "Theta"
+
+    def _pos_to_raw(self, axis: Axis, value_mm: float) -> float:
+        """Real mm -> raw units for an absolute position (applies offset)."""
+        if not self._is_linear(axis):
+            return value_mm
+        return (value_mm - self._offset.get(axis.name, 0.0)) / self._mm_per_unit
+
+    def _pos_to_mm(self, axis: Axis, value_raw: float) -> float:
+        """Raw units -> real mm for an absolute position (applies offset)."""
+        if not self._is_linear(axis):
+            return value_raw
+        return value_raw * self._mm_per_unit + self._offset.get(axis.name, 0.0)
+
+    def _delta_to_raw(self, axis: Axis, value_mm: float) -> float:
+        """Real mm(/s) -> raw units for a relative delta/velocity/accel (no offset)."""
+        if not self._is_linear(axis):
+            return value_mm
+        return value_mm / self._mm_per_unit
+
+    def _delta_to_mm(self, axis: Axis, value_raw: float) -> float:
+        """Raw units -> real mm(/s) for a relative delta/velocity/accel (no offset)."""
+        if not self._is_linear(axis):
+            return value_raw
+        return value_raw * self._mm_per_unit
+
+    def _group_pos_to_raw(self, *positions: float) -> tuple:
+        return tuple(self._pos_to_raw(axis, v) for axis, v in zip(self._group_axes, positions))
+
+    def _group_delta_to_raw(self, *deltas: float) -> tuple:
+        return tuple(self._delta_to_raw(axis, v) for axis, v in zip(self._group_axes, deltas))
 
     # ------------------------------------------------------------------
     # Motor & enable
@@ -249,59 +323,66 @@ class MMCCommands:
     # ------------------------------------------------------------------
 
     def get_actual_position(self, axis: Axis) -> float:
-        """Read the axis stepper position tracker (ACP)."""
-        return self._send(f"{self._ax(axis)} ACP")
+        """Read the axis stepper position tracker (ACP), in real mm."""
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ACP"))
 
     def set_actual_position(self, axis: Axis, value: float) -> float:
-        """Set/zero the actual position register (ACP). Returns new value."""
-        return self._send(f"{self._ax(axis)} ACP {value:.6g}")
+        """Set/zero the actual position register (ACP), given real mm. Returns new value in mm."""
+        raw = self._pos_to_raw(axis, value)
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ACP {raw:.6g}"))
 
     def get_encoder_position(self, axis: Axis) -> float:
-        """Read raw encoder position (ENP). Distinct from ACP — use to detect lost steps."""
-        return self._send(f"{self._ax(axis)} ENP")
+        """Read raw encoder position (ENP) in real mm. Distinct from ACP — use to detect lost steps."""
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ENP"))
 
     def set_encoder_position(self, axis: Axis, value: float) -> float:
-        """Zero or offset the encoder position register."""
-        return self._send(f"{self._ax(axis)} ENP {value:.6g}")
+        """Zero or offset the encoder position register, given real mm."""
+        raw = self._pos_to_raw(axis, value)
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ENP {raw:.6g}"))
 
     def get_commanded_position(self, axis: Axis) -> float:
-        return self._send(f"{self._ax(axis)} COP")
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} COP"))
 
     def get_destination_position(self, axis: Axis) -> float:
-        """Read the target position of the current or most recent move (DEP)."""
-        return self._send(f"{self._ax(axis)} DEP")
+        """Read the target position of the current or most recent move (DEP), in real mm."""
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} DEP"))
 
     def set_speed(self, axis: Axis, value: float) -> float:
-        return self._send(f"{self._ax(axis)} SPD {value:.6g}")
+        raw = self._delta_to_raw(axis, value)
+        return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} SPD {raw:.6g}"))
 
     def get_speed(self, axis: Axis) -> float:
-        return self._send(f"{self._ax(axis)} SPD")
+        return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} SPD"))
 
     def set_accel(self, axis: Axis, value: float) -> float:
-        return self._send(f"{self._ax(axis)} ACL {value:.6g}")
+        raw = self._delta_to_raw(axis, value)
+        return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} ACL {raw:.6g}"))
 
     def get_accel(self, axis: Axis) -> float:
-        return self._send(f"{self._ax(axis)} ACL")
+        return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} ACL"))
 
     def set_decel(self, axis: Axis, value: float) -> float:
-        return self._send(f"{self._ax(axis)} DCL {value:.6g}")
+        raw = self._delta_to_raw(axis, value)
+        return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} DCL {raw:.6g}"))
 
     def get_decel(self, axis: Axis) -> float:
-        return self._send(f"{self._ax(axis)} DCL")
+        return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} DCL"))
 
     def set_negative_limit(self, axis: Axis, value: float) -> float:
-        """Set software negative travel limit (NLT). Motion beyond this raises an error."""
-        return self._send(f"{self._ax(axis)} NLT {value:.6g}")
+        """Set software negative travel limit (NLT), given real mm. Motion beyond this raises an error."""
+        raw = self._pos_to_raw(axis, value)
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} NLT {raw:.6g}"))
 
     def get_negative_limit(self, axis: Axis) -> float:
-        return self._send(f"{self._ax(axis)} NLT")
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} NLT"))
 
     def set_positive_limit(self, axis: Axis, value: float) -> float:
-        """Set software positive travel limit (PLT)."""
-        return self._send(f"{self._ax(axis)} PLT {value:.6g}")
+        """Set software positive travel limit (PLT), given real mm."""
+        raw = self._pos_to_raw(axis, value)
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} PLT {raw:.6g}"))
 
     def get_positive_limit(self, axis: Axis) -> float:
-        return self._send(f"{self._ax(axis)} PLT")
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} PLT"))
 
     def validate_soft_limits(
         self, axes: tuple[Axis, ...] = ALL_AXES
@@ -338,27 +419,32 @@ class MMCCommands:
     # ------------------------------------------------------------------
 
     def begin_move_to(self, axis: Axis, position: float) -> None:
-        """Non-blocking absolute move (BMT). Returns immediately; poll MIF to wait."""
-        self._send(f"{self._ax(axis)} BMT {position:.6g}")
+        """Non-blocking absolute move (BMT), given real mm. Returns immediately; poll MIF to wait."""
+        raw = self._pos_to_raw(axis, position)
+        self._send(f"{self._ax(axis)} BMT {raw:.6g}")
 
     def begin_move_by(self, axis: Axis, delta: float) -> None:
-        """Non-blocking relative move (BMB)."""
-        self._send(f"{self._ax(axis)} BMB {delta:.6g}")
+        """Non-blocking relative move (BMB), given real mm."""
+        raw = self._delta_to_raw(axis, delta)
+        self._send(f"{self._ax(axis)} BMB {raw:.6g}")
 
     def move_to(self, axis: Axis, position: float) -> None:
-        """Blocking absolute move (MVT). TCP response held until move completes."""
-        self._send(f"{self._ax(axis)} MVT {position:.6g}")
+        """Blocking absolute move (MVT), given real mm. TCP response held until move completes."""
+        raw = self._pos_to_raw(axis, position)
+        self._send(f"{self._ax(axis)} MVT {raw:.6g}")
 
     def move_by(self, axis: Axis, delta: float) -> None:
-        """Blocking relative move (MVB)."""
-        self._send(f"{self._ax(axis)} MVB {delta:.6g}")
+        """Blocking relative move (MVB), given real mm."""
+        raw = self._delta_to_raw(axis, delta)
+        self._send(f"{self._ax(axis)} MVB {raw:.6g}")
 
     def jog(self, axis: Axis, speed: float) -> float:
-        """Start continuous velocity motion at speed (JOG). Pass 0 to stop.
+        """Start continuous velocity motion at speed (mm/s) (JOG). Pass 0 to stop.
 
-        Speed sign determines direction. Returns the axis speed after command.
+        Speed sign determines direction. Returns the axis speed (mm/s) after command.
         """
-        return self._send(f"{self._ax(axis)} JOG {speed:.6g}")
+        raw = self._delta_to_raw(axis, speed)
+        return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} JOG {raw:.6g}"))
 
     def begin_stop(self, axis: Axis) -> None:
         """Controlled deceleration stop (BST)."""
@@ -395,32 +481,32 @@ class MMCCommands:
         self._send(f"{self._gx()} INI {indices}")
 
     def group_begin_move_to(self, *positions: float) -> None:
-        """Non-blocking coordinated absolute move (BMT on group)."""
-        self._send(f"{self._gx()} BMT {self._fmt_params(*positions)}")
+        """Non-blocking coordinated absolute move (BMT on group), given real mm."""
+        self._send(f"{self._gx()} BMT {self._fmt_params(*self._group_pos_to_raw(*positions))}")
 
     def group_begin_move_by(self, *deltas: float) -> None:
-        """Non-blocking coordinated relative move (BMB on group)."""
-        self._send(f"{self._gx()} BMB {self._fmt_params(*deltas)}")
+        """Non-blocking coordinated relative move (BMB on group), given real mm."""
+        self._send(f"{self._gx()} BMB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
 
     def group_move_to(self, *positions: float) -> None:
-        """Blocking coordinated absolute move (MVT on group)."""
-        self._send(f"{self._gx()} MVT {self._fmt_params(*positions)}")
+        """Blocking coordinated absolute move (MVT on group), given real mm."""
+        self._send(f"{self._gx()} MVT {self._fmt_params(*self._group_pos_to_raw(*positions))}")
 
     def group_move_by(self, *deltas: float) -> None:
-        """Blocking coordinated relative move (MVB on group)."""
-        self._send(f"{self._gx()} MVB {self._fmt_params(*deltas)}")
+        """Blocking coordinated relative move (MVB on group), given real mm."""
+        self._send(f"{self._gx()} MVB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
 
     def append_move_to(self, *positions: float) -> None:
-        """Queue an absolute waypoint into the curve buffer (AMT).
+        """Queue an absolute waypoint into the curve buffer (AMT), given real mm.
 
         Must be called after group_begin_move_to to chain waypoints for
         smooth blended trajectory. The controller executes them in sequence.
         """
-        self._send(f"{self._gx()} AMT {self._fmt_params(*positions)}")
+        self._send(f"{self._gx()} AMT {self._fmt_params(*self._group_pos_to_raw(*positions))}")
 
     def append_move_by(self, *deltas: float) -> None:
-        """Queue a relative waypoint into the curve buffer (AMB)."""
-        self._send(f"{self._gx()} AMB {self._fmt_params(*deltas)}")
+        """Queue a relative waypoint into the curve buffer (AMB), given real mm."""
+        self._send(f"{self._gx()} AMB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
 
     def append_arc(self, radius: float, theta: float, phi: float, extra: Optional[float] = None) -> None:
         """Queue an arc segment (ARC). 3D arc takes radius, theta, phi, plus one extra param."""
@@ -446,20 +532,35 @@ class MMCCommands:
         return bool(self._send(f"{self._gx()} MIF"))
 
     def group_set_speed(self, value: float) -> float:
-        return self._send(f"{self._gx()} SPD {value:.6g}")
+        """Set the group's coordinated move speed, given real mm/s.
+
+        Converted using the group's first axis — coordinated speed is a
+        single scalar shared by all group axes, so this assumes uniform
+        mm_per_unit across the group (true for this hardware: X/Y/Z all
+        measured at the same 15 mm/unit ratio, see
+        docs/GANTRY_UNIT_CALIBRATION.md).
+        """
+        raw = self._delta_to_raw(self._group_axes[0], value) if self._group_axes else value
+        result = self._send(f"{self._gx()} SPD {raw:.6g}")
+        return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_get_speed(self) -> float:
-        return self._send(f"{self._gx()} SPD")
+        result = self._send(f"{self._gx()} SPD")
+        return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_set_accel(self, value: float) -> float:
-        return self._send(f"{self._gx()} ACL {value:.6g}")
+        raw = self._delta_to_raw(self._group_axes[0], value) if self._group_axes else value
+        result = self._send(f"{self._gx()} ACL {raw:.6g}")
+        return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_set_decel(self, value: float) -> float:
-        return self._send(f"{self._gx()} DCL {value:.6g}")
+        raw = self._delta_to_raw(self._group_axes[0], value) if self._group_axes else value
+        result = self._send(f"{self._gx()} DCL {raw:.6g}")
+        return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_set_actual_position(self, *positions: float) -> None:
-        """Zero or offset all group axes simultaneously (ACP on group)."""
-        self._send(f"{self._gx()} ACP {self._fmt_params(*positions)}")
+        """Zero or offset all group axes simultaneously (ACP on group), given real mm."""
+        self._send(f"{self._gx()} ACP {self._fmt_params(*self._group_pos_to_raw(*positions))}")
 
     # ------------------------------------------------------------------
     # Capture mechanism — precise limit-switch / event position latching
@@ -492,12 +593,12 @@ class MMCCommands:
         return bool(self._send(f"{self._ax(axis)} CAB"))
 
     def get_capture_position(self, axis: Axis) -> float:
-        """Read the hardware-latched position at the moment of the capture event (CAP).
+        """Read the hardware-latched position at the moment of the capture event (CAP), in real mm.
 
         This is more precise than polling actual_position because it is
         timestamped at the interrupt level rather than at the poll interval.
         """
-        return self._send(f"{self._ax(axis)} CAP")
+        return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} CAP"))
 
     def capture_has_tripped(self, axis: Axis) -> bool:
         """Return True if a capture event has occurred since last arm_capture (CAT)."""

@@ -18,8 +18,11 @@ a failure on real hardware means the assumption is wrong):
 
 import pytest
 
+from laguna import rangefinder as rangefinder_module
 from laguna.rangefinder import (
+    OD2000Rangefinder,
     RangefinderSubsystem,
+    WTT12LRangefinder,
     decode_dp4200_wtt12l_analog_pdin,
     decode_od2000_pdin,
     decode_wtt12l_pdin,
@@ -391,6 +394,105 @@ def _encode_wtt12l_distance_mm(distance_mm: int, status_byte: int = 0x00) -> str
     """Helper: encode a distance_mm value to an 8-char WTT12L PDIN hex string."""
     raw = distance_mm.to_bytes(2, byteorder="big", signed=False) + b"\x00" + bytes([status_byte])
     return raw.hex().upper()
+
+
+# ---------------------------------------------------------------------------
+# On-demand HTTP path: activate()/deactivate()/read_mm() and the
+# OD2000Rangefinder/WTT12LRangefinder subclasses. read_pdin_hex/write_acyclic
+# are monkeypatched — no real network access.
+# ---------------------------------------------------------------------------
+
+
+class TestOd2000RangefinderOnDemand:
+    def _make(self, **extra_config):
+        mqtt = FakeMqttSubscriber()
+        config = {"topic": "laguna/od2000", "pdin_port": 2, "al1342_host": "192.168.1.251", **extra_config}
+        return OD2000Rangefinder(config, mqtt), mqtt
+
+    def test_subsystem_name(self):
+        assert OD2000Rangefinder.subsystem_name == "od2000"
+
+    def test_read_mm_requires_al1342_host(self):
+        mqtt = FakeMqttSubscriber()
+        rf = OD2000Rangefinder({"topic": "laguna/od2000", "pdin_port": 2}, mqtt)
+        with pytest.raises(RuntimeError):
+            rf.read_mm()
+
+    def test_read_mm_decodes_and_applies_offset(self, monkeypatch):
+        rf, _mqtt = self._make(offset_mm=10.0)
+        monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: _encode_distance_nm(200_000_000))
+        assert abs(rf.read_mm() - 210.0) < 0.001
+
+    def test_activate_writes_laser_on(self, monkeypatch):
+        rf, _mqtt = self._make()
+        calls = []
+        monkeypatch.setattr(
+            rangefinder_module, "write_acyclic",
+            lambda host, port, index, subindex, value: calls.append((host, port, index, subindex, value)),
+        )
+        rf.activate()
+        assert calls == [("192.168.1.251", 2, 97, 0, "00")]
+
+    def test_deactivate_writes_laser_off(self, monkeypatch):
+        rf, _mqtt = self._make()
+        calls = []
+        monkeypatch.setattr(
+            rangefinder_module, "write_acyclic",
+            lambda host, port, index, subindex, value: calls.append(value),
+        )
+        rf.deactivate()
+        assert calls == ["01"]
+
+    def test_activate_requires_al1342_host(self):
+        mqtt = FakeMqttSubscriber()
+        rf = OD2000Rangefinder({"topic": "laguna/od2000", "pdin_port": 2}, mqtt)
+        with pytest.raises(RuntimeError):
+            rf.activate()
+
+
+class TestWtt12lRangefinderOnDemand:
+    def test_subsystem_name(self):
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+        assert rf.subsystem_name == "wtt12l"
+
+    def test_activate_deactivate_are_noops(self, monkeypatch):
+        """The DP4200 analog bridge has no laser control path — activate()/
+        deactivate() must not attempt any AL1342 write."""
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+
+        def fail(*a, **kw):
+            raise AssertionError("write_acyclic should not be called for WTT12LRangefinder")
+
+        monkeypatch.setattr(rangefinder_module, "write_acyclic", fail)
+        rf.activate()
+        rf.deactivate()
+
+    def test_read_mm_uses_dp4200_decoder(self, monkeypatch):
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+        # "2890FD01" -> channel1_raw 0x2890 = 10384 uA -> 10.384 mA -> ~600mm (see decoder tests)
+        monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: "2890FD01")
+        assert abs(rf.read_mm() - 600) < 50
+
+    def test_calibration_applies_against_current_ma_not_distance_mm(self, monkeypatch, tmp_path):
+        from laguna.rangefinder.calibration import CalibrationPoint, LinearCalibration
+
+        cal = LinearCalibration.fit(
+            "wtt12l_powerprox",
+            [CalibrationPoint(known_height_mm=0.0, raw_value=0.0), CalibrationPoint(known_height_mm=100.0, raw_value=10.0)],
+        )
+        cal_path = tmp_path / "wtt12l_cal.csv"
+        cal.to_csv(cal_path)
+
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder(
+            {"pdin_port": 7, "al1342_host": "192.168.1.251", "calibration_file": str(cal_path)}, mqtt
+        )
+        # current_ma = 10.384 for this hex (see decoder tests) -> real_height_mm ~= 103.84
+        monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: "2890FD01")
+        assert abs(rf.read_mm() - 103.84) < 0.01
 
 
 class TestDecodeWtt12lPdin:

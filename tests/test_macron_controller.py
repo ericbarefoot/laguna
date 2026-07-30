@@ -183,3 +183,139 @@ class TestSubsystemInterface:
         controller, _conn = self._make_controller({})  # every command hits an unscripted response
         controller.connect()
         controller.stop()  # must not propagate
+
+
+class TestMoveTo:
+    def _make_controller(self, responses=None, mm_per_unit=15.0):
+        conn = FakeSnapConnection(responses or {})
+        controller = GantryController(connection=conn, mm_per_unit=mm_per_unit)
+        return controller, conn
+
+    def test_vector_move_routes_through_fence_checked_gcode_path(self):
+        # X=150mm, Y=0, Z=0 (raw 10 0 0 at mm_per_unit=15), Theta=0 (unconverted).
+        responses = {
+            "C1 INI 1 2 5": "0",
+            "C1 BMT 10 0 0": "0",
+            "C1 MIF": "1",
+            "A6 MVT 0": "0",
+        }
+        controller, conn = self._make_controller(responses)
+        assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
+        assert conn.sent == ["C1 INI 1 2 5", "C1 BMT 10 0 0", "C1 MIF", "A6 MVT 0"]
+
+    def test_vector_move_length_mismatch_raises(self):
+        controller, _conn = self._make_controller({})
+        with pytest.raises(ValueError):
+            controller.move_to([1.0, 2.0])
+
+    def test_vector_move_is_fence_checked(self):
+        cfg = dict(BASE_CONFIG, fences=[{"type": "box", "name": "bed", "x": [0, 10], "y": [0, 10], "z": [0, 10]}])
+        controller = GantryController.from_config(cfg)
+        from laguna.robot.macron.fences import FenceViolation
+
+        with pytest.raises(FenceViolation):
+            controller.move_to([500.0, 500.0, 5.0, 0.0])
+
+    def test_keyword_move_backfills_other_cartesian_axes_and_routes_through_gcode(self):
+        # Only X given -> Y/Z backfilled via a live get_actual_position()
+        # read, then the whole thing goes through the same coordinated
+        # gcode path as the vector form (C1 INI/SPD/BMT/MIF), not a
+        # single-axis A1 MVT.
+        responses = {
+            "A2 ACP": "0",  # Y backfill
+            "A5 ACP": "0",  # Z backfill
+            "C1 INI 1 2 5": "0",
+            "C1 SPD 0.133333": "0.133333",
+            "C1 BMT 10 0 0": "0",
+            "C1 MIF": "1",
+        }
+        controller, conn = self._make_controller(responses)
+        assert controller.move_to(X=150.0, speed=2.0) is True
+        assert conn.sent == [
+            "A2 ACP", "A5 ACP", "C1 INI 1 2 5", "C1 SPD 0.133333", "C1 BMT 10 0 0", "C1 MIF",
+        ]
+
+    def test_keyword_move_is_fence_checked(self):
+        from laguna.robot.macron.fences import BoxFence, FenceViolation
+
+        conn = FakeSnapConnection({"A2 ACP": "0", "A5 ACP": "0"})
+        controller = GantryController(
+            connection=conn, mm_per_unit=15.0,
+            fences=[BoxFence("bed", 0, 10, 0, 10, 0, 10)],
+        )
+        with pytest.raises(FenceViolation):
+            controller.move_to(X=500.0)  # Y/Z backfill to 0,0 (in-bounds); X clearly outside
+
+    def test_theta_only_keyword_move_does_not_touch_cartesian_axes(self):
+        # A pure Theta move must not query, move, or otherwise touch X/Y/Z
+        # at all — no ACP reads, no C1 group commands.
+        controller, conn = self._make_controller({"A6 MVT 90": "90"})
+        assert controller.move_to(Theta=90.0) is True
+        assert conn.sent == ["A6 MVT 90"]
+
+    def test_keyword_move_of_unconfigured_axis_raises(self):
+        conn = FakeSnapConnection({})
+        controller = GantryController(connection=conn, axes=(X_AXIS, Y_AXIS))  # no Z configured
+        with pytest.raises(ValueError):
+            controller.move_to(Z=1.0)
+
+    def test_no_vector_or_keywords_raises(self):
+        controller, _conn = self._make_controller({})
+        with pytest.raises(ValueError):
+            controller.move_to()
+
+
+class TestHomeEnableDisableWaitForMove:
+    def _make_controller(self, responses=None):
+        conn = FakeSnapConnection(responses or {})
+        controller = GantryController(connection=conn)
+        return controller, conn
+
+    def test_home_delegates_to_homing_home_all(self, monkeypatch):
+        controller, _conn = self._make_controller({})
+        from laguna.robot.macron.homing import HomingResult
+
+        monkeypatch.setattr(controller.homing, "home_all", lambda: HomingResult(success=True, axis_results={}))
+        assert controller.home() is True
+
+    def test_home_reports_failure(self, monkeypatch):
+        controller, _conn = self._make_controller({})
+        from laguna.robot.macron.homing import HomingResult
+
+        monkeypatch.setattr(
+            controller.homing, "home_all",
+            lambda: HomingResult(success=False, axis_results={}, error="timeout"),
+        )
+        assert controller.home() is False
+
+    def test_enable_enables_motor_and_drive_on_every_axis(self):
+        responses = {f"A{i} MTR 1": "1" for i in (1, 2, 5, 6)}
+        responses.update({f"A{i} ENA 1": "1" for i in (1, 2, 5, 6)})
+        controller, conn = self._make_controller(responses)
+        controller.enable()
+        assert "A1 MTR 1" in conn.sent
+        assert "A1 ENA 1" in conn.sent
+
+    def test_disable_disables_drive_and_motor_on_every_axis(self):
+        responses = {f"A{i} ENA 0": "0" for i in (1, 2, 5, 6)}
+        responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)})
+        controller, conn = self._make_controller(responses)
+        controller.disable()
+        assert "A1 ENA 0" in conn.sent
+        assert "A1 MTR 0" in conn.sent
+
+    def test_wait_for_move_polls_until_finished(self):
+        calls = {"n": 0}
+
+        def mif_response(cmd):
+            calls["n"] += 1
+            return "1" if calls["n"] >= 2 else "0"
+
+        controller, _conn = self._make_controller({"C1 MIF": mif_response})
+        controller.wait_for_move(timeout=5.0)
+        assert calls["n"] == 2
+
+    def test_wait_for_move_times_out(self):
+        controller, _conn = self._make_controller({"C1 MIF": "0"})
+        with pytest.raises(TimeoutError):
+            controller.wait_for_move(timeout=0.05)

@@ -37,10 +37,8 @@ a fresh TCP connection per request, not a single occasional read.
    no-valid-return fallback — check the laser is on first.
 """
 
-import json
-import urllib.request
-
 from laguna.rangefinder import decode_od2000_pdin
+from laguna.rangefinder.al1342 import read_pdin_hex, write_acyclic
 
 # --- Connection settings — adjust for your setup ---
 AL1342_IP = "192.168.1.251"
@@ -55,19 +53,7 @@ def read_distance(al1342_ip: str = AL1342_IP, pdin_port: int = PDIN_PORT, timeou
     AL1342 returns a non-200 code (e.g. 503 if the OD2000 is disconnected
     or the port number is wrong).
     """
-    pdin_path = f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/pdin/getdata"
-    payload = json.dumps({"code": "request", "cid": -1, "adr": pdin_path}).encode()
-    req = urllib.request.Request(
-        f"http://{al1342_ip}/", data=payload, headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read())
-
-    if body.get("code") != 200:
-        raise RuntimeError(f"AL1342 returned code {body.get('code')} for {pdin_path} — "
-                            f"check pdin_port and that the OD2000 is connected")
-
-    hex_str = body["data"]["value"]
+    hex_str = read_pdin_hex(al1342_ip, pdin_port, timeout=timeout)
     return decode_od2000_pdin(hex_str)
 
 
@@ -78,20 +64,7 @@ def set_laser(on: bool, al1342_ip: str = AL1342_IP, pdin_port: int = PDIN_PORT, 
     OFF, which is backwards from what you'd guess. Raises RuntimeError if
     the AL1342 doesn't accept the write (e.g. wrong pdin_port).
     """
-    payload = json.dumps({
-        "code": "request", "cid": -1,
-        "adr": f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/iolwriteacyclic",
-        "data": {"index": 97, "subindex": 0, "value": "00" if on else "01"},
-    }).encode()
-    req = urllib.request.Request(
-        f"http://{al1342_ip}/", data=payload, headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read())
-
-    if body.get("code") != 200:
-        raise RuntimeError(f"AL1342 returned code {body.get('code')} setting laser "
-                            f"{'on' if on else 'off'}")
+    write_acyclic(al1342_ip, pdin_port, index=97, subindex=0, value="00" if on else "01", timeout=timeout)
 
 
 def main():

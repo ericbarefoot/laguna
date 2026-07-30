@@ -11,6 +11,7 @@ laguna.weir.SaflWeirController for the established pattern this mirrors).
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .commands import (
@@ -90,6 +91,8 @@ class GantryController:
         fences: Optional[List[Fence]] = None,
         gcode_axes: Tuple[Axis, Axis, Axis] = (X_AXIS, Y_AXIS, Z_AXIS),
         safe_mode: bool = True,
+        mm_per_unit: float = 1.0,
+        coordinate_offset_mm: Optional[Dict[str, float]] = None,
     ):
         self._connection = connection
         self._axes = axes
@@ -98,7 +101,13 @@ class GantryController:
         self._safe_mode = safe_mode
         self._is_connected = False
 
-        self.cmd = MMCCommands(connection, group_index=group_index)
+        self.cmd = MMCCommands(
+            connection,
+            group_index=group_index,
+            mm_per_unit=mm_per_unit,
+            coordinate_offset_mm=coordinate_offset_mm,
+            group_axes=gcode_axes,
+        )
 
         self.fence_registry = FenceRegistry()
         for fence in fences or []:
@@ -152,6 +161,11 @@ class GantryController:
             fences=fences,
             gcode_axes=gcode_axes,
             safe_mode=config.get("safe_mode", True),
+            # Temporary DSM-project workaround — see docs/GANTRY_UNIT_CALIBRATION.md.
+            # Flip gantry.mm_per_acp_unit to 1.0 in config once fixed at the source;
+            # nothing else needs to change.
+            mm_per_unit=config.get("mm_per_acp_unit", 1.0),
+            coordinate_offset_mm=config.get("coordinate_offset"),
         )
 
     # ------------------------------------------------------------------
@@ -200,6 +214,148 @@ class GantryController:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry shutdown: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Simple verbs (mirrors laguna.weir.SaflWeirController's shape) —
+    # the richer per-axis API (self.cmd, self.gcode, self.homing) stays
+    # directly reachable for anything these don't cover.
+    # ------------------------------------------------------------------
+
+    def move_to(
+        self,
+        vector: Optional[List[float]] = None,
+        *,
+        X: Optional[float] = None,
+        Y: Optional[float] = None,
+        Z: Optional[float] = None,
+        Theta: Optional[float] = None,
+        speed: Optional[float] = None,
+    ) -> bool:
+        """Move to an absolute position, in real mm (and degrees/units for Theta).
+
+        Both forms are fence-checked wherever they touch X/Y/Z, routed
+        through the coordinated gcode path (GCodeExecutor.plan/execute) —
+        the same path a hand-written G-code program would use, so a
+        FenceViolation is raised before anything moves.
+
+          - ``move_to([x, y, z, theta])`` — one value per configured axis,
+            in the same order as ``self._axes`` (X, Y, Z, Theta by
+            default).
+          - ``move_to(X=100)`` / ``move_to(X=100, Z=5)`` — move only the
+            given axes. Any configured Cartesian axis *not* given is
+            backfilled with its real current position (a live
+            get_actual_position() read) before the fence check runs, so
+            the checked path reflects where the gantry actually is, not
+            an assumed one.
+
+        Theta is outside the Cartesian gcode/fence model (fences.py only
+        checks X/Y/Z) and is always moved as a separate, non-fence-checked
+        single-axis command. A pure Theta-only call (no X/Y/Z given, in
+        either form) skips the gcode path entirely — it doesn't query,
+        move, or otherwise touch X/Y/Z motors or brakes at all.
+
+        For anything this doesn't cover — bypassing the fence check
+        deliberately, non-coordinated per-axis motion — use self.cmd
+        directly.
+
+        Args:
+            vector: Full-length position vector, or None to use keywords.
+            X, Y, Z, Theta: Per-axis absolute targets (real mm; Theta in
+                whatever unit that axis's raw-to-real conversion yields).
+            speed: Optional feed rate (mm/s) applied to the move(s).
+
+        Returns:
+            True if a move was issued.
+
+        Raises:
+            ValueError: If vector's length doesn't match the configured
+                axes, an axis keyword names an axis not configured on this
+                gantry, or neither vector nor any keyword was given.
+            FenceViolation: If the X/Y/Z path would enter an exclusion zone.
+        """
+        axes_by_name = {axis.name: axis for axis in self._axes}
+
+        if vector is not None:
+            if len(vector) != len(self._axes):
+                raise ValueError(
+                    f"move_to(vector=...) expects {len(self._axes)} values "
+                    f"(one per configured axis: {[a.name for a in self._axes]}), "
+                    f"got {len(vector)}"
+                )
+            target_by_name: Dict[str, float] = {
+                axis.name: value for axis, value in zip(self._axes, vector)
+            }
+        else:
+            target_by_name = {}
+            for name, value in (("X", X), ("Y", Y), ("Z", Z), ("Theta", Theta)):
+                if value is None:
+                    continue
+                if name not in axes_by_name:
+                    raise ValueError(f"Axis {name!r} is not configured on this gantry")
+                target_by_name[name] = value
+            if not target_by_name:
+                raise ValueError("move_to() requires either vector=... or at least one of X=/Y=/Z=/Theta=")
+
+        theta_value = target_by_name.pop("Theta", None)
+
+        cartesian_axes = [axis for axis in self._axes if axis.name != "Theta"]
+        if any(axis.name in target_by_name for axis in cartesian_axes):
+            gcode_words: List[str] = []
+            for axis in cartesian_axes:
+                value = target_by_name.get(axis.name)
+                if value is None:
+                    value = self.cmd.get_actual_position(axis)  # backfill: real current position
+                gcode_words.append(f"{axis.name}{value:.6f}")
+            if speed is not None:
+                gcode_words.append(f"F{speed * 60:.6f}")  # gcode feed rate is mm/min
+            text = "G90\nG1 " + " ".join(gcode_words)
+            trajectory = self.gcode.plan(text)
+            self.gcode.execute(trajectory)
+
+        if theta_value is not None:
+            theta_axis = axes_by_name["Theta"]
+            if speed is not None:
+                self.cmd.set_speed(theta_axis, speed)
+            self.cmd.move_to(theta_axis, theta_value)
+
+        return True
+
+    def home(self) -> bool:
+        """Run the homing routine on all configured axes.
+
+        Returns:
+            True if homing completed successfully on every axis.
+        """
+        result = self.homing.home_all()
+        return result.success
+
+    def enable(self) -> None:
+        """Enable motor drive on all configured axes."""
+        for axis in self._axes:
+            self.cmd.set_motor(axis, True)
+            self.cmd.set_enable(axis, True)
+
+    def disable(self) -> None:
+        """Disable motor drive on all configured axes (allows manual repositioning)."""
+        for axis in self._axes:
+            self.cmd.set_enable(axis, False)
+            self.cmd.set_motor(axis, False)
+
+    def wait_for_move(self, timeout: float = 30.0) -> None:
+        """Block until the coordinated group's current move completes, or timeout elapses.
+
+        Only tracks the coordinated (X/Y/Z) group — a Theta-only move
+        issued via move_to(Theta=...) isn't covered by this; poll
+        self.cmd.move_is_finished(THETA_AXIS) directly for that.
+
+        Raises:
+            TimeoutError: If the move hasn't finished within `timeout`.
+        """
+        deadline = time.monotonic() + timeout
+        while not self.cmd.group_move_is_finished():
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Gantry move did not finish within {timeout:.0f}s")
+            time.sleep(0.05)
 
 
 def _build_transport(config: Dict[str, Any]) -> SnapConnection:

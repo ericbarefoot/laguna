@@ -96,6 +96,22 @@ except ImportError:
     sys.exit(1)
 
 
+# Real mm per raw controller (ACP) unit on the linear (X/Y/Z) axes —
+# confirmed on hardware 2026-07-28, see docs/GANTRY_UNIT_CALIBRATION.md.
+# This is the ONE place scan math converts between the two: incoming
+# end_mm/feed_rate_mm_s (real mm, from the scan_start request) are divided
+# by this to get the raw ACP values the BMT/SPD hardware commands need;
+# start_pos_mm/accel_mm_s2/decel_mm_s2/actual_end_mm (read from the
+# controller as raw ACP/ACL/DCL) are multiplied by this before being used
+# in dead-reckoning math or reported back — so scan_done/scan_started
+# results and the CSV's pos_mm column are real mm end-to-end. If the
+# Snap2Motion/DSM project's axis scale is fixed at the source, flip this to
+# 1.0 — nothing else in this file needs to change. Kept as a plain
+# module-level literal (not imported from laguna.config) for the same
+# standalone-deployment reason SAFE_COMMANDS is duplicated rather than
+# imported — see module docstring.
+MM_PER_ACP_UNIT = 15.0
+
 # Kept in sync by hand with pi_bridge.py's SAFE_COMMANDS — see module
 # docstring for why this can't just be a shared import.
 SAFE_COMMANDS = {
@@ -473,11 +489,14 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
             daemon=True,
         )
 
-        bridge.send(f"{ax} SPD {feed_rate_mm_s}", timeout=5.0)
+        feed_rate_raw = feed_rate_mm_s / MM_PER_ACP_UNIT
+        end_raw = end_mm / MM_PER_ACP_UNIT
+        bridge.send(f"{ax} SPD {feed_rate_raw}", timeout=5.0)
         poll_thread.start()
-        bridge.send(f"{ax} BMT {end_mm}", timeout=5.0)
+        bridge.send(f"{ax} BMT {end_raw}", timeout=5.0)
         t_move_start = time.time()
-        _log(f"Scan move started: {ax} -> {end_mm} mm at {feed_rate_mm_s} mm/s")
+        _log(f"Scan move started: {ax} -> {end_mm} mm at {feed_rate_mm_s} mm/s "
+             f"(raw: {end_raw:.3f} @ {feed_rate_raw:.3f})")
 
         while True:
             if stop_event.is_set():
@@ -507,7 +526,7 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
                 break
 
         actual_end_raw = bridge.send(f"{ax} ACP", timeout=5.0)
-        actual_end_mm = float(_parse_blc_response(actual_end_raw))
+        actual_end_mm = float(_parse_blc_response(actual_end_raw)) * MM_PER_ACP_UNIT
 
     except Exception as exc:
         _log(f"SCAN ERROR: {exc}")
@@ -695,11 +714,11 @@ def main() -> None:
 
             try:
                 start_raw = bridge.send(f"{axis} ACP", timeout=5.0)
-                start_pos_mm = float(_parse_blc_response(start_raw))
+                start_pos_mm = float(_parse_blc_response(start_raw)) * MM_PER_ACP_UNIT
                 acl_raw = bridge.send(f"{axis} ACL", timeout=5.0)
-                accel_mm_s2 = float(_parse_blc_response(acl_raw))
+                accel_mm_s2 = float(_parse_blc_response(acl_raw)) * MM_PER_ACP_UNIT
                 dcl_raw = bridge.send(f"{axis} DCL", timeout=5.0)
-                decel_mm_s2 = float(_parse_blc_response(dcl_raw))
+                decel_mm_s2 = float(_parse_blc_response(dcl_raw)) * MM_PER_ACP_UNIT
             except Exception as exc:
                 _log(f"scan_start: failed to query axis state: {exc}")
                 _emit({"id": request_id, "error": f"failed to query axis state: {exc}"})

@@ -44,42 +44,22 @@ Design note on what "raw_value" means per device:
 from __future__ import annotations
 
 import argparse
-import json
 import statistics
 import sys
 import time
-import urllib.request
 from typing import Callable, List
 
 from laguna.rangefinder import decode_dp4200_wtt12l_analog_pdin, decode_od2000_pdin
+from laguna.rangefinder.al1342 import read_pdin_hex
 from laguna.rangefinder.calibration import CalibrationPoint, LinearCalibration
 
 
-def _al1342_pdin_hex(al1342_ip: str, pdin_port: int, timeout: float = 5.0) -> str:
-    """One on-demand pdin/getdata read against the AL1342. See
-    docs/MQTT_AL1342_SETUP.md — the AL1342 has no DNS of its own, address
-    it by raw IP, and this is plain HTTP POST, not MQTT."""
-    adr = f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/pdin/getdata"
-    payload = json.dumps({"code": "request", "cid": -1, "adr": adr}).encode()
-    req = urllib.request.Request(
-        f"http://{al1342_ip}/", data=payload, headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read())
-    if body.get("code") != 200:
-        raise RuntimeError(
-            f"AL1342 returned code {body.get('code')} for {adr} — "
-            f"check pdin_port and that the device is connected"
-        )
-    return body["data"]["value"]
-
-
 def _read_od2000_raw(al1342_ip: str, pdin_port: int) -> float:
-    return decode_od2000_pdin(_al1342_pdin_hex(al1342_ip, pdin_port))["distance_mm"]
+    return decode_od2000_pdin(read_pdin_hex(al1342_ip, pdin_port))["distance_mm"]
 
 
 def _read_wtt12l_powerprox_raw(al1342_ip: str, pdin_port: int) -> float:
-    return decode_dp4200_wtt12l_analog_pdin(_al1342_pdin_hex(al1342_ip, pdin_port))["current_ma"]
+    return decode_dp4200_wtt12l_analog_pdin(read_pdin_hex(al1342_ip, pdin_port))["current_ma"]
 
 
 DEVICES: dict = {

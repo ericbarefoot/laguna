@@ -29,7 +29,7 @@ class FlumeLab:
     Example::
 
         lab = FlumeLab("config.yaml")
-        lab.add(CameraManager(configs)).add(RobotController(cfg))
+        lab.add(CameraManager(configs)).add(GantryController.from_config(lab.config.get("gantry")))
         lab.connect_all()
         with lab.experiment() as clock:
             lab.scheduler.run(duration=300)
@@ -69,11 +69,11 @@ class FlumeLab:
 
         The subsystem is stored both in ``self._subsystems`` (keyed by name)
         and as a direct attribute (``self.<subsystem_name>``), making
-        ``lab.cameras``, ``lab.robot``, etc. work naturally.
+        ``lab.cameras``, ``lab.gantry``, etc. work naturally.
 
         Args:
             subsystem: Any object with a ``subsystem_name`` class or instance
-                       attribute (e.g. CameraManager, RobotController).
+                       attribute (e.g. CameraManager, GantryController).
 
         Returns:
             self — so calls can be chained: ``lab.add(cam).add(robot)``
@@ -345,6 +345,128 @@ class FlumeLab:
         else:
             logger.info("Resuming experiment for %.1f more seconds...", remaining_s)
         return self.scheduler.run_async(remaining_s)
+
+    # ------------------------------------------------------------------
+    # Simple verbs — thin delegates to the richer per-subsystem API, for
+    # the most common actions (see laguna.robot.macron.controller.GantryController
+    # and laguna.robot.macron.profiler.TopographicProfiler for everything
+    # these don't cover).
+    # ------------------------------------------------------------------
+
+    def move_to(self, vector: Optional[list] = None, **axes) -> bool:
+        """Move the gantry to an absolute position.
+
+        Thin delegate to ``self.gantry.move_to()`` — see
+        GantryController.move_to() for the full vector
+        (``move_to([x, y, z, theta])``) vs. per-axis keyword
+        (``move_to(X=100)``) forms.
+
+        Raises:
+            RuntimeError: If no 'gantry' subsystem is registered.
+        """
+        gantry = self._subsystems.get("gantry")
+        if gantry is None:
+            raise RuntimeError("move_to() requires a 'gantry' subsystem — lab.add(GantryController(...))")
+        return gantry.move_to(vector, **axes)
+
+    def acquire_scan(
+        self,
+        instrument: str,
+        start: Optional[list] = None,
+        end: Optional[list] = None,
+        output: Optional[str] = None,
+        feed_rate_mm_s: Optional[float] = None,
+    ):
+        """Move to `start` (if given) and scan to `end`, saving a topographic profile.
+
+        `start`/`end` are full position vectors, one value per configured
+        gantry axis (same order as move_to()'s vector form) — exactly one
+        component may differ between them, since a single scan pass only
+        moves one axis (see TopographicProfiler.scan()); that's the axis
+        actually scanned.
+
+        Args:
+            instrument: "od2000" or "wtt12l" (alias for "wtt12l_powerprox")
+                — selects which rangefinder feeds the scan, and whose
+                config section (al1342_host, pdin_port) is used.
+            start: Optional full position vector to move to before
+                scanning. If omitted, the scan starts from wherever the
+                gantry already is.
+            end: Full position vector marking where the scan axis should
+                stop. Required.
+            output: Optional CSV path for the result (renamed from the
+                profiler's default auto-timestamped path). If omitted, the
+                default output_dir/timestamped path is used.
+            feed_rate_mm_s: Scan speed in mm/s. Required — deliberately no
+                default, since this drives a real hardware move.
+
+        Returns:
+            ProfileResult (path, metadata, DataFrame) — see
+            laguna.robot.macron.profiler.ProfileResult.
+
+        Raises:
+            RuntimeError: If no 'gantry' subsystem is registered.
+            ValueError: If `end` or `feed_rate_mm_s` is missing, `start`/
+                `end` don't match the configured axis count, or they don't
+                differ on exactly one axis.
+            KeyError: If no config section exists for `instrument`.
+        """
+        from laguna.robot.macron.profiler import TopographicProfiler
+
+        gantry = self._subsystems.get("gantry")
+        if gantry is None:
+            raise RuntimeError("acquire_scan() requires a 'gantry' subsystem — lab.add(GantryController(...))")
+        if end is None:
+            raise ValueError("acquire_scan() requires end=[...]")
+        if feed_rate_mm_s is None:
+            raise ValueError("acquire_scan() requires feed_rate_mm_s — no default for a hardware move")
+
+        if start is not None:
+            self.move_to(start)
+
+        axis_names = [axis.name for axis in gantry._axes]
+        if start is None:
+            start = [gantry.cmd.get_actual_position(axis) for axis in gantry._axes]
+        if len(start) != len(axis_names) or len(end) != len(axis_names):
+            raise ValueError(
+                f"start/end must have {len(axis_names)} values (one per configured axis: {axis_names})"
+            )
+
+        differing = [name for name, s, e in zip(axis_names, start, end) if abs(e - s) > 1e-9]
+        if len(differing) != 1:
+            raise ValueError(
+                "acquire_scan() infers the scan axis as the single component where "
+                f"start and end differ; got {len(differing)} differing axes: {differing}"
+            )
+        scan_axis = next(axis for axis in gantry._axes if axis.name == differing[0])
+        end_mm = end[axis_names.index(differing[0])]
+
+        sensor = "wtt12l_powerprox" if instrument in ("wtt12l", "wtt12l_powerprox") else instrument
+        rf_config = self.config.get(instrument)
+        gantry_config = self.config.get("gantry")
+
+        profiler = TopographicProfiler(
+            gantry=gantry,
+            pi_host=gantry_config.get("host"),
+            pi_user=gantry_config.get("ssh_user", "oak"),
+            pi_key=gantry_config.get("ssh_key"),
+            pdin_port=rf_config.get("pdin_port", 1),
+            al1342_host=rf_config.get("al1342_host"),
+            output_dir=str(Path(output).parent) if output else "/tmp",
+            sensor=sensor,
+        )
+        result = profiler.scan(axis=scan_axis.token(), end_mm=end_mm, feed_rate_mm_s=feed_rate_mm_s)
+
+        if output:
+            output_path = Path(output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            old_meta = Path(str(result.path).replace(".csv", "_meta.json"))
+            result.path.replace(output_path)
+            if old_meta.exists():
+                old_meta.replace(Path(str(output_path).replace(".csv", "_meta.json")))
+            result.path = output_path
+
+        return result
 
     def emergency_stop(self) -> None:
         """Emergency stop — immediately shut down all registered systems."""

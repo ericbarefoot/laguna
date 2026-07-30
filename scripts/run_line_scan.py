@@ -14,20 +14,14 @@ analog-input bridge (its own native IO-Link process data never validated
 on this AL1342), so it has no programmatic laser control — see that doc's
 "Consequence: no programmatic laser control on this path".
 
---- Real-world units: two independent corrections applied here ---
+--- Real-world units ---
 
-1. Horizontal (position along the scan axis): TopographicProfiler /
-   gantry_agent.py's CSV `pos_mm` column is, despite the name, raw ACP
-   controller units, not real mm — confirmed 15 mm/unit on this hardware
-   (see docs/GANTRY_UNIT_CALIBRATION.md). That finding was only patched
-   into examples/example_05_gantry_single_axis.py as a stopgap; this
-   script applies the same MM_PER_ACP_UNIT stopgap to the scan CSV's
-   position column specifically (`real_pos_mm`), rather than waiting on
-   the deeper source-level fix described in that doc (reconfiguring the
-   Snap2Motion axis scale, or threading the conversion through
-   commands.py/gantry_agent.py/profiler.py). If that deeper fix lands,
-   MM_PER_ACP_UNIT here should become 1.0 and eventually this whole
-   correction step deleted.
+1. Horizontal (position along the scan axis): gantry_agent.py now applies
+   the 15 mm/unit conversion itself (see its MM_PER_ACP_UNIT constant and
+   docs/GANTRY_UNIT_CALIBRATION.md), so TopographicProfiler's CSV `pos_mm`
+   column and `actual_start_mm`/`actual_end_mm` metadata are already real
+   mm — this script no longer needs to convert them itself. `--distance-mm`
+   below is passed straight through as real mm.
 
 2. Vertical (sensor reading -> real height): a linear (slope + intercept)
    correction from laguna.rangefinder.calibration, fitted against known
@@ -96,10 +90,11 @@ SENSOR_DEFAULTS = {
     "wtt12l_powerprox": {"pdin_port": 7, "raw_column": "current_ma"},
 }
 
-# --- Horizontal unit stopgap — see module docstring point 1 and
-# docs/GANTRY_UNIT_CALIBRATION.md. Same constant as
-# examples/example_05_gantry_single_axis.py; keep in sync by hand until
-# the deeper fix lands (that doc's "Fallback" section, item 3). ---
+# --- Horizontal unit conversion — see module docstring point 1 and
+# docs/GANTRY_UNIT_CALIBRATION.md. Used only to interpret this script's own
+# direct `ACP` query below (a raw passthrough command, not routed through
+# gantry_agent.py's scan protocol, which now converts internally) — keep in
+# sync by hand with gantry_agent.py's MM_PER_ACP_UNIT. ---
 MM_PER_ACP_UNIT = 15.0
 
 DEFAULT_OUTPUT_DIR = "experiments/scan_output"
@@ -109,11 +104,15 @@ def add_real_world_columns(
     df: pd.DataFrame,
     calibration: "LinearCalibration | None",
     raw_column: str = "distance_mm",
-    mm_per_acp_unit: float = MM_PER_ACP_UNIT,
 ) -> pd.DataFrame:
     """Add real_pos_mm (always) and real_height_mm (if a calibration is
-    given) to a raw scan DataFrame. Returns a new DataFrame — does not
-    mutate the input.
+    given) to a scan DataFrame. Returns a new DataFrame — does not mutate
+    the input.
+
+    `pos_mm` is already real mm as of gantry_agent.py's own
+    MM_PER_ACP_UNIT conversion (docs/GANTRY_UNIT_CALIBRATION.md) — this
+    just copies it to `real_pos_mm` for a consistent column name across
+    calibrated and uncalibrated output.
 
     raw_column: which CSV column the calibration was fitted against and
     should be applied to — "distance_mm" for od2000, "current_ma" for
@@ -122,7 +121,7 @@ def add_real_world_columns(
 
     Kept as a standalone function (not buried in main()) so it's usable
     directly against an already-retrieved CSV, e.g. to re-derive real
-    units from an old raw scan without re-running it:
+    units from an old scan without re-running it:
 
         df = pd.read_csv("profile_20260728_221009.csv")
         cal = LinearCalibration.from_csv("od2000_cal.csv")
@@ -130,7 +129,7 @@ def add_real_world_columns(
             "profile_..._real_units.csv")
     """
     out = df.copy()
-    out["real_pos_mm"] = out["pos_mm"] * mm_per_acp_unit
+    out["real_pos_mm"] = out["pos_mm"]
     if calibration is not None:
         out["real_height_mm"] = calibration.apply(out[raw_column])
     return out
@@ -146,9 +145,12 @@ def run_scan(
     pdin_port: int,
 ) -> ProfileResult:
     """Run one line scan on `axis` (raw "A1"/"A2" form), relative distance
-    `distance_mm` (real mm — converted to raw ACP units here before being
-    passed to TopographicProfiler.scan(), which still speaks raw units;
-    see module docstring point 1) from wherever the axis currently is.
+    `distance_mm` (real mm) from wherever the axis currently is.
+
+    TopographicProfiler.scan() (via gantry_agent.py) now speaks real mm
+    directly, so only the initial position query needs local unit
+    conversion (it's a raw `ACP` passthrough command, not routed through
+    the scan protocol) — see module docstring point 1.
 
     Runs the scan on a background thread while the main thread waits for
     either scan completion or the user typing 'stop' + Enter — NOT "open a
@@ -160,10 +162,8 @@ def run_scan(
     start_raw = float(conn.send(f"{axis} ACP"))
     start_mm = start_raw * MM_PER_ACP_UNIT
     target_mm = start_mm + distance_mm
-    target_raw = target_mm / MM_PER_ACP_UNIT
-    rate_raw = rate_mm_s / MM_PER_ACP_UNIT
     print(f"Current position: {start_mm:.3f} mm ({start_raw:.3f} raw units)")
-    print(f"Scan target ({distance_mm:+.3f} mm): {target_mm:.3f} mm ({target_raw:.3f} raw units)")
+    print(f"Scan target ({distance_mm:+.3f} mm): {target_mm:.3f} mm")
 
     gantry = GantryController(connection=conn)
     profiler = TopographicProfiler(
@@ -193,7 +193,7 @@ def run_scan(
 
     def do_scan():
         try:
-            scan_result["value"] = profiler.scan(axis=axis, end_mm=target_raw, feed_rate_mm_s=rate_raw)
+            scan_result["value"] = profiler.scan(axis=axis, end_mm=target_mm, feed_rate_mm_s=rate_mm_s)
         except Exception as exc:
             scan_result["error"] = exc
 
@@ -288,9 +288,9 @@ def main() -> None:
         print("=== Scan complete ===")
         print(f"Samples collected : {result.metadata['samples']}")
         print(f"Achieved rate     : {result.metadata.get('achieved_rate_hz', 0):.1f} Hz")
-        print(f"Start position    : {result.metadata['actual_start_mm'] * MM_PER_ACP_UNIT:.3f} mm")
-        print(f"End position      : {result.metadata['actual_end_mm'] * MM_PER_ACP_UNIT:.3f} mm")
-        print(f"Actual distance   : {result.metadata['actual_distance_mm'] * MM_PER_ACP_UNIT:.3f} mm")
+        print(f"Start position    : {result.metadata['actual_start_mm']:.3f} mm")
+        print(f"End position      : {result.metadata['actual_end_mm']:.3f} mm")
+        print(f"Actual distance   : {result.metadata['actual_distance_mm']:.3f} mm")
         print(f"Raw CSV path      : {result.path}")
 
         if result.df is None:
