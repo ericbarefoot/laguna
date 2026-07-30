@@ -63,6 +63,8 @@ class FakeGo:
         self.frame_rate = 0.0
         self.trigger_source = -1
         self.scan_mode = -1
+        self.generation_type = -1
+        self.start_trigger = -1
         self.fixed_length = 0.0
         self.length_limit_min = 1.0
         self.length_limit_max = 5000.0
@@ -128,6 +130,18 @@ class FakeGo:
         self.fixed_length = float(_val(length))
         return g.kOK
 
+    def GoSurfaceGeneration_SetGenerationType(self, surface, gen_type):
+        self._record("GoSurfaceGeneration_SetGenerationType", (surface, gen_type))
+        self.generation_type = int(_val(gen_type))
+        return g.kOK
+
+    def GoSurfaceGenerationFixedLength_SetStartTrigger(self, surface, trigger):
+        self._record(
+            "GoSurfaceGenerationFixedLength_SetStartTrigger", (surface, trigger)
+        )
+        self.start_trigger = int(_val(trigger))
+        return g.kOK
+
     # -- getters ---------------------------------------------------------
 
     def GoTransform_Speed(self, transform):
@@ -153,6 +167,15 @@ class FakeGo:
 
     def GoSetup_FrameRateLimitMax(self, setup):
         return self.frame_rate_limit_max
+
+    def GoSurfaceGeneration_GenerationType(self, surface):
+        return self.generation_type
+
+    def GoSurfaceGenerationFixedLength_StartTrigger(self, surface):
+        return self.start_trigger
+
+    def GoSurfaceGenerationFixedLength_Length(self, surface):
+        return self.fixed_length
 
     # -- data channel ----------------------------------------------------
 
@@ -433,6 +456,37 @@ class TestConfigure:
         with pytest.raises(ValueError, match="outside the sensor's current supported"):
             scanner.configure(frame_rate_hz=5000.0)
 
+    def test_frame_rate_rechecked_after_flush(self, scanner):
+        """The ceiling is dynamic: observed on hardware dropping by half once
+        max-frame-rate mode was disabled. A rate that passed the pre-write
+        check must still be caught if the post-flush ceiling moved below it,
+        because an unachievable rate silently corrupts Y spacing."""
+        fake = scanner._fake.go
+        original_flush = fake.GoSensor_Flush
+
+        def flush_and_drop_ceiling(sensor):
+            fake.frame_rate_limit_max = 221.563   # ceiling halves post-flush
+            return original_flush(sensor)
+
+        fake.GoSensor_Flush = flush_and_drop_ceiling
+        with pytest.raises(ValueError, match="cannot deliver that rate|maximum frame rate"):
+            scanner.configure(frame_rate_hz=400.0)
+
+    def test_frame_rate_readback_mismatch_is_trusted_over_request(self, scanner):
+        """If the sensor reports a different rate than requested, believe the
+        sensor — Y-spacing bookkeeping depends on the real value."""
+        fake = scanner._fake.go
+        original_set = fake.GoSetup_SetFrameRate
+
+        def set_but_clamp(setup, rate):
+            original_set(setup, rate)
+            fake.frame_rate = 180.0   # sensor clamps to something else
+            return g.kOK
+
+        fake.GoSetup_SetFrameRate = set_but_clamp
+        applied = scanner.configure(frame_rate_hz=200.0)
+        assert applied["frame_rate_hz"] == pytest.approx(180.0)
+
     def test_flush_pushes_config_last(self, scanner):
         """GoSensor_Flush must come after the setters that need pushing."""
         scanner.configure()
@@ -444,6 +498,24 @@ class TestConfigure:
         scanner._fake.go.length_limit_max = 100.0
         with pytest.raises(ValueError, match="outside the sensor's supported range"):
             scanner.configure(fixed_length_mm=500.0)
+
+    def test_status_reports_the_whole_recipe_in_words(self, scanner):
+        """Status must show start trigger and generation type, not just the
+        trigger source — those two are what make the recipe encoderless, and
+        reading them back is how you confirm configure() actually landed."""
+        scanner.configure()
+        status = scanner.get_status()
+        assert status["sensor_scan_mode"] == "surface"
+        assert status["sensor_trigger_source"] == "time"
+        assert status["sensor_surface_generation"] == "fixed_length"
+        assert status["sensor_start_trigger"] == "software"
+        assert status["sensor_fixed_length_mm"] == pytest.approx(200.0)
+
+    def test_status_labels_unknown_enum_values(self, scanner):
+        """An unrecognized enum must be visible, not silently mislabeled."""
+        scanner.configure()
+        scanner._fake.go.start_trigger = 99
+        assert scanner.get_status()["sensor_start_trigger"] == "unknown(99)"
 
     def test_config_defaults_used_when_args_omitted(self, scanner):
         applied = scanner.configure()

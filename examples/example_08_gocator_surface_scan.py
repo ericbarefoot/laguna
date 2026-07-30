@@ -52,7 +52,15 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Connect and configure the sensor, print status, then exit — no motion",
+        help="Connect and print sensor status, then exit. Read-only: does not "
+        "move the gantry and does not write any sensor settings.",
+    )
+    parser.add_argument(
+        "--configure",
+        action="store_true",
+        help="Apply the scan configuration to the sensor without scanning. "
+        "Combine with --dry-run to set up the sensor and stop. Note this "
+        "writes travel speed to sensor flash when it changes.",
     )
     args = parser.parse_args()
 
@@ -81,8 +89,15 @@ def main() -> int:
         return 1
 
     try:
-        applied = scanner.configure()
-        logger.info("Sensor configured: %s", applied)
+        if args.configure or not args.dry_run:
+            applied = scanner.configure()
+            logger.info("Sensor configured: %s", applied)
+        else:
+            logger.info(
+                "--dry-run without --configure: reading sensor state only, "
+                "not writing any settings."
+            )
+
         logger.info("Status: %s", scanner.get_status())
 
         if args.dry_run:
