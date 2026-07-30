@@ -168,40 +168,58 @@ _DEFAULT_SDK_DIRS = (
 )
 
 
+def _has_libs(directory: Path) -> bool:
+    return (directory / "libGoSdk.so").exists() and (directory / "libkApi.so").exists()
+
+
 def find_lib_dir(explicit: Optional[str] = None) -> Path:
     """Locate the directory holding ``libGoSdk.so`` and ``libkApi.so``.
 
-    Resolution order: `explicit` argument, ``$LAGUNA_GOSDK_LIB_DIR``,
-    ``$LAGUNA_GOSDK_DIR/lib/linux_x64``, then a few conventional locations.
+    An explicitly configured location wins outright: if `explicit` (the
+    gocator config's ``sdk_lib_dir``), ``$LAGUNA_GOSDK_LIB_DIR``, or
+    ``$LAGUNA_GOSDK_DIR`` is set, only those are considered — a bad explicit
+    path raises rather than silently falling back, so you never end up
+    loading a *different* SDK build than the one you asked for. Conventional
+    locations are searched only when nothing explicit was given.
 
     Raises:
         FileNotFoundError: If no candidate directory contains both libraries,
             with the searched paths and a pointer to the build script.
     """
-    candidates: List[Path] = []
-
+    explicit_candidates: List[Path] = []
     if explicit:
-        candidates.append(Path(explicit).expanduser())
+        explicit_candidates.append(Path(explicit).expanduser())
     if os.environ.get("LAGUNA_GOSDK_LIB_DIR"):
-        candidates.append(Path(os.environ["LAGUNA_GOSDK_LIB_DIR"]).expanduser())
+        explicit_candidates.append(
+            Path(os.environ["LAGUNA_GOSDK_LIB_DIR"]).expanduser()
+        )
     if os.environ.get("LAGUNA_GOSDK_DIR"):
-        candidates.append(
+        explicit_candidates.append(
             Path(os.environ["LAGUNA_GOSDK_DIR"]).expanduser() / _DEFAULT_LIB_SUBDIR
         )
-    for root in _DEFAULT_SDK_DIRS:
-        candidates.append(Path(root).expanduser() / _DEFAULT_LIB_SUBDIR)
+
+    if explicit_candidates:
+        candidates = explicit_candidates
+        hint = (
+            "This location was set explicitly (sdk_lib_dir / $LAGUNA_GOSDK_LIB_DIR /\n"
+            "$LAGUNA_GOSDK_DIR), so no default locations were searched. Build the\n"
+            "libraries with scripts/build_gosdk.sh, or correct the setting."
+        )
+    else:
+        candidates = [Path(root).expanduser() / _DEFAULT_LIB_SUBDIR for root in _DEFAULT_SDK_DIRS]
+        hint = (
+            "The vendor SDK ships no prebuilt x86_64 libraries — build them with\n"
+            "  scripts/build_gosdk.sh\n"
+            "then set LAGUNA_GOSDK_LIB_DIR (or the gocator config's sdk_lib_dir)."
+        )
 
     for candidate in candidates:
-        if (candidate / "libGoSdk.so").exists() and (candidate / "libkApi.so").exists():
+        if _has_libs(candidate):
             return candidate
 
     searched = "\n  ".join(str(c) for c in candidates)
     raise FileNotFoundError(
-        "Could not find libGoSdk.so + libkApi.so. Searched:\n  "
-        f"{searched}\n"
-        "The vendor SDK ships no prebuilt x86_64 libraries — build them with\n"
-        "  scripts/build_gosdk.sh\n"
-        "then set LAGUNA_GOSDK_LIB_DIR (or the gocator config's sdk_lib_dir)."
+        f"Could not find libGoSdk.so + libkApi.so. Searched:\n  {searched}\n{hint}"
     )
 
 

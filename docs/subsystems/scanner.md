@@ -28,13 +28,27 @@ eyeballing settings and running alignment.
 | Item | Value |
 |------|-------|
 | IP | `192.168.1.10` |
+| Sensor ID | 188089 |
 | Model | Gocator 2690 (2600 series) |
-| Scan rate | 900–10000 Hz (low end = full FOV; high end needs reduced FOV + uniform spacing off) |
+| Scan rate (datasheet) | 900–10000 Hz (high end needs reduced FOV + uniform spacing off) |
+| **Scan rate (measured, this unit)** | **max 443.127 Hz at stock FOV/exposure** |
 | Points per profile | 3700 |
 | X resolution | 124–550 µm |
 | Field of view (X) | 385–2000 mm |
 | Measurement range (Z) | 1550 mm, clearance 325 mm |
 | Z repeatability | 12 µm |
+
+Don't plan around the datasheet's 10 kHz headline: read live on 2026-07-30,
+this unit's `GoSetup_FrameRateLimitMax` was **443.127 Hz** at its configured
+FOV/exposure/uniform-spacing. `configure()` validates `frame_rate_hz` against
+that live limit and raises rather than letting an over-range value through.
+
+Settings read off the sensor the same day (its state before laguna touched
+anything): Surface mode, Time trigger, Fixed-Length generation, start trigger
+`SEQUENTIAL`, fixed length 500 mm, travel speed 100 mm/s, exposure 434.9 µs,
+uniform spacing on, max-frame-rate on. Note `configure()` changes the start
+trigger from `SEQUENTIAL` to `SOFTWARE` — that's the one deliberate departure
+from how the sensor was left after manual web-UI testing.
 
 ---
 
@@ -127,11 +141,15 @@ lab.gocator.save_scan(scan, formats=("npz", "ply"))
 lab.disconnect_all()
 ```
 
-`scan_with_gantry()` uses the per-axis command path (`cmd.set_speed` +
-`cmd.begin_move_to`) rather than `gantry.move_to()`, because the trigger must
+`scan_with_gantry()` drives the axis through its `AxisHandle`
+(`gantry.axis("X")`) rather than `gantry.move_to()`, because the trigger must
 fire *while* the axis is mid-move and `move_to()` blocks until the move
-finishes. That also means it **bypasses the fence check** `move_to()`
-performs — validate your target is inside the work envelope.
+finishes. `AxisHandle.begin_move_to()` is non-blocking and still enforces the
+gantry's `safe_mode` gate — the raw `gantry.cmd` path does not, on the
+socket_bridge/ethernet/rs232 transports.
+
+It does **not** fence-check the target the way `move_to()` does, so validate
+your destination is inside the work envelope.
 
 ### Manual lifecycle
 
@@ -200,10 +218,11 @@ gocator:
 ```
 
 Picking a frame rate: `Y spacing = travel_speed / frame_rate`. At 20 mm/s and
-500 Hz that's 0.04 mm between profiles — far finer than the 0.124–0.55 mm X
+400 Hz that's 0.05 mm between profiles — far finer than the 0.124–0.55 mm X
 resolution, so X is usually the limiting axis. Lower the frame rate (or raise
-the feed rate) to trade Y density for scan time; the datasheet's 10 kHz
-ceiling only applies with reduced FOV and uniform spacing disabled.
+the feed rate) to trade Y density for scan time. Keep the value under the
+sensor's live ceiling (443 Hz measured here, see above); `configure()` will
+reject anything over it.
 
 ---
 
@@ -231,6 +250,18 @@ python -m pytest tests/test_gocator_scanner.py -q
 
 ---
 
+## Verified against hardware (2026-07-30)
+
+The read path is confirmed working end-to-end from Python against the real
+sensor — SDK loads, all bound symbols resolve, discovery finds the unit,
+`GoSensor_Connect` succeeds, and every settings accessor returns sane values
+(the table above was read this way). Clean disconnect too.
+
+**Discovery needs UDP broadcast** (port 3220). `GoSystem_FindSensorByIpAddress`
+searches the *discovered* list, so it returns `kERROR_NOT_FOUND` (-999) on a
+network that blocks broadcast even when the sensor answers ICMP fine. If you
+see -999, check broadcast reachability before suspecting the IP.
+
 ## Open items
 
 - **Verify `GoSensor_Trigger()` is the right software-start call.** The recipe
@@ -238,6 +269,10 @@ python -m pytest tests/test_gocator_scanner.py -q
   the SDK is implemented but untested. No SDK sample calls `_Trigger()`, so
   this is the highest-risk assumption in the module. If it doesn't work,
   check what the web UI actually sends.
+- **Nothing has yet *written* to the sensor from laguna** — the hardware
+  verification above was strictly read-only, so `configure()`'s write path
+  (including the `GoTransform_SetSpeed` flash write and the `SEQUENTIAL` →
+  `SOFTWARE` start-trigger change) is still unexercised.
 - **Confirm which message type the sensor emits** with this configuration
   (`UNIFORM_SURFACE` vs `SURFACE_POINT_CLOUD`). Both paths are implemented;
   only one will exercise on hardware.

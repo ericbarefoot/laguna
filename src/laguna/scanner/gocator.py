@@ -278,6 +278,19 @@ class GocatorScanner:
         lib.call("GoSetup_SetTriggerSource", setup, _g.k32s(_g.GO_TRIGGER_TIME))
 
         if rate:
+            # The achievable max depends on FOV/exposure/spacing, so it's read
+            # live rather than assumed from the datasheet — on this 2690 at
+            # stock settings it's ~443 Hz, far below the datasheet's 10 kHz
+            # headline figure (which needs reduced FOV + uniform spacing off).
+            lo = float(lib.go.GoSetup_FrameRateLimitMin(setup))
+            hi = float(lib.go.GoSetup_FrameRateLimitMax(setup))
+            if hi > 0 and not (lo <= float(rate) <= hi):
+                raise ValueError(
+                    f"frame_rate_hz={rate} outside the sensor's current supported "
+                    f"range [{lo:.3f}, {hi:.3f}] Hz. The upper limit depends on "
+                    "field of view, exposure, and uniform spacing — lower the "
+                    "rate, or relax those settings to raise the ceiling."
+                )
             lib.call("GoSetup_EnableMaxFrameRate", setup, _g.kBool(_g.kFALSE))
             lib.call("GoSetup_SetFrameRate", setup, _g.k64f(float(rate)))
             self._frame_rate_hz = float(rate)
@@ -590,13 +603,17 @@ class GocatorScanner:
         acceleration ramp, fires the software trigger, and receives the
         surface.
 
-        Uses the per-axis command path (``gantry.cmd.set_speed`` +
-        ``begin_move_to``) rather than ``gantry.move_to()``, because the
-        trigger has to fire *while* the axis is mid-move — ``move_to()``
-        runs the coordinated gcode path and blocks until the move finishes.
-        Note this bypasses the fence check that ``move_to()`` performs, so
-        the caller is responsible for the target being inside the work
-        envelope.
+        Drives the axis through its ``AxisHandle`` (``gantry.axis(name)``)
+        rather than ``gantry.move_to()``, because the trigger has to fire
+        *while* the axis is mid-move and ``move_to()`` runs the coordinated
+        gcode path, blocking until the move finishes. AxisHandle's
+        ``begin_move_to`` is non-blocking and — importantly — still enforces
+        the gantry's ``safe_mode`` gate, which the raw ``gantry.cmd`` path
+        does not on the socket_bridge/ethernet/rs232 transports.
+
+        Note this path does **not** fence-check the target the way
+        ``move_to()`` does, so the caller is responsible for the destination
+        being inside the work envelope.
 
         Args:
             gantry: A connected GantryController.
@@ -617,20 +634,16 @@ class GocatorScanner:
 
         Raises:
             RuntimeError: If not connected.
-            ValueError: If `axis` isn't a configured axis on this gantry.
+            KeyError: If `axis` isn't a configured axis on this gantry.
+            SnapMotionError: If the gantry's safe_mode blocks the move.
         """
-        axis_obj = next((a for a in gantry._axes if a.name == axis), None)
-        if axis_obj is None:
-            raise ValueError(
-                f"Axis {axis!r} is not configured on this gantry "
-                f"(have: {[a.name for a in gantry._axes]})"
-            )
+        handle = gantry.axis(axis)
 
         self.configure(travel_speed_mm_s=feed_rate_mm_s)
 
         start_mm = None
         try:
-            start_mm = gantry.cmd.get_actual_position(axis_obj)
+            start_mm = handle.get_position()
         except Exception as e:
             logger.debug("Could not read gantry start position: %s", e)
 
@@ -658,8 +671,8 @@ class GocatorScanner:
                 end_mm,
                 feed_rate_mm_s,
             )
-            gantry.cmd.set_speed(axis_obj, feed_rate_mm_s)
-            gantry.cmd.begin_move_to(axis_obj, end_mm)
+            handle.set_speed(feed_rate_mm_s)
+            handle.begin_move_to(end_mm)   # safe_mode-gated, non-blocking
             time.sleep(settle_s)
             self.trigger()
             return self.receive_surface(timeout_s=timeout_s, metadata=meta)

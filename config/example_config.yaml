@@ -115,9 +115,14 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
 #                                # this is what scales the Y (travel) axis, since
 #                                # there is no encoder. Writes to sensor flash,
 #                                # so laguna only pushes it when it changes.
-#   frame_rate_hz: 500          # profile trigger rate; omit for the sensor's max.
+#   frame_rate_hz: 400          # profile trigger rate; omit for the sensor's max.
 #                                # Y spacing = travel_speed / frame_rate
-#                                # (20 mm/s at 500 Hz = 0.04 mm between profiles)
+#                                # (20 mm/s at 400 Hz = 0.05 mm between profiles).
+#                                # The real ceiling is FOV/exposure-dependent —
+#                                # measured 443.127 Hz on this unit at stock
+#                                # settings (2026-07-30), NOT the datasheet's
+#                                # 10 kHz headline. laguna validates against the
+#                                # sensor's live limit and rejects over-range values.
 #   fixed_length_mm: 200.0      # surface length along travel; cover the scan distance
 #   exposure_us: null           # laser exposure; omit to leave the sensor's setting
 #   uniform_spacing: null       # true/false to force X resampling on/off; omit to
