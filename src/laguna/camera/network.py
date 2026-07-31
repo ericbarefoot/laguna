@@ -14,6 +14,7 @@ Standalone CLI usage (same as the sandbox script):
 import json
 import logging
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -88,7 +89,7 @@ class CameraArray:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kwargs: dict = {"username": self.ssh_user, "timeout": 10}
         if self.ssh_key:
-            kwargs["key_filename"] = self.ssh_key
+            kwargs["key_filename"] = os.path.expanduser(self.ssh_key)
         if self.ssh_passphrase:
             kwargs["passphrase"] = self.ssh_passphrase
         client.connect(hostname, **kwargs)

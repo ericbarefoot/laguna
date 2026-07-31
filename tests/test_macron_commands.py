@@ -9,6 +9,7 @@ import pytest
 
 from laguna.robot.macron.commands import (
     ALL_AXES,
+    AxisHandle,
     IOMap,
     MMCCommands,
     THETA_AXIS,
@@ -59,8 +60,12 @@ class TestTokenFormat:
         assert conn.sent == ["SOB 4 1"]
 
     def test_group_move_formats_multiple_params(self):
+        # group_axes defaults to (X, Y) only — confirmed on hardware that Z
+        # can't join the coordinated group (see GCodeExecutor). Pass an
+        # explicit 3-axis group_axes here since this test's purpose is
+        # verifying generic multi-param formatting, not the default.
         conn = FakeSnapConnection({"C1 BMT 10 20 30": "0"})
-        cmd = MMCCommands(conn)
+        cmd = MMCCommands(conn, group_axes=(X_AXIS, Y_AXIS, Z_AXIS))
         cmd.group_begin_move_to(10, 20, 30)
         assert conn.sent == ["C1 BMT 10 20 30"]
 
@@ -162,3 +167,109 @@ class TestIOMapGatedBrakeHelpers:
         io_map = IOMap()
         assert cmd.brake_is_disengaged(X_AXIS, io_map) is True
         assert conn.sent == []
+
+
+class TestAxisHandleMotion:
+    """AxisHandle.move_to()/move_by() poll (BMT/BMB + MIF) rather than
+    using the firmware's blocking MVT/MVB directly — a move slower than a
+    transport's fixed per-command read timeout (e.g. PiGantryConnection's
+    5s) would otherwise spuriously time out and error even though the move
+    is still legitimately in progress.
+    """
+
+    def test_move_to_sends_begin_move_then_polls_not_blocking_mvt(self):
+        conn = FakeSnapConnection({"A1 BMT 10": "0", "A1 MIF": "1"})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
+        handle.move_to(10.0)
+        assert conn.sent == ["A1 BMT 10", "A1 MIF"]
+        assert "A1 MVT 10" not in conn.sent
+
+    def test_move_by_sends_begin_move_by_then_polls(self):
+        conn = FakeSnapConnection({"A1 BMB 5": "0", "A1 MIF": "1"})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
+        handle.move_by(5.0)
+        assert conn.sent == ["A1 BMB 5", "A1 MIF"]
+
+    def test_move_to_polls_until_finished(self):
+        calls = {"n": 0}
+
+        def mif_response(cmd):
+            calls["n"] += 1
+            return "1" if calls["n"] >= 3 else "0"
+
+        conn = FakeSnapConnection({"A1 BMT 10": "0", "A1 MIF": mif_response})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
+        handle.move_to(10.0)
+        assert conn.sent.count("A1 MIF") == 3
+
+    def test_move_to_blocked_by_safe_mode_before_touching_the_wire(self):
+        conn = FakeSnapConnection({})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: True)
+        with pytest.raises(SnapMotionError):
+            handle.move_to(10.0)
+        assert conn.sent == []
+
+    def test_move_to_aborts_and_raises_on_timeout(self):
+        conn = FakeSnapConnection({"A1 BMT 10": "0", "A1 MIF": "0", "A1 ABT": "0"})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
+        with pytest.raises(SnapMotionError):
+            handle.move_to(10.0, timeout=0.02)
+        assert "A1 ABT" in conn.sent
+
+    def test_get_motor_and_get_enable_delegate_to_the_bound_axis(self):
+        conn = FakeSnapConnection({"A1 MTR": "1", "A1 ENA": "0"})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
+        assert handle.get_motor() is True
+        assert handle.get_enable() is False
+
+
+class TestReadAxisState:
+    """MMCCommands.read_axis_state() (AxisHandle.state()) queries each
+    field independently — a single failing query (e.g. a stalled/faulted
+    axis erroring on one register) must not lose the rest.
+    """
+
+    _ALL_OK_RESPONSES = {
+        "A2 ACP": "10", "A2 COP": "10", "A2 DEP": "10", "A2 ENP": "10",
+        "A2 SPD": "5", "A2 ACL": "100", "A2 DCL": "100",
+        "A2 MTR": "1", "A2 ENA": "1", "A2 MIF": "1",
+        "A2 CAB": "0", "A2 CAP": "0", "A2 CAT": "0",
+        "A2 NLT": "0", "A2 PLT": "0",
+    }
+
+    def test_all_fields_populated_when_every_query_succeeds(self):
+        conn = FakeSnapConnection(self._ALL_OK_RESPONSES)
+        cmd = MMCCommands(conn)
+        state = cmd.read_axis_state(Y_AXIS)
+        assert state.actual_position == 10.0
+        assert state.motor_on is True
+        assert state.errors == {}
+
+    def test_one_failing_query_is_recorded_without_losing_the_others(self):
+        # A stalled/faulted axis might error on one specific register (e.g.
+        # the encoder, ENP) while everything else still reads fine.
+        responses = dict(self._ALL_OK_RESPONSES)
+        responses["A2 ENP"] = SnapMotionError(33)
+        conn = FakeSnapConnection(responses)
+        cmd = MMCCommands(conn)
+        state = cmd.read_axis_state(Y_AXIS)
+        assert state.actual_position == 10.0  # unaffected
+        assert state.motor_on is True          # unaffected
+        assert state.encoder_position == 0.0   # kept at the dataclass default
+        assert "encoder_position" in state.errors
+        assert "33" in state.errors["encoder_position"]
+
+    def test_axis_handle_state_surfaces_the_same_errors_dict(self):
+        responses = dict(self._ALL_OK_RESPONSES)
+        responses["A2 ENP"] = SnapMotionError(33)
+        conn = FakeSnapConnection(responses)
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, Y_AXIS, is_safe_mode=lambda: True)
+        state = handle.state()
+        assert "encoder_position" in state.errors

@@ -69,11 +69,16 @@ nav:
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
-      - Rangefinder profiling brainstorm: RANGEFINDER_PROFILING.md
+      - Rangefinder profiling: RANGEFINDER_PROFILING.md
+      - MQTT & AL1342 setup: MQTT_AL1342_SETUP.md
+      - WTT12L PowerProx setup: WTT12L_POWERPROX_SETUP.md
+      - Unit calibration finding: GANTRY_UNIT_CALIBRATION.md
+      - Sensor noise characterization: SENSOR_NOISE_CHARACTERIZATION.md
   - Subsystems:
       - Camera: subsystems/camera.md
       - Weir: subsystems/weir.md
       - Gauge: subsystems/gauge.md
+      - Rangefinder: subsystems/rangefinder.md
       - Flow: subsystems/flow.md
       - Schedule: subsystems/schedule.md
       - Timing: subsystems/timing.md

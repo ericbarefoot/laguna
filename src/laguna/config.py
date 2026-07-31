@@ -106,6 +106,33 @@ class Config:
                     "order": ["Z", "X", "Y"],
                 },
                 "fences": [],
+                # TEMPORARY: 1 raw controller (ACP) unit measures as this many real
+                # mm on X/Y/Z — confirmed 15.0 on hardware 2026-07-28, see
+                # docs/GANTRY_UNIT_CALIBRATION.md. This is the single toggle: once
+                # the Snap2Motion/DSM project's axis scale is fixed at the source,
+                # change this to 1.0 (and gantry_agent.py's matching
+                # MM_PER_ACP_UNIT constant) — nothing else needs to change.
+                "mm_per_acp_unit": 15.0,
+                # Real-mm translation from the gantry's raw zero to a real-world
+                # origin, applied on top of mm_per_acp_unit. Not a rotation/affine
+                # matrix — nothing in this codebase needs axis rotation today.
+                "coordinate_offset": {"X": 0.0, "Y": 0.0, "Z": 0.0, "Theta": 0.0},
+            },
+            "mqtt": {
+                "broker_host": "red.lab",
+                "broker_port": 1883,
+                "client_id": "laguna",
+                "keepalive": 60,
+                "topics": [],
+                "qos": 0,
+            },
+            "rangefinder": {
+                "topic": "laguna/od2000",
+                "pdin_port": 1,       # IO-Link port the OD2000 is connected to (1-8)
+                "offset_mm": 0.0,     # physical mounting offset if needed
+                "al1342_host": None,  # AL1342 raw IP — required for activate()/read_mm()
+                "calibration_file": None,  # path to a LinearCalibration CSV, see
+                                            # scripts/calibrate_rangefinder.py
             },
         }
     

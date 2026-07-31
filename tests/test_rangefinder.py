@@ -1,0 +1,584 @@
+"""Tests for the RangefinderSubsystem and OD2000 PDIN decoder.
+
+Hardware assumptions encoded here (each test documents one assumption;
+a failure on real hardware means the assumption is wrong):
+
+  - AL1342 PDIN hex is big-endian int32 distance in nm (not µm, not mm, not
+    little-endian). If decode_od2000_pdin returns ~0.2 mm when you expect
+    ~200 mm, the unit assumption is wrong. If the distance sign or sign is
+    scrambled, the byte order is wrong.
+  - The pdin path inside the AL1342 event JSON is exactly
+    '/iolinkmaster/port[N]/iolinkdevice/pdin' with square-bracket notation.
+  - The OD2000 range is approximately 20–1200 mm; readings outside that
+    range indicate misconfig, wrong port, or a disconnected sensor.
+  - Q1/Q2 switching outputs live in byte 5 of the PDIN, bits 0 and 1.
+  - Scale byte (byte 4) is normally 0; non-zero values are logged but do not
+    invalidate the distance reading.
+"""
+
+import pytest
+
+from laguna import rangefinder as rangefinder_module
+from laguna.rangefinder import (
+    OD2000Rangefinder,
+    RangefinderSubsystem,
+    WTT12LRangefinder,
+    decode_dp4200_wtt12l_analog_pdin,
+    decode_od2000_pdin,
+    decode_wtt12l_pdin,
+)
+
+
+# ---------------------------------------------------------------------------
+# decode_od2000_pdin — pure function, no hardware needed
+# ---------------------------------------------------------------------------
+
+
+def _encode_distance_nm(distance_nm: int) -> str:
+    """Helper: encode a distance_nm value back to 12-char OD2000 hex string."""
+    raw = distance_nm.to_bytes(4, byteorder="big", signed=True) + b"\x00\x00"
+    return raw.hex().upper()
+
+
+class TestDecodeOd2000Pdin:
+    def test_zero_distance(self):
+        """All-zero PDIN → distance_nm = 0, distance_mm = 0.0."""
+        result = decode_od2000_pdin("000000000000")
+        assert result["distance_nm"] == 0
+        assert result["distance_mm"] == 0.0
+        assert result["scale"] == 0
+        assert result["q1"] is False
+        assert result["q2"] is False
+
+    def test_known_200mm(self):
+        """200 mm = 200_000_000 nm = 0x0BEBC200.
+        If this fails on hardware (distance_mm ~ 0.0002 not 200), the AL1342
+        is publishing in µm, not nm. If the value is ~3355443200 nm, the bytes
+        are little-endian instead of big-endian.
+        """
+        # 200_000_000 in big-endian hex = 0BEBC200
+        result = decode_od2000_pdin("0BEBC2000000")
+        assert result["distance_nm"] == 200_000_000
+        assert abs(result["distance_mm"] - 200.0) < 0.001
+
+    def test_roundtrip_500mm(self):
+        """Roundtrip encode/decode for 500 mm."""
+        hex_str = _encode_distance_nm(500_000_000)
+        result = decode_od2000_pdin(hex_str)
+        assert abs(result["distance_mm"] - 500.0) < 0.001
+
+    def test_big_endian_not_little(self):
+        """Confirm the decoder is big-endian.
+        If hardware reads come back ~0.2 mm when the target is ~200 mm,
+        try: distance_nm = int.from_bytes(raw[0:4], 'little', signed=True)
+        and update the decoder.
+        """
+        # 0x00C8 0000 = 13_107_200 nm ≈ 13.1 mm (little-endian interpretation of 0x0000C800)
+        # Big-endian of same 4 bytes: 0x0000C800 = 51_200 nm ≈ 0.051 mm
+        # The test here checks a clearly asymmetric value to expose the difference
+        result_big = decode_od2000_pdin("0BEBC2000000")  # big-endian 200mm
+        # If we accidentally decoded little-endian the value would be completely different
+        assert result_big["distance_mm"] > 100.0, (
+            "Expected ~200 mm from big-endian decode; got {:.3f} mm. "
+            "If hardware gives wrong values, check byte order — AL1342 may publish little-endian.".format(
+                result_big["distance_mm"]
+            )
+        )
+
+    def test_q1_only(self):
+        """Byte 5 = 0x01 → Q1 True, Q2 False."""
+        hex_str = _encode_distance_nm(200_000_000)[:-2] + "01"
+        result = decode_od2000_pdin(hex_str)
+        assert result["q1"] is True
+        assert result["q2"] is False
+
+    def test_q2_only(self):
+        """Byte 5 = 0x02 → Q1 False, Q2 True."""
+        hex_str = _encode_distance_nm(200_000_000)[:-2] + "02"
+        result = decode_od2000_pdin(hex_str)
+        assert result["q1"] is False
+        assert result["q2"] is True
+
+    def test_both_q_bits(self):
+        """Byte 5 = 0x03 → both Q1 and Q2 True."""
+        hex_str = _encode_distance_nm(300_000_000)[:-2] + "03"
+        result = decode_od2000_pdin(hex_str)
+        assert result["q1"] is True
+        assert result["q2"] is True
+
+    def test_nonzero_scale_byte(self):
+        """Scale byte (byte 4) nonzero should not crash the decoder.
+        The OD2000 normally sends scale=0. A non-zero value may appear in
+        certain operating modes; the decoder should pass it through.
+        """
+        # scale = 0x05 in byte 4
+        raw_nm = (200_000_000).to_bytes(4, "big", signed=True)
+        hex_str = (raw_nm + b"\x05\x00").hex()
+        result = decode_od2000_pdin(hex_str)
+        assert result["scale"] == 5
+        assert result["distance_nm"] == 200_000_000
+
+    def test_negative_distance(self):
+        """Negative distance_nm is representable (sensor out of range below zero).
+        decode_od2000_pdin should return it without raising; caller decides
+        whether to discard it.
+        """
+        # -1 in big-endian signed 4 bytes = FFFFFFFF
+        result = decode_od2000_pdin("FFFFFFFF0000")
+        assert result["distance_nm"] == -1
+        assert result["distance_mm"] < 0.0
+
+    def test_wrong_hex_length_raises(self):
+        """If AL1342 sends more or fewer bytes than expected, fromhex raises.
+        On hardware: if you see IndexError/ValueError here, the OD2000 process
+        data layout is different from the 7002T15 IODD spec (6 bytes).
+        """
+        with pytest.raises((ValueError, IndexError)):
+            decode_od2000_pdin("AABB")  # only 2 bytes
+
+    def test_plausible_range(self):
+        """Values in OD2000 measurement range (20–1200 mm) should decode cleanly.
+        If hardware reads are consistently outside this range, check sensor
+        mounting distance and set the operating range in the sensor config.
+        """
+        for mm in [20, 100, 500, 1000, 1200]:
+            nm = mm * 1_000_000
+            hex_str = _encode_distance_nm(nm)
+            result = decode_od2000_pdin(hex_str)
+            assert abs(result["distance_mm"] - mm) < 0.01, (
+                f"Roundtrip failed for {mm} mm: got {result['distance_mm']:.3f} mm"
+            )
+
+
+# ---------------------------------------------------------------------------
+# AL1342 JSON envelope extraction
+# ---------------------------------------------------------------------------
+
+
+def _make_al1342_event(pdin_port: int, pdin_hex: str, code: int = 200) -> dict:
+    """Build a realistic AL1342 MQTT event payload for a given port and hex."""
+    return {
+        "code": "event",
+        "cid": 10,
+        "adr": "",
+        "data": {
+            "eventno": "6317",
+            "srcurl": "/timer[1]/counter/datachanged",
+            "payload": {
+                f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/pdin": {
+                    "code": code,
+                    "data": pdin_hex,
+                }
+            },
+        },
+    }
+
+
+class TestExtractPdinHex:
+    """Tests for the JSON path used to extract PDIN hex from AL1342 events.
+
+    The exact path /iolinkmaster/port[N]/iolinkdevice/pdin is from the AL1342
+    manual §9.2.22. If the hardware produces a different path structure, these
+    tests will fail with a KeyError that identifies exactly which key is wrong.
+    """
+
+    def _extract(self, msg: dict, port: int) -> str:
+        key = f"/iolinkmaster/port[{port}]/iolinkdevice/pdin"
+        return msg["data"]["payload"][key]["data"]
+
+    def test_port_1_standard_path(self):
+        """Port 1, standard AL1342 event envelope."""
+        msg = _make_al1342_event(1, "0BEBC2000000")
+        hex_str = self._extract(msg, 1)
+        assert hex_str == "0BEBC2000000"
+
+    def test_port_4_path(self):
+        """Port 4 — confirm the port number appears in the key with brackets."""
+        msg = _make_al1342_event(4, "0BEBC2000000")
+        hex_str = self._extract(msg, 4)
+        assert hex_str == "0BEBC2000000"
+
+    def test_wrong_port_raises_keyerror(self):
+        """Requesting port 2 when OD2000 is on port 1 → KeyError.
+        On hardware: if you see this error, check 'pdin_port' in config.
+        """
+        msg = _make_al1342_event(1, "0BEBC2000000")
+        with pytest.raises(KeyError):
+            self._extract(msg, 2)
+
+    def test_pdin_code_200_means_ok(self):
+        """code=200 in the pdin entry means the IO-Link read succeeded.
+        A non-200 code (e.g. 503) means the port has no device or the device
+        is in SIO/DI mode — check IO-Link COM mode config on the OD2000.
+        """
+        msg = _make_al1342_event(1, "0BEBC2000000", code=200)
+        assert msg["data"]["payload"]["/iolinkmaster/port[1]/iolinkdevice/pdin"]["code"] == 200
+
+    def test_pdin_error_code_503(self):
+        """code=503 means the IO-Link port has no device or is not in COM mode.
+        The 'data' field may be empty or missing in this case.
+        Tests that the code field is accessible without crashing on code != 200.
+        """
+        msg = _make_al1342_event(1, "", code=503)
+        entry = msg["data"]["payload"]["/iolinkmaster/port[1]/iolinkdevice/pdin"]
+        assert entry["code"] == 503
+
+    def test_full_decode_pipeline(self):
+        """End-to-end: AL1342 event → extract hex → decode PDIN."""
+        msg = _make_al1342_event(1, _encode_distance_nm(350_000_000))
+        hex_str = self._extract(msg, 1)
+        result = decode_od2000_pdin(hex_str)
+        assert abs(result["distance_mm"] - 350.0) < 0.001
+
+
+# ---------------------------------------------------------------------------
+# RangefinderSubsystem with a fake MqttSubscriber
+# ---------------------------------------------------------------------------
+
+
+class FakeMqttSubscriber:
+    """Minimal double for MqttSubscriber, injectable into RangefinderSubsystem."""
+
+    subsystem_name = "mqtt"
+
+    def __init__(self):
+        self._is_connected = False
+        self._queues: dict = {}
+        self._topics: list = []
+        self.connected_called = 0
+        self.disconnect_called = 0
+
+    def connect(self) -> bool:
+        self._is_connected = True
+        self.connected_called += 1
+        return True
+
+    def disconnect(self) -> None:
+        self._is_connected = False
+        self.disconnect_called += 1
+
+    def subscribe(self, topic: str) -> None:
+        if topic not in self._queues:
+            self._queues[topic] = []
+            self._topics.append(topic)
+
+    def push(self, topic: str, payload: dict) -> None:
+        """Test helper: inject a message as if MQTT delivered it."""
+        self._queues.setdefault(topic, []).append(payload)
+
+    def drain(self, topic: str) -> list:
+        items = list(self._queues.get(topic, []))
+        self._queues[topic] = []
+        return items
+
+    def get_latest(self, topic: str) -> dict:
+        items = self._queues.get(topic, [])
+        last = items[-1] if items else None
+        self._queues[topic] = []
+        return last
+
+    def get_status(self) -> dict:
+        return {"is_connected": self._is_connected}
+
+
+def _make_rangefinder(pdin_port: int = 1):
+    mqtt = FakeMqttSubscriber()
+    config = {"topic": "laguna/od2000", "pdin_port": pdin_port, "offset_mm": 0.0}
+    rf = RangefinderSubsystem(config, mqtt)
+    return rf, mqtt
+
+
+class TestRangefinderSubsystem:
+    def test_connect_delegates_to_mqtt(self):
+        rf, mqtt = _make_rangefinder()
+        result = rf.connect()
+        assert result is True
+        assert mqtt.connected_called == 1
+
+    def test_connect_does_not_double_connect(self):
+        rf, mqtt = _make_rangefinder()
+        mqtt._is_connected = True  # already connected
+        rf.connect()
+        assert mqtt.connected_called == 0  # skipped
+
+    def test_disconnect_delegates(self):
+        rf, mqtt = _make_rangefinder()
+        rf.connect()
+        rf.disconnect()
+        assert mqtt.disconnect_called == 1
+        assert rf._is_connected is False
+
+    def test_get_status_before_any_reading(self):
+        rf, mqtt = _make_rangefinder()
+        rf.connect()
+        status = rf.get_status()
+        assert status["is_connected"] is True
+        assert status["latest_distance_mm"] is None
+
+    def test_get_distance_from_mqtt_message(self):
+        """Push a realistic AL1342 event and confirm distance_mm is returned."""
+        rf, mqtt = _make_rangefinder(pdin_port=1)
+        rf.connect()
+        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(400_000_000)))
+        dist = rf.get_distance_mm()
+        assert dist is not None
+        assert abs(dist - 400.0) < 0.001
+
+    def test_get_distance_returns_none_when_no_messages(self):
+        rf, mqtt = _make_rangefinder()
+        rf.connect()
+        assert rf.get_distance_mm() is None
+
+    def test_get_latest_sample_returns_wall_time(self):
+        """get_latest_sample() returns (wall_time, distance_mm)."""
+        rf, mqtt = _make_rangefinder(pdin_port=1)
+        rf.connect()
+        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(200_000_000)))
+        sample = rf.get_latest_sample()
+        assert sample is not None
+        wall_time, distance_mm = sample
+        assert wall_time > 0
+        assert abs(distance_mm - 200.0) < 0.001
+
+    def test_wrong_port_in_payload_does_not_crash(self):
+        """If the MQTT message has port[2] but pdin_port=1, the decode silently
+        fails (the sample is dropped). On hardware: if get_distance_mm() always
+        returns None despite MQTT messages arriving, check pdin_port in config.
+        """
+        rf, mqtt = _make_rangefinder(pdin_port=1)
+        rf.connect()
+        # Push a message with port 2 data — should be silently skipped
+        mqtt.push("laguna/od2000", _make_al1342_event(2, _encode_distance_nm(200_000_000)))
+        assert rf.get_distance_mm() is None
+
+    def test_offset_mm_applied(self):
+        """offset_mm is added to the raw distance_mm."""
+        mqtt = FakeMqttSubscriber()
+        config = {"topic": "laguna/od2000", "pdin_port": 1, "offset_mm": 50.0}
+        rf = RangefinderSubsystem(config, mqtt)
+        rf.connect()
+        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(200_000_000)))
+        dist = rf.get_distance_mm()
+        assert abs(dist - 250.0) < 0.001
+
+    def test_sample_count_increments(self):
+        rf, mqtt = _make_rangefinder()
+        rf.connect()
+        for _ in range(5):
+            mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(300_000_000)))
+        rf.get_distance_mm()
+        assert rf._sample_count == 5
+
+    def test_get_status_after_readings(self):
+        rf, mqtt = _make_rangefinder()
+        rf.connect()
+        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(500_000_000)))
+        rf.get_distance_mm()
+        status = rf.get_status()
+        assert abs(status["latest_distance_mm"] - 500.0) < 0.001
+        assert status["sample_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# decode_wtt12l_pdin — pure function, no hardware needed
+#
+# Layout taken from SICK's official "Technical Information: Photoelectric
+# sensors, SICK Smart Sensors / IO-Link" (www.sick.com/8022709), table 6 —
+# NOT yet confirmed against physical WTT12L-A2523 hardware. If real readings
+# come back wrong, see docs/WTT12L_POWERPROX_SETUP.md Step 4 for the likely
+# culprits (byte order, Process data select mode, units).
+# ---------------------------------------------------------------------------
+
+
+def _encode_wtt12l_distance_mm(distance_mm: int, status_byte: int = 0x00) -> str:
+    """Helper: encode a distance_mm value to an 8-char WTT12L PDIN hex string."""
+    raw = distance_mm.to_bytes(2, byteorder="big", signed=False) + b"\x00" + bytes([status_byte])
+    return raw.hex().upper()
+
+
+# ---------------------------------------------------------------------------
+# On-demand HTTP path: activate()/deactivate()/read_mm() and the
+# OD2000Rangefinder/WTT12LRangefinder subclasses. read_pdin_hex/write_acyclic
+# are monkeypatched — no real network access.
+# ---------------------------------------------------------------------------
+
+
+class TestOd2000RangefinderOnDemand:
+    def _make(self, **extra_config):
+        mqtt = FakeMqttSubscriber()
+        config = {"topic": "laguna/od2000", "pdin_port": 2, "al1342_host": "192.168.1.251", **extra_config}
+        return OD2000Rangefinder(config, mqtt), mqtt
+
+    def test_subsystem_name(self):
+        assert OD2000Rangefinder.subsystem_name == "od2000"
+
+    def test_read_mm_requires_al1342_host(self):
+        mqtt = FakeMqttSubscriber()
+        rf = OD2000Rangefinder({"topic": "laguna/od2000", "pdin_port": 2}, mqtt)
+        with pytest.raises(RuntimeError):
+            rf.read_mm()
+
+    def test_read_mm_decodes_and_applies_offset(self, monkeypatch):
+        rf, _mqtt = self._make(offset_mm=10.0)
+        monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: _encode_distance_nm(200_000_000))
+        assert abs(rf.read_mm() - 210.0) < 0.001
+
+    def test_activate_writes_laser_on(self, monkeypatch):
+        rf, _mqtt = self._make()
+        calls = []
+        monkeypatch.setattr(
+            rangefinder_module, "write_acyclic",
+            lambda host, port, index, subindex, value: calls.append((host, port, index, subindex, value)),
+        )
+        rf.activate()
+        assert calls == [("192.168.1.251", 2, 97, 0, "00")]
+
+    def test_deactivate_writes_laser_off(self, monkeypatch):
+        rf, _mqtt = self._make()
+        calls = []
+        monkeypatch.setattr(
+            rangefinder_module, "write_acyclic",
+            lambda host, port, index, subindex, value: calls.append(value),
+        )
+        rf.deactivate()
+        assert calls == ["01"]
+
+    def test_activate_requires_al1342_host(self):
+        mqtt = FakeMqttSubscriber()
+        rf = OD2000Rangefinder({"topic": "laguna/od2000", "pdin_port": 2}, mqtt)
+        with pytest.raises(RuntimeError):
+            rf.activate()
+
+
+class TestWtt12lRangefinderOnDemand:
+    def test_subsystem_name(self):
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+        assert rf.subsystem_name == "wtt12l"
+
+    def test_activate_deactivate_are_noops(self, monkeypatch):
+        """The DP4200 analog bridge has no laser control path — activate()/
+        deactivate() must not attempt any AL1342 write."""
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+
+        def fail(*a, **kw):
+            raise AssertionError("write_acyclic should not be called for WTT12LRangefinder")
+
+        monkeypatch.setattr(rangefinder_module, "write_acyclic", fail)
+        rf.activate()
+        rf.deactivate()
+
+    def test_read_mm_uses_dp4200_decoder(self, monkeypatch):
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+        # "2890FD01" -> channel1_raw 0x2890 = 10384 uA -> 10.384 mA -> ~600mm (see decoder tests)
+        monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: "2890FD01")
+        assert abs(rf.read_mm() - 600) < 50
+
+    def test_calibration_applies_against_current_ma_not_distance_mm(self, monkeypatch, tmp_path):
+        from laguna.rangefinder.calibration import CalibrationPoint, LinearCalibration
+
+        cal = LinearCalibration.fit(
+            "wtt12l_powerprox",
+            [CalibrationPoint(known_height_mm=0.0, raw_value=0.0), CalibrationPoint(known_height_mm=100.0, raw_value=10.0)],
+        )
+        cal_path = tmp_path / "wtt12l_cal.csv"
+        cal.to_csv(cal_path)
+
+        mqtt = FakeMqttSubscriber()
+        rf = WTT12LRangefinder(
+            {"pdin_port": 7, "al1342_host": "192.168.1.251", "calibration_file": str(cal_path)}, mqtt
+        )
+        # current_ma = 10.384 for this hex (see decoder tests) -> real_height_mm ~= 103.84
+        monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: "2890FD01")
+        assert abs(rf.read_mm() - 103.84) < 0.01
+
+
+class TestDecodeWtt12lPdin:
+    def test_zero_distance(self):
+        result = decode_wtt12l_pdin("00000000")
+        assert result["distance_mm"] == 0
+        assert result["ql1"] is False
+        assert result["ql2"] is False
+
+    def test_known_500mm(self):
+        """500 mm = 0x01F4, directly as mm (no nm/µm scaling, unlike the OD2000)."""
+        result = decode_wtt12l_pdin("01F40000")
+        assert result["distance_mm"] == 500
+
+    def test_roundtrip_900mm(self):
+        hex_str = _encode_wtt12l_distance_mm(900)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["distance_mm"] == 900
+
+    def test_ql1_only(self):
+        hex_str = _encode_wtt12l_distance_mm(300, status_byte=0x01)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["ql1"] is True
+        assert result["ql2"] is False
+
+    def test_ql2_only(self):
+        hex_str = _encode_wtt12l_distance_mm(300, status_byte=0x02)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["ql1"] is False
+        assert result["ql2"] is True
+
+    def test_both_ql_bits(self):
+        hex_str = _encode_wtt12l_distance_mm(300, status_byte=0x03)
+        result = decode_wtt12l_pdin(hex_str)
+        assert result["ql1"] is True
+        assert result["ql2"] is True
+
+
+# ---------------------------------------------------------------------------
+# decode_dp4200_wtt12l_analog_pdin — pure function, no hardware needed
+#
+# Confirmed on hardware 2026-07-28 against the WTT12L-A2523's analog output
+# (WTT12L native IO-Link process data never validated; see
+# decode_wtt12l_pdin's docstring). Two real readings anchor these tests:
+#   600 mm  -> pdin "2890FD01" -> channel1_raw 0x2890 = 10384 -> 10.384 mA
+#   1115 mm -> pdin "3F02FD01" -> channel1_raw 0x3F02 = 16130 -> 16.130 mA
+# Channel 2 (bytes 2-3) was constant "FD01" at both distances (unconnected
+# input) and is intentionally not decoded.
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeDp4200Wtt12lAnalogPdin:
+    def test_known_600mm_reading(self):
+        """Real hardware reading at 600 mm. Decoded value has ~20-30 mm of
+        slop (see function docstring) — this checks it's in the right
+        ballpark, not exact agreement."""
+        result = decode_dp4200_wtt12l_analog_pdin("2890FD01")
+        assert abs(result["current_ma"] - 10.384) < 0.001
+        assert abs(result["distance_mm"] - 600) < 50
+
+    def test_known_1115mm_reading(self):
+        """Real hardware reading at 1115 mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("3F02FD01")
+        assert abs(result["current_ma"] - 16.130) < 0.001
+        assert abs(result["distance_mm"] - 1115) < 50
+
+    def test_4ma_maps_to_near_mm(self):
+        """4 mA (0x0FA0 = 4000 uA) should decode to exactly near_mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("0FA0FD01")
+        assert abs(result["distance_mm"] - 100.0) < 0.001
+
+    def test_20ma_maps_to_far_mm(self):
+        """20 mA (0x4E20 = 20000 uA) should decode to exactly far_mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("4E20FD01")
+        assert abs(result["distance_mm"] - 1400.0) < 0.001
+
+    def test_custom_span(self):
+        """near_mm/far_mm are overridable if the sensor gets taught a
+        different span later."""
+        result = decode_dp4200_wtt12l_analog_pdin(
+            "0FA0FD01", near_mm=50.0, far_mm=2000.0
+        )
+        assert abs(result["distance_mm"] - 50.0) < 0.001
+
+    def test_channel2_not_in_result(self):
+        """Channel 2 (the unconnected input) should not leak into the
+        decoded dict — only current_ma and distance_mm."""
+        result = decode_dp4200_wtt12l_analog_pdin("2890FD01")
+        assert set(result.keys()) == {"current_ma", "distance_mm"}

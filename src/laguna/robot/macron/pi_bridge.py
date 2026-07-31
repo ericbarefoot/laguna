@@ -9,13 +9,36 @@ command — too slow for frequent position polling or streamed motion — the
 one-shot-per-call pattern used by laguna.camera.network.CameraArray is fine
 for occasional captures but not for this.
 
+gantry_agent.py is the sole owner of the BLC serial port and can run a full
+topographic scan on a background thread while remaining responsive to a
+stop command — see its module docstring. Because a scan's completion
+message arrives asynchronously (long after the request that started it),
+this class runs a background reader thread that dispatches every incoming
+line either to the pending request it answers, or to a dedicated scan
+result queue. See "Async scan protocol" below.
+
 Wire protocol, one JSON object per line:
   PC -> agent:   {"id": N, "cmd": "A1 ACP", "timeout": 5.0}
                  {"op": "ping"}
                  {"op": "close"}
+                 {"id": N, "op": "scan_start", "axis": "A1", "end_mm": 500.0,
+                  "feed_rate_mm_s": 5.0, "al1342_host": "192.168.1.251",
+                  "pdin_port": 2, "output": "/tmp/profile_....csv"}
+                 {"op": "scan_stop"}
   agent -> PC:   {"ready": true}                      (once, at startup)
                  {"id": N, "raw": "0 12.000 >"}
                  {"id": N, "error": "...", "code": 600}
+                 {"id": N, "scan_started": true, "start_pos_mm": ..., ...}  (ack)
+                 {"id": N, "error": "..."}                                  (scan rejected)
+                 {"scan_stop_ack": true}
+
+Async scan protocol: a scan's *completion* arrives independently of any
+request/response pairing —
+  {"scan_done": true, "id": N, "csv_path": ..., "actual_start_mm": ..., ...}
+  {"scan_error": "...", "id": N}
+These are routed by the reader thread to a dedicated queue, retrieved via
+wait_for_scan_result(), not via the per-request dispatch used for everything
+else.
 
 Safe-mode gate: every command is checked against SAFE_COMMANDS by
 check_safe_mode() BEFORE anything is written to the channel. This is
@@ -23,13 +46,19 @@ independent of any other safety layer in this codebase (fences, dry_run,
 confirm_cb) and cannot be bypassed by a bug elsewhere — while safe_mode is
 True, only read-only query commands can ever reach the wire from this
 class. gantry_agent.py keeps an identical, independently-enforced copy of
-this table on the Pi side as defense in depth.
+this table on the Pi side as defense in depth. scan_start is gated the same
+way agent-side (checked against "BMT", not on the allowlist) — this class
+does not duplicate that check client-side since scan_start isn't a bare
+ASCII command string, but the agent will reject it and the rejection
+surfaces as a SnapMotionError from start_scan().
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import queue
 import re
 import threading
 import time
@@ -168,9 +197,18 @@ class PiGantryConnection(SnapConnection):
 
         self._client = None
         self._channel = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # serializes send()/start_scan() request/ack cycles
+        self._write_lock = threading.Lock()    # guards raw channel.send() calls
         self._next_id = 1
         self._stdout_buf = b""
+
+        self._pending: dict = {}                # request id -> queue.Queue, filled by reader thread
+        self._pending_lock = threading.Lock()
+        self._scan_result_queue: "queue.Queue[dict]" = queue.Queue()
+        self._scan_running = False               # plain bool; atomic under the GIL, same
+                                                  # pattern as MqttSubscriber._is_connected
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -188,7 +226,7 @@ class PiGantryConnection(SnapConnection):
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kwargs: dict = {"username": self.ssh_user, "port": self.ssh_port, "timeout": self.timeout}
         if self.ssh_key:
-            kwargs["key_filename"] = self.ssh_key
+            kwargs["key_filename"] = os.path.expanduser(self.ssh_key)
         if self.ssh_passphrase:
             kwargs["passphrase"] = self.ssh_passphrase
         client.connect(self.host, **kwargs)
@@ -211,8 +249,21 @@ class PiGantryConnection(SnapConnection):
         self._channel = channel
         self._stdout_buf = b""
         self._next_id = 1
+        self._pending = {}
+        self._scan_running = False
+        # Drain anything left in the scan result queue from a prior connection
+        while True:
+            try:
+                self._scan_result_queue.get_nowait()
+            except queue.Empty:
+                break
 
         self._await_ready()
+
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
         logger.info("Connected to gantry agent on %s via SSH", self.host)
 
     def _await_ready(self) -> None:
@@ -231,6 +282,7 @@ class PiGantryConnection(SnapConnection):
             logger.debug("[agent] %s", msg)
 
     def disconnect(self) -> None:
+        self._reader_stop.set()
         channel = self._channel
         client = self._client
         self._channel = None
@@ -249,6 +301,18 @@ class PiGantryConnection(SnapConnection):
                 client.close()
             except Exception:
                 pass
+        reader = self._reader_thread
+        self._reader_thread = None
+        if reader is not None and reader.is_alive():
+            reader.join(timeout=2.0)
+        # Wake up anything blocked on a pending-request queue — the
+        # connection is gone, so no response will ever arrive for them.
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for q in pending:
+            q.put({"error": "connection closed", "code": 0})
+        self._scan_running = False
         logger.info("Disconnected from gantry agent")
 
     @property
@@ -259,13 +323,57 @@ class PiGantryConnection(SnapConnection):
             and not self._channel.exit_status_ready()
         )
 
+    @property
+    def is_scan_running(self) -> bool:
+        return self._scan_running
+
     # ------------------------------------------------------------------
-    # Command exchange
+    # Background reader — dispatches every incoming line
+    # ------------------------------------------------------------------
+
+    def _reader_loop(self) -> None:
+        while not self._reader_stop.is_set():
+            line = self._read_line(None)
+            if line is None:
+                break
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug("[agent stdout] %s", line)
+                continue
+
+            if "scan_done" in msg or "scan_error" in msg:
+                self._scan_running = False
+                self._scan_result_queue.put(msg)
+                continue
+            if "pong" in msg or "scan_stop_ack" in msg or "scan_running" in msg:
+                logger.debug("[agent] %s", msg)
+                continue
+
+            mid = msg.get("id")
+            if mid is not None:
+                with self._pending_lock:
+                    q = self._pending.pop(mid, None)
+                if q is not None:
+                    q.put(msg)
+                    continue
+
+            logger.debug("[agent] discarding unmatched message: %s", msg)
+
+    def _write_line(self, payload: str) -> None:
+        with self._write_lock:
+            self._channel.send((payload + "\n").encode("ascii"))
+
+    # ------------------------------------------------------------------
+    # Command exchange (interactive)
     # ------------------------------------------------------------------
 
     def send(self, command: str) -> str:
         if self.safe_mode:
             check_safe_mode(command)  # raises before anything is written
+
+        if self._scan_running:
+            raise SnapMotionError(0, "Cannot send interactive command: scan in progress")
 
         with self._lock:
             if not self.is_connected:
@@ -276,30 +384,118 @@ class PiGantryConnection(SnapConnection):
 
             request_id = self._next_id
             self._next_id += 1
+            q: "queue.Queue[dict]" = queue.Queue()
+            with self._pending_lock:
+                self._pending[request_id] = q
             payload = json.dumps({"id": request_id, "cmd": command, "timeout": self.timeout})
             try:
-                self._channel.send((payload + "\n").encode("ascii"))
+                self._write_line(payload)
             except Exception as exc:
+                with self._pending_lock:
+                    self._pending.pop(request_id, None)
                 raise SnapMotionError(0, f"Failed to send to agent: {exc}") from exc
 
-            deadline = time.monotonic() + self.timeout
-            while True:
-                line = self._read_line(deadline)
-                if line is None:
-                    raise SnapMotionError(
-                        COMM_TIMEOUT_CODE, f"Timed out waiting for agent response to {command!r}"
-                    )
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.debug("[agent stdout] %s", line)
-                    continue
-                if msg.get("id") != request_id:
-                    logger.debug("[agent] discarding out-of-order/late reply: %s", msg)
-                    continue
-                if "error" in msg:
-                    raise SnapMotionError(int(msg.get("code", 0)), str(msg["error"]))
-                return _parse_response(msg["raw"])
+            try:
+                msg = q.get(timeout=self.timeout)
+            except queue.Empty:
+                with self._pending_lock:
+                    self._pending.pop(request_id, None)
+                raise SnapMotionError(
+                    COMM_TIMEOUT_CODE, f"Timed out waiting for agent response to {command!r}"
+                )
+
+        if "error" in msg:
+            raise SnapMotionError(int(msg.get("code", 0)), str(msg["error"]))
+        return _parse_response(msg["raw"])
+
+    # ------------------------------------------------------------------
+    # Scan control
+    # ------------------------------------------------------------------
+
+    def start_scan(
+        self, axis: str, end_mm: float, feed_rate_mm_s: float,
+        al1342_host: str, pdin_port: int, output: str,
+        sensor: str = "od2000",
+    ) -> dict:
+        """Start a topographic scan on the agent. Returns the ack dict
+        ({"scan_started": True, "start_pos_mm": ..., "accel_mm_s2": ...,
+        "decel_mm_s2": ...}). Raises SnapMotionError if the agent rejects it
+        (blocked by its own safe_mode, a scan is already running, or
+        `sensor` isn't one gantry_agent.py recognizes) or on timeout waiting
+        for the ack. The scan itself then runs on the agent's background
+        thread — use wait_for_scan_result() to block for completion, and
+        stop_scan() to cancel it early.
+
+        sensor: "od2000" (default) or "wtt12l_powerprox" — see
+        gantry_agent.py's SENSOR_DECODERS and
+        docs/WTT12L_POWERPROX_SETUP.md. Selects both the pdin decode and
+        whether the agent attempts laser on/off (skipped for
+        wtt12l_powerprox — see that doc's "no programmatic laser control
+        on this path").
+        """
+        if self._scan_running:
+            raise SnapMotionError(0, "Scan already in progress")
+
+        with self._lock:
+            if not self.is_connected:
+                if self.reconnect_on_failure:
+                    self._reconnect()
+                else:
+                    raise SnapMotionError(0, "Not connected")
+
+            request_id = self._next_id
+            self._next_id += 1
+            q: "queue.Queue[dict]" = queue.Queue()
+            with self._pending_lock:
+                self._pending[request_id] = q
+            payload = json.dumps({
+                "id": request_id, "op": "scan_start",
+                "axis": axis, "end_mm": end_mm, "feed_rate_mm_s": feed_rate_mm_s,
+                "al1342_host": al1342_host, "pdin_port": pdin_port, "output": output,
+                "sensor": sensor,
+            })
+            try:
+                self._write_line(payload)
+            except Exception as exc:
+                with self._pending_lock:
+                    self._pending.pop(request_id, None)
+                raise SnapMotionError(0, f"Failed to send scan_start: {exc}") from exc
+
+            try:
+                msg = q.get(timeout=self.timeout)
+            except queue.Empty:
+                with self._pending_lock:
+                    self._pending.pop(request_id, None)
+                raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for scan_start ack")
+
+        if "error" in msg:
+            raise SnapMotionError(0, str(msg["error"]))
+        self._scan_running = True
+        return msg
+
+    def stop_scan(self) -> None:
+        """Request the agent cancel the currently running scan (sends BST
+        on the scanning axis). Fire-and-forget — call wait_for_scan_result()
+        to observe the scan's actual completion afterward; a stopped scan
+        still finishes normally through the same scan_done path (see
+        gantry_agent.py), just with fewer samples than a full pass.
+        """
+        self._write_line(json.dumps({"op": "scan_stop"}))
+
+    def wait_for_scan_result(self, timeout: float) -> dict:
+        """Block for the async scan_done/scan_error message. Raises
+        SnapMotionError on timeout. Returns the raw dict either way — check
+        for "error" in the result to distinguish success from failure."""
+        try:
+            result = self._scan_result_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for scan result")
+        self._scan_running = False
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
     def _reconnect(self) -> None:
         for attempt in range(1, self.max_reconnect_attempts + 1):
@@ -316,23 +512,28 @@ class PiGantryConnection(SnapConnection):
             0, f"Failed to reconnect to {self.host} after {self.max_reconnect_attempts} attempts"
         )
 
-    def _read_line(self, deadline: float) -> Optional[str]:
-        """Read one newline-delimited line from the channel's stdout, with a deadline.
+    def _read_line(self, deadline: Optional[float]) -> Optional[str]:
+        """Read one newline-delimited line from the channel's stdout.
 
-        Also drains stderr to the logger while waiting (progress/diagnostic
-        output from the agent).
+        deadline=None means block indefinitely (used by the reader thread's
+        main loop, which is the only caller now that reads are centralized
+        there — send()/start_scan() get their responses via a queue
+        instead). Also drains stderr to the logger while waiting.
         """
         while b"\n" not in self._stdout_buf:
-            if time.monotonic() > deadline:
+            if deadline is not None and time.monotonic() > deadline:
                 return None
-            if self._channel.recv_stderr_ready():
-                chunk = self._channel.recv_stderr(4096)
+            channel = self._channel
+            if channel is None:
+                return None
+            if channel.recv_stderr_ready():
+                chunk = channel.recv_stderr(4096)
                 for line in chunk.decode("utf-8", errors="replace").splitlines():
                     if line.strip():
                         logger.info("[gantry_agent] %s", line)
-            if self._channel.recv_ready():
-                self._stdout_buf += self._channel.recv(4096)
-            elif self._channel.exit_status_ready():
+            if channel.recv_ready():
+                self._stdout_buf += channel.recv(4096)
+            elif channel.exit_status_ready():
                 return None
             else:
                 time.sleep(0.01)

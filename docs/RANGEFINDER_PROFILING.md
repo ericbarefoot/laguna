@@ -1,15 +1,45 @@
 # Topographic Profiling with the SICK OD2000 Rangefinder
 
-**Status as of 2026-07-19: brainstorm/design only. No code exists yet, no
-hardware has been touched for this. Written after a serial-polling speed
-benchmark on the gantry's motion controller (see `MACRON_GANTRY.md` and
-`../experiments/gantry_polling_speed_test/`) found that controller capped at
-~3.48 Hz for safe position polling, and that attempting to pipeline reads for
-more speed caused the controller to hang (a physical power-cycle was
-required to recover). This document asks: can we build a topographic
-elevation profile — moving the gantry along one axis while a laser
-rangefinder takes distance readings — without depending on high-rate
-position feedback from that controller at all?**
+**Status as of 2026-07-28: implemented and unified into the gantry agent.**
+Scanning no longer uses a separate deployed script — `gantry_agent.py`
+(`src/laguna/robot/macron/gantry_agent.py`, the same persistent Pi-side
+process that already handles interactive axis commands via
+`PiGantryConnection`) is the sole owner of the BLC serial port and runs
+scans on a background thread, with a live STOP path
+(`TopographicProfiler.stop()` → agent-side `BST`). `TopographicProfiler`
+(`src/laguna/robot/macron/profiler.py`) is now a thin coordinator over
+`gantry.connection.start_scan()`/`wait_for_scan_result()`. See
+`docs/subsystems/rangefinder.md` for usage and `docs/MQTT_AL1342_SETUP.md`
+for the one-time AL1342 hardware bring-up steps.
+
+**Open items resolved:**
+- Serial safety: a single `threading.Lock` inside `SerialBridge.send()`
+  serializes interactive commands and the scan worker thread on one shared
+  connection — no more disconnect/reconnect handoff between two processes.
+- Clock correction not needed — BLC serial and OD2000 polling both run on
+  the Pi's single local clock.
+- AL1342 achieved rate: MQTT push tops out at 2 Hz (`timer[n]` floor,
+  confirmed by measurement); scans instead poll `pdin/getdata` directly
+  over a persistent HTTP connection, measured at **380.7 Hz, zero errors**
+  on hardware 2026-07-28 — see `docs/MQTT_AL1342_SETUP.md`.
+- PDIN byte layout confirmed: big-endian int32 nm, validated against a
+  physical 808.4 mm ± 0.1 mm reference (decoded 808.2778 mm).
+- `serial_bridge.py` confirmed (from source) to hold the serial port
+  permanently for its process lifetime — it and `gantry_agent.py` must
+  never run concurrently; no longer something `TopographicProfiler` needs
+  to work around, since it doesn't touch the serial port itself at all.
+
+**Open items remaining:** run a commanded-vs-actual validation pass on real
+hardware (compare predicted end position to ACP after a real move); confirm
+STOP latency on hardware (expected ~one MIF poll tick, ~0.1s).
+
+---
+
+*Original brainstorm (retained for context):* written after a serial-polling
+speed benchmark found the controller capped at ~3.48 Hz for safe position
+polling, and that pipelining reads caused a hang requiring physical power-cycle.
+This document asked: can we build a topographic elevation profile without
+depending on high-rate position feedback from that controller at all?
 
 **Confirmed so far:** the scan is 1D, on an **X or Y** axis (a separate tool
 handles 2D scans, out of scope here); the profiling/fusion logic should run

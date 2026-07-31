@@ -13,7 +13,7 @@ scheduler, and event log.
 - **[Quick reference](QUICKREF.md)** — install steps and the fastest path
   to a running experiment.
 
-## Gantry (Modusystems OEM-2T / Snap2Motion)
+## Gantry (Modusystems OEM-2T / Snap2Motion) & rangefinders
 
 - **[Usage guide](GANTRY_GUIDE.md)** — how to drive it from Python, the
   ASCII command reference split into motion vs. read-only, the safety
@@ -22,6 +22,50 @@ scheduler, and event log.
 - **[Technical reference](MACRON_GANTRY.md)** — protocol derivation, digital
   IO channel decode, file-by-file breakdown, current hardware-verification
   status. Start here if you're *extending* the driver itself.
+- **[Rangefinder profiling](RANGEFINDER_PROFILING.md)** — topographic
+  scanning: how `TopographicProfiler`/`gantry_agent.py` fuse gantry motion
+  with live OD2000/WTT12L readings into a CSV profile.
+- **[MQTT & AL1342 setup](MQTT_AL1342_SETUP.md)** — one-time hardware
+  bring-up for the ifm AL1342 IO-Link master (Mosquitto config, static IP,
+  port discovery) that both rangefinders sit behind.
+- **[WTT12L PowerProx setup](WTT12L_POWERPROX_SETUP.md)** — why the
+  WTT12L's native IO-Link path never validated, and the DP4200
+  analog-bridge workaround used instead.
+- **[Unit calibration finding](GANTRY_UNIT_CALIBRATION.md)** — the
+  confirmed 15 mm/unit gantry scale-factor bug and the software workaround
+  (`gantry.mm_per_acp_unit`) now baked into `MMCCommands`/`gantry_agent.py`.
+- **[Sensor noise characterization](SENSOR_NOISE_CHARACTERIZATION.md)** —
+  separating real vibration/obstacle structure in scan data from sensor
+  read noise.
+
+## Recent work (2026-07-18 → 2026-07-29)
+
+Roughly chronological, each item links to the doc with the full writeup:
+
+1. **MQTT + OD2000 rangefinder integration** — AL1342 bring-up, PDIN
+   decode, `RangefinderSubsystem` MQTT streaming path
+   ([MQTT & AL1342 setup](MQTT_AL1342_SETUP.md)).
+2. **Gantry ACP-unit scale finding** — confirmed 1 ACP unit = 15mm on
+   X/Y/Z, not 1mm ([Unit calibration finding](GANTRY_UNIT_CALIBRATION.md)).
+3. **Gantry control and scanning unified into `gantry_agent.py`**, and
+   verified on real hardware — moves, brake engage/disengage, STOP, and a
+   full topographic scan ([Technical reference](MACRON_GANTRY.md)).
+4. **WTT12L PowerProx bring-up** via a DP4200 analog bridge, after its
+   native IO-Link path failed to validate
+   ([WTT12L PowerProx setup](WTT12L_POWERPROX_SETUP.md)).
+5. **Line-scan scripts consolidated** (`scripts/run_line_scan.py`,
+   replacing several near-duplicate `server-setup/plans/*.py` scripts)
+   with real-world-unit output and a `--sensor od2000|wtt12l_powerprox`
+   flag.
+6. **Sensor noise characterized** — separating real scan structure from
+   sensor read noise
+   ([Sensor noise characterization](SENSOR_NOISE_CHARACTERIZATION.md)).
+7. **API consistency refactor**: `GantryController`/rangefinder
+   subsystems now follow the same `connect()`/`activate()`/`read_mm()`
+   shape as `laguna.weir`, with simple `FlumeLab.move_to()`/
+   `acquire_scan()` verbs on top; the 15mm/unit conversion moved from
+   scattered per-script constants into a single `gantry.mm_per_acp_unit`
+   config toggle (see the unit calibration doc above).
 
 ## Other subsystems
 
