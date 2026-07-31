@@ -237,6 +237,30 @@ class PiGantryConnection(SnapConnection):
         finally:
             sftp.close()
 
+        # Warn about pre-existing agents before launching another. A session
+        # killed abruptly (Ctrl-C in a REPL, dropped SSH, an exception past
+        # disconnect()) never delivers the "close" op, so its agent lingers
+        # holding the serial port. The new agent now refuses to open the port
+        # in that case (exclusive=True in gantry_agent.SerialBridge), which is
+        # a clean failure — but naming the stale PIDs turns a confusing
+        # "failed to open serial port" into an obvious one.
+        try:
+            _, check_out, _ = client.exec_command(
+                "pgrep -f 'laguna_gantry_agent|serial_bridge' || true"
+            )
+            stale = [p for p in check_out.read().decode().split() if p.strip()]
+            if stale:
+                logger.warning(
+                    "Found %d existing gantry_agent/serial_bridge process(es) on %s "
+                    "(PIDs: %s) already holding the serial port. Two writers on one "
+                    "controller interleave bytes mid-command and can corrupt it — "
+                    "stop them first: ssh %s@%s 'kill %s'",
+                    len(stale), self.host, ", ".join(stale),
+                    self.ssh_user, self.host, " ".join(stale),
+                )
+        except Exception as exc:  # never block connecting on a diagnostic
+            logger.debug("Could not check for stale agents: %s", exc)
+
         safe_flag = "" if self.safe_mode else " --allow-motion"
         remote_cmd = (
             f"python3 {REMOTE_AGENT_PATH} "

@@ -374,8 +374,18 @@ class SerialBridge:
     """
 
     def __init__(self, port: str, baud: int, timeout: float = 5.0):
+        # exclusive=True is load-bearing, not hygiene. Linux does not lock
+        # tty devices by default, so without it a second agent (or
+        # serial_bridge.py) opens the same port happily and both write to
+        # the controller. Their bytes interleave mid-command, so the PLC's
+        # ASCII interpreter sees spliced garbage like "A5 ACC1 INI 1 2 5" —
+        # and this interpreter is already known to have at least one input
+        # it handles by corrupting the responder's program (see
+        # notes/2026-07-30-responder-node-incident.md). Failing loudly on
+        # the second open is enormously preferable to feeding it garbage.
         self._ser = serial.Serial(
             port, baudrate=baud, bytesize=8, parity="N", stopbits=1, timeout=timeout,
+            exclusive=True,
         )
         self._ser.reset_input_buffer()
         self._lock = threading.Lock()
@@ -642,6 +652,18 @@ def main() -> None:
     try:
         bridge = SerialBridge(args.port, args.baud)
     except Exception as exc:
+        # The overwhelmingly common cause is another process already holding
+        # the port — a stale agent orphaned by an interrupted session, or
+        # serial_bridge.py. Say so, and say how to find it: the alternative
+        # is two writers splicing bytes into the controller (see
+        # SerialBridge.__init__).
+        _log(f"FAILED to open serial port: {exc}")
+        _log(
+            "If this is a lock/busy error, another process already owns the "
+            "port. Find it with:  ps -ef | grep -E 'gantry_agent|serial_bridge' "
+            "| grep -v grep   and stop it before reconnecting. Never run two "
+            "of them against the same controller."
+        )
         _emit({"error": f"failed to open serial port: {exc}"})
         sys.exit(1)
     _log("Serial port open.")

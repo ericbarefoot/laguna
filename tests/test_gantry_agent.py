@@ -457,6 +457,48 @@ class _NonReentrantFakeSerial:
         return b
 
 
+class TestSerialBridgeExclusiveOpen:
+    """The port must be opened exclusively.
+
+    Linux doesn't lock tty devices by default, so without exclusive=True a
+    second agent (or serial_bridge.py) opens the same port and both write to
+    the controller. Their bytes splice mid-command and the PLC's ASCII
+    interpreter receives garbage — and this interpreter is known to have an
+    input it handles by corrupting the responder's program (see
+    notes/2026-07-30-responder-node-incident.md). A second opener must fail
+    loudly rather than silently corrupt the wire.
+    """
+
+    def test_serial_opened_exclusively(self, monkeypatch):
+        captured = {}
+
+        class _FakeSerial:
+            def __init__(self, port, **kwargs):
+                captured["port"] = port
+                captured.update(kwargs)
+
+            def reset_input_buffer(self):
+                pass
+
+        monkeypatch.setattr(ga.serial, "Serial", _FakeSerial)
+        ga.SerialBridge("/dev/ttyUSB0", 9600)
+        assert captured.get("exclusive") is True, (
+            "SerialBridge must open the port with exclusive=True — without it, "
+            "two agents can write to the controller simultaneously"
+        )
+
+    def test_open_failure_propagates(self, monkeypatch):
+        """A busy port must raise, not be swallowed — main() turns this into
+        an actionable 'another process owns the port' message."""
+
+        def _boom(port, **kwargs):
+            raise OSError(16, "Device or resource busy")
+
+        monkeypatch.setattr(ga.serial, "Serial", _boom)
+        with pytest.raises(OSError):
+            ga.SerialBridge("/dev/ttyUSB0", 9600)
+
+
 class TestSerialBridgeLocking:
     def _make_bridge(self, response=b" 1.000 >"):
         bridge = ga.SerialBridge.__new__(ga.SerialBridge)  # bypass __init__'s real serial.Serial() open
