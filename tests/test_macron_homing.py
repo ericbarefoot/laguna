@@ -51,13 +51,18 @@ class TestHomeAxisHappyPath:
             "A1 JOG -10": "-10",
             "A1 CAT": _trip_after(2),  # trips on the 3rd poll
             "A1 BST": "0",
-            "A1 MIF": _trip_after(1),  # finishes on the 2nd poll
+            # Same MIF response is polled twice: once for the post-BST
+            # controlled-stop wait, once for the standoff move below (both
+            # non-blocking BMT/MIF now — move_to() is banned, see
+            # commands.py). By the second poll the counter is already past
+            # threshold, so it reports finished on the first call.
+            "A1 MIF": _trip_after(1),
             "A1 CAP": "-24.500",       # hardware-latched trip position
             "A1 ACP": _trip_after(1, before="-25.100", after="5.000"),
             # ^ first ACP-read call (current position after decel) = -25.100;
             #   second ACP-read call (final standoff readout) = 5.000
             zero_cmd: str((-25.1) - (-24.5)),
-            "A1 MVT 5": "5",
+            "A1 BMT 5": "0",
         }
         proc, conn = self._make_procedure(responses)
         final_pos = proc.home_axis(X_AXIS)
@@ -78,7 +83,7 @@ class TestHomeAxisHappyPath:
             "A1 CAP": "0",
             "A1 ACP": "0",
             "A1 ACP 0": "0",
-            "A1 MVT 5": "5",
+            "A1 BMT 5": "0",
         }
         proc, conn = self._make_procedure(responses)
         proc.home_axis(X_AXIS)
@@ -99,7 +104,7 @@ class TestHomeAxisHappyPath:
             "A1 CAP": "0",
             "A1 ACP": "0",
             "A1 ACP 0": "0",
-            "A1 MVT 5": "5",
+            "A1 BMT 5": "0",
         }
         conn = FakeSnapConnection(responses)
         cmd = MMCCommands(conn)
@@ -147,7 +152,7 @@ class TestHomeAxisBrakeHandling:
             "A2 CAP": "0",
             "A2 ACP": "0",
             "A2 ACP 0": "0",
-            "A2 MVT 5": "5",
+            "A2 BMT 5": "0",
         }
         conn = FakeSnapConnection(responses)
         cmd = MMCCommands(conn)

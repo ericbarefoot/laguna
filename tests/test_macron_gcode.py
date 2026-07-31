@@ -200,16 +200,47 @@ class TestExecutorTypeGuard:
 
 class TestExecutorLinearMoves:
     def test_executes_group_init_then_moves(self):
+        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): group init
+        # no longer spans Z (the responder node) — see GCodeExecutor's class
+        # docstring. X10 with Z unchanged means no Z leg is sent at all.
         responses = {
-            "C1 INI 1 2 5": "0",
+            "C1 INI 1 2": "0",
             "C1 SPD 20": "20",
-            "C1 BMT 10 0 0": "0",
+            "C1 BMT 10 0": "0",
             "C1 MIF": "1",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 F1200")
         executor.execute(trajectory)
-        assert conn.sent == ["C1 INI 1 2 5", "C1 SPD 20", "C1 BMT 10 0 0", "C1 MIF"]
+        assert conn.sent == ["C1 INI 1 2", "C1 SPD 20", "C1 BMT 10 0", "C1 MIF"]
+
+    def test_group_init_is_sent_once_not_per_execute(self):
+        """DEBUG PATCH: INI is remembered across execute() calls — a 40-move
+        run was re-sending an identical `C1 INI 1 2` 40 times."""
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 SPD 20": "20",
+            "C1 BMT 10 0": "0",
+            "C1 BMT 20 0": "0",
+            "C1 MIF": "1",
+        }
+        executor, conn = _make_executor(responses)
+        for target in ("G1 X10 F1200", "G1 X20 F1200"):
+            executor.execute(executor.plan(target))
+        assert conn.sent.count("C1 INI 1 2") == 1
+        assert conn.sent.count("C1 BMT 10 0") == 1
+        assert conn.sent.count("C1 BMT 20 0") == 1
+
+    def test_reset_group_init_forces_ini_to_be_resent(self):
+        """A power-cycle/reflash can clear the controller's group state —
+        GantryController.connect() calls this so the next move re-inits."""
+        responses = {"C1 INI 1 2": "0", "C1 SPD 20": "20", "C1 BMT 10 0": "0", "C1 MIF": "1"}
+        executor, conn = _make_executor(responses)
+        executor.execute(executor.plan("G1 X10 F1200"))
+        executor.reset_group_init()
+        executor._current_pos = (0.0, 0.0, 0.0)  # pretend we're back at the start
+        executor.execute(executor.plan("G1 X10 F1200"))
+        assert conn.sent.count("C1 INI 1 2") == 2
 
     def test_polls_until_move_finished(self):
         calls = {"n": 0}
@@ -219,14 +250,38 @@ class TestExecutorLinearMoves:
             return "1" if calls["n"] >= 3 else "0"
 
         responses = {
-            "C1 INI 1 2 5": "0",
-            "C1 BMT 5 0 0": "0",
+            "C1 INI 1 2": "0",
+            "C1 BMT 5 0": "0",
             "C1 MIF": mif_response,
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X5")
         executor.execute(trajectory)
         assert conn.sent.count("C1 MIF") == 3
+
+    def test_moves_z_independently_of_the_xy_group(self):
+        """DEBUG PATCH: a move touching both Z and X/Y never sends a single
+        3-axis group command (that's `C1 INI 1 2 5`, confirmed on the bench
+        to return error 1010) — Z goes out as its own single-axis leg,
+        polled separately, before the XY group leg."""
+        responses = {
+            "C1 INI 1 2": "0",
+            "A5 SPD 10": "10",
+            "A5 BMT 3": "0",
+            "A5 MIF": "1",
+            "C1 SPD 10": "10",
+            "C1 BMT 10 0": "0",
+            "C1 MIF": "1",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "C1 INI 1 2",
+            "A5 SPD 10", "A5 BMT 3", "A5 MIF",
+            "C1 SPD 10", "C1 BMT 10 0", "C1 MIF",
+        ]
+        assert "C1 INI 1 2 5" not in conn.sent
 
     def test_dry_run_sends_nothing(self):
         executor, conn = _make_executor({}, dry_run=True)
@@ -235,16 +290,16 @@ class TestExecutorLinearMoves:
         assert conn.sent == []
 
     def test_confirm_cb_can_abort_before_sending(self):
-        executor, conn = _make_executor({"C1 INI 1 2 5": "0"}, confirm_cb=lambda move: False)
+        executor, conn = _make_executor({"C1 INI 1 2": "0"}, confirm_cb=lambda move: False)
         trajectory = executor.plan("G1 X10")
         with pytest.raises(GCodeExecutionAborted):
             executor.execute(trajectory)
-        assert "C1 BMT 10 0 0" not in conn.sent
+        assert "C1 BMT 10 0" not in conn.sent
 
     def test_confirm_cb_receives_the_move(self):
         seen = []
         executor, conn = _make_executor(
-            {"C1 INI 1 2 5": "0", "C1 BMT 10 0 0": "0", "C1 MIF": "1"},
+            {"C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 MIF": "1"},
             confirm_cb=lambda move: seen.append(move) or True,
         )
         trajectory = executor.plan("G1 X10")
@@ -260,13 +315,13 @@ class TestExecutorHomeDwellPause:
             "SOB 4 1": "0", "INB 8": "1",  # Y brake disengage + status confirm
             "A5 AIC": "0", "A5 CAB": "0", "A5 JOG -10": "-10", "A5 CAT": "1",
             "A5 BST": "0", "A5 MIF": "1", "A5 CAP": "0", "A5 ACP": "0", "A5 ACP 0": "0",
-            "A5 MVT 5": "5",
+            "A5 BMT 5": "0",  # non-blocking standoff move (move_to() is banned)
             "A1 AIC": "0", "A1 CAB": "0", "A1 JOG -10": "-10", "A1 CAT": "1",
             "A1 BST": "0", "A1 MIF": "1", "A1 CAP": "0", "A1 ACP": "0", "A1 ACP 0": "0",
-            "A1 MVT 5": "5",
+            "A1 BMT 5": "0",  # non-blocking standoff move (move_to() is banned)
             "A2 AIC": "0", "A2 CAB": "0", "A2 JOG -10": "-10", "A2 CAT": "1",
             "A2 BST": "0", "A2 MIF": "1", "A2 CAP": "0", "A2 ACP": "0", "A2 ACP 0": "0",
-            "A2 MVT 5": "5",
+            "A2 BMT 5": "0",  # non-blocking standoff move (move_to() is banned)
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G28")

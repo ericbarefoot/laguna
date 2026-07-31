@@ -28,8 +28,9 @@ this module does not model them as Axis objects or send A3/A4/A7/A8 commands.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 import logging
 
 from .connection import SnapConnection, SnapMotionError
@@ -45,6 +46,94 @@ GROUP_TOKEN_FMT = "C{n}"  # coordinated-group commands
 # Uninitialized/garbage software limits observed on this hardware are large
 # (~±8.2e8); anything beyond this threshold is treated as "not really set".
 GARBAGE_LIMIT_THRESHOLD = 1e6
+
+
+# ---------------------------------------------------------------------------
+# Move-completion polling
+# ---------------------------------------------------------------------------
+#
+# DEBUG PATCH (branch debug/e415117-no-cross-node-group): confirmed on
+# hardware 2026-07-31 that polling MIF in a tight loop while a coordinated
+# group move is in flight destabilizes this controller. A C1 INI/BMT
+# oscillation test polling C1 MIF every 0.05s failed reproducibly on its
+# 6th move (~13s in) — the Pi-side agent logged a >5s serial read timeout
+# on C1 MIF, i.e. the controller stopped answering the wire entirely, not
+# a network/SSH fault. The identical test polling sparsely (one check near
+# the predicted finish time, then every 0.5s) ran 60 moves over 142s with
+# zero failures. Single-axis (A<n> BMT/MIF) moves polled at the same 0.05s
+# never failed across 15 cycles, so the trigger is specifically
+# high-frequency querying *during group interpolation*, not query rate
+# alone and not motion alone.
+#
+# Every wait-for-move loop in this driver therefore sleeps through most of
+# the move's predicted duration before its first query, then polls slowly.
+# Both knobs are module-level so tests can zero them out (see
+# tests/conftest.py) rather than sleeping in real time.
+SPARSE_POLL_INTERVAL_S = 0.5
+
+# Fraction of a move's predicted duration to sleep through before the first
+# query. Below 1.0 so that a slightly-optimistic prediction (accel/decel
+# ramps make real moves run longer than distance/speed) still lands the
+# first poll before completion rather than long after it.
+PREDICTED_SLEEP_FRACTION = 0.85
+
+
+def predicted_move_s(distance: float, speed: Optional[float]) -> float:
+    """Nominal duration of a move, for sparse move-completion polling.
+
+    Deliberately ignores accel/decel ramps, which only make the real move
+    take *longer* than this — combined with PREDICTED_SLEEP_FRACTION being
+    below 1.0, that keeps the first poll safely before completion rather
+    than after it. Returns 0.0 when the speed is unknown or non-positive
+    (e.g. a G-code program that never specified an F word, so the
+    controller is using whatever SPD it already had), which just means
+    polling starts immediately — still at the sparse interval.
+
+    Units only have to be consistent between the two arguments (mm and
+    mm/s, or degrees and degrees/s for Theta).
+    """
+    if not speed or speed <= 0:
+        return 0.0
+    return abs(distance) / speed
+
+
+def poll_until_move_finished(
+    is_finished: Callable[[], bool],
+    predicted_s: float = 0.0,
+    timeout_s: float = 30.0,
+) -> bool:
+    """Wait for a move to finish, querying the controller as little as possible.
+
+    Sleeps through PREDICTED_SLEEP_FRACTION of `predicted_s` before the
+    first `is_finished()` call, then polls every SPARSE_POLL_INTERVAL_S.
+    See this module's "Move-completion polling" note for why the tight
+    polling this replaces is actively harmful on this hardware.
+
+    Args:
+        is_finished: Callable returning True once the move has completed —
+            typically MMCCommands.move_is_finished/group_move_is_finished
+            bound to an axis (each call is one MIF query on the wire).
+        predicted_s: Expected move duration in seconds, if known (distance
+            / speed at the call site). 0.0 means "no idea" — polling then
+            starts immediately, still at the sparse interval.
+        timeout_s: Give up after this long. The initial predicted sleep
+            counts against it, and is clamped so it can never overshoot it.
+
+    Returns:
+        True if the move finished, False if `timeout_s` elapsed first. The
+        caller decides what a timeout means (abort and raise, or warn and
+        continue) — see the call sites in gcode.py/homing.py/controller.py.
+    """
+    deadline = time.monotonic() + timeout_s
+    initial_sleep = max(0.0, min(predicted_s * PREDICTED_SLEEP_FRACTION, timeout_s))
+    if initial_sleep > 0:
+        time.sleep(initial_sleep)
+    while True:
+        if is_finished():
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(SPARSE_POLL_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +273,26 @@ class IOMap:
 # ---------------------------------------------------------------------------
 # Command interface
 # ---------------------------------------------------------------------------
+
+# DEBUG PATCH (branch debug/e415117-no-cross-node-group): blocking motion
+# primitives (MVT/MVB, single-axis and group) are banned outright — they
+# hold the wire's request/response round trip open until the firmware
+# reports the physical move complete, for however long that takes,
+# including axes that are already at the requested target (e.g.
+# GantryController.move_to()'s old unconditional Theta-branch MVT, which
+# fired on every vector move regardless of whether Theta had actually
+# moved). Every caller now uses the non-blocking begin_move_to/begin_move_by
+# (+ move_is_finished polling) instead, which never leaves a
+# request/response pair open for an unbounded stretch — see also
+# GCodeExecutor's Z/XY split, which was migrated the same way. No caller
+# in this codebase used the blocking group forms at all.
+_BLOCKING_MOTION_BANNED = (
+    "{blocking}() is banned — it blocks on the wire until the physical move "
+    "completes (or the read times out), for however long that takes, even "
+    "for a zero-distance move to an already-current position. Use "
+    "{nonblocking}() and poll move_is_finished()/group_move_is_finished() instead."
+)
+
 
 class MMCCommands:
     """Formats, sends, and parses all Snap2Motion ASCII commands.
@@ -429,14 +538,12 @@ class MMCCommands:
         self._send(f"{self._ax(axis)} BMB {raw:.6g}")
 
     def move_to(self, axis: Axis, position: float) -> None:
-        """Blocking absolute move (MVT), given real mm. TCP response held until move completes."""
-        raw = self._pos_to_raw(axis, position)
-        self._send(f"{self._ax(axis)} MVT {raw:.6g}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(_BLOCKING_MOTION_BANNED.format(blocking="move_to", nonblocking="begin_move_to"))
 
     def move_by(self, axis: Axis, delta: float) -> None:
-        """Blocking relative move (MVB), given real mm."""
-        raw = self._delta_to_raw(axis, delta)
-        self._send(f"{self._ax(axis)} MVB {raw:.6g}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(_BLOCKING_MOTION_BANNED.format(blocking="move_by", nonblocking="begin_move_by"))
 
     def jog(self, axis: Axis, speed: float) -> float:
         """Start continuous velocity motion at speed (mm/s) (JOG). Pass 0 to stop.
@@ -489,12 +596,16 @@ class MMCCommands:
         self._send(f"{self._gx()} BMB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
 
     def group_move_to(self, *positions: float) -> None:
-        """Blocking coordinated absolute move (MVT on group), given real mm."""
-        self._send(f"{self._gx()} MVT {self._fmt_params(*self._group_pos_to_raw(*positions))}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(
+            _BLOCKING_MOTION_BANNED.format(blocking="group_move_to", nonblocking="group_begin_move_to")
+        )
 
     def group_move_by(self, *deltas: float) -> None:
-        """Blocking coordinated relative move (MVB on group), given real mm."""
-        self._send(f"{self._gx()} MVB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(
+            _BLOCKING_MOTION_BANNED.format(blocking="group_move_by", nonblocking="group_begin_move_by")
+        )
 
     def append_move_to(self, *positions: float) -> None:
         """Queue an absolute waypoint into the curve buffer (AMT), given real mm.

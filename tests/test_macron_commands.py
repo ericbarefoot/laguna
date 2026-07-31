@@ -7,6 +7,7 @@ prefixes, no brackets).
 
 import pytest
 
+from laguna.robot.macron import commands as macron_commands
 from laguna.robot.macron.commands import (
     ALL_AXES,
     IOMap,
@@ -15,6 +16,8 @@ from laguna.robot.macron.commands import (
     X_AXIS,
     Y_AXIS,
     Z_AXIS,
+    poll_until_move_finished,
+    predicted_move_s,
 )
 from laguna.robot.macron.connection import SnapMotionError
 from tests.macron_fixtures import FakeSnapConnection
@@ -162,3 +165,94 @@ class TestIOMapGatedBrakeHelpers:
         io_map = IOMap()
         assert cmd.brake_is_disengaged(X_AXIS, io_map) is True
         assert conn.sent == []
+
+
+class TestPredictedMoveS:
+    """predicted_move_s feeds the sparse move-completion polling — see
+    commands.py's "Move-completion polling" note."""
+
+    def test_distance_over_speed(self):
+        assert predicted_move_s(20.0, 10.0) == 2.0
+
+    def test_negative_distance_is_treated_as_magnitude(self):
+        # Callers pass raw target-minus-current deltas, which are signed.
+        assert predicted_move_s(-20.0, 10.0) == 2.0
+
+    @pytest.mark.parametrize("speed", [None, 0.0, -5.0])
+    def test_unknown_or_nonpositive_speed_predicts_nothing(self, speed):
+        # 0.0 means "poll immediately (but still sparsely)" rather than
+        # sleeping on a bogus prediction.
+        assert predicted_move_s(20.0, speed) == 0.0
+
+
+class TestPollUntilMoveFinished:
+    """The actual fix for the group-motion stall: query the controller as
+    little as possible while a move is in flight. Confirmed on hardware
+    that tight polling during group interpolation makes this controller
+    stop answering the wire entirely — see commands.py's module note."""
+
+    @pytest.fixture
+    def sparse(self, monkeypatch):
+        """Restore realistic pacing (the suite-wide autouse fixture in
+        conftest.py zeroes it), with a fake clock that advances only when
+        the code sleeps — so timeouts are genuinely exercised without the
+        suite waiting in real time.
+        """
+        slept = []
+        now = {"t": 0.0}
+
+        def fake_sleep(seconds):
+            slept.append(seconds)
+            now["t"] += seconds
+
+        monkeypatch.setattr(macron_commands, "SPARSE_POLL_INTERVAL_S", 0.5)
+        monkeypatch.setattr(macron_commands, "PREDICTED_SLEEP_FRACTION", 0.85)
+        monkeypatch.setattr(macron_commands.time, "sleep", fake_sleep)
+        monkeypatch.setattr(macron_commands.time, "monotonic", lambda: now["t"])
+        return slept
+
+    def test_returns_true_when_finished(self):
+        assert poll_until_move_finished(lambda: True) is True
+
+    def test_returns_false_on_timeout(self):
+        assert poll_until_move_finished(lambda: False, timeout_s=0.0) is False
+
+    def test_sleeps_through_most_of_the_predicted_duration_first(self, sparse):
+        poll_until_move_finished(lambda: True, predicted_s=2.0, timeout_s=30.0)
+        # 0.85 * 2.0s slept up front, before a single query went out.
+        assert sparse == [pytest.approx(1.7)]
+
+    def test_a_long_move_costs_only_a_couple_of_queries(self, sparse):
+        """The regression this guards: the old tight loop issued ~40 MIF
+        queries for a 2s move; this must issue a small handful."""
+        calls = {"n": 0}
+
+        def is_finished():
+            calls["n"] += 1
+            return calls["n"] >= 3  # finishes on the 3rd query
+
+        assert poll_until_move_finished(is_finished, predicted_s=2.0, timeout_s=30.0) is True
+        assert calls["n"] == 3
+        # One predicted-duration sleep, then one sparse interval per retry.
+        assert sparse == [pytest.approx(1.7), 0.5, 0.5]
+
+    def test_unknown_duration_polls_immediately_but_still_sparsely(self, sparse):
+        calls = {"n": 0}
+
+        def is_finished():
+            calls["n"] += 1
+            return calls["n"] >= 2
+
+        poll_until_move_finished(is_finished, predicted_s=0.0, timeout_s=30.0)
+        assert sparse == [0.5]  # no up-front sleep, still the sparse interval between queries
+
+    def test_predicted_sleep_never_overshoots_the_timeout(self, sparse):
+        # A wildly optimistic prediction must not sleep past the deadline
+        # and turn a timeout into an unbounded wait: the up-front sleep is
+        # clamped to timeout_s (2.0, not 0.85 * 1000).
+        assert poll_until_move_finished(lambda: False, predicted_s=1000.0, timeout_s=2.0) is False
+        assert sparse[0] == pytest.approx(2.0)
+        # Only the one sparse-interval retry after that — the deadline is
+        # checked after a query, so an unfinished move gets a last look at
+        # the deadline rather than being abandoned a poll early.
+        assert sparse == [pytest.approx(2.0), 0.5]

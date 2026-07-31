@@ -63,7 +63,7 @@ from laguna.robot.macron.fences import FenceViolation
 # --- Connection settings — adjust for your setup ---
 PI_HOST = "red.lab"
 PI_USER = "oak"
-PI_KEY = "~/.ssh/id_ed25519"
+PI_KEY = "/home/eric/.ssh/id_ed25519"
 REMOTE_SERIAL_DEVICE = "/dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0"
 AL1342_HOST = "192.168.1.251"
 OD2000_PDIN_PORT = 2
@@ -71,7 +71,7 @@ WTT12L_PDIN_PORT = 7
 
 # --- Motion AND scanning are off by default. Flip this only when you've
 #     decided to actually move something. ---
-ALLOW_MOTION = False
+ALLOW_MOTION = True
 
 
 def build_lab() -> FlumeLab:
@@ -185,8 +185,8 @@ def main():
     # ------------------------------------------------------------------
 
     print()
-    print("Homing gantry...")
-    lab.gantry.home()
+    print("Do not home gantry...")
+    # lab.gantry.home()
 
     print("Moving to (100, 50, 10, 0) mm...")
     lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0)
@@ -226,6 +226,9 @@ def main():
         output="experiments/scan_output/example_07_wtt12l.csv",
     )
     print(f"  -> {wtt12l_result.path} ({wtt12l_result.metadata.get('samples')} samples)")
+
+    print("returning to home")
+    lab.gantry.move_to([0.0, 0.0, 0.0, 0.0], speed=10.0)
 
     lab.disconnect_all()
     print("Done!")

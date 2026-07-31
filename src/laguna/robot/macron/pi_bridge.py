@@ -196,6 +196,7 @@ class PiGantryConnection(SnapConnection):
 
         self._client = None
         self._channel = None
+        self._stdin = None                     # kept alive deliberately — see connect()
         self._lock = threading.Lock()          # serializes send()/start_scan() request/ack cycles
         self._write_lock = threading.Lock()    # guards raw channel.send() calls
         self._next_id = 1
@@ -241,11 +242,25 @@ class PiGantryConnection(SnapConnection):
             f"python3 {REMOTE_AGENT_PATH} "
             f"--port {self.remote_serial_device} --baud {self.remote_baud}{safe_flag}"
         )
-        _, stdout, _stderr = client.exec_command(remote_cmd)
+        stdin, stdout, _stderr = client.exec_command(remote_cmd)
         channel = stdout.channel
 
         self._client = client
         self._channel = channel
+        # Keep the stdin file object alive for the connection's lifetime.
+        # paramiko's ChannelStdinFile.close() calls channel.shutdown_write(),
+        # and BufferedFile.__del__ calls close() — so letting this be
+        # garbage collected sends EOF on the agent's stdin, and the agent
+        # (whose main loop is `for raw_line in sys.stdin`) shuts down
+        # cleanly and exits mid-session. Because paramiko's objects sit in
+        # reference cycles, that collection happened on the *cyclic*
+        # collector's schedule rather than at a fixed point, so the agent
+        # appeared to die at random times — 10ms into one run, 36s into
+        # another — and more readily in allocation-heavy processes (a full
+        # FlumeLab with MQTT subscribers) than in small scripts. Confirmed
+        # 2026-07-31: an explicit gc.collect() right after connect() flips
+        # channel.eof_sent False->True and kills the agent every time.
+        self._stdin = stdin
         self._stdout_buf = b""
         self._next_id = 1
         self._pending = {}
@@ -286,6 +301,11 @@ class PiGantryConnection(SnapConnection):
         client = self._client
         self._channel = None
         self._client = None
+        # Release the deliberately-held stdin handle (see connect()). Now
+        # the EOF it sends on close is what we actually want — we're
+        # telling the agent to shut down anyway, right after the explicit
+        # {"op": "close"} below.
+        self._stdin = None
         if channel is not None:
             try:
                 channel.send((json.dumps({"op": "close"}) + "\n").encode("ascii"))

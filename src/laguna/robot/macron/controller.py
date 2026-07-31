@@ -22,6 +22,8 @@ from .commands import (
     X_AXIS,
     Y_AXIS,
     Z_AXIS,
+    poll_until_move_finished,
+    predicted_move_s,
 )
 from .connection import EthernetConnection, RS232Connection, SnapConnection, SnapMotionError
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
@@ -30,6 +32,11 @@ from .homing import HomingConfig, HomingProcedure
 from .pi_bridge import PiGantryConnection
 
 logger = logging.getLogger(__name__)
+
+# Tolerance for deciding whether an axis actually needs to move — used only
+# by the debug-patch Theta skip in move_to() (see its comment there). Needed
+# because mm/degree values round-trip through raw controller units and back.
+_POSITION_EPSILON_MM = 1e-3
 
 _NAMED_AXES = {
     "X": X_AXIS,
@@ -177,6 +184,11 @@ class GantryController:
         try:
             self._connection.connect()
             self._is_connected = self._connection.is_connected
+            # The controller may have been power-cycled/reflashed while we
+            # were away, clearing its coordinated-group state — make the
+            # next move re-send INI rather than assume it survived. See
+            # GCodeExecutor._init_group.
+            self.gcode.reset_group_init()
             return self._is_connected
         except Exception as exc:
             logger.error("Failed to connect gantry: %s", exc)
@@ -314,9 +326,24 @@ class GantryController:
 
         if theta_value is not None:
             theta_axis = axes_by_name["Theta"]
-            if speed is not None:
-                self.cmd.set_speed(theta_axis, speed)
-            self.cmd.move_to(theta_axis, theta_value)
+            # DEBUG PATCH (branch debug/e415117-no-cross-node-group): the
+            # vector move_to() form always passes theta_value (0.0 if the
+            # caller didn't care about Theta at all), so this used to fire
+            # a blocking MVT unconditionally — including when Theta was
+            # already at the target, e.g. every scan-setup move in
+            # example_07. move_to() is now banned outright (see
+            # commands.py); this does a live read first and skips the move
+            # entirely if Theta hasn't actually changed, same as the
+            # X/Y/Z legs in GCodeExecutor._execute_linear.
+            current_theta = self.cmd.get_actual_position(theta_axis)
+            if abs(theta_value - current_theta) > _POSITION_EPSILON_MM:
+                if speed is not None:
+                    self.cmd.set_speed(theta_axis, speed)
+                self.cmd.begin_move_to(theta_axis, theta_value)
+                self._wait_for_axis_move_finished(
+                    theta_axis,
+                    predicted_s=predicted_move_s(theta_value - current_theta, speed),
+                )
 
         return True
 
@@ -341,21 +368,46 @@ class GantryController:
             self.cmd.set_enable(axis, False)
             self.cmd.set_motor(axis, False)
 
-    def wait_for_move(self, timeout: float = 30.0) -> None:
+    def wait_for_move(self, timeout: float = 30.0, predicted_s: float = 0.0) -> None:
         """Block until the coordinated group's current move completes, or timeout elapses.
 
-        Only tracks the coordinated (X/Y/Z) group — a Theta-only move
-        issued via move_to(Theta=...) isn't covered by this; poll
+        Only tracks the coordinated (X/Y) group — a Theta-only move issued
+        via move_to(Theta=...) isn't covered by this; poll
         self.cmd.move_is_finished(THETA_AXIS) directly for that.
+
+        DEBUG PATCH (branch debug/e415117-no-cross-node-group): polls
+        sparsely via commands.poll_until_move_finished. This is the public
+        "wait for the move I just started" entry point, so it is exactly
+        the loop most likely to be querying C<n> MIF while a group move is
+        interpolating — the pattern confirmed on hardware to make this
+        controller stop answering the wire; see commands.py's module note.
+        Pass `predicted_s` (distance / speed) when known so most of the
+        wait costs no wire traffic at all.
 
         Raises:
             TimeoutError: If the move hasn't finished within `timeout`.
         """
-        deadline = time.monotonic() + timeout
-        while not self.cmd.group_move_is_finished():
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"Gantry move did not finish within {timeout:.0f}s")
-            time.sleep(0.05)
+        if not poll_until_move_finished(
+            self.cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout
+        ):
+            raise TimeoutError(f"Gantry move did not finish within {timeout:.0f}s")
+
+    def _wait_for_axis_move_finished(
+        self, axis: Axis, timeout: float = 30.0, predicted_s: float = 0.0
+    ) -> None:
+        """Block until a single axis's move-finished flag is set, aborting on timeout.
+
+        DEBUG PATCH (branch debug/e415117-no-cross-node-group): used by the
+        Theta branch of move_to() now that it issues a non-blocking
+        begin_move_to instead of a blocking move_to() (banned — see
+        commands.py). Polls sparsely via commands.poll_until_move_finished
+        — see that function's module note.
+        """
+        if not poll_until_move_finished(
+            lambda: self.cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout
+        ):
+            self.cmd.abort(axis)
+            raise TimeoutError(f"{axis.name} move did not finish within {timeout:.0f}s — aborted")
 
 
 def _build_transport(config: Dict[str, Any]) -> SnapConnection:

@@ -193,15 +193,21 @@ class TestMoveTo:
 
     def test_vector_move_routes_through_fence_checked_gcode_path(self):
         # X=150mm, Y=0, Z=0 (raw 10 0 0 at mm_per_unit=15), Theta=0 (unconverted).
+        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): the group
+        # never spans Z (the responder node) — see GCodeExecutor's class
+        # docstring — and Z is unchanged here, so no Z leg is sent at all.
+        # Theta is read live (A6 ACP) and, since it's already at 0, no
+        # Theta move is sent at all (move_to() — blocking MVT — is banned
+        # regardless; see commands.py).
         responses = {
-            "C1 INI 1 2 5": "0",
-            "C1 BMT 10 0 0": "0",
+            "C1 INI 1 2": "0",
+            "C1 BMT 10 0": "0",
             "C1 MIF": "1",
-            "A6 MVT 0": "0",
+            "A6 ACP": "0",
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
-        assert conn.sent == ["C1 INI 1 2 5", "C1 BMT 10 0 0", "C1 MIF", "A6 MVT 0"]
+        assert conn.sent == ["C1 INI 1 2", "C1 BMT 10 0", "C1 MIF", "A6 ACP"]
 
     def test_vector_move_length_mismatch_raises(self):
         controller, _conn = self._make_controller({})
@@ -224,15 +230,15 @@ class TestMoveTo:
         responses = {
             "A2 ACP": "0",  # Y backfill
             "A5 ACP": "0",  # Z backfill
-            "C1 INI 1 2 5": "0",
+            "C1 INI 1 2": "0",
             "C1 SPD 0.133333": "0.133333",
-            "C1 BMT 10 0 0": "0",
+            "C1 BMT 10 0": "0",
             "C1 MIF": "1",
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to(X=150.0, speed=2.0) is True
         assert conn.sent == [
-            "A2 ACP", "A5 ACP", "C1 INI 1 2 5", "C1 SPD 0.133333", "C1 BMT 10 0 0", "C1 MIF",
+            "A2 ACP", "A5 ACP", "C1 INI 1 2", "C1 SPD 0.133333", "C1 BMT 10 0", "C1 MIF",
         ]
 
     def test_keyword_move_is_fence_checked(self):
@@ -248,10 +254,24 @@ class TestMoveTo:
 
     def test_theta_only_keyword_move_does_not_touch_cartesian_axes(self):
         # A pure Theta move must not query, move, or otherwise touch X/Y/Z
-        # at all — no ACP reads, no C1 group commands.
-        controller, conn = self._make_controller({"A6 MVT 90": "90"})
+        # at all — no ACP reads for X/Y/Z, no C1 group commands.
+        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): Theta now
+        # reads its live position first (A6 ACP) and moves non-blocking
+        # (A6 BMT + A6 MIF poll) instead of a blocking A6 MVT — move_to()
+        # is banned; see commands.py.
+        controller, conn = self._make_controller({
+            "A6 ACP": "0", "A6 BMT 90": "0", "A6 MIF": "1",
+        })
         assert controller.move_to(Theta=90.0) is True
-        assert conn.sent == ["A6 MVT 90"]
+        assert conn.sent == ["A6 ACP", "A6 BMT 90", "A6 MIF"]
+
+    def test_theta_move_skipped_entirely_when_already_at_target(self):
+        # DEBUG PATCH: the vector move_to() form always passes a Theta
+        # value (0.0 if the caller doesn't care) — if Theta is already
+        # there, no move (blocking or not) should be sent at all.
+        controller, conn = self._make_controller({"A6 ACP": "0"})
+        assert controller.move_to(Theta=0.0) is True
+        assert conn.sent == ["A6 ACP"]
 
     def test_keyword_move_of_unconfigured_axis_raises(self):
         conn = FakeSnapConnection({})
