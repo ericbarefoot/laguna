@@ -63,7 +63,7 @@ from laguna.robot.macron.fences import FenceViolation
 # --- Connection settings — adjust for your setup ---
 PI_HOST = "red.lab"
 PI_USER = "oak"
-PI_KEY = "/home/eric/.ssh/id_ed25519"
+PI_KEY = "~/.ssh/id_ed25519"
 REMOTE_SERIAL_DEVICE = "/dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0"
 AL1342_HOST = "192.168.1.251"
 OD2000_PDIN_PORT = 2

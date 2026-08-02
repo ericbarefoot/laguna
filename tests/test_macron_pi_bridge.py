@@ -7,6 +7,7 @@ RS232Connection's fake socket/serial objects.
 """
 
 import json
+import os
 import threading
 
 import pytest
@@ -575,3 +576,21 @@ class TestEnaRefusedByTransport:
 
     def test_ena_is_not_on_the_safe_command_allowlist(self):
         assert "ENA" not in SAFE_COMMANDS
+
+
+class TestSshKeyTildeExpansion:
+    """paramiko does not tilde-expand key_filename, so a configured
+    "~/.ssh/id_ed25519" was passed through literally and failed with
+    ENOENT. Ported from 5c170d3 (plan step 1)."""
+
+    def test_tilde_is_expanded(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/testuser")
+        conn = PiGantryConnection(
+            host="red.lab", ssh_user="oak", remote_serial_device="/dev/fake",
+            ssh_key="~/.ssh/id_ed25519",
+        )
+        assert os.path.expanduser(conn.ssh_key) == "/home/testuser/.ssh/id_ed25519"
+
+    def test_absolute_path_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/testuser")
+        assert os.path.expanduser("/etc/keys/id_ed25519") == "/etc/keys/id_ed25519"
