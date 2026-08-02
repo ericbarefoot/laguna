@@ -13,8 +13,10 @@ import pytest
 
 from laguna.robot.macron.connection import COMM_TIMEOUT_CODE, SnapMotionError
 from laguna.robot.macron.pi_bridge import (
+    SAFE_COMMANDS,
     PiGantryConnection,
     SafeModeConnection,
+    check_ena_banned,
     check_safe_mode,
     parse_command,
 )
@@ -539,3 +541,37 @@ class TestLegacyModemLinesFlag:
             host="red.lab", ssh_user="oak", remote_serial_device="/dev/ttyFAKE"
         )
         assert conn.legacy_modem_lines is False
+
+
+class TestEnaRefusedByTransport:
+    """Layer 2 of the ENA ban: the transport refuses it regardless of
+    safe_mode, so a raw string send cannot reach the wire either. See
+    pi_bridge.check_ena_banned."""
+
+    @pytest.mark.parametrize("cmd", ["A5 ENA", "A5 ENA 1", "a5 ena", "A1 ENA 0", "  A6  ENA  "])
+    def test_refused(self, cmd):
+        with pytest.raises(SnapMotionError, match="ENA"):
+            check_ena_banned(cmd)
+
+    @pytest.mark.parametrize("cmd", ["A5 ACP", "A1 MTR 1", "C1 BMT 10 0", "A5 ENP", "ENABLE"])
+    def test_unrelated_commands_pass(self, cmd):
+        """Must not false-positive on ENP, or on a longer word containing
+        'ena' — the ban is on the ENA token, not the substring."""
+        check_ena_banned(cmd)
+
+    def test_refused_even_when_safe_mode_is_off(self):
+        """safe_mode can be switched off; this ban must hold either way."""
+        conn, channel = _make_connection(safe_mode=False)
+        with pytest.raises(SnapMotionError, match="ENA"):
+            conn.send("A5 ENA 1")
+        assert channel.sent == []      # never reached the wire
+
+    def test_refused_by_safe_mode_connection_wrapper(self):
+        inner = FakeSnapConnection({})
+        wrapper = SafeModeConnection(inner, safe_mode=False)
+        with pytest.raises(SnapMotionError, match="ENA"):
+            wrapper.send("A5 ENA")
+        assert inner.sent == []
+
+    def test_ena_is_not_on_the_safe_command_allowlist(self):
+        assert "ENA" not in SAFE_COMMANDS

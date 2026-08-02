@@ -942,3 +942,26 @@ class TestDisableHangupOnClose:
         monkeypatch.setattr(termios, "tcgetattr",
                             lambda fd: (_ for _ in ()).throw(OSError("not a tty")))
         assert ga._disable_hangup_on_close(_FakeSerialPort()) is False
+
+
+class TestEnaRefusedAgentSide:
+    """Layer 3 of the ENA ban — the last line before the wire. Enforced on
+    the Pi independently of both PC-side layers and of safe_mode, the same
+    defense-in-depth reasoning as SAFE_COMMANDS being duplicated here.
+    Addressing ENA on a responder-node axis crashes the controller; the node
+    must then be reflashed. Confirmed on hardware 2026-08-02, reproduced
+    from a bare tio terminal with no laguna code involved."""
+
+    @pytest.mark.parametrize("cmd", ["A5 ENA", "A5 ENA 1", "a5 ena", "A1 ENA 0", "  A6  ENA  "])
+    def test_refused(self, cmd):
+        with pytest.raises(PermissionError, match="ENA"):
+            ga.check_ena_banned(cmd)
+
+    @pytest.mark.parametrize("cmd", ["A5 ACP", "A1 MTR 1", "C1 BMT 10 0", "A5 ENP", "ENABLE"])
+    def test_unrelated_commands_pass(self, cmd):
+        """Must not false-positive on ENP, or on a longer word containing
+        'ena' — the ban is on the ENA token, not the substring."""
+        ga.check_ena_banned(cmd)
+
+    def test_ena_is_not_on_the_agent_allowlist(self):
+        assert "ENA" not in ga.SAFE_COMMANDS

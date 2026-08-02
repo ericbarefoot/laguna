@@ -119,11 +119,19 @@ SAFE_COMMANDS = {
     "INB": 1, "ISI": 1, "ALI": 1,
     "ACP": 0, "ENP": 0, "COP": 0, "DEP": 0,
     "SPD": 0, "ACL": 0, "DCL": 0, "NLT": 0, "PLT": 0,
-    "MTR": 0, "ENA": 0, "MIF": 0,
+    "MTR": 0, "MIF": 0,   # ENA deliberately absent — see _ENA_RE below
     "CAB": 0, "CAP": 0, "CAT": 0, "PFP": 0, "PFV": 0,
 }
 
 _PREFIX_RE = re.compile(r"^[AC]\d+$")
+
+# Refused unconditionally, independent of safe_mode and of the PC-side
+# check — same defense-in-depth reasoning as SAFE_COMMANDS being duplicated
+# here. Sending ENA to a responder-node axis (A5/Z, A6/Theta) crashes this
+# controller: the node stops answering entirely and must be reflashed.
+# Confirmed on hardware 2026-08-02, reproduced from a bare tio terminal
+# with no laguna code involved, using a bare ENA read with no argument.
+_ENA_RE = re.compile(r"(?:^|\s)ENA(?:\s|$)", re.IGNORECASE)
 _TOKEN_SPLIT = re.compile(r"[,\s]+")
 
 DEFAULT_LOG_PATH = Path(__file__).parent / "gantry_agent.log"
@@ -162,6 +170,22 @@ def parse_command(cmd: str):
     if idx >= len(tokens):
         raise ValueError(f"command has no mnemonic: {cmd!r}")
     return tokens[idx].upper(), len(tokens) - idx - 1
+
+
+def check_ena_banned(cmd: str) -> None:
+    """Raise if cmd addresses ENA. Enforced regardless of safe_mode.
+
+    See _ENA_RE. This is the last line of defense before the wire: even a
+    raw command that bypassed both PC-side layers must not reach the
+    controller, because the responder does not survive it.
+    """
+    if _ENA_RE.search(cmd):
+        raise PermissionError(
+            f"command {cmd!r} refused: ENA crashes this controller's responder "
+            "node (confirmed on hardware 2026-08-02, reproducible from a bare "
+            "serial terminal). The axes are enabled at power-up by the "
+            "controller's own DSM program — nothing needs this command."
+        )
 
 
 def check_safe_mode(cmd: str) -> None:
@@ -868,6 +892,16 @@ def main() -> None:
         timeout = float(msg.get("timeout", 5.0))
         if request_id is None or cmd is None:
             _log(f"Ignoring malformed request: {raw_line!r}")
+            continue
+
+        # Unconditional, before the safe_mode gate: safe_mode can be turned
+        # off, and this must hold either way. See check_ena_banned.
+        try:
+            check_ena_banned(cmd)
+        except PermissionError as exc:
+            _log(f"REFUSED (ENA ban): {cmd!r} — {exc}")
+            _audit(log_path, {"id": request_id, "cmd": cmd, "refused": True, "reason": str(exc)})
+            _emit({"id": request_id, "error": str(exc), "code": 0})
             continue
 
         if safe_mode:

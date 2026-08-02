@@ -82,11 +82,36 @@ SAFE_COMMANDS = {
     "INB": 1, "ISI": 1, "ALI": 1,
     "ACP": 0, "ENP": 0, "COP": 0, "DEP": 0,
     "SPD": 0, "ACL": 0, "DCL": 0, "NLT": 0, "PLT": 0,
-    "MTR": 0, "ENA": 0, "MIF": 0,
+    "MTR": 0, "MIF": 0,   # ENA deliberately absent — see check_ena_banned
     "CAB": 0, "CAP": 0, "CAT": 0, "PFP": 0, "PFV": 0,
 }
 
 _PREFIX_RE = re.compile(r"^[AC]\d+$")
+
+# ENA is refused unconditionally — NOT part of the safe_mode allowlist,
+# because safe_mode only applies when it is switched on and this must hold
+# always. Sending ENA to a responder-node axis (A5/Z, A6/Theta) crashes
+# this controller: the node stops answering entirely (error 70 — a ~575 ms
+# inter-node timeout — on every subsequent command, including reads that
+# worked moments earlier) and has to be reflashed. Confirmed on hardware
+# 2026-08-02 and reproduced from a bare `tio` terminal with no laguna code
+# involved, using a bare ENA *read* with no argument. Banned for all axes:
+# the controller's own DSM program enables the axes at power-up, so nothing
+# here needs the command. See MMCCommands._ENA_BANNED.
+_ENA_RE = re.compile(r"(?:^|\s)ENA(?:\s|$)", re.IGNORECASE)
+
+
+def check_ena_banned(cmd: str) -> None:
+    """Raise if cmd addresses ENA on any axis. Called before every send."""
+    if _ENA_RE.search(cmd):
+        raise SnapMotionError(
+            0,
+            f"Command {cmd!r} refused: ENA crashes this controller's responder "
+            "node (confirmed on hardware 2026-08-02, reproducible from a bare "
+            "serial terminal). The axes are already enabled at power-up by the "
+            "controller's DSM program — nothing needs this command.",
+        )
+
 
 
 def parse_command(cmd: str) -> Tuple[str, int]:
@@ -148,6 +173,7 @@ class SafeModeConnection(SnapConnection):
         return self._inner.is_connected
 
     def send(self, command: str) -> str:
+        check_ena_banned(command)     # unconditional — see check_ena_banned
         if self.safe_mode:
             check_safe_mode(command)  # raises before touching the inner connection
         return self._inner.send(command)
@@ -430,6 +456,7 @@ class PiGantryConnection(SnapConnection):
     # ------------------------------------------------------------------
 
     def send(self, command: str) -> str:
+        check_ena_banned(command)     # unconditional — see check_ena_banned
         if self.safe_mode:
             check_safe_mode(command)  # raises before anything is written
 

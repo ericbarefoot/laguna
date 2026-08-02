@@ -256,3 +256,49 @@ class TestPollUntilMoveFinished:
         # checked after a query, so an unfinished move gets a last look at
         # the deadline rather than being abandoned a poll early.
         assert sparse == [pytest.approx(2.0), 0.5]
+
+
+class TestEnaBanned:
+    """ENA is refused at every layer. Addressing it on a responder-node axis
+    (A5/Z, A6/Theta) crashes this controller: the node stops answering
+    entirely (error 70 on everything, including reads that worked moments
+    earlier) and must be reflashed. Confirmed on hardware 2026-08-02,
+    reproduced from a bare tio terminal with no laguna code involved, using
+    a bare ENA *read* with no argument."""
+
+    def test_set_enable_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.set_enable(Z_AXIS, True)
+
+    def test_get_enable_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.get_enable(Z_AXIS)
+
+    def test_banned_for_commander_axes_too(self):
+        """Evidence only covers the responder, but nothing needs ENA at all
+        and the blast radius warrants a blanket refusal."""
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.set_enable(X_AXIS, True)
+
+    def test_nothing_reaches_the_wire(self):
+        conn = FakeSnapConnection({})
+        cmd = MMCCommands(conn)
+        for call in (lambda: cmd.set_enable(Z_AXIS, True), lambda: cmd.get_enable(Z_AXIS)):
+            with pytest.raises(RuntimeError):
+                call()
+        assert conn.sent == []
+
+    def test_read_axis_state_does_not_query_ena(self):
+        """read_axis_state() used to read ENA — that batch would have
+        crashed the responder every time it was called on Z or Theta."""
+        conn = FakeSnapConnection({
+            "A5 ACP": "0", "A5 COP": "0", "A5 DEP": "0", "A5 ENP": "0",
+            "A5 SPD": "0", "A5 ACL": "0", "A5 DCL": "0", "A5 MTR": "1",
+            "A5 MIF": "1", "A5 CAB": "0", "A5 CAP": "0", "A5 CAT": "0",
+            "A5 NLT": "0", "A5 PLT": "0",
+        })
+        MMCCommands(conn).read_axis_state(Z_AXIS)
+        assert not any("ENA" in c for c in conn.sent)

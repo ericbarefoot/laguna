@@ -312,21 +312,22 @@ class TestHomeEnableDisableWaitForMove:
         )
         assert controller.home() is False
 
-    def test_enable_enables_motor_and_drive_on_every_axis(self):
+    def test_enable_turns_on_every_motor_and_never_sends_ena(self):
+        # ENA on a responder-node axis crashes the controller — confirmed on
+        # hardware 2026-08-02 and reproduced from a bare tio terminal. The
+        # DSM program enables the axes at power-up, so MTR alone is enough.
         responses = {f"A{i} MTR 1": "1" for i in (1, 2, 5, 6)}
-        responses.update({f"A{i} ENA 1": "1" for i in (1, 2, 5, 6)})
         controller, conn = self._make_controller(responses)
         controller.enable()
-        assert "A1 MTR 1" in conn.sent
-        assert "A1 ENA 1" in conn.sent
+        assert conn.sent == ["A1 MTR 1", "A2 MTR 1", "A5 MTR 1", "A6 MTR 1"]
+        assert not any("ENA" in c for c in conn.sent)
 
-    def test_disable_disables_drive_and_motor_on_every_axis(self):
-        responses = {f"A{i} ENA 0": "0" for i in (1, 2, 5, 6)}
-        responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)})
+    def test_disable_turns_off_every_motor_and_never_sends_ena(self):
+        responses = {f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)}
         controller, conn = self._make_controller(responses)
         controller.disable()
-        assert "A1 ENA 0" in conn.sent
-        assert "A1 MTR 0" in conn.sent
+        assert conn.sent == ["A1 MTR 0", "A2 MTR 0", "A5 MTR 0", "A6 MTR 0"]
+        assert not any("ENA" in c for c in conn.sent)
 
     def test_wait_for_move_polls_until_finished(self):
         calls = {"n": 0}

@@ -357,15 +357,23 @@ class GantryController:
         return result.success
 
     def enable(self) -> None:
-        """Enable motor drive on all configured axes."""
+        """Turn motor drive on for all configured axes (MTR only).
+
+        Does NOT send ENA. Addressing ENA on a responder-node axis (Z,
+        Theta) crashes this controller — see MMCCommands._ENA_BANNED. The
+        controller's own DSM program enables the axes at power-up, so the
+        drive-enable half of this was never load-bearing here.
+        """
         for axis in self._axes:
             self.cmd.set_motor(axis, True)
-            self.cmd.set_enable(axis, True)
 
     def disable(self) -> None:
-        """Disable motor drive on all configured axes (allows manual repositioning)."""
+        """Turn motor drive off for all configured axes (MTR only), allowing
+        manual repositioning.
+
+        Does NOT send ENA — see enable().
+        """
         for axis in self._axes:
-            self.cmd.set_enable(axis, False)
             self.cmd.set_motor(axis, False)
 
     def wait_for_move(self, timeout: float = 30.0, predicted_s: float = 0.0) -> None:

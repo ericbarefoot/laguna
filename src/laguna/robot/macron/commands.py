@@ -181,7 +181,10 @@ class AxisState:
     accel: float = 0.0                 # ACL
     decel: float = 0.0                 # DCL
     motor_on: bool = False             # MTR
-    enabled: bool = False              # ENA
+    # ENA is banned (see _ENA_BANNED) — reading it crashes the responder
+    # node. This field is never populated by read_axis_state() and stays at
+    # its default; kept so existing callers don't break on attribute access.
+    enabled: bool = False              # ENA — NEVER POPULATED, see above
     move_is_finished: bool = True      # MIF
     capture_bit: bool = False          # CAB — live state of capture input
     capture_position: float = 0.0      # CAP — position latched at capture event
@@ -291,6 +294,53 @@ _BLOCKING_MOTION_BANNED = (
     "completes (or the read times out), for however long that takes, even "
     "for a zero-distance move to an already-current position. Use "
     "{nonblocking}() and poll move_is_finished()/group_move_is_finished() instead."
+)
+
+
+# ---------------------------------------------------------------------------
+# ENA is banned outright — it crashes this controller
+# ---------------------------------------------------------------------------
+#
+# Confirmed on hardware 2026-08-02, reproduced three times independently,
+# including from a bare `tio` terminal with no laguna code in the loop:
+# addressing ENA on a responder-node axis (A5/Z, A6/Theta) kills the
+# responder. Every subsequent command to A5/A6 — including a plain `ACP`
+# position read that worked moments earlier — returns error 70, which is a
+# ~575 ms timeout of the commander waiting on the inter-node link. The node
+# does not recover on its own and the program has to be reflashed.
+#
+#     tio session, 2026-08-02, human-typed, seconds apart:
+#         a5 acp   ->  0 0.005 >     healthy
+#         a5 ena   ->  70 >          <-- crashes here
+#         a5 acp   ->  70 >          previously-working read now dead
+#
+# Note the crashing form is a bare *read* with no argument, so this is not
+# "enabling the axis does something dangerous" — merely addressing the ENA
+# register on those axes is enough. That makes it a controller firmware
+# fault, not a driver bug, and nothing this codebase can do except refuse
+# to emit the command.
+#
+# Banned for ALL axes, not just A5/A6. The evidence only covers the
+# responder, but per the DSM program currently running on the commander the
+# axes are already enabled at power-up, so no laguna workflow needs ENA at
+# all. Given the blast radius, a blanket refusal is the right trade until
+# the vendor explains the fault.
+#
+# Enforced in three independent layers, deliberately duplicated the same
+# way the safe_mode allowlist is:
+#   1. here, so the typed API cannot construct it
+#   2. pi_bridge.PiGantryConnection.send(), so a raw string send is refused
+#      client-side regardless of safe_mode
+#   3. gantry_agent.py on the Pi, so nothing reaches the wire even if the
+#      PC-side layers are bypassed
+_ENA_BANNED = (
+    "{call}() is banned: sending ENA to a responder-node axis (A5/Z, A6/Theta) "
+    "crashes this controller — the node stops answering entirely (error 70 on "
+    "every subsequent command, including reads that worked a moment earlier) "
+    "and has to be reflashed. Confirmed on hardware 2026-08-02, reproduced "
+    "from a bare serial terminal with no laguna code involved, using a bare "
+    "ENA *read*. The axes are already enabled at power-up by the controller's "
+    "own DSM program, so nothing here needs this command."
 )
 
 
@@ -421,11 +471,12 @@ class MMCCommands:
         return bool(self._send(f"{self._gx()} MTR {val}"))
 
     def set_enable(self, axis: Axis, enabled: bool) -> bool:
-        val = 1 if enabled else 0
-        return bool(self._send(f"{self._ax(axis)} ENA {val}"))
+        """Banned — see _ENA_BANNED."""
+        raise RuntimeError(_ENA_BANNED.format(call="set_enable"))
 
     def get_enable(self, axis: Axis) -> bool:
-        return bool(self._send(f"{self._ax(axis)} ENA"))
+        """Banned — see _ENA_BANNED."""
+        raise RuntimeError(_ENA_BANNED.format(call="get_enable"))
 
     # ------------------------------------------------------------------
     # Position & kinematics — single axis
@@ -833,7 +884,8 @@ class MMCCommands:
             accel=self.get_accel(axis),
             decel=self.get_decel(axis),
             motor_on=self.get_motor(axis),
-            enabled=self.get_enable(axis),
+            # enabled= deliberately omitted: reading ENA crashes the
+            # responder node (see _ENA_BANNED). Left at its default.
             move_is_finished=self.move_is_finished(axis),
             capture_bit=self.get_capture_bit(axis),
             capture_position=self.get_capture_position(axis),
