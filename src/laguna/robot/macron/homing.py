@@ -156,7 +156,25 @@ class HomingProcedure:
 
         Stops and returns a failure result on the first axis that fails rather
         than leaving the gantry in a partially homed state.
+
+        Temporarily disabled: physical obstructions currently block several
+        of the limit switches this routine depends on, making it unsafe to
+        run. Raises NotImplementedError unconditionally until the
+        obstructions are cleared, homing has been re-verified safe, and this
+        guard is removed. Use GantryController.set_position() to
+        re-reference an axis's position register in the meantime (declares
+        where the gantry already is; commands no motion).
+
+        Raises:
+            NotImplementedError: Always, while this guard is in place.
         """
+        raise NotImplementedError(
+            "Homing is temporarily disabled — physical obstructions currently block "
+            "several of the limit switches this routine depends on. Use "
+            "GantryController.set_position() to re-reference position registers "
+            "manually instead. Remove this guard once the obstructions are cleared "
+            "and homing has been re-verified safe."
+        )
         results: dict[str, float] = {}
         for axis in self._config.home_order:
             try:

@@ -309,24 +309,17 @@ class TestExecutorLinearMoves:
 
 
 class TestExecutorHomeDwellPause:
-    def test_g28_calls_home_all(self):
-        responses = {
-            "SOB 5 1": "0", "INB 1": "1",  # Z brake disengage + status confirm
-            "SOB 4 1": "0", "INB 8": "1",  # Y brake disengage + status confirm
-            "A5 AIC": "0", "A5 CAB": "0", "A5 JOG -10": "-10", "A5 CAT": "1",
-            "A5 BST": "0", "A5 MIF": "1", "A5 CAP": "0", "A5 ACP": "0", "A5 ACP 0": "0",
-            "A5 BMT 5": "0",  # non-blocking standoff move (move_to() is banned)
-            "A1 AIC": "0", "A1 CAB": "0", "A1 JOG -10": "-10", "A1 CAT": "1",
-            "A1 BST": "0", "A1 MIF": "1", "A1 CAP": "0", "A1 ACP": "0", "A1 ACP 0": "0",
-            "A1 BMT 5": "0",  # non-blocking standoff move (move_to() is banned)
-            "A2 AIC": "0", "A2 CAB": "0", "A2 JOG -10": "-10", "A2 CAT": "1",
-            "A2 BST": "0", "A2 MIF": "1", "A2 CAP": "0", "A2 ACP": "0", "A2 ACP 0": "0",
-            "A2 BMT 5": "0",  # non-blocking standoff move (move_to() is banned)
-        }
-        executor, conn = _make_executor(responses)
+    def test_g28_raises_while_homing_is_disabled(self):
+        """HomingProcedure.home_all() raises unconditionally while physical
+        obstructions block several of the limit switches it depends on
+        (plan step 2, from 5c170d3). G28 therefore cannot run, and must
+        fail before touching the wire rather than jogging into a blocked
+        switch."""
+        executor, conn = _make_executor({})
         trajectory = executor.plan("G28")
-        executor.execute(trajectory)
-        assert "A5 JOG -10" in conn.sent  # Z (home_order default starts with Z)
+        with pytest.raises(NotImplementedError, match="Homing is temporarily disabled"):
+            executor.execute(trajectory)
+        assert conn.sent == []  # nothing reached the controller
 
     def test_g4_dwell_sleeps(self, monkeypatch):
         slept = []
