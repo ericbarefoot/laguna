@@ -3,6 +3,8 @@ the software workaround for the 15 mm/unit gantry finding (see
 docs/GANTRY_UNIT_CALIBRATION.md). Offline, driven against FakeSnapConnection.
 """
 
+import pytest
+
 from laguna.robot.macron.commands import MMCCommands, THETA_AXIS, X_AXIS, Y_AXIS, Z_AXIS
 from tests.macron_fixtures import FakeSnapConnection
 
@@ -35,25 +37,57 @@ class TestPositionConversion:
         assert conn.sent == ["A1 ACP 10"]
         assert result == 150.0
 
-    def test_move_to_converts_absolute_position(self):
-        conn = FakeSnapConnection({"A1 MVT 10": "0"})
+    def test_begin_move_to_converts_absolute_position(self):
+        # move_to()
+        # (blocking MVT) is banned — see TestBannedBlockingMotion below —
+        # so conversion coverage moves to its non-blocking replacement,
+        # begin_move_to() (BMT), which shares the same _pos_to_raw plumbing.
+        conn = FakeSnapConnection({"A1 BMT 10": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0)
-        cmd.move_to(X_AXIS, 150.0)
-        assert conn.sent == ["A1 MVT 10"]
+        cmd.begin_move_to(X_AXIS, 150.0)
+        assert conn.sent == ["A1 BMT 10"]
 
-    def test_move_to_applies_offset_before_scaling(self):
+    def test_begin_move_to_applies_offset_before_scaling(self):
         # world mm 155, offset 5 -> raw position 150, then /15 -> 10 raw units
-        conn = FakeSnapConnection({"A1 MVT 10": "0"})
+        conn = FakeSnapConnection({"A1 BMT 10": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0, coordinate_offset_mm={"X": 5.0})
-        cmd.move_to(X_AXIS, 155.0)
-        assert conn.sent == ["A1 MVT 10"]
+        cmd.begin_move_to(X_AXIS, 155.0)
+        assert conn.sent == ["A1 BMT 10"]
 
-    def test_move_by_delta_ignores_offset(self):
+    def test_begin_move_by_delta_ignores_offset(self):
         # a relative delta must NOT have the offset subtracted — only scale applies
-        conn = FakeSnapConnection({"A1 MVB 10": "0"})
+        conn = FakeSnapConnection({"A1 BMB 10": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0, coordinate_offset_mm={"X": 100.0})
-        cmd.move_by(X_AXIS, 150.0)
-        assert conn.sent == ["A1 MVB 10"]
+        cmd.begin_move_by(X_AXIS, 150.0)
+        assert conn.sent == ["A1 BMB 10"]
+
+
+class TestBannedBlockingMotion:
+    """blocking
+    motion primitives hold the wire open until the physical move completes
+    — including a zero-distance move to an already-current position, which
+    is exactly what caused GantryController.move_to()'s old Theta branch to
+    stall unnecessarily. Banned outright; see commands.py."""
+
+    def test_move_to_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.move_to(X_AXIS, 150.0)
+
+    def test_move_by_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.move_by(X_AXIS, 150.0)
+
+    def test_group_move_to_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.group_move_to(150.0, 0.0, 0.0)
+
+    def test_group_move_by_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.group_move_by(150.0, 0.0, 0.0)
 
 
 class TestVelocityConversion:

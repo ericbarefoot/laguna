@@ -7,14 +7,17 @@ RS232Connection's fake socket/serial objects.
 """
 
 import json
+import os
 import threading
 
 import pytest
 
 from laguna.robot.macron.connection import COMM_TIMEOUT_CODE, SnapMotionError
 from laguna.robot.macron.pi_bridge import (
+    SAFE_COMMANDS,
     PiGantryConnection,
     SafeModeConnection,
+    check_ena_banned,
     check_safe_mode,
     parse_command,
 )
@@ -444,3 +447,150 @@ class TestSendBlockedDuringScan:
         channel.queue_line({"id": 2, "raw": "0 7.000 >"})
         result = conn.send("A1 ACP")
         assert result == "7.000"
+
+
+class TestStaleSerialPortHolderWarning:
+    """connect() checks whether anything already holds the remote serial
+    port before launching an agent. A stale agent left by an interrupted
+    session (or a tio terminal) makes the new agent's exclusive open fail;
+    naming the holder turns a confusing error into an obvious one.
+    Diagnostic only — must never block connecting or raise."""
+
+    class _FakeSSHClient:
+        def __init__(self, output="", raises=None):
+            self._output = output
+            self._raises = raises
+            self.commands = []
+
+        def exec_command(self, cmd):
+            self.commands.append(cmd)
+            if self._raises is not None:
+                raise self._raises
+
+            class _Out:
+                def __init__(self, data):
+                    self._data = data
+
+                def read(self):
+                    return self._data.encode()
+
+            return None, _Out(self._output), None
+
+    def _conn(self):
+        return PiGantryConnection(
+            host="red.lab", ssh_user="oak", remote_serial_device="/dev/ttyFAKE"
+        )
+
+    def test_warns_when_something_holds_the_port(self, caplog):
+        conn = self._conn()
+        client = self._FakeSSHClient(output="/dev/ttyFAKE:  4242\n")
+        with caplog.at_level("WARNING"):
+            conn._warn_about_stale_port_holders(client)
+        assert "4242" in caplog.text
+        assert "/dev/ttyFAKE" in caplog.text
+
+    def test_silent_when_port_is_free(self, caplog):
+        conn = self._conn()
+        client = self._FakeSSHClient(output="   \n")
+        with caplog.at_level("WARNING"):
+            conn._warn_about_stale_port_holders(client)
+        assert caplog.text == ""
+
+    def test_checks_the_configured_device(self):
+        conn = self._conn()
+        client = self._FakeSSHClient()
+        conn._warn_about_stale_port_holders(client)
+        assert "/dev/ttyFAKE" in client.commands[0]
+
+    def test_never_raises_if_the_check_itself_fails(self):
+        """A diagnostic must not be able to break connecting."""
+        conn = self._conn()
+        client = self._FakeSSHClient(raises=RuntimeError("ssh exploded"))
+        conn._warn_about_stale_port_holders(client)  # must not raise
+
+
+class TestLegacyModemLinesFlag:
+    """The agent drives DTR/RTS low and clears HUPCL by default, so neither
+    opening nor closing the port toggles the modem lines into the
+    controller. legacy_modem_lines=True restores the old behaviour so the
+    two can be A/B tested against the responder dropping off the inter-node
+    link. See gantry_agent.SerialBridge.__init__."""
+
+    def _remote_cmd(self, **overrides):
+        """Build the agent command line the way connect() does."""
+        conn = PiGantryConnection(
+            host="red.lab", ssh_user="oak",
+            remote_serial_device="/dev/ttyFAKE", **overrides
+        )
+        safe_flag = "" if conn.safe_mode else " --allow-motion"
+        modem_flag = " --legacy-modem-lines" if conn.legacy_modem_lines else ""
+        return f"--port {conn.remote_serial_device} --baud {conn.remote_baud}{safe_flag}{modem_flag}"
+
+    def test_default_does_not_pass_the_flag(self):
+        assert "--legacy-modem-lines" not in self._remote_cmd()
+
+    def test_opt_in_passes_the_flag(self):
+        assert "--legacy-modem-lines" in self._remote_cmd(legacy_modem_lines=True)
+
+    def test_composes_with_allow_motion(self):
+        cmd = self._remote_cmd(safe_mode=False, legacy_modem_lines=True)
+        assert "--allow-motion" in cmd
+        assert "--legacy-modem-lines" in cmd
+
+    def test_defaults_to_safe_behaviour(self):
+        conn = PiGantryConnection(
+            host="red.lab", ssh_user="oak", remote_serial_device="/dev/ttyFAKE"
+        )
+        assert conn.legacy_modem_lines is False
+
+
+class TestEnaRefusedByTransport:
+    """Layer 2 of the ENA ban: the transport refuses it regardless of
+    safe_mode, so a raw string send cannot reach the wire either. See
+    pi_bridge.check_ena_banned."""
+
+    @pytest.mark.parametrize("cmd", ["A5 ENA", "A5 ENA 1", "a5 ena", "A1 ENA 0", "  A6  ENA  "])
+    def test_refused(self, cmd):
+        with pytest.raises(SnapMotionError, match="ENA"):
+            check_ena_banned(cmd)
+
+    @pytest.mark.parametrize("cmd", ["A5 ACP", "A1 MTR 1", "C1 BMT 10 0", "A5 ENP", "ENABLE"])
+    def test_unrelated_commands_pass(self, cmd):
+        """Must not false-positive on ENP, or on a longer word containing
+        'ena' — the ban is on the ENA token, not the substring."""
+        check_ena_banned(cmd)
+
+    def test_refused_even_when_safe_mode_is_off(self):
+        """safe_mode can be switched off; this ban must hold either way."""
+        conn, channel = _make_connection(safe_mode=False)
+        with pytest.raises(SnapMotionError, match="ENA"):
+            conn.send("A5 ENA 1")
+        assert channel.sent == []      # never reached the wire
+
+    def test_refused_by_safe_mode_connection_wrapper(self):
+        inner = FakeSnapConnection({})
+        wrapper = SafeModeConnection(inner, safe_mode=False)
+        with pytest.raises(SnapMotionError, match="ENA"):
+            wrapper.send("A5 ENA")
+        assert inner.sent == []
+
+    def test_ena_is_not_on_the_safe_command_allowlist(self):
+        assert "ENA" not in SAFE_COMMANDS
+
+
+class TestSshKeyTildeExpansion:
+    """paramiko does not tilde-expand key_filename, so a configured
+    "~/.ssh/id_ed25519" was passed through literally and failed with
+    ENOENT. Ported from 5c170d3 (plan step 1)."""
+
+    def test_tilde_is_expanded(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/testuser")
+        conn = PiGantryConnection(
+            host="red.lab", ssh_user="oak", remote_serial_device="/dev/fake",
+            ssh_key="~/.ssh/id_ed25519",
+        )
+        assert os.path.expanduser(conn.ssh_key) == "/home/testuser/.ssh/id_ed25519"
+
+    def test_absolute_path_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/testuser")
+        assert os.path.expanduser("/etc/keys/id_ed25519") == "/etc/keys/id_ed25519"

@@ -188,6 +188,7 @@ class TopographicProfiler:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         connect_kwargs: dict = {"username": self._pi_user, "port": 22}
         if self._pi_key:
+            # paramiko does not tilde-expand key_filename — see pi_bridge.py.
             connect_kwargs["key_filename"] = os.path.expanduser(self._pi_key)
         client.connect(self._pi_host, **connect_kwargs)
         try:

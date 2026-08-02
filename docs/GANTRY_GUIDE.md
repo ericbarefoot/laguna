@@ -9,19 +9,21 @@ this guide is the "how do I use it" companion to that technical reference.
 ## Topology
 
 ```
-laguna (this PC) --SSH/socket--> red.dyn.ucr.edu (Pi, "oak" account)
-                                      |
-                                 serial_bridge.py (raw TCP<->serial passthrough, port 9700)
-                                      |
-                                 RS232 --> OEM-2T rev D controller --> gantry motors
+laguna (this PC) --SSH--> red.dyn.ucr.edu (Pi, "oak" account)
+                               |
+                          gantry_agent.py (sole owner of the serial port)
+                               |
+                          RS232 --> OEM-2T rev D controller --> gantry motors
 ```
 
 The controller sits too far from the PC for direct serial, so a Raspberry
-Pi next to it bridges the connection. Two transports implement the same
-`SnapConnection` interface (`src/laguna/robot/macron/connection.py`):
-`RS232Connection` over the Pi's raw TCP passthrough (default, simplest), or
-`PiGantryConnection` — a persistent SSH+JSON agent for lower per-command
-latency in production use.
+Pi next to it bridges the connection. Transports implement the same
+`SnapConnection` interface (`src/laguna/robot/macron/connection.py`). The
+default is `PiGantryConnection` — a persistent SSH+JSON agent that launches
+and owns `gantry_agent.py` on the Pi, and the only transport that supports
+topographic scanning. The former default, `RS232Connection` over the Pi's
+raw TCP passthrough (`serial_bridge.py`, the `socket_bridge` transport), is
+retired — see `docs/MACRON_GANTRY.md`, "Retired: `serial_bridge.py`".
 
 ## Where it sits in the software stack
 

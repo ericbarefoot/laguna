@@ -7,15 +7,15 @@ ASCII. Useful for quick manual testing, calibration, and one-off moves.
 
 --- Background you need before running this ---
 
-1. Transport: this uses PiGantryConnection ("pi_agent" transport), NOT the
-   default "socket_bridge". PiGantryConnection SFTPs and launches
+1. Transport: this uses PiGantryConnection ("pi_agent" transport), which
+   is also the default. PiGantryConnection SFTPs and launches
    gantry_agent.py on the Pi over SSH; that process owns the BLC serial
    port for the whole session (interactive commands AND full topographic
    scans both go through it — see docs/MACRON_GANTRY.md). Make sure
-   serial_bridge.py is NOT running on the Pi first — the two cannot
-   coexist, since serial_bridge.py opens the serial device once at
-   startup and never releases it. Check with:
-       ssh oak@red.lab 'pgrep -af serial_bridge.py'
+   nothing else already holds the serial port first — a stale agent from
+   an interrupted session, or a tio terminal. Two writers interleave
+   bytes mid-command and leave the controller parsing garbage. Check with:
+       ssh oak@red.lab 'fuser /dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0'
 
 2. safe_mode: PiGantryConnection defaults to safe_mode=True, which allows
    only read-only queries (ACP, INB, MIF, etc — see SAFE_COMMANDS in
@@ -76,7 +76,7 @@ from laguna.robot.macron.pi_bridge import PiGantryConnection
 # --- Connection settings — adjust for your setup ---
 PI_HOST = "red.lab"
 PI_USER = "oak"
-PI_KEY = "/home/eric/.ssh/id_ed25519"
+PI_KEY = "~/.ssh/id_ed25519"
 REMOTE_SERIAL_DEVICE = "/dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0"
 REMOTE_BAUD = 9600
 

@@ -13,6 +13,7 @@ Standalone CLI usage (same as the sandbox script):
 
 import json
 import logging
+import os
 import math
 import os
 import threading
@@ -89,6 +90,7 @@ class CameraArray:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kwargs: dict = {"username": self.ssh_user, "timeout": 10}
         if self.ssh_key:
+            # paramiko does not tilde-expand key_filename — see pi_bridge.py.
             kwargs["key_filename"] = os.path.expanduser(self.ssh_key)
         if self.ssh_passphrase:
             kwargs["passphrase"] = self.ssh_passphrase

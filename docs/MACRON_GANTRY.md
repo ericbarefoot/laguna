@@ -18,48 +18,66 @@ declarations.**
 ## Topology
 
 ```
-laguna (this PC) --SSH/socket--> red.dyn.ucr.edu (Pi, "oak" account)
-                                      |
-                                 serial_bridge.py (raw TCP<->serial passthrough, port 9700)
-                                      |
-                                 RS232 --> OEM-2T rev D controller --> gantry motors
+laguna (this PC) --SSH--> red.dyn.ucr.edu (Pi, "oak" account)
+                               |
+                          gantry_agent.py (sole owner of the serial port)
+                               |
+                          RS232 --> OEM-2T rev D controller --> gantry motors
 ```
 
 The controller is physically too far from this PC for direct serial, so a
-Raspberry Pi sits next to it. Two ways to reach it, both implementing the
-same `SnapConnection` interface so the rest of the driver doesn't care which
-is active:
+Raspberry Pi sits next to it. The transports below all implement the same
+`SnapConnection` interface, so the rest of the driver doesn't care which is
+active:
 
-1. **`RS232Connection(port="socket://red.dyn.ucr.edu:9700")`** — default.
-   Talks to `serial_bridge.py`, a raw, protocol-unaware TCP↔serial
-   passthrough already running on the Pi (started manually — see "Resuming
-   after a Pi reboot" below). No Pi-side `laguna` code needed. Requires
-   `serial.serial_for_url()`, not plain `serial.Serial()` — the plain form
-   silently fails on `socket://` URLs. **Does not support topographic
-   scanning** — see below.
-2. **`PiGantryConnection`** (`pi_bridge.py`) — persistent SSH+JSON-line
-   transport. Deploys and drives `gantry_agent.py` (standalone, pyserial-only,
-   no `laguna` install needed on the Pi) as a long-running process over one
-   SSH channel, for lower per-command latency than a fresh SSH connect+exec
-   each time. **Required for `TopographicProfiler`** (`profiler.py`) —
-   `gantry_agent.py` is the sole owner of the BLC serial port for its whole
-   session and, since 2026-07-28, also runs full topographic scans on a
-   background thread with a live STOP path (`start_scan()`/`stop_scan()`/
-   `wait_for_scan_result()`), sharing the same serial connection as
-   interactive commands via a lock rather than taking turns with a separate
-   process. See `docs/subsystems/rangefinder.md`.
+1. **`PiGantryConnection`** (`pi_bridge.py`) — **the default.** Persistent
+   SSH+JSON-line transport. Deploys and drives `gantry_agent.py` (standalone,
+   pyserial-only, no `laguna` install needed on the Pi) as a long-running
+   process over one SSH channel, for lower per-command latency than a fresh
+   SSH connect+exec each time. **Required for `TopographicProfiler`**
+   (`profiler.py`) — `gantry_agent.py` is the sole owner of the BLC serial
+   port for its whole session and, since 2026-07-28, also runs full
+   topographic scans on a background thread with a live STOP path
+   (`start_scan()`/`stop_scan()`/`wait_for_scan_result()`), sharing the same
+   serial connection as interactive commands via a lock rather than taking
+   turns with a separate process. See `docs/subsystems/rangefinder.md`.
+2. **`EthernetConnection` / `RS232Connection`** — direct transports for a
+   controller reachable over the network or a local serial port.
 
-Both transports (and `RS232Connection`/`EthernetConnection` generally) can be
-wrapped in **`SafeModeConnection`** to add the same query-only allowlist gate
-`PiGantryConnection` has natively — see "Safety model" below.
+All transports can be wrapped in **`SafeModeConnection`** to add the same
+query-only allowlist gate `PiGantryConnection` has natively — see "Safety
+model" below.
 
-**`serial_bridge.py` and `gantry_agent.py` must never run at the same time**
-— both try to own the same serial device, and `serial_bridge.py` opens it
-once at process start and never releases it (confirmed by reading its
-source on the Pi, 2026-07-28), so `gantry_agent.py` would fail to open the
-port if `serial_bridge.py` is already running. This was previously just a
-theoretical conflict; it's load-bearing now that scanning also depends on
-`gantry_agent.py` owning the port.
+### Retired: `serial_bridge.py` (the `socket_bridge` transport)
+
+`socket_bridge` — `RS232Connection(port="socket://red.dyn.ucr.edu:9700")`
+pointed at `serial_bridge.py`, a raw protocol-unaware TCP↔serial passthrough
+on the Pi — **was** the default. It is retired as of 2026-08-02. The
+transport code still exists and works if you configure it explicitly, but
+nothing should start `serial_bridge.py` again. Why:
+
+- It bound `0.0.0.0:9700` with **no authentication and no protocol
+  validation** — arbitrary bytes straight into the controller's ASCII
+  interpreter. Its `bridge.log` records 92 connections from ~32 unique IPs,
+  nearly all datacenter/scanner ranges rather than lab machines.
+- It never lived in this repo — only on the Pi, unversioned, hand-started,
+  and it did not survive a reboot. The default transport depended on a file
+  tracked nowhere.
+- It cannot do topographic scanning; only `pi_agent` can.
+- `tio` on the Pi covers the direct-serial debugging use case, and covers it
+  better — a human at a terminal is inherently a single writer.
+
+**Correction to an earlier claim in this document:** it previously said
+`gantry_agent.py` "would fail to open the port if `serial_bridge.py` is
+already running." **That was wrong**, both before and after
+`gantry_agent.py` gained `exclusive=True`. Linux does not lock tty devices
+by default, and pyserial's `exclusive` flag uses `fcntl.flock(LOCK_EX |
+LOCK_NB)`, which is *advisory* — it only conflicts with other flock holders.
+`serial_bridge.py` took no lock, so the two could open the same port
+simultaneously and interleave bytes mid-command, leaving the controller's
+ASCII interpreter parsing spliced garbage. `exclusive=True` protects against
+a second **agent**, not against `serial_bridge.py`. Retiring the bridge is
+what actually closes that hole.
 
 ## Protocol
 
@@ -275,30 +293,9 @@ explicit authorization in a future conversation.
 
 ### Resuming after a Pi reboot or session gap
 
-`serial_bridge.py` is **not** a systemd service — it was started manually
-and will not survive a Pi reboot. To check/restart it:
-
-```bash
-ssh -i ~/.ssh/id_ed25519 oak@red.dyn.ucr.edu 'ps -ef | grep serial_bridge | grep -v grep'
-# if nothing:
-ssh -i ~/.ssh/id_ed25519 oak@red.dyn.ucr.edu \
-  'cd ~/modusystems_dev && nohup python3 serial_bridge.py > bridge.log 2>&1 & disown'
-```
-
-Once the controller is confirmed running the right program, retry:
-
-```python
-from laguna.robot.macron import RS232Connection, SafeModeConnection
-conn = SafeModeConnection(RS232Connection(port="socket://red.dyn.ucr.edu:9700"), safe_mode=True)
-conn.connect()
-conn.send("WHT")  # should return "0", not time out
-```
-
-**If you need `PiGantryConnection`/`TopographicProfiler` instead** (required
-for scanning): confirm `serial_bridge.py` is **not** running first (see
-above — the two cannot coexist), then just `connect()` as normal —
-`PiGantryConnection.connect()` SFTPs and launches `gantry_agent.py` itself,
-no manual Pi-side step needed, unlike `serial_bridge.py`:
+Nothing needs starting by hand any more. `PiGantryConnection.connect()` SFTPs
+`gantry_agent.py` to the Pi and launches it itself, so the default
+`pi_agent` transport recovers from a reboot with no Pi-side step:
 
 ```python
 from laguna.robot.macron import GantryController
@@ -306,6 +303,32 @@ gantry = GantryController.from_config(config.get("gantry"))  # transport: pi_age
 gantry.connect()
 gantry.connection.send("WHT")  # should return "0"
 ```
+
+First, confirm nothing else already holds the serial port — a stale agent
+orphaned by an interrupted session (Ctrl-C in a REPL, a dropped SSH
+connection, an exception before `disconnect()`) will still be holding it,
+and two writers on one controller interleave bytes mid-command:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 oak@red.dyn.ucr.edu \
+  'ps -eo pid,cmd | grep -E "[g]antry_agent|[s]erial_bridge"'
+# and, definitively:
+ssh -i ~/.ssh/id_ed25519 oak@red.dyn.ucr.edu \
+  'fuser /dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0'
+```
+
+Both should be empty. If either shows a process, stop it before connecting.
+
+For direct, protocol-free serial access (the job `serial_bridge.py` used to
+do), use `tio` in a terminal on the Pi — one human, one writer:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 oak@red.dyn.ucr.edu
+tio -m ONLCRNL -b 9600 /dev/ttyUSB0 --local-echo
+```
+
+Do not run `tio` and a `gantry_agent.py` session at the same time, for the
+same two-writer reason.
 
 ### Remaining open items (not blockers for M0-M3, tracked for later)
 

@@ -200,9 +200,9 @@ class TestExecutorTypeGuard:
 
 class TestExecutorLinearMoves:
     def test_executes_group_init_then_moves(self):
-        # X only -> Y/Z stay at the start position (0,0,0), so no Z leg;
-        # the coordinated group is X/Y only (see gcode.py's "Z/XY node
-        # split" note — Z can't join it on this hardware).
+        # group init
+        # no longer spans Z (the responder node) — see GCodeExecutor's class
+        # docstring. X10 with Z unchanged means no Z leg is sent at all.
         responses = {
             "C1 INI 1 2": "0",
             "C1 SPD 20": "20",
@@ -213,6 +213,34 @@ class TestExecutorLinearMoves:
         trajectory = executor.plan("G1 X10 F1200")
         executor.execute(trajectory)
         assert conn.sent == ["C1 INI 1 2", "C1 SPD 20", "C1 BMT 10 0", "C1 MIF"]
+
+    def test_group_init_is_sent_once_not_per_execute(self):
+        """INI is remembered across execute() calls — a 40-move
+        run was re-sending an identical `C1 INI 1 2` 40 times."""
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 SPD 20": "20",
+            "C1 BMT 10 0": "0",
+            "C1 BMT 20 0": "0",
+            "C1 MIF": "1",
+        }
+        executor, conn = _make_executor(responses)
+        for target in ("G1 X10 F1200", "G1 X20 F1200"):
+            executor.execute(executor.plan(target))
+        assert conn.sent.count("C1 INI 1 2") == 1
+        assert conn.sent.count("C1 BMT 10 0") == 1
+        assert conn.sent.count("C1 BMT 20 0") == 1
+
+    def test_reset_group_init_forces_ini_to_be_resent(self):
+        """A power-cycle/reflash can clear the controller's group state —
+        GantryController.connect() calls this so the next move re-inits."""
+        responses = {"C1 INI 1 2": "0", "C1 SPD 20": "20", "C1 BMT 10 0": "0", "C1 MIF": "1"}
+        executor, conn = _make_executor(responses)
+        executor.execute(executor.plan("G1 X10 F1200"))
+        executor.reset_group_init()
+        executor._current_pos = (0.0, 0.0, 0.0)  # pretend we're back at the start
+        executor.execute(executor.plan("G1 X10 F1200"))
+        assert conn.sent.count("C1 INI 1 2") == 2
 
     def test_polls_until_move_finished(self):
         calls = {"n": 0}
@@ -231,6 +259,45 @@ class TestExecutorLinearMoves:
         executor.execute(trajectory)
         assert conn.sent.count("C1 MIF") == 3
 
+    def test_moves_z_independently_of_the_xy_group(self):
+        """A move touching both Z and X/Y is split at plan() time into a
+        Z-only leg then an XY-only leg, so it never sends a 3-axis group
+        command (`C1 INI 1 2 5`, confirmed on the bench to return error
+        1010). Group init is lazy — it lands on the XY leg, after the Z
+        leg has already run."""
+        responses = {
+            "A5 SPD 10": "10",
+            "A5 BMT 3": "0",
+            "A5 MIF": "1",
+            "C1 INI 1 2": "0",
+            "C1 SPD 10": "10",
+            "C1 BMT 10 0": "0",
+            "C1 MIF": "1",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "A5 SPD 10", "A5 BMT 3", "A5 MIF",
+            "C1 INI 1 2", "C1 SPD 10", "C1 BMT 10 0", "C1 MIF",
+        ]
+        assert "C1 INI 1 2 5" not in conn.sent
+
+    def test_split_happens_before_fence_checking(self):
+        """The split runs in plan(), so the waypoints that get fence-checked
+        are the L-shaped path actually executed — not the nominal diagonal.
+        A fence the diagonal would miss but the L-path enters must still be
+        caught."""
+        from laguna.robot.macron.fences import BoxFence
+        # Straight diagonal (0,0,0)->(10,10,5) misses this box; the split
+        # path goes (0,0,0)->(0,0,5)->(10,10,5), whose second leg crosses it.
+        executor, conn = _make_executor(
+            {}, fences=[BoxFence("post", 4, 6, 4, 6, 4, 6)]
+        )
+        with pytest.raises(FenceViolation):
+            executor.plan("G1 X10 Y10 Z5 F600")
+        assert conn.sent == []
+
     def test_dry_run_sends_nothing(self):
         executor, conn = _make_executor({}, dry_run=True)
         trajectory = executor.plan("G1 X10 Y10 F600")
@@ -238,14 +305,11 @@ class TestExecutorLinearMoves:
         assert conn.sent == []
 
     def test_confirm_cb_can_abort_before_sending(self):
-        # confirm_cb is checked before anything is sent — including group
-        # init, which is now lazy (only sent by the first XY-leg
-        # execution) rather than eager at the top of execute().
-        executor, conn = _make_executor({}, confirm_cb=lambda move: False)
+        executor, conn = _make_executor({"C1 INI 1 2": "0"}, confirm_cb=lambda move: False)
         trajectory = executor.plan("G1 X10")
         with pytest.raises(GCodeExecutionAborted):
             executor.execute(trajectory)
-        assert conn.sent == []
+        assert "C1 BMT 10 0" not in conn.sent
 
     def test_confirm_cb_receives_the_move(self):
         seen = []
@@ -259,98 +323,18 @@ class TestExecutorLinearMoves:
         assert seen[0].target == (10.0, 0.0, 0.0)
 
 
-class TestZXYNodeSplit:
-    """Z can't join the coordinated group on this hardware (confirmed: C1
-    INI 1 2 succeeds, C1 INI 1 2 5 fails with error 1010 — see gcode.py's
-    "Z/XY node split" note). A move touching both Z and X/Y is split into
-    a Z-only leg followed by an XY-only leg (Z-first) before fence-checking,
-    so the checked path matches what's actually executed.
-    """
-
-    def test_combined_move_splits_into_z_leg_then_xy_leg(self):
-        responses = {
-            "A5 SPD 10": "10",
-            "A5 BMT 5": "0",
-            "A5 MIF": "1",
-            "C1 INI 1 2": "0",
-            "C1 SPD 10": "10",
-            "C1 BMT 10 20": "0",
-            "C1 MIF": "1",
-        }
-        executor, conn = _make_executor(responses)
-        trajectory = executor.plan("G1 X10 Y20 Z5 F600")
-        executor.execute(trajectory)
-        # Z leg fully completes (SPD, BMT, MIF) before the XY group is
-        # even initialized — Z-first, per the gantry's use as a
-        # subtractive CNC / sensor-positioning rig.
-        assert conn.sent == [
-            "A5 SPD 10", "A5 BMT 5", "A5 MIF",
-            "C1 INI 1 2", "C1 SPD 10", "C1 BMT 10 20", "C1 MIF",
-        ]
-
-    def test_z_only_move_never_touches_group(self):
-        responses = {"A5 BMT 5": "0", "A5 MIF": "1"}
-        executor, conn = _make_executor(responses)
-        trajectory = executor.plan("G1 Z5")
-        executor.execute(trajectory)
-        assert conn.sent == ["A5 BMT 5", "A5 MIF"]
-        assert not any(cmd.startswith("C1") for cmd in conn.sent)
-
-    def test_group_init_sent_once_across_two_execute_calls(self):
-        responses = {
-            "C1 INI 1 2": "0",
-            "C1 BMT 10 0": "0",
-            "C1 BMT 20 0": "0",
-            "C1 MIF": "1",
-        }
-        executor, conn = _make_executor(responses)
-        executor.execute(executor.plan("G1 X10"))
-        executor.execute(executor.plan("G1 X20"))
-        assert conn.sent.count("C1 INI 1 2") == 1
-
-    def test_fence_check_reflects_the_actual_z_first_path_not_the_diagonal(self):
-        # A tall post directly above the start position (Z >= 3), not
-        # covering the endpoint's XY footprint. The nominal 3D diagonal
-        # from (0,0,0) to (10,10,5) leaves this XY footprint almost
-        # immediately (by t=0.1, x=y=1 already outside x/y in [-1,1]),
-        # while Z is still only 0.5 — so a diagonal-only check would call
-        # this safe. But the real Z-first execution climbs Z from 0 to 5
-        # while still sitting at the start XY (0,0) — squarely inside the
-        # post's footprint — so it must be flagged.
-        post = BoxFence("post_above_origin", -1, 1, -1, 1, 3, 10)
-        executor, conn = _make_executor({}, fences=[post])
-        with pytest.raises(FenceViolation):
-            executor.plan("G1 X10 Y10 Z5")
-        assert conn.sent == []
-
-    def test_split_path_avoids_a_hazard_the_diagonal_would_have_hit(self):
-        # A low obstacle midway along X (z in [0,3]), Y unchanged. The
-        # nominal diagonal from (0,0,0) to (10,0,5) passes through this
-        # box around t in [0.3,0.6] (x in [3,6], z in [1.5,3]) — a
-        # diagonal-only check would reject this move. The real Z-first
-        # execution climbs to Z=5 (clear of the box's z<=3) before ever
-        # moving in X, so the actual path never enters the box.
-        low_post = BoxFence("low_post", 3, 7, -1, 1, 0, 3)
-        executor, conn = _make_executor(
-            {"A5 BMT 5": "0", "A5 MIF": "1", "C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 MIF": "1"},
-            fences=[low_post],
-        )
-        trajectory = executor.plan("G1 X10 Z5")  # Y unspecified -> stays 0
-        executor.execute(trajectory)  # must not raise FenceViolation
-        assert conn.sent == ["A5 BMT 5", "A5 MIF", "C1 INI 1 2", "C1 BMT 10 0", "C1 MIF"]
-
-
 class TestExecutorHomeDwellPause:
     def test_g28_raises_while_homing_is_disabled(self):
-        # G28 delegates to HomingProcedure.home_all(), which is temporarily
-        # gated off (physical obstructions block several limit switches on
-        # the real machine — see HomingProcedure.home_all()). Restore the
-        # full happy-path assertion here (checking the JOG/CAT/zero/standoff
-        # sequence) once that guard is removed.
+        """HomingProcedure.home_all() raises unconditionally while physical
+        obstructions block several of the limit switches it depends on
+        (plan step 2, from 5c170d3). G28 therefore cannot run, and must
+        fail before touching the wire rather than jogging into a blocked
+        switch."""
         executor, conn = _make_executor({})
         trajectory = executor.plan("G28")
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(NotImplementedError, match="Homing is temporarily disabled"):
             executor.execute(trajectory)
+        assert conn.sent == []  # nothing reached the controller
 
     def test_g4_dwell_sleeps(self, monkeypatch):
         slept = []

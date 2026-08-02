@@ -28,10 +28,10 @@ this module does not model them as Axis objects or send A3/A4/A7/A8 commands.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 import logging
-import time
 
 from .connection import SnapConnection, SnapMotionError
 
@@ -46,6 +46,93 @@ GROUP_TOKEN_FMT = "C{n}"  # coordinated-group commands
 # Uninitialized/garbage software limits observed on this hardware are large
 # (~±8.2e8); anything beyond this threshold is treated as "not really set".
 GARBAGE_LIMIT_THRESHOLD = 1e6
+
+
+# ---------------------------------------------------------------------------
+# Move-completion polling
+# ---------------------------------------------------------------------------
+#
+# Confirmed on hardware 2026-07-31: that polling MIF in a tight loop while a coordinated
+# group move is in flight destabilizes this controller. A C1 INI/BMT
+# oscillation test polling C1 MIF every 0.05s failed reproducibly on its
+# 6th move (~13s in) — the Pi-side agent logged a >5s serial read timeout
+# on C1 MIF, i.e. the controller stopped answering the wire entirely, not
+# a network/SSH fault. The identical test polling sparsely (one check near
+# the predicted finish time, then every 0.5s) ran 60 moves over 142s with
+# zero failures. Single-axis (A<n> BMT/MIF) moves polled at the same 0.05s
+# never failed across 15 cycles, so the trigger is specifically
+# high-frequency querying *during group interpolation*, not query rate
+# alone and not motion alone.
+#
+# Every wait-for-move loop in this driver therefore sleeps through most of
+# the move's predicted duration before its first query, then polls slowly.
+# Both knobs are module-level so tests can zero them out (see
+# tests/conftest.py) rather than sleeping in real time.
+SPARSE_POLL_INTERVAL_S = 0.5
+
+# Fraction of a move's predicted duration to sleep through before the first
+# query. Below 1.0 so that a slightly-optimistic prediction (accel/decel
+# ramps make real moves run longer than distance/speed) still lands the
+# first poll before completion rather than long after it.
+PREDICTED_SLEEP_FRACTION = 0.85
+
+
+def predicted_move_s(distance: float, speed: Optional[float]) -> float:
+    """Nominal duration of a move, for sparse move-completion polling.
+
+    Deliberately ignores accel/decel ramps, which only make the real move
+    take *longer* than this — combined with PREDICTED_SLEEP_FRACTION being
+    below 1.0, that keeps the first poll safely before completion rather
+    than after it. Returns 0.0 when the speed is unknown or non-positive
+    (e.g. a G-code program that never specified an F word, so the
+    controller is using whatever SPD it already had), which just means
+    polling starts immediately — still at the sparse interval.
+
+    Units only have to be consistent between the two arguments (mm and
+    mm/s, or degrees and degrees/s for Theta).
+    """
+    if not speed or speed <= 0:
+        return 0.0
+    return abs(distance) / speed
+
+
+def poll_until_move_finished(
+    is_finished: Callable[[], bool],
+    predicted_s: float = 0.0,
+    timeout_s: float = 30.0,
+) -> bool:
+    """Wait for a move to finish, querying the controller as little as possible.
+
+    Sleeps through PREDICTED_SLEEP_FRACTION of `predicted_s` before the
+    first `is_finished()` call, then polls every SPARSE_POLL_INTERVAL_S.
+    See this module's "Move-completion polling" note for why the tight
+    polling this replaces is actively harmful on this hardware.
+
+    Args:
+        is_finished: Callable returning True once the move has completed —
+            typically MMCCommands.move_is_finished/group_move_is_finished
+            bound to an axis (each call is one MIF query on the wire).
+        predicted_s: Expected move duration in seconds, if known (distance
+            / speed at the call site). 0.0 means "no idea" — polling then
+            starts immediately, still at the sparse interval.
+        timeout_s: Give up after this long. The initial predicted sleep
+            counts against it, and is clamped so it can never overshoot it.
+
+    Returns:
+        True if the move finished, False if `timeout_s` elapsed first. The
+        caller decides what a timeout means (abort and raise, or warn and
+        continue) — see the call sites in gcode.py/homing.py/controller.py.
+    """
+    deadline = time.monotonic() + timeout_s
+    initial_sleep = max(0.0, min(predicted_s * PREDICTED_SLEEP_FRACTION, timeout_s))
+    if initial_sleep > 0:
+        time.sleep(initial_sleep)
+    while True:
+        if is_finished():
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(SPARSE_POLL_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +187,17 @@ class AxisState:
     accel: float = 0.0                 # ACL
     decel: float = 0.0                 # DCL
     motor_on: bool = False             # MTR
-    enabled: bool = False              # ENA
+    # ENA is banned (see _ENA_BANNED) — reading it crashes the responder
+    # node. This field is never populated by read_axis_state() and stays at
+    # its default; kept so existing callers don't break on attribute access.
+    enabled: bool = False              # ENA — NEVER POPULATED, see above
     move_is_finished: bool = True      # MIF
     capture_bit: bool = False          # CAB — live state of capture input
     capture_position: float = 0.0      # CAP — position latched at capture event
     capture_has_tripped: bool = False  # CAT — latch flag (cleared by ArmCapture)
     negative_limit: float = 0.0        # NLT — software negative travel limit
     positive_limit: float = 0.0        # PLT — software positive travel limit
-    errors: Dict[str, str] = field(default_factory=dict)  # field name -> error message, if that query failed
+    errors: Dict[str, str] = field(default_factory=dict)  # field name -> error, if that query failed
 
 
 @dataclass
@@ -194,6 +284,73 @@ class IOMap:
 # Command interface
 # ---------------------------------------------------------------------------
 
+# blocking motion
+# primitives (MVT/MVB, single-axis and group) are banned outright — they
+# hold the wire's request/response round trip open until the firmware
+# reports the physical move complete, for however long that takes,
+# including axes that are already at the requested target (e.g.
+# GantryController.move_to()'s old unconditional Theta-branch MVT, which
+# fired on every vector move regardless of whether Theta had actually
+# moved). Every caller now uses the non-blocking begin_move_to/begin_move_by
+# (+ move_is_finished polling) instead, which never leaves a
+# request/response pair open for an unbounded stretch — see also
+# GCodeExecutor's Z/XY split, which was migrated the same way. No caller
+# in this codebase used the blocking group forms at all.
+_BLOCKING_MOTION_BANNED = (
+    "{blocking}() is banned — it blocks on the wire until the physical move "
+    "completes (or the read times out), for however long that takes, even "
+    "for a zero-distance move to an already-current position. Use "
+    "{nonblocking}() and poll move_is_finished()/group_move_is_finished() instead."
+)
+
+
+# ---------------------------------------------------------------------------
+# ENA is banned outright — it crashes this controller
+# ---------------------------------------------------------------------------
+#
+# Confirmed on hardware 2026-08-02, reproduced three times independently,
+# including from a bare `tio` terminal with no laguna code in the loop:
+# addressing ENA on a responder-node axis (A5/Z, A6/Theta) kills the
+# responder. Every subsequent command to A5/A6 — including a plain `ACP`
+# position read that worked moments earlier — returns error 70, which is a
+# ~575 ms timeout of the commander waiting on the inter-node link. The node
+# does not recover on its own and the program has to be reflashed.
+#
+#     tio session, 2026-08-02, human-typed, seconds apart:
+#         a5 acp   ->  0 0.005 >     healthy
+#         a5 ena   ->  70 >          <-- crashes here
+#         a5 acp   ->  70 >          previously-working read now dead
+#
+# Note the crashing form is a bare *read* with no argument, so this is not
+# "enabling the axis does something dangerous" — merely addressing the ENA
+# register on those axes is enough. That makes it a controller firmware
+# fault, not a driver bug, and nothing this codebase can do except refuse
+# to emit the command.
+#
+# Banned for ALL axes, not just A5/A6. The evidence only covers the
+# responder, but per the DSM program currently running on the commander the
+# axes are already enabled at power-up, so no laguna workflow needs ENA at
+# all. Given the blast radius, a blanket refusal is the right trade until
+# the vendor explains the fault.
+#
+# Enforced in three independent layers, deliberately duplicated the same
+# way the safe_mode allowlist is:
+#   1. here, so the typed API cannot construct it
+#   2. pi_bridge.PiGantryConnection.send(), so a raw string send is refused
+#      client-side regardless of safe_mode
+#   3. gantry_agent.py on the Pi, so nothing reaches the wire even if the
+#      PC-side layers are bypassed
+_ENA_BANNED = (
+    "{call}() is banned: sending ENA to a responder-node axis (A5/Z, A6/Theta) "
+    "crashes this controller — the node stops answering entirely (error 70 on "
+    "every subsequent command, including reads that worked a moment earlier) "
+    "and has to be reflashed. Confirmed on hardware 2026-08-02, reproduced "
+    "from a bare serial terminal with no laguna code involved, using a bare "
+    "ENA *read*. The axes are already enabled at power-up by the controller's "
+    "own DSM program, so nothing here needs this command."
+)
+
+
 class MMCCommands:
     """Formats, sends, and parses all Snap2Motion ASCII commands.
 
@@ -218,7 +375,7 @@ class MMCCommands:
         group_index: int = 1,
         mm_per_unit: float = 1.0,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
-        group_axes: tuple[Axis, ...] = (X_AXIS, Y_AXIS),
+        group_axes: tuple[Axis, ...] = (X_AXIS, Y_AXIS, Z_AXIS),
     ):
         """
         Args:
@@ -238,13 +395,6 @@ class MMCCommands:
                 arguments map to, in order — must match how the group was
                 configured (e.g. via GCodeExecutor/GantryController). Used
                 only to look up per-axis mm_per_unit/offset for group moves.
-                Defaults to (X, Y) only: confirmed on hardware that the
-                coordinated group cannot include Z (`C1 INI 1 2` succeeds,
-                `C1 INI 1 2 5` fails with error 1010) — Z lives on a
-                separate networked PLC node (the responder) from X/Y (the
-                commander), and this firmware's coordinated-group feature
-                doesn't span that boundary. See GCodeExecutor for how Z
-                moves are driven instead (a separate single-axis leg).
         """
         self._conn = connection
         self._group = group_index
@@ -328,11 +478,12 @@ class MMCCommands:
         return bool(self._send(f"{self._gx()} MTR {val}"))
 
     def set_enable(self, axis: Axis, enabled: bool) -> bool:
-        val = 1 if enabled else 0
-        return bool(self._send(f"{self._ax(axis)} ENA {val}"))
+        """Banned — see _ENA_BANNED."""
+        raise RuntimeError(_ENA_BANNED.format(call="set_enable"))
 
     def get_enable(self, axis: Axis) -> bool:
-        return bool(self._send(f"{self._ax(axis)} ENA"))
+        """Banned — see _ENA_BANNED."""
+        raise RuntimeError(_ENA_BANNED.format(call="get_enable"))
 
     # ------------------------------------------------------------------
     # Position & kinematics — single axis
@@ -445,14 +596,12 @@ class MMCCommands:
         self._send(f"{self._ax(axis)} BMB {raw:.6g}")
 
     def move_to(self, axis: Axis, position: float) -> None:
-        """Blocking absolute move (MVT), given real mm. TCP response held until move completes."""
-        raw = self._pos_to_raw(axis, position)
-        self._send(f"{self._ax(axis)} MVT {raw:.6g}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(_BLOCKING_MOTION_BANNED.format(blocking="move_to", nonblocking="begin_move_to"))
 
     def move_by(self, axis: Axis, delta: float) -> None:
-        """Blocking relative move (MVB), given real mm."""
-        raw = self._delta_to_raw(axis, delta)
-        self._send(f"{self._ax(axis)} MVB {raw:.6g}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(_BLOCKING_MOTION_BANNED.format(blocking="move_by", nonblocking="begin_move_by"))
 
     def jog(self, axis: Axis, speed: float) -> float:
         """Start continuous velocity motion at speed (mm/s) (JOG). Pass 0 to stop.
@@ -505,12 +654,16 @@ class MMCCommands:
         self._send(f"{self._gx()} BMB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
 
     def group_move_to(self, *positions: float) -> None:
-        """Blocking coordinated absolute move (MVT on group), given real mm."""
-        self._send(f"{self._gx()} MVT {self._fmt_params(*self._group_pos_to_raw(*positions))}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(
+            _BLOCKING_MOTION_BANNED.format(blocking="group_move_to", nonblocking="group_begin_move_to")
+        )
 
     def group_move_by(self, *deltas: float) -> None:
-        """Blocking coordinated relative move (MVB on group), given real mm."""
-        self._send(f"{self._gx()} MVB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
+        """Banned — see _BLOCKING_MOTION_BANNED."""
+        raise RuntimeError(
+            _BLOCKING_MOTION_BANNED.format(blocking="group_move_by", nonblocking="group_begin_move_by")
+        )
 
     def append_move_to(self, *positions: float) -> None:
         """Queue an absolute waypoint into the curve buffer (AMT), given real mm.
@@ -732,9 +885,16 @@ class MMCCommands:
 
         Each query is issued and caught independently — a single failing
         query (e.g. a stalled/faulted axis erroring on one specific
-        register) does not lose the rest; that field keeps its default
-        and the failure is recorded in the returned AxisState.errors
-        dict, keyed by field name.
+        register) does not lose the rest; that field keeps its default and
+        the failure is recorded in the returned AxisState.errors dict,
+        keyed by field name. This is what made it possible to see, live,
+        that a stalled Y axis's stepper-side bookkeeping was fine while its
+        encoder/capture registers had gone unreachable — a precise signal
+        that an all-or-nothing read would have hidden entirely.
+
+        Note: `enabled` is NOT queried. Reading ENA on a responder-node
+        axis crashes the controller (see _ENA_BANNED), so that field always
+        keeps its default here.
         """
         state = AxisState()
         queries: Dict[str, Callable[[], Any]] = {
@@ -746,7 +906,7 @@ class MMCCommands:
             "accel": lambda: self.get_accel(axis),
             "decel": lambda: self.get_decel(axis),
             "motor_on": lambda: self.get_motor(axis),
-            "enabled": lambda: self.get_enable(axis),
+            # "enabled" deliberately absent — ENA is banned, see _ENA_BANNED
             "move_is_finished": lambda: self.move_is_finished(axis),
             "capture_bit": lambda: self.get_capture_bit(axis),
             "capture_position": lambda: self.get_capture_position(axis),
@@ -795,6 +955,11 @@ class MMCCommands:
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Per-axis convenience handle
+# ---------------------------------------------------------------------------
+
+
 class AxisHandle:
     """Binds one configured Axis to MMCCommands, exposed as lab.gantry.<name>
     (and lab.gantry.axis("<Name>")) by GantryController — see controller.py.
@@ -802,13 +967,13 @@ class AxisHandle:
     Pure delegation to the matching MMCCommands method (same axis-prefixed
     ASCII commands, same units/conversion) — this class adds no new wire
     behavior. The one exception is motion-starting calls (move_to/move_by/
-    begin_move_to/begin_move_by/jog/abort), which check is_safe_mode() and
-    raise before issuing anything: PiGantryConnection/SafeModeConnection
-    already gate motion at the transport, but RS232Connection/
-    EthernetConnection (the socket_bridge/ethernet/rs232 transports built by
-    _build_transport in controller.py) are deliberately dumb passthroughs
-    with no gate of their own, so this is the only check standing between a
-    bare lab.gantry.y.move_to(...) and the wire on those transports.
+    begin_move_to/begin_move_by/jog), which check is_safe_mode() and raise
+    before issuing anything: PiGantryConnection/SafeModeConnection already
+    gate motion at the transport, but RS232Connection/EthernetConnection
+    (the ethernet/rs232 transports built by _build_transport in
+    controller.py) are deliberately dumb passthroughs with no gate of their
+    own, so this is the only check standing between a bare
+    lab.gantry.y.move_to(...) and the wire on those transports.
     """
 
     def __init__(
@@ -873,53 +1038,53 @@ class AxisHandle:
     def get_encoder_position(self) -> float:
         return self._cmd.get_encoder_position(self._axis)
 
-    # -- motor / enable ----------------------------------------------------
+    # -- motor -------------------------------------------------------------
+    # No enable/disable-drive (ENA) counterpart: addressing ENA on a
+    # responder-node axis crashes the controller — see _ENA_BANNED. MTR is
+    # the whole story here, and the axes are drive-enabled at power-up by
+    # the controller's own DSM program anyway.
 
     def enable(self) -> None:
+        """Turn this axis's motor drive on (MTR). Does not send ENA."""
         self._cmd.set_motor(self._axis, True)
-        self._cmd.set_enable(self._axis, True)
 
     def disable(self) -> None:
-        self._cmd.set_enable(self._axis, False)
+        """Turn this axis's motor drive off (MTR). Does not send ENA."""
         self._cmd.set_motor(self._axis, False)
 
     def get_motor(self) -> bool:
         """True if this axis's motor drive (MTR) is currently on."""
         return self._cmd.get_motor(self._axis)
 
-    def get_enable(self) -> bool:
-        """True if this axis is currently enabled (ENA)."""
-        return self._cmd.get_enable(self._axis)
-
     # -- motion (safe_mode-gated) -------------------------------------
 
     def move_to(self, position: float, timeout: float = 30.0) -> None:
         """Move to an absolute position (real mm), blocking until it finishes.
 
-        Internally issues a non-blocking begin_move_to (BMT) and polls
-        is_move_finished() rather than sending the firmware's blocking MVT
-        directly — MVT withholds its wire response until the physical move
-        completes, and a move slower than the transport's fixed per-command
-        read timeout (e.g. PiGantryConnection's 5s) would spuriously time
-        out and error even though the move is still legitimately in
-        progress. Polling keeps every individual wire round-trip fast and
-        fixed-timeout, while `timeout` governs how long this call itself is
-        willing to wait for the move to actually finish.
+        Issues a non-blocking begin_move_to (BMT) and polls, rather than
+        the firmware's blocking MVT — MVT withholds its wire response until
+        the physical move completes, so a move slower than the transport's
+        fixed per-command read timeout would spuriously error even though
+        the move is legitimately in progress. (MMCCommands.move_to is
+        banned outright for that reason.) Polling keeps every wire
+        round-trip short, while `timeout` governs how long this call waits
+        for the move itself.
 
         Raises:
             SnapMotionError: If the move doesn't finish within `timeout`
                 (the move is aborted before raising).
         """
         self._check_motion_allowed("move_to")
+        distance = abs(position - self.get_position())
         self._cmd.begin_move_to(self._axis, position)
-        self._poll_move_finished(timeout)
+        self._poll_move_finished(timeout, predicted_s=predicted_move_s(distance, self._last_speed()))
 
     def move_by(self, delta: float, timeout: float = 30.0) -> None:
-        """Relative move (real mm), blocking until it finishes. See move_to() for why
-        this polls internally rather than using the firmware's blocking MVB."""
+        """Relative move (real mm), blocking until it finishes. See move_to()
+        for why this polls internally rather than using the blocking MVB."""
         self._check_motion_allowed("move_by")
         self._cmd.begin_move_by(self._axis, delta)
-        self._poll_move_finished(timeout)
+        self._poll_move_finished(timeout, predicted_s=predicted_move_s(delta, self._last_speed()))
 
     def begin_move_to(self, position: float) -> None:
         """Non-blocking absolute move (BMT); poll is_move_finished() to wait."""
@@ -931,15 +1096,34 @@ class AxisHandle:
         self._check_motion_allowed("begin_move_by")
         self._cmd.begin_move_by(self._axis, delta)
 
-    def _poll_move_finished(self, timeout: float, poll_interval: float = 0.05) -> None:
-        deadline = time.monotonic() + timeout
-        while not self._cmd.move_is_finished(self._axis):
-            if time.monotonic() > deadline:
-                self._cmd.abort(self._axis)
-                raise SnapMotionError(
-                    0, f"{self._axis.name} move did not finish within {timeout:.0f}s — aborted"
-                )
-            time.sleep(poll_interval)
+    def _last_speed(self) -> Optional[float]:
+        """This axis's configured speed (SPD), for predicting move duration.
+
+        Returns None if the query fails, which just means polling starts
+        immediately instead of sleeping through a prediction — see
+        poll_until_move_finished.
+        """
+        try:
+            return self.get_speed()
+        except SnapMotionError:
+            return None
+
+    def _poll_move_finished(self, timeout: float, predicted_s: float = 0.0) -> None:
+        """Wait for this axis's move, querying MIF as little as possible.
+
+        Uses the shared sparse poller rather than a tight loop — see the
+        "Move-completion polling" note at the top of this module for why
+        tight polling is actively harmful on this controller.
+        """
+        if not poll_until_move_finished(
+            lambda: self._cmd.move_is_finished(self._axis),
+            predicted_s=predicted_s,
+            timeout_s=timeout,
+        ):
+            self._cmd.abort(self._axis)
+            raise SnapMotionError(
+                0, f"{self._axis.name} move did not finish within {timeout:.0f}s — aborted"
+            )
 
     def jog(self, speed: float) -> float:
         """Continuous velocity motion (JOG); pass 0 to stop (not gated)."""

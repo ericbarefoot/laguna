@@ -11,6 +11,10 @@ from laguna.robot.macron.fences import BoxFence
 from laguna.robot.macron.pi_bridge import PiGantryConnection
 from tests.macron_fixtures import FakeSnapConnection
 
+# Deliberately still socket_bridge: that transport is retired as the *default*
+# (pi_agent is now, see src/laguna/config.py) but the code path remains
+# supported, and it's the cheapest fixture here — it builds an RS232Connection
+# without needing SSH parameters, and no test below actually connects.
 BASE_CONFIG = {
     "transport": "socket_bridge",
     "host": "red.dyn.ucr.edu",
@@ -88,11 +92,10 @@ class TestFromConfigAxesAndIOMap:
         controller = GantryController.from_config(cfg)
         assert controller._axes == (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
 
-    def test_gcode_axes_default_to_xy_group_with_separate_z(self):
-        # Z can't join the coordinated group on this hardware (confirmed:
-        # C1 INI 1 2 succeeds, C1 INI 1 2 5 fails with error 1010) — the
-        # group is X/Y only, and Z drives via a separate leg. See
-        # GCodeExecutor / gcode.py's "Z/XY node split" note.
+    def test_gcode_group_is_xy_only_with_z_held_separately(self):
+        """Z cannot join the coordinated group on this hardware, so the
+        executor takes the two commander axes as its group and Z as a
+        separate single-axis leg — see gcode.py's "Z/XY node split"."""
         controller = GantryController.from_config(BASE_CONFIG)
         assert controller.gcode._axes == (X_AXIS, Y_AXIS)
         assert controller.gcode._z_axis == Z_AXIS
@@ -155,69 +158,6 @@ class TestSubsystemInterface:
         assert controller.connect() is True
         assert conn.is_connected is True
 
-    def test_connect_enables_and_releases_brakes_on_y_and_z_when_safe_mode_false(self):
-        # Enable-then-release, per axis, strictly in that order (see
-        # _release_brakes_on_connect's docstring): motor torque must be
-        # holding before a fail-safe brake like Z's is released.
-        responses = {
-            "A2 MTR 1": "1", "A2 ENA 1": "1", "SOB 4 1": "0",
-            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",
-        }
-        conn = FakeSnapConnection(responses)
-        controller = GantryController(connection=conn, safe_mode=False)
-        assert controller.connect() is True
-        assert conn.sent == [
-            "A2 MTR 1", "A2 ENA 1", "SOB 4 1",
-            "A5 MTR 1", "A5 ENA 1", "SOB 5 1",
-        ]
-
-    def test_connect_does_not_touch_x_or_theta_on_brake_release(self):
-        # X/Theta have no brake at all -- confirm connect() never touches them.
-        responses = {
-            "A2 MTR 1": "1", "A2 ENA 1": "1", "SOB 4 1": "0",
-            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",
-        }
-        conn = FakeSnapConnection(responses)
-        controller = GantryController(connection=conn, safe_mode=False)
-        controller.connect()
-        assert not any(cmd.startswith("A1 ") for cmd in conn.sent)  # X
-        assert not any(cmd.startswith("A6 ") for cmd in conn.sent)  # Theta
-
-    def test_connect_does_not_touch_brakes_when_safe_mode_true(self):
-        # safe_mode=True (the default) must leave the connection exactly as
-        # found — MTR/SOB are both output-setting commands safe_mode is
-        # supposed to block; any attempt here would hit FakeSnapConnection's
-        # "no scripted response" assertion since responses is empty.
-        conn = FakeSnapConnection({})
-        controller = GantryController(connection=conn, safe_mode=True)
-        assert controller.connect() is True
-        assert conn.sent == []
-
-    def test_connect_skips_brake_release_if_channel_unconfigured_without_raising(self):
-        from laguna.robot.macron.commands import IOMap
-
-        responses = {
-            "A2 MTR 1": "1", "A2 ENA 1": "1",
-            "A5 MTR 1": "1", "A5 ENA 1": "1",
-        }
-        conn = FakeSnapConnection(responses)
-        io_map = IOMap(y_brake_output=None, z_brake_output=None)
-        controller = GantryController(connection=conn, safe_mode=False, io_map=io_map)
-        assert controller.connect() is True  # must not raise despite unconfigured channels
-
-    def test_connect_continues_to_next_axis_if_enable_fails(self):
-        from laguna.robot.macron.connection import SnapMotionError
-
-        responses = {
-            "A2 MTR 1": SnapMotionError(99),  # Y fails to enable
-            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",  # Z still processed
-        }
-        conn = FakeSnapConnection(responses)
-        controller = GantryController(connection=conn, safe_mode=False)
-        assert controller.connect() is True  # connect() itself still succeeds
-        assert "SOB 4 1" not in conn.sent  # Y's brake was never touched — enable failed first
-        assert "SOB 5 1" in conn.sent
-
     def test_disconnect_clears_connected_state(self):
         controller, conn = self._make_controller()
         controller.connect()
@@ -252,34 +192,6 @@ class TestSubsystemInterface:
         controller.connect()
         controller.stop()  # must not propagate
 
-    def test_soft_stop_sends_bst_to_every_axis(self):
-        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
-        controller, conn = self._make_controller(responses)
-        controller.connect()
-        controller.soft_stop()
-        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
-
-    def test_soft_stop_does_not_touch_brakes_or_motor(self):
-        # Unlike stop(): no SOB (brake), no MTR (motor disable) commands.
-        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
-        controller, conn = self._make_controller(responses)
-        controller.connect()
-        controller.soft_stop()
-        assert not any(cmd.startswith("SOB") for cmd in conn.sent)
-        assert not any("MTR" in cmd for cmd in conn.sent)
-
-    def test_soft_stop_continues_past_a_failing_axis(self):
-        from laguna.robot.macron.connection import SnapMotionError
-
-        responses = {
-            "A1 BST": SnapMotionError(99),
-            "A2 BST": "0", "A5 BST": "0", "A6 BST": "0",
-        }
-        controller, conn = self._make_controller(responses)
-        controller.connect()
-        controller.soft_stop()  # must not raise
-        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
-
 
 class TestMoveTo:
     def _make_controller(self, responses=None, mm_per_unit=15.0):
@@ -289,21 +201,21 @@ class TestMoveTo:
 
     def test_vector_move_routes_through_fence_checked_gcode_path(self):
         # X=150mm, Y=0, Z=0 (raw 10 0 0 at mm_per_unit=15), Theta=0 (unconverted).
-        # Z is unchanged from the start position (0,0,0) -> no Z leg, and the
-        # coordinated group is X/Y only (Z can't join it on this hardware —
-        # see gcode.py's "Z/XY node split" note).
-        # Theta moves via begin_move_to (BMT) + poll (MIF), not the blocking
-        # MVT — see AxisHandle.move_to() in commands.py.
+        # the group
+        # never spans Z (the responder node) — see GCodeExecutor's class
+        # docstring — and Z is unchanged here, so no Z leg is sent at all.
+        # Theta is read live (A6 ACP) and, since it's already at 0, no
+        # Theta move is sent at all (move_to() — blocking MVT — is banned
+        # regardless; see commands.py).
         responses = {
             "C1 INI 1 2": "0",
             "C1 BMT 10 0": "0",
             "C1 MIF": "1",
-            "A6 BMT 0": "0",
-            "A6 MIF": "1",
+            "A6 ACP": "0",
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
-        assert conn.sent == ["C1 INI 1 2", "C1 BMT 10 0", "C1 MIF", "A6 BMT 0", "A6 MIF"]
+        assert conn.sent == ["C1 INI 1 2", "C1 BMT 10 0", "C1 MIF", "A6 ACP"]
 
     def test_vector_move_length_mismatch_raises(self):
         controller, _conn = self._make_controller({})
@@ -322,10 +234,7 @@ class TestMoveTo:
         # Only X given -> Y/Z backfilled via a live get_actual_position()
         # read, then the whole thing goes through the same coordinated
         # gcode path as the vector form (C1 INI/SPD/BMT/MIF), not a
-        # single-axis A1 MVT. Z backfills to 0, matching the start position,
-        # so no Z leg is needed — the coordinated group is X/Y only (Z
-        # can't join it on this hardware, see gcode.py's "Z/XY node split"
-        # note).
+        # single-axis A1 MVT.
         responses = {
             "A2 ACP": "0",  # Y backfill
             "A5 ACP": "0",  # Z backfill
@@ -353,11 +262,24 @@ class TestMoveTo:
 
     def test_theta_only_keyword_move_does_not_touch_cartesian_axes(self):
         # A pure Theta move must not query, move, or otherwise touch X/Y/Z
-        # at all — no ACP reads, no C1 group commands. Moves via BMT + poll
-        # (MIF), not the blocking MVT — see AxisHandle.move_to().
-        controller, conn = self._make_controller({"A6 BMT 90": "90", "A6 MIF": "1"})
+        # at all — no ACP reads for X/Y/Z, no C1 group commands.
+        # Theta now
+        # reads its live position first (A6 ACP) and moves non-blocking
+        # (A6 BMT + A6 MIF poll) instead of a blocking A6 MVT — move_to()
+        # is banned; see commands.py.
+        controller, conn = self._make_controller({
+            "A6 ACP": "0", "A6 BMT 90": "0", "A6 MIF": "1",
+        })
         assert controller.move_to(Theta=90.0) is True
-        assert conn.sent == ["A6 BMT 90", "A6 MIF"]
+        assert conn.sent == ["A6 ACP", "A6 BMT 90", "A6 MIF"]
+
+    def test_theta_move_skipped_entirely_when_already_at_target(self):
+        # the vector move_to() form always passes a Theta
+        # value (0.0 if the caller doesn't care) — if Theta is already
+        # there, no move (blocking or not) should be sent at all.
+        controller, conn = self._make_controller({"A6 ACP": "0"})
+        assert controller.move_to(Theta=0.0) is True
+        assert conn.sent == ["A6 ACP"]
 
     def test_keyword_move_of_unconfigured_axis_raises(self):
         conn = FakeSnapConnection({})
@@ -369,52 +291,6 @@ class TestMoveTo:
         controller, _conn = self._make_controller({})
         with pytest.raises(ValueError):
             controller.move_to()
-
-
-class TestSetPosition:
-    """set_position() mirrors laguna.weir.SaflWeirController.set_elevation()
-    — recalibrates position registers (ACP), commands no motion. Unlike
-    move_to(), it never backfills or fence-checks: only the given axes are
-    touched at all.
-    """
-
-    def _make_controller(self, responses=None, mm_per_unit=15.0):
-        conn = FakeSnapConnection(responses or {})
-        controller = GantryController(connection=conn, mm_per_unit=mm_per_unit)
-        return controller, conn
-
-    def test_vector_sets_every_configured_axis(self):
-        # X=150mm, Y=30mm, Z=45mm (raw 10, 2, 3 at mm_per_unit=15),
-        # Theta=90 (unconverted, rotary).
-        responses = {
-            "A1 ACP 10": "10", "A2 ACP 2": "2", "A5 ACP 3": "3", "A6 ACP 90": "90",
-        }
-        controller, conn = self._make_controller(responses)
-        assert controller.set_position([150.0, 30.0, 45.0, 90.0]) is True
-        assert conn.sent == ["A1 ACP 10", "A2 ACP 2", "A5 ACP 3", "A6 ACP 90"]
-
-    def test_vector_length_mismatch_raises(self):
-        controller, _conn = self._make_controller({})
-        with pytest.raises(ValueError):
-            controller.set_position([1.0, 2.0])
-
-    def test_keyword_only_touches_given_axes(self):
-        # Only Y given -> only A2 ACP is sent. No backfill reads (unlike
-        # move_to), no other axis touched at all.
-        controller, conn = self._make_controller({"A2 ACP 2": "2"})
-        assert controller.set_position(Y=30.0) is True
-        assert conn.sent == ["A2 ACP 2"]
-
-    def test_keyword_of_unconfigured_axis_raises(self):
-        conn = FakeSnapConnection({})
-        controller = GantryController(connection=conn, axes=(X_AXIS, Y_AXIS))  # no Z configured
-        with pytest.raises(ValueError):
-            controller.set_position(Z=1.0)
-
-    def test_no_vector_or_keywords_raises(self):
-        controller, _conn = self._make_controller({})
-        with pytest.raises(ValueError):
-            controller.set_position()
 
 
 class TestHomeEnableDisableWaitForMove:
@@ -440,30 +316,22 @@ class TestHomeEnableDisableWaitForMove:
         )
         assert controller.home() is False
 
-    def test_home_raises_while_homing_is_disabled(self):
-        # Unmocked home_all() — homing is temporarily gated off (physical
-        # obstructions block several limit switches on the real machine —
-        # see HomingProcedure.home_all()), and home() must let that raise
-        # propagate rather than swallow it into a False return.
-        controller, _conn = self._make_controller({})
-        with pytest.raises(NotImplementedError):
-            controller.home()
-
-    def test_enable_enables_motor_and_drive_on_every_axis(self):
+    def test_enable_turns_on_every_motor_and_never_sends_ena(self):
+        # ENA on a responder-node axis crashes the controller — confirmed on
+        # hardware 2026-08-02 and reproduced from a bare tio terminal. The
+        # DSM program enables the axes at power-up, so MTR alone is enough.
         responses = {f"A{i} MTR 1": "1" for i in (1, 2, 5, 6)}
-        responses.update({f"A{i} ENA 1": "1" for i in (1, 2, 5, 6)})
         controller, conn = self._make_controller(responses)
         controller.enable()
-        assert "A1 MTR 1" in conn.sent
-        assert "A1 ENA 1" in conn.sent
+        assert conn.sent == ["A1 MTR 1", "A2 MTR 1", "A5 MTR 1", "A6 MTR 1"]
+        assert not any("ENA" in c for c in conn.sent)
 
-    def test_disable_disables_drive_and_motor_on_every_axis(self):
-        responses = {f"A{i} ENA 0": "0" for i in (1, 2, 5, 6)}
-        responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)})
+    def test_disable_turns_off_every_motor_and_never_sends_ena(self):
+        responses = {f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)}
         controller, conn = self._make_controller(responses)
         controller.disable()
-        assert "A1 ENA 0" in conn.sent
-        assert "A1 MTR 0" in conn.sent
+        assert conn.sent == ["A1 MTR 0", "A2 MTR 0", "A5 MTR 0", "A6 MTR 0"]
+        assert not any("ENA" in c for c in conn.sent)
 
     def test_wait_for_move_polls_until_finished(self):
         calls = {"n": 0}
@@ -482,85 +350,255 @@ class TestHomeEnableDisableWaitForMove:
             controller.wait_for_move(timeout=0.05)
 
 
-class TestSetSafeModeBrakeSync:
-    """set_safe_mode() keeps Y/Z's brakes in sync with the transition:
-    turning safe_mode off releases them (motor enabled first, brake
-    released second); turning it back on re-engages them. See
-    _enable_and_release_brakes()/_engage_brakes() in controller.py.
-    """
+class TestAxisHandles:
+    """Per-axis handles (plan steps 4 + 6, from 5c170d3). lab.gantry.y
+    exposes the same commands as self.cmd, bound to one axis."""
 
     def _make_controller(self, responses=None, safe_mode=True):
         conn = FakeSnapConnection(responses or {})
-        controller = GantryController(connection=conn, safe_mode=safe_mode)
-        controller._is_connected = True  # simulate an already-connected gantry
-        return controller, conn
+        return GantryController(connection=conn, safe_mode=safe_mode), conn
 
-    def test_turning_safe_mode_off_enables_and_releases_brakes(self):
+    def test_dynamic_attribute_per_configured_axis(self):
+        controller, _ = self._make_controller()
+        assert controller.x.name == "X"
+        assert controller.theta.index == 6
+
+    def test_axis_lookup_by_name(self):
+        controller, _ = self._make_controller()
+        assert controller.axis("Z").index == 5
+
+    def test_unknown_axis_name_raises_listing_configured_axes(self):
+        controller, _ = self._make_controller()
+        with pytest.raises(ValueError, match="No axis named"):
+            controller.axis("W")
+
+    def test_handle_delegates_to_the_right_axis_prefix(self):
+        controller, conn = self._make_controller({"A2 SPD 5": "5"})
+        controller.y.set_speed(5)
+        assert conn.sent == ["A2 SPD 5"]
+
+    def test_motion_is_blocked_by_safe_mode_before_reaching_the_wire(self):
+        """RS232/Ethernet transports have no gate of their own, so this
+        client-side check is the only thing between a bare
+        lab.gantry.y.move_to() and the wire on those transports."""
+        controller, conn = self._make_controller(safe_mode=True)
+        from laguna.robot.macron.connection import SnapMotionError
+        with pytest.raises(SnapMotionError, match="safe_mode"):
+            controller.y.begin_move_to(10)
+        assert conn.sent == []
+
+    def test_stopping_is_never_gated(self):
+        controller, conn = self._make_controller({"A2 STP": "0"}, safe_mode=True)
+        controller.y.stop()
+        assert conn.sent == ["A2 STP"]
+
+    def test_enable_disable_send_mtr_only_never_ena(self):
+        controller, conn = self._make_controller({"A2 MTR 1": "1", "A2 MTR 0": "0"})
+        controller.y.enable()
+        controller.y.disable()
+        assert conn.sent == ["A2 MTR 1", "A2 MTR 0"]
+        assert not any("ENA" in c for c in conn.sent)
+
+    def test_axis_without_a_brake_raises(self):
+        controller, _ = self._make_controller()
+        with pytest.raises(ValueError, match="no brake"):
+            controller.x.engage_brake()
+
+
+class TestBrakeVerbs:
+    """GantryController.engage_brake/disengage_brake accept a name, an Axis,
+    or a handle — same effect as the handle method."""
+
+    def _make_controller(self, responses=None):
+        conn = FakeSnapConnection(responses or {})
+        return GantryController(connection=conn), conn
+
+    @pytest.mark.parametrize("axis_ref", ["Y", Y_AXIS])
+    def test_accepts_name_or_axis_object(self, axis_ref):
+        controller, conn = self._make_controller({"SOB 4 0": "0"})
+        controller.engage_brake(axis_ref)
+        assert conn.sent == ["SOB 4 0"]
+
+    def test_accepts_a_handle(self):
+        controller, conn = self._make_controller({"SOB 4 1": "0"})
+        controller.disengage_brake(controller.y)
+        assert conn.sent == ["SOB 4 1"]
+
+    def test_rejects_a_nonsense_reference(self):
+        controller, _ = self._make_controller()
+        with pytest.raises(TypeError):
+            controller.engage_brake(42)
+
+
+class TestSetPosition:
+    """set_position() declares where the gantry already is (ACP write) —
+    the interim way to re-reference it while homing is disabled. Commands
+    no motion."""
+
+    def _make_controller(self, responses=None, mm_per_unit=15.0):
+        conn = FakeSnapConnection(responses or {})
+        return GantryController(connection=conn, mm_per_unit=mm_per_unit), conn
+
+    def test_keyword_form_writes_only_the_given_axes(self):
+        controller, conn = self._make_controller({"A1 ACP 10": "10"})
+        assert controller.set_position(X=150.0) is True
+        assert conn.sent == ["A1 ACP 10"]      # 150mm / 15 = 10 raw
+
+    def test_vector_form_writes_every_axis(self):
+        responses = {"A1 ACP 1": "1", "A2 ACP 2": "2", "A5 ACP 3": "3", "A6 ACP 4": "4"}
+        controller, conn = self._make_controller(responses)
+        controller.set_position([15.0, 30.0, 45.0, 4.0])   # Theta unconverted
+        assert conn.sent == ["A1 ACP 1", "A2 ACP 2", "A5 ACP 3", "A6 ACP 4"]
+
+    def test_commands_no_motion(self):
+        controller, conn = self._make_controller({"A1 ACP 10": "10"})
+        controller.set_position(X=150.0)
+        assert not any(m in c for c in conn.sent for m in ("BMT", "BMB", "MVT", "JOG"))
+
+    def test_vector_length_mismatch_raises(self):
+        controller, _ = self._make_controller()
+        with pytest.raises(ValueError):
+            controller.set_position([1.0, 2.0])
+
+    def test_no_arguments_raises(self):
+        controller, _ = self._make_controller()
+        with pytest.raises(ValueError):
+            controller.set_position()
+
+
+class TestSoftStop:
+    """soft_stop() decelerates on each axis's own ramp (BST) and leaves
+    brakes and motors alone — the gentle counterpart to stop()'s hard
+    zero-decel abort."""
+
+    def _make_controller(self, responses=None):
+        conn = FakeSnapConnection(responses or {})
+        return GantryController(connection=conn), conn
+
+    def test_sends_bst_to_every_axis(self):
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        controller, conn = self._make_controller(responses)
+        controller.soft_stop()
+        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+
+    def test_leaves_brakes_and_motors_alone(self):
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        controller, conn = self._make_controller(responses)
+        controller.soft_stop()
+        assert not any(("SOB" in c or "MTR" in c) for c in conn.sent)
+
+    def test_one_failing_axis_does_not_stop_the_others(self):
+        controller, conn = self._make_controller({})  # every command unscripted
+        controller.soft_stop()                        # must not raise
+        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+
+
+class TestConnectBrakeRelease:
+    """connect() turns Y/Z's motors on and releases their brakes when motion
+    is already permitted (plan step 10, from e5f8a95). Once the motor holds
+    torque an engaged brake serves no purpose and is a hazard — the next
+    move would stall against it, which is what corrupted Y's encoder
+    feedback on 2026-07-30."""
+
+    RESPONSES = {
+        "A2 MTR 1": "1", "SOB 4 1": "0",   # Y: motor on, brake released
+        "A5 MTR 1": "1", "SOB 5 1": "0",   # Z: motor on, brake released
+    }
+
+    def _make_controller(self, safe_mode, responses=None):
+        conn = FakeSnapConnection(responses if responses is not None else dict(self.RESPONSES))
+        return GantryController(connection=conn, safe_mode=safe_mode), conn
+
+    def test_releases_brakes_when_motion_is_permitted(self):
+        controller, conn = self._make_controller(safe_mode=False)
+        assert controller.connect() is True
+        assert conn.sent == ["A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1"]
+
+    def test_motor_on_strictly_before_brake_release(self):
+        """Z's brake is fail-safe/spring-engaged: releasing it before the
+        motor holds torque could drop a loaded Z under gravity."""
+        controller, conn = self._make_controller(safe_mode=False)
+        controller.connect()
+        assert conn.sent.index("A5 MTR 1") < conn.sent.index("SOB 5 1")
+
+    def test_never_sends_ena(self):
+        """The source commit sent ENA here, which would crash the responder
+        node on every connect with motion enabled."""
+        controller, conn = self._make_controller(safe_mode=False)
+        controller.connect()
+        assert not any("ENA" in c for c in conn.sent)
+
+    def test_does_nothing_while_safe_mode_is_on(self):
+        """MTR and SOB are both output-setting commands, which safe_mode's
+        guarantee has to cover."""
+        controller, conn = self._make_controller(safe_mode=True)
+        assert controller.connect() is True
+        assert conn.sent == []
+
+    def test_only_touches_braked_axes(self):
+        controller, conn = self._make_controller(safe_mode=False)
+        controller.connect()
+        assert not any(c.startswith(("A1 ", "A6 ")) for c in conn.sent)
+
+    def test_a_failing_axis_does_not_block_the_other(self):
+        """A faulted axis is logged and skipped, not allowed to abort the
+        whole connect — the other axis still gets its brake released."""
+        from laguna.robot.macron.connection import SnapMotionError
         responses = {
-            "A2 MTR 1": "1", "A2 ENA 1": "1", "SOB 4 1": "0",
-            "A5 MTR 1": "1", "A5 ENA 1": "1", "SOB 5 1": "0",
+            "A2 MTR 1": SnapMotionError(70),   # Y's motor won't come on
+            "A5 MTR 1": "1", "SOB 5 1": "0",
         }
-        controller, conn = self._make_controller(responses, safe_mode=True)
-        assert controller.set_safe_mode(False) is True
-        assert conn.sent == [
-            "A2 MTR 1", "A2 ENA 1", "SOB 4 1",
-            "A5 MTR 1", "A5 ENA 1", "SOB 5 1",
-        ]
+        controller, conn = self._make_controller(safe_mode=False, responses=responses)
+        assert controller.connect() is True             # must not raise
+        assert "SOB 4 1" not in conn.sent               # Y's brake stayed engaged...
+        assert "SOB 5 1" in conn.sent                   # ...but Z still got released
 
-    def test_turning_safe_mode_on_engages_brakes(self):
-        responses = {"SOB 4 0": "0", "SOB 5 0": "0"}
-        controller, conn = self._make_controller(responses, safe_mode=False)
+
+class TestSetSafeMode:
+    """set_safe_mode() flips the flag and syncs Y/Z's brakes to match."""
+
+    def _make_controller(self, safe_mode=True, responses=None):
+        conn = FakeSnapConnection(responses or {
+            "A2 MTR 1": "1", "SOB 4 1": "0", "A5 MTR 1": "1", "SOB 5 1": "0",
+            "SOB 4 0": "0", "SOB 5 0": "0",
+        })
+        return GantryController(connection=conn, safe_mode=safe_mode), conn
+
+    def test_disabling_releases_brakes(self):
+        controller, conn = self._make_controller(safe_mode=True)
+        controller.connect()
+        conn.sent.clear()
+        assert controller.set_safe_mode(False) is True
+        assert conn.sent == ["A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1"]
+
+    def test_enabling_engages_brakes_and_leaves_motors_on(self):
+        controller, conn = self._make_controller(safe_mode=False)
+        controller.connect()
+        conn.sent.clear()
         assert controller.set_safe_mode(True) is True
         assert conn.sent == ["SOB 4 0", "SOB 5 0"]
+        assert not any("MTR" in c for c in conn.sent)
 
-    def test_no_op_when_not_connected(self):
-        conn = FakeSnapConnection({})  # any brake/enable command would raise (unscripted)
-        controller = GantryController(connection=conn, safe_mode=True)
-        assert controller.set_safe_mode(False) is True
-        assert conn.sent == []
+    def test_flag_propagates_to_the_transport_gate(self):
+        controller, conn = self._make_controller(safe_mode=True)
+        conn.safe_mode = True
+        controller.set_safe_mode(False)
         assert controller._safe_mode is False
+        assert conn.safe_mode is False
 
-    def test_pi_gantry_connection_engages_brakes_after_reconnect_when_turning_on(self, monkeypatch):
-        from laguna.robot.macron.pi_bridge import PiGantryConnection
+    def test_no_brake_traffic_when_not_connected(self):
+        """connect() applies the release side itself, with whatever
+        safe_mode is set to by then."""
+        controller, conn = self._make_controller(safe_mode=True)
+        controller.set_safe_mode(False)
+        assert conn.sent == []
 
-        conn = PiGantryConnection(host="fake", ssh_user="oak", remote_serial_device="/dev/fake")
-        controller = GantryController(connection=conn, safe_mode=False)
-        controller._is_connected = True
-        monkeypatch.setattr(controller, "disconnect", lambda: None)
-        monkeypatch.setattr(controller, "connect", lambda: True)
-        engaged = []
-        monkeypatch.setattr(controller, "_engage_brakes", lambda: engaged.append(True))
-
-        assert controller.set_safe_mode(True) is True
-        assert engaged == [True]
-
-    def test_pi_gantry_connection_does_not_engage_brakes_when_turning_off(self, monkeypatch):
-        # connect() itself releases brakes when safe_mode is already False
-        # (tested separately in TestSubsystemInterface) — set_safe_mode()
-        # must not also call _engage_brakes() in this direction.
-        from laguna.robot.macron.pi_bridge import PiGantryConnection
-
-        conn = PiGantryConnection(host="fake", ssh_user="oak", remote_serial_device="/dev/fake")
-        controller = GantryController(connection=conn, safe_mode=True)
-        controller._is_connected = True
-        monkeypatch.setattr(controller, "disconnect", lambda: None)
-        monkeypatch.setattr(controller, "connect", lambda: True)
-        engaged = []
-        monkeypatch.setattr(controller, "_engage_brakes", lambda: engaged.append(True))
-
-        assert controller.set_safe_mode(False) is True
-        assert engaged == []
-
-    def test_pi_gantry_connection_reconnect_failure_propagates_false(self, monkeypatch):
-        from laguna.robot.macron.pi_bridge import PiGantryConnection
-
-        conn = PiGantryConnection(host="fake", ssh_user="oak", remote_serial_device="/dev/fake")
-        controller = GantryController(connection=conn, safe_mode=True)
-        controller._is_connected = True
-        monkeypatch.setattr(controller, "disconnect", lambda: None)
-        monkeypatch.setattr(controller, "connect", lambda: False)
-        engaged = []
-        monkeypatch.setattr(controller, "_engage_brakes", lambda: engaged.append(True))
-
-        assert controller.set_safe_mode(False) is False
-        assert engaged == []  # never reached — reconnect failed first
+    def test_axis_handles_see_the_new_flag_immediately(self):
+        """The handles' gate closes over self._safe_mode, so flipping it
+        must take effect without rebuilding them."""
+        from laguna.robot.macron.connection import SnapMotionError
+        controller, _ = self._make_controller(safe_mode=True)
+        with pytest.raises(SnapMotionError):
+            controller.y.begin_move_to(1)
+        controller.set_safe_mode(False)
+        controller.y._check_motion_allowed("test")   # no longer raises

@@ -83,9 +83,15 @@ class Config:
                 "event_log": "./experiment_events.csv",
             },
             "gantry": {
-                "transport": "socket_bridge",  # socket_bridge | pi_agent | ethernet | rs232
+                # pi_agent is the default: it launches gantry_agent.py over SSH
+                # itself, is the sole owner of the serial port, and is the only
+                # transport that supports topographic scanning. socket_bridge
+                # was the previous default; it depended on serial_bridge.py, a
+                # hand-started Pi-side script that has been retired — see
+                # docs/MACRON_GANTRY.md.
+                "transport": "pi_agent",  # pi_agent | ethernet | rs232 | socket_bridge (retired)
                 "host": "red.dyn.ucr.edu",
-                "bridge_port": 9700,  # serial_bridge.py's TCP port on the Pi
+                "bridge_port": 9700,  # only used by the retired socket_bridge transport
                 "ssh_user": "oak",  # for the pi_agent transport
                 "ssh_key": "~/.ssh/id_ed25519",
                 "remote_serial_device": (

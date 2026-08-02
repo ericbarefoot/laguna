@@ -20,12 +20,12 @@ gantry connection, handled automatically below from the same flag).
 --- Background you need before setting ALLOW_MOTION = True ---
 
 1. Requires the pi_agent transport (gantry_agent.py running on the Pi,
-   reached via PiGantryConnection) — the default socket_bridge transport
-   in config/example_config.yaml can't scan. This script forces
-   transport: pi_agent below rather than requiring you to edit your local
-   config file first, purely so this example is runnable standalone; a
-   real experiment script would instead just set that in
-   config/example_config.yaml directly. See docs/MACRON_GANTRY.md and
+   reached via PiGantryConnection). That is the default in
+   config/example_config.yaml; the retired socket_bridge transport could
+   not scan at all. This script sets transport: pi_agent explicitly below
+   so it stays runnable standalone against an older local config file; a
+   real experiment script would just rely on the config default. See
+   docs/MACRON_GANTRY.md and
    examples/example_05_gantry_single_axis.py.
 2. Requires both rangefinders wired through the AL1342 IO-Link master —
    see docs/MQTT_AL1342_SETUP.md (OD2000) and
@@ -71,7 +71,7 @@ WTT12L_PDIN_PORT = 7
 
 # --- Motion AND scanning are off by default. Flip this only when you've
 #     decided to actually move something. ---
-ALLOW_MOTION = True
+ALLOW_MOTION = False
 
 
 def build_lab() -> FlumeLab:
@@ -185,8 +185,18 @@ def main():
     # ------------------------------------------------------------------
 
     print()
-    print("Homing gantry...")
-    lab.gantry.home()
+    # Homing is temporarily disabled: physical obstructions currently block
+    # several of the limit switches the routine depends on, so
+    # lab.gantry.home() raises NotImplementedError rather than jogging into
+    # them (see HomingProcedure.home_all). Until that is cleared, declare
+    # the reference frame instead — set_position() tells the controller
+    # where the gantry already is, and commands no motion:
+    #
+    #     lab.gantry.set_position([0.0, 0.0, 0.0, 0.0])
+    #
+    # This example assumes the gantry is already referenced and just moves
+    # from wherever it is.
+    print("Skipping homing (temporarily disabled — see comment above).")
 
     print("Moving to (100, 50, 10, 0) mm...")
     lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0)
@@ -226,6 +236,12 @@ def main():
         output="experiments/scan_output/example_07_wtt12l.csv",
     )
     print(f"  -> {wtt12l_result.path} ({wtt12l_result.metadata.get('samples')} samples)")
+
+    # Park at the origin so repeated runs start from a known place. Note
+    # this is the controller's zero, not wherever this run happened to
+    # start.
+    print("Returning to the origin...")
+    lab.gantry.move_to([0.0, 0.0, 0.0, 0.0], speed=10.0)
 
     lab.disconnect_all()
     print("Done!")

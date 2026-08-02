@@ -83,11 +83,36 @@ SAFE_COMMANDS = {
     "INB": 1, "ISI": 1, "ALI": 1,
     "ACP": 0, "ENP": 0, "COP": 0, "DEP": 0,
     "SPD": 0, "ACL": 0, "DCL": 0, "NLT": 0, "PLT": 0,
-    "MTR": 0, "ENA": 0, "MIF": 0,
+    "MTR": 0, "MIF": 0,   # ENA deliberately absent — see check_ena_banned
     "CAB": 0, "CAP": 0, "CAT": 0, "PFP": 0, "PFV": 0,
 }
 
 _PREFIX_RE = re.compile(r"^[AC]\d+$")
+
+# ENA is refused unconditionally — NOT part of the safe_mode allowlist,
+# because safe_mode only applies when it is switched on and this must hold
+# always. Sending ENA to a responder-node axis (A5/Z, A6/Theta) crashes
+# this controller: the node stops answering entirely (error 70 — a ~575 ms
+# inter-node timeout — on every subsequent command, including reads that
+# worked moments earlier) and has to be reflashed. Confirmed on hardware
+# 2026-08-02 and reproduced from a bare `tio` terminal with no laguna code
+# involved, using a bare ENA *read* with no argument. Banned for all axes:
+# the controller's own DSM program enables the axes at power-up, so nothing
+# here needs the command. See MMCCommands._ENA_BANNED.
+_ENA_RE = re.compile(r"(?:^|\s)ENA(?:\s|$)", re.IGNORECASE)
+
+
+def check_ena_banned(cmd: str) -> None:
+    """Raise if cmd addresses ENA on any axis. Called before every send."""
+    if _ENA_RE.search(cmd):
+        raise SnapMotionError(
+            0,
+            f"Command {cmd!r} refused: ENA crashes this controller's responder "
+            "node (confirmed on hardware 2026-08-02, reproducible from a bare "
+            "serial terminal). The axes are already enabled at power-up by the "
+            "controller's DSM program — nothing needs this command.",
+        )
+
 
 
 def parse_command(cmd: str) -> Tuple[str, int]:
@@ -149,6 +174,7 @@ class SafeModeConnection(SnapConnection):
         return self._inner.is_connected
 
     def send(self, command: str) -> str:
+        check_ena_banned(command)     # unconditional — see check_ena_banned
         if self.safe_mode:
             check_safe_mode(command)  # raises before touching the inner connection
         return self._inner.send(command)
@@ -173,6 +199,7 @@ class PiGantryConnection(SnapConnection):
         safe_mode: bool = True,
         reconnect_on_failure: bool = True,
         max_reconnect_attempts: int = 3,
+        legacy_modem_lines: bool = False,
     ):
         if not host:
             raise ValueError("host must be a non-empty string")
@@ -194,9 +221,16 @@ class PiGantryConnection(SnapConnection):
         self.safe_mode = safe_mode
         self.reconnect_on_failure = reconnect_on_failure
         self.max_reconnect_attempts = max_reconnect_attempts
+        # Pass --legacy-modem-lines to the agent, restoring the pre-2026-08-02
+        # behaviour of asserting DTR/RTS on open and leaving HUPCL set (so
+        # closing the port hangs up the line). Only for A/B testing whether
+        # modem-line transitions are what knocks the responder node off the
+        # inter-node link — see gantry_agent.SerialBridge.__init__.
+        self.legacy_modem_lines = legacy_modem_lines
 
         self._client = None
         self._channel = None
+        self._stdin = None                     # kept alive deliberately — see connect()
         self._lock = threading.Lock()          # serializes send()/start_scan() request/ack cycles
         self._write_lock = threading.Lock()    # guards raw channel.send() calls
         self._next_id = 1
@@ -226,6 +260,8 @@ class PiGantryConnection(SnapConnection):
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kwargs: dict = {"username": self.ssh_user, "port": self.ssh_port, "timeout": self.timeout}
         if self.ssh_key:
+            # paramiko does not tilde-expand key_filename, so "~/.ssh/id_ed25519"
+            # was passed through literally and failed with ENOENT.
             kwargs["key_filename"] = os.path.expanduser(self.ssh_key)
         if self.ssh_passphrase:
             kwargs["passphrase"] = self.ssh_passphrase
@@ -237,16 +273,34 @@ class PiGantryConnection(SnapConnection):
         finally:
             sftp.close()
 
+        self._warn_about_stale_port_holders(client)
+
         safe_flag = "" if self.safe_mode else " --allow-motion"
+        modem_flag = " --legacy-modem-lines" if self.legacy_modem_lines else ""
         remote_cmd = (
             f"python3 {REMOTE_AGENT_PATH} "
-            f"--port {self.remote_serial_device} --baud {self.remote_baud}{safe_flag}"
+            f"--port {self.remote_serial_device} --baud {self.remote_baud}"
+            f"{safe_flag}{modem_flag}"
         )
-        _, stdout, _stderr = client.exec_command(remote_cmd)
+        stdin, stdout, _stderr = client.exec_command(remote_cmd)
         channel = stdout.channel
 
         self._client = client
         self._channel = channel
+        # Keep the stdin file object alive for the connection's lifetime.
+        # paramiko's ChannelStdinFile.close() calls channel.shutdown_write(),
+        # and BufferedFile.__del__ calls close() — so letting this be
+        # garbage collected sends EOF on the agent's stdin, and the agent
+        # (whose main loop is `for raw_line in sys.stdin`) shuts down
+        # cleanly and exits mid-session. Because paramiko's objects sit in
+        # reference cycles, that collection happened on the *cyclic*
+        # collector's schedule rather than at a fixed point, so the agent
+        # appeared to die at random times — 10ms into one run, 36s into
+        # another — and more readily in allocation-heavy processes (a full
+        # FlumeLab with MQTT subscribers) than in small scripts. Confirmed
+        # 2026-07-31: an explicit gc.collect() right after connect() flips
+        # channel.eof_sent False->True and kills the agent every time.
+        self._stdin = stdin
         self._stdout_buf = b""
         self._next_id = 1
         self._pending = {}
@@ -265,6 +319,37 @@ class PiGantryConnection(SnapConnection):
         self._reader_thread.start()
 
         logger.info("Connected to gantry agent on %s via SSH", self.host)
+
+    def _warn_about_stale_port_holders(self, client) -> None:
+        """Log a warning if anything already holds the remote serial port.
+
+        A session killed abruptly (Ctrl-C in a REPL, dropped SSH, an exception
+        before disconnect()) never delivers the "close" op, so its agent
+        lingers holding the port. The new agent now refuses to open it in that
+        case (exclusive=True in gantry_agent.SerialBridge), which is a clean
+        failure — but naming the holder turns a confusing "failed to open
+        serial port" into an obvious one.
+
+        Checks the device itself via fuser rather than only pattern-matching
+        process names, so it also catches holders that aren't agents at all
+        (e.g. a tio terminal left open). Purely diagnostic — never blocks
+        connecting, and never raises.
+        """
+        try:
+            _, out, _ = client.exec_command(
+                f"fuser {self.remote_serial_device} 2>/dev/null; "
+                "ps -eo pid,args | grep '[l]aguna_gantry_agent' || true"
+            )
+            holders = out.read().decode().strip()
+            if holders:
+                logger.warning(
+                    "Something already holds %s on %s before we launch the agent:\n%s\n"
+                    "Two writers on one controller interleave bytes mid-command and can "
+                    "corrupt it. Stop the holder before reconnecting.",
+                    self.remote_serial_device, self.host, holders,
+                )
+        except Exception as exc:  # never block connecting on a diagnostic
+            logger.debug("Could not check for stale serial-port holders: %s", exc)
 
     def _await_ready(self) -> None:
         deadline = time.monotonic() + READY_TIMEOUT
@@ -287,6 +372,11 @@ class PiGantryConnection(SnapConnection):
         client = self._client
         self._channel = None
         self._client = None
+        # Release the deliberately-held stdin handle (see connect()). Now
+        # the EOF it sends on close is what we actually want — we're
+        # telling the agent to shut down anyway, right after the explicit
+        # {"op": "close"} below.
+        self._stdin = None
         if channel is not None:
             try:
                 channel.send((json.dumps({"op": "close"}) + "\n").encode("ascii"))
@@ -369,6 +459,7 @@ class PiGantryConnection(SnapConnection):
     # ------------------------------------------------------------------
 
     def send(self, command: str) -> str:
+        check_ena_banned(command)     # unconditional — see check_ena_banned
         if self.safe_mode:
             check_safe_mode(command)  # raises before anything is written
 

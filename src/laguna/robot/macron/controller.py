@@ -23,6 +23,8 @@ from .commands import (
     X_AXIS,
     Y_AXIS,
     Z_AXIS,
+    poll_until_move_finished,
+    predicted_move_s,
 )
 from .connection import EthernetConnection, RS232Connection, SnapConnection, SnapMotionError
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
@@ -31,6 +33,11 @@ from .homing import HomingConfig, HomingProcedure
 from .pi_bridge import PiGantryConnection
 
 logger = logging.getLogger(__name__)
+
+# Tolerance for deciding whether an axis actually needs to move — used only
+# by the debug-patch Theta skip in move_to() (see its comment there). Needed
+# because mm/degree values round-trip through raw controller units and back.
+_POSITION_EPSILON_MM = 1e-3
 
 _NAMED_AXES = {
     "X": X_AXIS,
@@ -246,6 +253,11 @@ class GantryController:
         try:
             self._connection.connect()
             self._is_connected = self._connection.is_connected
+            # The controller may have been power-cycled/reflashed while we
+            # were away, clearing its coordinated-group state — make the
+            # next move re-send INI rather than assume it survived. See
+            # GCodeExecutor._init_group.
+            self.gcode.reset_group_init()
         except Exception as exc:
             logger.error("Failed to connect gantry: %s", exc)
             self._is_connected = False
@@ -256,27 +268,29 @@ class GantryController:
         return self._is_connected
 
     def _enable_and_release_brakes(self) -> None:
-        """Enable each brake-equipped axis's motor, then release its brake.
+        """Turn each brake-equipped axis's motor on, then release its brake.
 
-        Once the motor is enabled, its own torque holds the axis in place,
-        so a still-engaged brake serves no purpose — and worse, it's a
-        hazard: the next motion command would stall directly against it
-        (this is exactly what corrupted Y's encoder feedback on
-        2026-07-30, requiring a power-cycle to recover).
+        Once the motor is on, its own torque holds the axis, so a
+        still-engaged brake serves no purpose — and worse, it is a hazard:
+        the next motion command would stall directly against it, which is
+        exactly what corrupted Y's encoder feedback on 2026-07-30 and
+        needed a power-cycle to clear.
 
-        Enable-then-release, strictly in that order, and never the
+        Motor-on then brake-release, strictly in that order and never the
         reverse: Z's brake is a fail-safe, spring-engaged design (SOB ON =
-        released) — releasing it before the motor is actually holding
-        torque would let a loaded Z axis drop under gravity (see IOMap's
-        docstring in commands.py).
+        released), so releasing it before the motor is holding torque would
+        let a loaded Z drop under gravity (see IOMap's docstring in
+        commands.py).
+
+        Sends MTR and SOB only. The source commit for this feature also
+        sent ENA here, which would crash the responder node every time a
+        connection was made with motion enabled — see _ENA_BANNED in
+        commands.py.
 
         Called by connect() (only when safe_mode is already False) and by
-        set_safe_mode(False) (transitioning safe_mode off) — see
-        _engage_brakes() for the mirror-image transition back to
-        safe_mode=True. Callers are responsible for the safe_mode check:
-        this method always sends MTR/SOB, which are both output-setting
-        commands safe_mode's "no motion, no output-setting commands"
-        guarantee must hold for (see SAFE_COMMANDS in pi_bridge.py).
+        set_safe_mode(False). Callers own the safe_mode check: this method
+        always sends output-setting commands, which safe_mode's "no motion,
+        no output-setting commands" guarantee has to cover.
         """
         for axis in self._axes:
             if axis not in (Y_AXIS, Z_AXIS):
@@ -285,7 +299,7 @@ class GantryController:
             try:
                 handle.enable()
             except SnapMotionError as exc:
-                logger.warning("Could not enable %s: %s", axis.name, exc)
+                logger.warning("Could not turn on %s's motor: %s", axis.name, exc)
                 continue
             try:
                 handle.disengage_brake()
@@ -294,17 +308,16 @@ class GantryController:
             except SnapMotionError as exc:
                 logger.warning("Could not disengage %s's brake: %s", axis.name, exc)
             else:
-                logger.info("%s: motor enabled, brake disengaged", axis.name)
+                logger.info("%s: motor on, brake disengaged", axis.name)
 
     def _engage_brakes(self) -> None:
         """Re-engage each brake-equipped axis's brake.
 
         Mirrors _enable_and_release_brakes() for the transition back to
         safe_mode=True — see set_safe_mode(). Only engages the brake;
-        deliberately doesn't disable the motor, since disengage/engage is
-        the only thing that was asked for here and safe_mode's own gate
-        (both client- and, for the pi_agent transport, agent-side) is what
-        actually blocks further motion commands from this point on.
+        deliberately leaves the motor on, since safe_mode's own gate (both
+        client-side and, on the pi_agent transport, agent-side) is what
+        actually blocks further motion from here.
         """
         for axis in self._axes:
             if axis not in (Y_AXIS, Z_AXIS):
@@ -345,40 +358,11 @@ class GantryController:
 
         Called by FlumeLab.emergency_stop() for every registered subsystem
         that has a stop() method — this is the gantry's emergency-stop path.
-        Hard stop: zero decel ramp (ABT), brakes engaged, motors disabled —
-        moving again afterward needs an explicit enable()/disengage_brake()
-        (or another connect()/set_safe_mode(False), which do both). For a
-        gentler stop that leaves the gantry ready to move immediately, use
-        soft_stop() instead.
         """
         try:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry shutdown: %s", exc)
-
-    def soft_stop(self) -> None:
-        """Decelerate every configured axis to a stop (BST), using each
-        axis's own configured accel/decel ramp — no abrupt zero-ramp abort.
-
-        Unlike stop(), this only stops motion: brakes are left exactly as
-        they were (not engaged) and motors are left enabled, so the gantry
-        is immediately ready for another move_to() afterward — no
-        enable()/disengage_brake() needed first. Use this for an ordinary
-        "cancel the current move" rather than an emergency; use stop() when
-        you actually want the machine locked down.
-
-        Non-blocking, like stop() — returns as soon as the stop commands
-        are sent, not once the axes have actually finished decelerating.
-        Call wait_for_move() afterward if you need to block until they have.
-
-        Never raises; a failure on one axis is logged and doesn't stop the
-        rest from being sent their own stop command.
-        """
-        for axis in self._axes:
-            try:
-                self.cmd.begin_stop(axis)
-            except SnapMotionError as exc:
-                logger.warning("Could not decelerate-stop %s: %s", axis.name, exc)
 
     # ------------------------------------------------------------------
     # Simple verbs (mirrors laguna.weir.SaflWeirController's shape) —
@@ -479,32 +463,26 @@ class GantryController:
 
         if theta_value is not None:
             theta_axis = axes_by_name["Theta"]
-            if speed is not None:
-                self.cmd.set_speed(theta_axis, speed)
-            # begin_move_to (BMT) + poll, not the blocking MVT directly — a
-            # slow rotation could otherwise exceed the transport's fixed
-            # per-command read timeout and spuriously error (same reasoning
-            # as GCodeExecutor's Z leg / AxisHandle.move_to() — see either).
-            # Deliberately not routed through AxisHandle.move_to(): that
-            # adds its own client-side safe_mode check, which would be
-            # inconsistent with the Cartesian branch above (which has none
-            # — it relies entirely on the transport-level gate).
-            self.cmd.begin_move_to(theta_axis, theta_value)
-            self._poll_theta_move_finished(theta_axis)
+            # the
+            # vector move_to() form always passes theta_value (0.0 if the
+            # caller didn't care about Theta at all), so this used to fire
+            # a blocking MVT unconditionally — including when Theta was
+            # already at the target, e.g. every scan-setup move in
+            # example_07. move_to() is now banned outright (see
+            # commands.py); this does a live read first and skips the move
+            # entirely if Theta hasn't actually changed, same as the
+            # X/Y/Z legs in GCodeExecutor._execute_linear.
+            current_theta = self.cmd.get_actual_position(theta_axis)
+            if abs(theta_value - current_theta) > _POSITION_EPSILON_MM:
+                if speed is not None:
+                    self.cmd.set_speed(theta_axis, speed)
+                self.cmd.begin_move_to(theta_axis, theta_value)
+                self._wait_for_axis_move_finished(
+                    theta_axis,
+                    predicted_s=predicted_move_s(theta_value - current_theta, speed),
+                )
 
         return True
-
-    def _poll_theta_move_finished(
-        self, axis: Axis, timeout: float = 30.0, poll_interval: float = 0.05
-    ) -> None:
-        deadline = time.monotonic() + timeout
-        while not self.cmd.move_is_finished(axis):
-            if time.monotonic() > deadline:
-                self.cmd.abort(axis)
-                raise SnapMotionError(
-                    0, f"{axis.name} move did not finish within {timeout:.0f}s — aborted"
-                )
-            time.sleep(poll_interval)
 
     def set_position(
         self,
@@ -520,16 +498,15 @@ class GantryController:
         Mirrors laguna.weir.SaflWeirController.set_elevation() — this
         recalibrates each given axis's position register (ACP) to the given
         real-mm value without commanding any motion. Use it to re-reference
-        the gantry after it's been repositioned by other means (e.g.
-        manually) — this is currently the only way to (re-)establish a
-        position reference, since home() is temporarily disabled (see
-        HomingProcedure.home_all()). To actually move the gantry, use
-        move_to().
+        the gantry after it has been repositioned by other means (e.g.
+        manually). This is currently the only way to (re-)establish a
+        position reference, since home() is temporarily disabled — see
+        HomingProcedure.home_all(). To actually move, use move_to().
 
         Both forms mirror move_to()'s shape — a full vector (one value per
         configured axis, in self._axes order) or per-axis keywords — except
-        unlike move_to(), any axis *not* given here is left completely
-        untouched: there's no backfill, since there's no move/fence-checked
+        that unlike move_to(), any axis *not* given is left completely
+        untouched: there is no backfill, since there is no fence-checked
         path to compute one for.
 
         Args:
@@ -574,49 +551,47 @@ class GantryController:
             self.cmd.set_actual_position(axes_by_name[name], value)
         return True
 
-    def home(self) -> bool:
-        """Run the homing routine on all configured axes.
+    def soft_stop(self) -> None:
+        """Decelerate every configured axis to a stop, leaving brakes and
+        motors alone.
 
-        Temporarily disabled: physical obstructions currently block several
-        of the limit switches this routine depends on. Delegates to
-        HomingProcedure.home_all(), which raises NotImplementedError
-        unconditionally until that guard is removed. Use set_position() to
-        re-reference an axis manually in the meantime.
+        The gentle counterpart to stop(): each axis decelerates using its
+        own accel/decel ramp (BST) rather than a zero-decel abort, and
+        nothing is disabled — so the gantry is immediately ready for
+        another move_to() with no re-enable cycle. Use this to cancel an
+        ordinary move; use stop() for an emergency.
 
-        Returns:
-            True if homing completed successfully on every axis.
-
-        Raises:
-            NotImplementedError: Always, while homing is disabled.
+        Never raises: one axis failing to stop is logged and does not
+        prevent the rest from getting their stop command.
         """
-        result = self.homing.home_all()
-        return result.success
+        for axis in self._axes:
+            try:
+                self.cmd.begin_stop(axis)
+            except Exception as exc:
+                logger.error("Error soft-stopping %s: %s", axis.name, exc)
 
     def set_safe_mode(self, enabled: bool) -> bool:
         """Enable or disable safe_mode, reconnecting the transport if needed
-        so the change actually takes effect, and syncing Y/Z's brakes to
-        match.
+        so the change actually takes effect, and syncing Y/Z's brakes to match.
 
         Setting ``self.connection.safe_mode`` directly is not enough for the
         pi_agent transport: gantry_agent.py enforces its own independent
         safe-mode gate (deliberate defense-in-depth — see pi_bridge.py's
         module docstring), fixed at process launch via the --allow-motion
-        flag baked into the SSH command in PiGantryConnection.connect().
-        An already-running agent keeps enforcing whatever it was launched
-        with, no matter what the client-side attribute says. This method
-        updates the flag and, if a PiGantryConnection is currently
-        connected, disconnects and reconnects so the agent relaunches with
-        the matching flag.
+        flag baked into the SSH command in PiGantryConnection.connect(). An
+        already-running agent keeps enforcing whatever it was launched with,
+        no matter what the client-side attribute says. This method updates
+        the flag and, if a PiGantryConnection is currently connected,
+        disconnects and reconnects so the agent relaunches to match.
 
-        Brakes follow the same transition, same reasoning as connect()'s
-        automatic release (see _enable_and_release_brakes()): turning
-        safe_mode off means motion is now possible, so Y/Z release (motor
-        enabled first, brake released second — never leave an axis with
-        neither holding it); turning safe_mode back on re-engages them,
-        since safe_mode's own gate is about to block further motion
-        commands from holding the axis via motor torque alone. No-op if
-        not currently connected — connect() will apply the release side of
-        this itself, using whatever safe_mode is set to by then.
+        Brakes follow the same transition, for the same reason as
+        connect()'s automatic release (see _enable_and_release_brakes()):
+        turning safe_mode off means motion is now possible, so Y/Z release
+        (motor on first, brake released second — never leave an axis with
+        neither holding it); turning it back on re-engages them, since
+        safe_mode's own gate is about to stop motor torque being
+        re-commanded. No-op if not currently connected — connect() applies
+        the release side itself, using whatever safe_mode is set to by then.
 
         Returns:
             True if the change took effect (including a successful
@@ -630,9 +605,9 @@ class GantryController:
             self.disconnect()
             if not self.connect():
                 return False
-            # connect() already released brakes if enabled=False (it checks
-            # self._safe_mode itself); it never engages, so that direction
-            # still needs an explicit call here.
+            # connect() already released the brakes if enabled=False (it
+            # checks self._safe_mode itself); it never engages, so that
+            # direction still needs an explicit call here.
             if enabled:
                 self._engage_brakes()
             return True
@@ -643,42 +618,89 @@ class GantryController:
                 self._enable_and_release_brakes()
         return True
 
+    def home(self) -> bool:
+        """Run the homing routine on all configured axes.
+
+        Returns:
+            True if homing completed successfully on every axis.
+        """
+        result = self.homing.home_all()
+        return result.success
+
     def enable(self) -> None:
-        """Enable motor drive on all configured axes."""
+        """Turn motor drive on for all configured axes (MTR only).
+
+        Does NOT send ENA. Addressing ENA on a responder-node axis (Z,
+        Theta) crashes this controller — see MMCCommands._ENA_BANNED. The
+        controller's own DSM program enables the axes at power-up, so the
+        drive-enable half of this was never load-bearing here.
+        """
         for axis in self._axes:
             self.cmd.set_motor(axis, True)
-            self.cmd.set_enable(axis, True)
 
     def disable(self) -> None:
-        """Disable motor drive on all configured axes (allows manual repositioning)."""
+        """Turn motor drive off for all configured axes (MTR only), allowing
+        manual repositioning.
+
+        Does NOT send ENA — see enable().
+        """
         for axis in self._axes:
-            self.cmd.set_enable(axis, False)
             self.cmd.set_motor(axis, False)
 
-    def wait_for_move(self, timeout: float = 30.0) -> None:
+    def wait_for_move(self, timeout: float = 30.0, predicted_s: float = 0.0) -> None:
         """Block until the coordinated group's current move completes, or timeout elapses.
 
-        Only tracks the coordinated (X/Y/Z) group — a Theta-only move
-        issued via move_to(Theta=...) isn't covered by this; poll
+        Only tracks the coordinated (X/Y) group — a Theta-only move issued
+        via move_to(Theta=...) isn't covered by this; poll
         self.cmd.move_is_finished(THETA_AXIS) directly for that.
+
+        polls
+        sparsely via commands.poll_until_move_finished. This is the public
+        "wait for the move I just started" entry point, so it is exactly
+        the loop most likely to be querying C<n> MIF while a group move is
+        interpolating — the pattern confirmed on hardware to make this
+        controller stop answering the wire; see commands.py's module note.
+        Pass `predicted_s` (distance / speed) when known so most of the
+        wait costs no wire traffic at all.
 
         Raises:
             TimeoutError: If the move hasn't finished within `timeout`.
         """
-        deadline = time.monotonic() + timeout
-        while not self.cmd.group_move_is_finished():
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"Gantry move did not finish within {timeout:.0f}s")
-            time.sleep(0.05)
+        if not poll_until_move_finished(
+            self.cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout
+        ):
+            raise TimeoutError(f"Gantry move did not finish within {timeout:.0f}s")
+
+    def _wait_for_axis_move_finished(
+        self, axis: Axis, timeout: float = 30.0, predicted_s: float = 0.0
+    ) -> None:
+        """Block until a single axis's move-finished flag is set, aborting on timeout.
+
+        used by the
+        Theta branch of move_to() now that it issues a non-blocking
+        begin_move_to instead of a blocking move_to() (banned — see
+        commands.py). Polls sparsely via commands.poll_until_move_finished
+        — see that function's module note.
+        """
+        if not poll_until_move_finished(
+            lambda: self.cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout
+        ):
+            self.cmd.abort(axis)
+            raise TimeoutError(f"{axis.name} move did not finish within {timeout:.0f}s — aborted")
 
 
 def _build_transport(config: Dict[str, Any]) -> SnapConnection:
-    transport = config.get("transport", "socket_bridge")
+    transport = config.get("transport", "pi_agent")
 
     if transport == "socket_bridge":
-        # Default path: the existing raw TCP<->serial passthrough already
-        # running on the Pi (serial_bridge.py) — no Pi-side laguna code
-        # needed. pyserial's serial_for_url() understands socket:// URLs.
+        # Retired path (2026-08-02): a raw TCP<->serial passthrough
+        # (serial_bridge.py) hand-started on the Pi. Still buildable if
+        # configured explicitly, but no longer the default and nothing
+        # should start that bridge again — it exposed an unauthenticated
+        # port straight to the controller's ASCII interpreter, and could
+        # hold the serial port alongside gantry_agent.py without either
+        # noticing. See docs/MACRON_GANTRY.md, "Retired: serial_bridge.py".
+        # pyserial's serial_for_url() understands socket:// URLs.
         host = config["host"]
         port = config.get("bridge_port", 9700)
         return RS232Connection(
@@ -746,8 +768,9 @@ def _build_homing_config(homing_cfg: Dict[str, Any], axes_cfg: List[Dict[str, An
 def _resolve_gcode_axes(axes_cfg: List[Dict[str, Any]]) -> Tuple[Axis, Axis]:
     """Pick the X/Y axes by name for the GCodeExecutor's coordinated group.
 
-    Z is resolved separately (see gcode_z_axis in from_config) — it can't
-    be part of this group on this hardware, see GCodeExecutor/gcode.py.
+    Z is deliberately not included — it cannot join the group on this
+    hardware and is passed separately as the executor's z_axis. See
+    gcode.py's "Z/XY node split" note.
     """
     resolved = [axis for axis in (_lookup_axis(axes_cfg, name) for name in ("X", "Y")) if axis]
     if len(resolved) == 2:

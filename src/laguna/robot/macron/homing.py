@@ -26,7 +26,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .commands import MMCCommands, Axis, IOMap, X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS
+from .commands import (
+    MMCCommands, Axis, IOMap, X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS,
+    poll_until_move_finished, predicted_move_s,
+)
 from .connection import SnapMotionError
 
 logger = logging.getLogger(__name__)
@@ -132,8 +135,18 @@ class HomingProcedure:
             axis.name, trip_pos,
         )
 
-        # Move to standoff
-        self._cmd.move_to(axis, cfg.standoff_distance)
+        # Move to standoff. Hardware-driven change, 2026-07/08:
+        # non-blocking begin_move_to + poll, like the backoff move above —
+        # move_to() (blocking MVT) is banned; see commands.py. Distance is
+        # measured from the just-rezeroed frame, in which the trip point is
+        # 0 and we're sitting `current_pos - trip_pos` past it.
+        self._cmd.begin_move_to(axis, cfg.standoff_distance)
+        self._wait_for_move_finished(
+            axis, cfg.backoff_timeout_s,
+            predicted_s=predicted_move_s(
+                abs(cfg.standoff_distance - (current_pos - trip_pos)), cfg.homing_speed
+            ),
+        )
         final_pos = self._cmd.get_actual_position(axis)
         logger.info("Axis %s homed. Standoff position: %.4f", axis.name, final_pos)
         return final_pos
@@ -204,7 +217,10 @@ class HomingProcedure:
         # Back off 2× standoff to ensure we clear the switch
         backoff = abs(self._config.standoff_distance) * 2
         self._cmd.begin_move_by(axis, backoff)
-        self._wait_for_move_finished(axis, self._config.backoff_timeout_s)
+        self._wait_for_move_finished(
+            axis, self._config.backoff_timeout_s,
+            predicted_s=predicted_move_s(backoff, self._config.homing_speed),
+        )
 
     def _wait_for_capture(self, axis: Axis) -> None:
         cfg = self._config
@@ -219,14 +235,21 @@ class HomingProcedure:
                 )
             time.sleep(cfg.poll_interval_s)
 
-    def _wait_for_move_finished(self, axis: Axis, timeout_s: float) -> None:
-        deadline = time.monotonic() + timeout_s
-        while not self._cmd.move_is_finished(axis):
-            if time.monotonic() > deadline:
-                self._cmd.abort(axis)
-                logger.warning(
-                    "Axis %s: move-finished timeout after %.1f s, aborted",
-                    axis.name, timeout_s,
-                )
-                return
-            time.sleep(self._config.poll_interval_s)
+    def _wait_for_move_finished(self, axis: Axis, timeout_s: float, predicted_s: float = 0.0) -> None:
+        """Wait for a single-axis move to finish, warning (not raising) on timeout.
+
+        polls
+        sparsely via commands.poll_until_move_finished rather than at
+        config.poll_interval_s — see that function's module note. Callers
+        that know the move's distance/speed pass `predicted_s` so most of
+        the wait costs no wire traffic at all; the capture-jog decel wait
+        (after BST) leaves it at 0.0 since decel time isn't known here.
+        """
+        if not poll_until_move_finished(
+            lambda: self._cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout_s
+        ):
+            self._cmd.abort(axis)
+            logger.warning(
+                "Axis %s: move-finished timeout after %.1f s, aborted",
+                axis.name, timeout_s,
+            )

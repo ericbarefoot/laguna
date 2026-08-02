@@ -7,15 +7,17 @@ prefixes, no brackets).
 
 import pytest
 
+from laguna.robot.macron import commands as macron_commands
 from laguna.robot.macron.commands import (
     ALL_AXES,
-    AxisHandle,
     IOMap,
     MMCCommands,
     THETA_AXIS,
     X_AXIS,
     Y_AXIS,
     Z_AXIS,
+    poll_until_move_finished,
+    predicted_move_s,
 )
 from laguna.robot.macron.connection import SnapMotionError
 from tests.macron_fixtures import FakeSnapConnection
@@ -60,12 +62,8 @@ class TestTokenFormat:
         assert conn.sent == ["SOB 4 1"]
 
     def test_group_move_formats_multiple_params(self):
-        # group_axes defaults to (X, Y) only — confirmed on hardware that Z
-        # can't join the coordinated group (see GCodeExecutor). Pass an
-        # explicit 3-axis group_axes here since this test's purpose is
-        # verifying generic multi-param formatting, not the default.
         conn = FakeSnapConnection({"C1 BMT 10 20 30": "0"})
-        cmd = MMCCommands(conn, group_axes=(X_AXIS, Y_AXIS, Z_AXIS))
+        cmd = MMCCommands(conn)
         cmd.group_begin_move_to(10, 20, 30)
         assert conn.sent == ["C1 BMT 10 20 30"]
 
@@ -169,107 +167,184 @@ class TestIOMapGatedBrakeHelpers:
         assert conn.sent == []
 
 
-class TestAxisHandleMotion:
-    """AxisHandle.move_to()/move_by() poll (BMT/BMB + MIF) rather than
-    using the firmware's blocking MVT/MVB directly — a move slower than a
-    transport's fixed per-command read timeout (e.g. PiGantryConnection's
-    5s) would otherwise spuriously time out and error even though the move
-    is still legitimately in progress.
-    """
+class TestPredictedMoveS:
+    """predicted_move_s feeds the sparse move-completion polling — see
+    commands.py's "Move-completion polling" note."""
 
-    def test_move_to_sends_begin_move_then_polls_not_blocking_mvt(self):
-        conn = FakeSnapConnection({"A1 BMT 10": "0", "A1 MIF": "1"})
-        cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
-        handle.move_to(10.0)
-        assert conn.sent == ["A1 BMT 10", "A1 MIF"]
-        assert "A1 MVT 10" not in conn.sent
+    def test_distance_over_speed(self):
+        assert predicted_move_s(20.0, 10.0) == 2.0
 
-    def test_move_by_sends_begin_move_by_then_polls(self):
-        conn = FakeSnapConnection({"A1 BMB 5": "0", "A1 MIF": "1"})
-        cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
-        handle.move_by(5.0)
-        assert conn.sent == ["A1 BMB 5", "A1 MIF"]
+    def test_negative_distance_is_treated_as_magnitude(self):
+        # Callers pass raw target-minus-current deltas, which are signed.
+        assert predicted_move_s(-20.0, 10.0) == 2.0
 
-    def test_move_to_polls_until_finished(self):
+    @pytest.mark.parametrize("speed", [None, 0.0, -5.0])
+    def test_unknown_or_nonpositive_speed_predicts_nothing(self, speed):
+        # 0.0 means "poll immediately (but still sparsely)" rather than
+        # sleeping on a bogus prediction.
+        assert predicted_move_s(20.0, speed) == 0.0
+
+
+class TestPollUntilMoveFinished:
+    """The actual fix for the group-motion stall: query the controller as
+    little as possible while a move is in flight. Confirmed on hardware
+    that tight polling during group interpolation makes this controller
+    stop answering the wire entirely — see commands.py's module note."""
+
+    @pytest.fixture
+    def sparse(self, monkeypatch):
+        """Restore realistic pacing (the suite-wide autouse fixture in
+        conftest.py zeroes it), with a fake clock that advances only when
+        the code sleeps — so timeouts are genuinely exercised without the
+        suite waiting in real time.
+        """
+        slept = []
+        now = {"t": 0.0}
+
+        def fake_sleep(seconds):
+            slept.append(seconds)
+            now["t"] += seconds
+
+        monkeypatch.setattr(macron_commands, "SPARSE_POLL_INTERVAL_S", 0.5)
+        monkeypatch.setattr(macron_commands, "PREDICTED_SLEEP_FRACTION", 0.85)
+        monkeypatch.setattr(macron_commands.time, "sleep", fake_sleep)
+        monkeypatch.setattr(macron_commands.time, "monotonic", lambda: now["t"])
+        return slept
+
+    def test_returns_true_when_finished(self):
+        assert poll_until_move_finished(lambda: True) is True
+
+    def test_returns_false_on_timeout(self):
+        assert poll_until_move_finished(lambda: False, timeout_s=0.0) is False
+
+    def test_sleeps_through_most_of_the_predicted_duration_first(self, sparse):
+        poll_until_move_finished(lambda: True, predicted_s=2.0, timeout_s=30.0)
+        # 0.85 * 2.0s slept up front, before a single query went out.
+        assert sparse == [pytest.approx(1.7)]
+
+    def test_a_long_move_costs_only_a_couple_of_queries(self, sparse):
+        """The regression this guards: the old tight loop issued ~40 MIF
+        queries for a 2s move; this must issue a small handful."""
         calls = {"n": 0}
 
-        def mif_response(cmd):
+        def is_finished():
             calls["n"] += 1
-            return "1" if calls["n"] >= 3 else "0"
+            return calls["n"] >= 3  # finishes on the 3rd query
 
-        conn = FakeSnapConnection({"A1 BMT 10": "0", "A1 MIF": mif_response})
-        cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
-        handle.move_to(10.0)
-        assert conn.sent.count("A1 MIF") == 3
+        assert poll_until_move_finished(is_finished, predicted_s=2.0, timeout_s=30.0) is True
+        assert calls["n"] == 3
+        # One predicted-duration sleep, then one sparse interval per retry.
+        assert sparse == [pytest.approx(1.7), 0.5, 0.5]
 
-    def test_move_to_blocked_by_safe_mode_before_touching_the_wire(self):
+    def test_unknown_duration_polls_immediately_but_still_sparsely(self, sparse):
+        calls = {"n": 0}
+
+        def is_finished():
+            calls["n"] += 1
+            return calls["n"] >= 2
+
+        poll_until_move_finished(is_finished, predicted_s=0.0, timeout_s=30.0)
+        assert sparse == [0.5]  # no up-front sleep, still the sparse interval between queries
+
+    def test_predicted_sleep_never_overshoots_the_timeout(self, sparse):
+        # A wildly optimistic prediction must not sleep past the deadline
+        # and turn a timeout into an unbounded wait: the up-front sleep is
+        # clamped to timeout_s (2.0, not 0.85 * 1000).
+        assert poll_until_move_finished(lambda: False, predicted_s=1000.0, timeout_s=2.0) is False
+        assert sparse[0] == pytest.approx(2.0)
+        # Only the one sparse-interval retry after that — the deadline is
+        # checked after a query, so an unfinished move gets a last look at
+        # the deadline rather than being abandoned a poll early.
+        assert sparse == [pytest.approx(2.0), 0.5]
+
+
+class TestEnaBanned:
+    """ENA is refused at every layer. Addressing it on a responder-node axis
+    (A5/Z, A6/Theta) crashes this controller: the node stops answering
+    entirely (error 70 on everything, including reads that worked moments
+    earlier) and must be reflashed. Confirmed on hardware 2026-08-02,
+    reproduced from a bare tio terminal with no laguna code involved, using
+    a bare ENA *read* with no argument."""
+
+    def test_set_enable_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.set_enable(Z_AXIS, True)
+
+    def test_get_enable_is_banned(self):
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.get_enable(Z_AXIS)
+
+    def test_banned_for_commander_axes_too(self):
+        """Evidence only covers the responder, but nothing needs ENA at all
+        and the blast radius warrants a blanket refusal."""
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(RuntimeError, match="banned"):
+            cmd.set_enable(X_AXIS, True)
+
+    def test_nothing_reaches_the_wire(self):
         conn = FakeSnapConnection({})
         cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: True)
-        with pytest.raises(SnapMotionError):
-            handle.move_to(10.0)
+        for call in (lambda: cmd.set_enable(Z_AXIS, True), lambda: cmd.get_enable(Z_AXIS)):
+            with pytest.raises(RuntimeError):
+                call()
         assert conn.sent == []
 
-    def test_move_to_aborts_and_raises_on_timeout(self):
-        conn = FakeSnapConnection({"A1 BMT 10": "0", "A1 MIF": "0", "A1 ABT": "0"})
-        cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
-        with pytest.raises(SnapMotionError):
-            handle.move_to(10.0, timeout=0.02)
-        assert "A1 ABT" in conn.sent
-
-    def test_get_motor_and_get_enable_delegate_to_the_bound_axis(self):
-        conn = FakeSnapConnection({"A1 MTR": "1", "A1 ENA": "0"})
-        cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: False)
-        assert handle.get_motor() is True
-        assert handle.get_enable() is False
+    def test_read_axis_state_does_not_query_ena(self):
+        """read_axis_state() used to read ENA — that batch would have
+        crashed the responder every time it was called on Z or Theta."""
+        conn = FakeSnapConnection({
+            "A5 ACP": "0", "A5 COP": "0", "A5 DEP": "0", "A5 ENP": "0",
+            "A5 SPD": "0", "A5 ACL": "0", "A5 DCL": "0", "A5 MTR": "1",
+            "A5 MIF": "1", "A5 CAB": "0", "A5 CAP": "0", "A5 CAT": "0",
+            "A5 NLT": "0", "A5 PLT": "0",
+        })
+        MMCCommands(conn).read_axis_state(Z_AXIS)
+        assert not any("ENA" in c for c in conn.sent)
 
 
-class TestReadAxisState:
-    """MMCCommands.read_axis_state() (AxisHandle.state()) queries each
-    field independently — a single failing query (e.g. a stalled/faulted
-    axis erroring on one register) must not lose the rest.
-    """
+class TestReadAxisStateResilience:
+    """read_axis_state() queries each register independently so one failing
+    query does not blow away every other field that already succeeded.
+    Ported from e5f8a95 (plan step 3) — this is what made it possible to
+    see, live, that a stalled Y axis's stepper-side bookkeeping (ACP/COP/
+    DEP/MTR/MIF) was fine while its encoder/capture registers had gone
+    unreachable."""
 
-    _ALL_OK_RESPONSES = {
-        "A2 ACP": "10", "A2 COP": "10", "A2 DEP": "10", "A2 ENP": "10",
-        "A2 SPD": "5", "A2 ACL": "100", "A2 DCL": "100",
-        "A2 MTR": "1", "A2 ENA": "1", "A2 MIF": "1",
-        "A2 CAB": "0", "A2 CAP": "0", "A2 CAT": "0",
-        "A2 NLT": "0", "A2 PLT": "0",
+    ALL_OK = {
+        "A1 ACP": "1", "A1 COP": "2", "A1 DEP": "3", "A1 ENP": "4",
+        "A1 SPD": "5", "A1 ACL": "6", "A1 DCL": "7", "A1 MTR": "1",
+        "A1 MIF": "1", "A1 CAB": "0", "A1 CAP": "8", "A1 CAT": "0",
+        "A1 NLT": "-9", "A1 PLT": "9",
     }
 
-    def test_all_fields_populated_when_every_query_succeeds(self):
-        conn = FakeSnapConnection(self._ALL_OK_RESPONSES)
-        cmd = MMCCommands(conn)
-        state = cmd.read_axis_state(Y_AXIS)
-        assert state.actual_position == 10.0
-        assert state.motor_on is True
+    def test_happy_path_populates_every_field_and_no_errors(self):
+        state = MMCCommands(FakeSnapConnection(self.ALL_OK)).read_axis_state(X_AXIS)
+        assert state.actual_position == 1.0
+        assert state.positive_limit == 9.0
         assert state.errors == {}
 
-    def test_one_failing_query_is_recorded_without_losing_the_others(self):
-        # A stalled/faulted axis might error on one specific register (e.g.
-        # the encoder, ENP) while everything else still reads fine.
-        responses = dict(self._ALL_OK_RESPONSES)
-        responses["A2 ENP"] = SnapMotionError(33)
-        conn = FakeSnapConnection(responses)
-        cmd = MMCCommands(conn)
-        state = cmd.read_axis_state(Y_AXIS)
-        assert state.actual_position == 10.0  # unaffected
-        assert state.motor_on is True          # unaffected
-        assert state.encoder_position == 0.0   # kept at the dataclass default
-        assert "encoder_position" in state.errors
-        assert "33" in state.errors["encoder_position"]
+    def test_one_failing_query_does_not_lose_the_others(self):
+        responses = dict(self.ALL_OK)
+        responses["A1 ENP"] = SnapMotionError(70)      # encoder unreachable
+        state = MMCCommands(FakeSnapConnection(responses)).read_axis_state(X_AXIS)
+        assert "encoder_position" in state.errors      # recorded...
+        assert state.encoder_position == 0.0           # ...and left at its default
+        assert state.actual_position == 1.0            # everything else survived
+        assert state.positive_limit == 9.0
 
-    def test_axis_handle_state_surfaces_the_same_errors_dict(self):
-        responses = dict(self._ALL_OK_RESPONSES)
-        responses["A2 ENP"] = SnapMotionError(33)
-        conn = FakeSnapConnection(responses)
-        cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, Y_AXIS, is_safe_mode=lambda: True)
-        state = handle.state()
-        assert "encoder_position" in state.errors
+    def test_several_failures_are_all_recorded_by_field_name(self):
+        responses = dict(self.ALL_OK)
+        for cmd in ("A1 ENP", "A1 CAB", "A1 CAP", "A1 CAT"):
+            responses[cmd] = SnapMotionError(70)
+        state = MMCCommands(FakeSnapConnection(responses)).read_axis_state(X_AXIS)
+        assert set(state.errors) == {
+            "encoder_position", "capture_bit", "capture_position", "capture_has_tripped",
+        }
+        assert state.actual_position == 1.0            # stepper side still readable
+
+    def test_still_never_queries_ena(self):
+        conn = FakeSnapConnection(self.ALL_OK)
+        MMCCommands(conn).read_axis_state(X_AXIS)
+        assert not any("ENA" in c for c in conn.sent)

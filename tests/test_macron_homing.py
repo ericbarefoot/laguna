@@ -51,13 +51,18 @@ class TestHomeAxisHappyPath:
             "A1 JOG -10": "-10",
             "A1 CAT": _trip_after(2),  # trips on the 3rd poll
             "A1 BST": "0",
-            "A1 MIF": _trip_after(1),  # finishes on the 2nd poll
+            # Same MIF response is polled twice: once for the post-BST
+            # controlled-stop wait, once for the standoff move below (both
+            # non-blocking BMT/MIF now — move_to() is banned, see
+            # commands.py). By the second poll the counter is already past
+            # threshold, so it reports finished on the first call.
+            "A1 MIF": _trip_after(1),
             "A1 CAP": "-24.500",       # hardware-latched trip position
             "A1 ACP": _trip_after(1, before="-25.100", after="5.000"),
             # ^ first ACP-read call (current position after decel) = -25.100;
             #   second ACP-read call (final standoff readout) = 5.000
             zero_cmd: str((-25.1) - (-24.5)),
-            "A1 MVT 5": "5",
+            "A1 BMT 5": "0",
         }
         proc, conn = self._make_procedure(responses)
         final_pos = proc.home_axis(X_AXIS)
@@ -78,7 +83,7 @@ class TestHomeAxisHappyPath:
             "A1 CAP": "0",
             "A1 ACP": "0",
             "A1 ACP 0": "0",
-            "A1 MVT 5": "5",
+            "A1 BMT 5": "0",
         }
         proc, conn = self._make_procedure(responses)
         proc.home_axis(X_AXIS)
@@ -99,7 +104,7 @@ class TestHomeAxisHappyPath:
             "A1 CAP": "0",
             "A1 ACP": "0",
             "A1 ACP 0": "0",
-            "A1 MVT 5": "5",
+            "A1 BMT 5": "0",
         }
         conn = FakeSnapConnection(responses)
         cmd = MMCCommands(conn)
@@ -147,7 +152,7 @@ class TestHomeAxisBrakeHandling:
             "A2 CAP": "0",
             "A2 ACP": "0",
             "A2 ACP 0": "0",
-            "A2 MVT 5": "5",
+            "A2 BMT 5": "0",
         }
         conn = FakeSnapConnection(responses)
         cmd = MMCCommands(conn)
@@ -171,21 +176,23 @@ class TestHomeAxisBrakeHandling:
 
 
 class TestHomeAll:
-    def test_home_all_raises_not_implemented_while_disabled(self):
-        # home_all() is temporarily gated off (physical obstructions block
-        # several limit switches on the real machine — see
-        # HomingProcedure.home_all()). This guard is expected to be removed
-        # once the obstructions are cleared and homing is re-verified safe;
-        # the "stops at first failure" behavior it currently shadows is
-        # still exercised via home_axis() directly (see TestHomeAxisHappyPath
-        # and friends) and should be restored here once home_all() is
-        # re-enabled.
+    """home_all() is disabled while physical obstructions block several of
+    the limit switches it depends on (plan step 2, from 5c170d3). It must
+    refuse before commanding any motion — a partial home into a blocked
+    switch is exactly what this guards against. home_axis() itself is left
+    callable and is still covered by the tests above, so the state machine
+    stays verified for whenever homing is re-enabled."""
+
+    def test_home_all_refuses_and_sends_nothing(self):
         conn = FakeSnapConnection({})
-        cmd = MMCCommands(conn)
-        config = HomingConfig(
-            homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=0.02, backoff_timeout_s=1.0,
-        )
-        proc = HomingProcedure(cmd, config)
-        with pytest.raises(NotImplementedError):
+        proc = HomingProcedure(MMCCommands(conn), HomingConfig())
+        with pytest.raises(NotImplementedError, match="Homing is temporarily disabled"):
+            proc.home_all()
+        assert conn.sent == []
+
+    def test_error_names_the_supported_alternative(self):
+        """Callers need to know what to do instead: set_position() declares
+        where the gantry already is, without commanding motion."""
+        proc = HomingProcedure(MMCCommands(FakeSnapConnection({})), HomingConfig())
+        with pytest.raises(NotImplementedError, match="set_position"):
             proc.home_all()

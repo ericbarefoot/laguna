@@ -121,9 +121,11 @@ scan still finishes normally through the same completion path, just with
 fewer samples).
 
 **Requires the `pi_agent` transport** (`transport: pi_agent` in the
-`gantry:` config section) — the default `socket_bridge` transport talks to
-`serial_bridge.py`, a separate process that holds the serial port
-permanently and cannot participate in scanning. See `docs/MACRON_GANTRY.md`.
+`gantry:` config section). This is the default as of 2026-08-02. The
+`socket_bridge` transport cannot scan — it talked to `serial_bridge.py`,
+which held the serial port permanently and could not participate in
+scanning; that bridge is now retired. See `docs/MACRON_GANTRY.md`,
+"Retired: `serial_bridge.py`".
 
 ```python
 from laguna import FlumeLab
@@ -228,6 +230,5 @@ subclass without changing the public API.
   DEVICE readout)
 - Verify whether hostname `red.lab` resolves in AL1342 MQTT callback URLs
   (substitute Pi IP if not)
-- Verify `serial_bridge.py` port-holding behavior — see `docs/MQTT_AL1342_SETUP.md`
 - Approach B upgrade path: wire OD2000 Q2/Qa → INB 7 for hardware-triggered
   capture-latch position recording (see `docs/RANGEFINDER_PROFILING.md`)
