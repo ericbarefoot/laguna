@@ -504,3 +504,38 @@ class TestStaleSerialPortHolderWarning:
         conn = self._conn()
         client = self._FakeSSHClient(raises=RuntimeError("ssh exploded"))
         conn._warn_about_stale_port_holders(client)  # must not raise
+
+
+class TestLegacyModemLinesFlag:
+    """The agent drives DTR/RTS low and clears HUPCL by default, so neither
+    opening nor closing the port toggles the modem lines into the
+    controller. legacy_modem_lines=True restores the old behaviour so the
+    two can be A/B tested against the responder dropping off the inter-node
+    link. See gantry_agent.SerialBridge.__init__."""
+
+    def _remote_cmd(self, **overrides):
+        """Build the agent command line the way connect() does."""
+        conn = PiGantryConnection(
+            host="red.lab", ssh_user="oak",
+            remote_serial_device="/dev/ttyFAKE", **overrides
+        )
+        safe_flag = "" if conn.safe_mode else " --allow-motion"
+        modem_flag = " --legacy-modem-lines" if conn.legacy_modem_lines else ""
+        return f"--port {conn.remote_serial_device} --baud {conn.remote_baud}{safe_flag}{modem_flag}"
+
+    def test_default_does_not_pass_the_flag(self):
+        assert "--legacy-modem-lines" not in self._remote_cmd()
+
+    def test_opt_in_passes_the_flag(self):
+        assert "--legacy-modem-lines" in self._remote_cmd(legacy_modem_lines=True)
+
+    def test_composes_with_allow_motion(self):
+        cmd = self._remote_cmd(safe_mode=False, legacy_modem_lines=True)
+        assert "--allow-motion" in cmd
+        assert "--legacy-modem-lines" in cmd
+
+    def test_defaults_to_safe_behaviour(self):
+        conn = PiGantryConnection(
+            host="red.lab", ssh_user="oak", remote_serial_device="/dev/ttyFAKE"
+        )
+        assert conn.legacy_modem_lines is False

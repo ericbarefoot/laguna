@@ -838,34 +838,107 @@ class TestRunScanWtt12lPowerprox:
         assert not any("scan_done" in msg for msg in emitted)
 
 
-class TestSerialBridgeExclusiveOpen:
-    """The port must be opened exclusively so a second agent fails loudly
-    rather than silently becoming a second writer — two writers interleave
-    bytes mid-command and leave the controller's ASCII interpreter parsing
-    spliced garbage. See SerialBridge.__init__."""
+class _FakeSerialPort:
+    """Stands in for serial.Serial() in its unopened form: attributes are
+    set first, then open() is called — the shape SerialBridge now uses so
+    it can drive DTR/RTS low rather than letting the constructor assert
+    them."""
 
-    def test_opens_port_with_exclusive_flag(self, monkeypatch):
-        captured = {}
+    def __init__(self):
+        self.opened = False
+        self.dtr = None
+        self.rts = None
+        self.exclusive = None
+        self.port = None
+        self.baudrate = None
+        self.timeout = None
+        self.buffer_reset = False
+        self.open_exc = None
 
-        class FakeSerial:
-            def __init__(self, port, **kwargs):
-                captured["port"] = port
-                captured.update(kwargs)
+    def open(self):
+        if self.open_exc is not None:
+            raise self.open_exc
+        self.opened = True
 
-            def reset_input_buffer(self):
-                pass
+    def fileno(self):
+        return 4242
 
-        monkeypatch.setattr(ga.serial, "Serial", FakeSerial)
+    def reset_input_buffer(self):
+        self.buffer_reset = True
+
+
+class TestSerialBridgePortSetup:
+    """The port must be opened exclusively (so a second agent fails loudly
+    rather than silently becoming a second writer) and without asserting
+    DTR/RTS or leaving HUPCL set (so neither opening nor closing the port
+    toggles the modem lines into the controller). See
+    SerialBridge.__init__ and _disable_hangup_on_close."""
+
+    @pytest.fixture
+    def fake_port(self, monkeypatch):
+        port = _FakeSerialPort()
+        monkeypatch.setattr(ga.serial, "Serial", lambda *a, **kw: port)
+        cleared = []
+        monkeypatch.setattr(ga, "_disable_hangup_on_close",
+                            lambda ser: cleared.append(ser) or True)
+        port.hupcl_cleared_for = cleared
+        return port
+
+    def test_opens_exclusively(self, fake_port):
         ga.SerialBridge("/dev/ttyFAKE", 9600)
-        assert captured["exclusive"] is True
+        assert fake_port.exclusive is True
 
-    def test_busy_port_propagates_rather_than_being_swallowed(self, monkeypatch):
+    def test_configures_before_opening(self, fake_port):
+        """Settings must be applied to an unopened port — using
+        serial.Serial(port, ...) would open and assert DTR/RTS first."""
+        ga.SerialBridge("/dev/ttyFAKE", 9600)
+        assert fake_port.opened is True
+        assert fake_port.port == "/dev/ttyFAKE"
+        assert fake_port.baudrate == 9600
+
+    def test_drives_dtr_and_rts_low_by_default(self, fake_port):
+        ga.SerialBridge("/dev/ttyFAKE", 9600)
+        assert fake_port.dtr is False
+        assert fake_port.rts is False
+
+    def test_clears_hupcl_by_default(self, fake_port):
+        ga.SerialBridge("/dev/ttyFAKE", 9600)
+        assert fake_port.hupcl_cleared_for == [fake_port]
+
+    def test_legacy_mode_leaves_modem_lines_alone(self, fake_port):
+        """--legacy-modem-lines restores the pre-2026-08-02 behaviour, for
+        A/B testing whether the modem lines are what drops the responder."""
+        ga.SerialBridge("/dev/ttyFAKE", 9600, assert_modem_lines=True)
+        assert fake_port.dtr is None       # never touched
+        assert fake_port.rts is None
+        assert fake_port.hupcl_cleared_for == []
+        assert fake_port.exclusive is True  # still exclusive either way
+
+    def test_busy_port_propagates_rather_than_being_swallowed(self, fake_port):
         """A second agent must not start on a port someone else holds."""
-
-        class BusySerial:
-            def __init__(self, *a, **kw):
-                raise ga.serial.SerialException("Could not exclusively lock port")
-
-        monkeypatch.setattr(ga.serial, "Serial", BusySerial)
+        fake_port.open_exc = ga.serial.SerialException("Could not exclusively lock port")
         with pytest.raises(ga.serial.SerialException):
             ga.SerialBridge("/dev/ttyFAKE", 9600)
+
+
+class TestDisableHangupOnClose:
+    def test_clears_the_hupcl_bit_in_cflag(self, monkeypatch):
+        import termios
+        captured = {}
+
+        # cflag with HUPCL set, plus an unrelated bit that must survive
+        attrs = [1, 2, termios.HUPCL | termios.CREAD, 4, 5, 6, [7]]
+        monkeypatch.setattr(termios, "tcgetattr", lambda fd: list(attrs))
+        monkeypatch.setattr(termios, "tcsetattr",
+                            lambda fd, when, a: captured.update(fd=fd, attrs=a))
+
+        assert ga._disable_hangup_on_close(_FakeSerialPort()) is True
+        assert not (captured["attrs"][2] & termios.HUPCL)   # cleared
+        assert captured["attrs"][2] & termios.CREAD          # untouched
+
+    def test_never_raises_if_termios_call_fails(self, monkeypatch):
+        """A failure here must not stop the agent from starting."""
+        import termios
+        monkeypatch.setattr(termios, "tcgetattr",
+                            lambda fd: (_ for _ in ()).throw(OSError("not a tty")))
+        assert ga._disable_hangup_on_close(_FakeSerialPort()) is False

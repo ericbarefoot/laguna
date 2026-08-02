@@ -364,6 +364,44 @@ def _poll_pdin_loop(al1342_host: str, pdin_path: str, out_queue: "queue.Queue[di
 # ---------------------------------------------------------------------------
 
 
+def _disable_hangup_on_close(ser) -> bool:
+    """Clear HUPCL on an open serial port so closing it does not drop DTR.
+
+    With HUPCL set (the default), the kernel lowers the modem control lines
+    when the last process closes the tty — a hangup. Devices that treat a
+    DTR drop as a reset therefore reset every time a program disconnects.
+    This is the same mechanism that reboots an Arduino when you close its
+    port, and it fires regardless of what bytes were sent, which makes it a
+    candidate for a fault that appears "only when the Python interface
+    connects, never from a bare serial terminal" — a terminal holds the
+    port open for the whole session, while our tooling opens and closes it
+    once per run.
+
+    Safe to call on a port that is already configured: pyserial's
+    _reconfigure_port() starts from tcgetattr() and never touches HUPCL
+    (verified against pyserial 3.5), so this survives the per-command
+    `timeout` writes in SerialBridge.send().
+
+    Returns True if HUPCL was cleared, False if that was not possible on
+    this platform. Never raises — a failure here must not stop the agent
+    from starting.
+    """
+    try:
+        import termios
+    except ImportError:  # non-POSIX; nothing to do
+        _log("HUPCL: termios unavailable on this platform — leaving as-is")
+        return False
+    try:
+        fd = ser.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[2] &= ~termios.HUPCL  # index 2 is c_cflag
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        return True
+    except Exception as exc:
+        _log(f"HUPCL: could not clear hangup-on-close ({exc}) — closing may drop DTR")
+        return False
+
+
 class SerialBridge:
     """Owns the serial port for the lifetime of the agent process.
 
@@ -373,7 +411,9 @@ class SerialBridge:
     on the wire — see module docstring.
     """
 
-    def __init__(self, port: str, baud: int, timeout: float = 5.0):
+    def __init__(self, port: str, baud: int, timeout: float = 5.0,
+                 assert_modem_lines: bool = False):
+        # --- exclusive access -------------------------------------------
         # exclusive=True is load-bearing, not hygiene. Linux does not lock tty
         # devices by default, so without it a second agent opens the same port
         # happily and both write to the controller. Their bytes interleave
@@ -389,10 +429,47 @@ class SerialBridge:
         # without taking a lock (the retired serial_bridge.py did exactly
         # that, which is why retiring it was the actual fix — see
         # docs/MACRON_GANTRY.md, "Retired: serial_bridge.py").
-        self._ser = serial.Serial(
-            port, baudrate=baud, bytesize=8, parity="N", stopbits=1, timeout=timeout,
-            exclusive=True,
-        )
+        #
+        # --- modem control lines (DTR/RTS) ------------------------------
+        # Configure the port BEFORE opening rather than using
+        # serial.Serial(port, ...), whose constructor opens immediately and
+        # asserts DTR and RTS on the way (serialposix.Serial.open() calls
+        # _update_dtr_state()/_update_rts_state()). Setting .dtr/.rts False
+        # first records the desired state, so open() drives them low instead.
+        #
+        # Why this matters here: error 70 from this controller is a ~575 ms
+        # TIMEOUT of the commander waiting on the responder node, not an axis
+        # fault (measured 2026-08-02: successes 31-79 ms, error 33 ~32 ms,
+        # error 70 574-591 ms across 24 samples — see
+        # sandbox/evidence/2026-08-02_error70-is-a-timeout.md). The responder
+        # has repeatedly gone unreachable "only when the Python interface
+        # connects, never from a bare serial terminal" — an observation no
+        # command-level hypothesis has explained. A DTR/RTS transition on
+        # open/close is a mechanism that fits it exactly, and is the classic
+        # cause of a device resetting when a program opens or closes its port.
+        #
+        # Honest limitation: the kernel raises the modem lines when a tty is
+        # opened, before userspace gets control, so this cannot eliminate the
+        # open-time transition entirely — it controls the state we settle
+        # into, and (via HUPCL below) the drop on close, which is the half
+        # that actually hangs up the line.
+        #
+        # assert_modem_lines=True restores the old behaviour for A/B testing
+        # (agent flag --legacy-modem-lines). Default is the safe path.
+        self._ser = serial.Serial()
+        self._ser.port = port
+        self._ser.baudrate = baud
+        self._ser.bytesize = 8
+        self._ser.parity = "N"
+        self._ser.stopbits = 1
+        self._ser.timeout = timeout
+        self._ser.exclusive = True
+        if not assert_modem_lines:
+            self._ser.dtr = False
+            self._ser.rts = False
+        self._ser.open()
+        if not assert_modem_lines:
+            _disable_hangup_on_close(self._ser)
         self._ser.reset_input_buffer()
         self._lock = threading.Lock()
 
@@ -646,6 +723,15 @@ def main() -> None:
              "no-motion restriction has been explicitly lifted. Also required "
              "for scan_start, which moves the gantry.",
     )
+    parser.add_argument(
+        "--legacy-modem-lines", action="store_true",
+        help="Assert DTR/RTS on open and leave HUPCL set, as this agent did "
+             "before 2026-08-02. The default (off) drives DTR/RTS low and "
+             "clears HUPCL so closing the port does not hang up the line. "
+             "Only for A/B testing whether modem-line transitions are what "
+             "knocks the responder node off the inter-node link — see "
+             "SerialBridge.__init__.",
+    )
     parser.add_argument("--log", default=str(DEFAULT_LOG_PATH))
     args = parser.parse_args()
 
@@ -654,9 +740,14 @@ def main() -> None:
     if not safe_mode:
         _log("WARNING: started with --allow-motion — agent-side safe-mode gate is DISABLED")
 
-    _log(f"Opening serial port {args.port} at {args.baud} baud...")
+    if args.legacy_modem_lines:
+        _log("WARNING: --legacy-modem-lines — DTR/RTS will be asserted on open "
+             "and HUPCL left set, so closing the port hangs up the line")
+    _log(f"Opening serial port {args.port} at {args.baud} baud "
+         f"(modem lines: {'legacy/asserted' if args.legacy_modem_lines else 'held low, no hangup on close'})...")
     try:
-        bridge = SerialBridge(args.port, args.baud)
+        bridge = SerialBridge(args.port, args.baud,
+                              assert_modem_lines=args.legacy_modem_lines)
     except Exception as exc:
         # The overwhelmingly common cause is another process already holding
         # the port — a stale agent orphaned by an interrupted session, or a

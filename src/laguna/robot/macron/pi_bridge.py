@@ -172,6 +172,7 @@ class PiGantryConnection(SnapConnection):
         safe_mode: bool = True,
         reconnect_on_failure: bool = True,
         max_reconnect_attempts: int = 3,
+        legacy_modem_lines: bool = False,
     ):
         if not host:
             raise ValueError("host must be a non-empty string")
@@ -193,6 +194,12 @@ class PiGantryConnection(SnapConnection):
         self.safe_mode = safe_mode
         self.reconnect_on_failure = reconnect_on_failure
         self.max_reconnect_attempts = max_reconnect_attempts
+        # Pass --legacy-modem-lines to the agent, restoring the pre-2026-08-02
+        # behaviour of asserting DTR/RTS on open and leaving HUPCL set (so
+        # closing the port hangs up the line). Only for A/B testing whether
+        # modem-line transitions are what knocks the responder node off the
+        # inter-node link — see gantry_agent.SerialBridge.__init__.
+        self.legacy_modem_lines = legacy_modem_lines
 
         self._client = None
         self._channel = None
@@ -240,9 +247,11 @@ class PiGantryConnection(SnapConnection):
         self._warn_about_stale_port_holders(client)
 
         safe_flag = "" if self.safe_mode else " --allow-motion"
+        modem_flag = " --legacy-modem-lines" if self.legacy_modem_lines else ""
         remote_cmd = (
             f"python3 {REMOTE_AGENT_PATH} "
-            f"--port {self.remote_serial_device} --baud {self.remote_baud}{safe_flag}"
+            f"--port {self.remote_serial_device} --baud {self.remote_baud}"
+            f"{safe_flag}{modem_flag}"
         )
         stdin, stdout, _stderr = client.exec_command(remote_cmd)
         channel = stdout.channel
