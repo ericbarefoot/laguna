@@ -42,14 +42,13 @@ class MqttSubscriber:
     ):
         self._host = config.get("broker_host", "red.lab")
         self._port = int(config.get("broker_port", 1883))
-        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): suffixed
-        # with a per-instance UUID so two subsystems built from the same
-        # config dict (e.g. od2000 + wtt12l in example_07, both reading
+        # Suffixed with a per-instance UUID so two subsystems built from the
+        # same config dict (e.g. od2000 + wtt12l in example_07, both reading
         # "mqtt" config) never collide on client ID — a broker disconnects
-        # the older client whenever a new connection reuses its ID
-        # (rc=7/MQTT_ERR_CONN_LOST on the loser), which sends both
-        # instances into an endless reconnect fight. Confirmed today by
-        # exactly that log pattern running example_07 on this branch.
+        # the older client whenever a new connection reuses its ID, which
+        # sends both instances into an endless reconnect fight. Observed on
+        # hardware as rc=7 (MQTT_ERR_CONN_LOST) alternating between the two
+        # topics; see MQTT_AL1342_SETUP.md.
         base_client_id = config.get("client_id", "laguna")
         self._client_id = f"{base_client_id}-{uuid.uuid4().hex[:8]}"
         self._keepalive = int(config.get("keepalive", 60))

@@ -463,7 +463,7 @@ class GantryController:
 
         if theta_value is not None:
             theta_axis = axes_by_name["Theta"]
-            # DEBUG PATCH (branch debug/e415117-no-cross-node-group): the
+            # the
             # vector move_to() form always passes theta_value (0.0 if the
             # caller didn't care about Theta at all), so this used to fire
             # a blocking MVT unconditionally — including when Theta was
@@ -654,7 +654,7 @@ class GantryController:
         via move_to(Theta=...) isn't covered by this; poll
         self.cmd.move_is_finished(THETA_AXIS) directly for that.
 
-        DEBUG PATCH (branch debug/e415117-no-cross-node-group): polls
+        polls
         sparsely via commands.poll_until_move_finished. This is the public
         "wait for the move I just started" entry point, so it is exactly
         the loop most likely to be querying C<n> MIF while a group move is
@@ -676,7 +676,7 @@ class GantryController:
     ) -> None:
         """Block until a single axis's move-finished flag is set, aborting on timeout.
 
-        DEBUG PATCH (branch debug/e415117-no-cross-node-group): used by the
+        used by the
         Theta branch of move_to() now that it issues a non-blocking
         begin_move_to instead of a blocking move_to() (banned — see
         commands.py). Polls sparsely via commands.poll_until_move_finished

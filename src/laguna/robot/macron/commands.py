@@ -52,8 +52,7 @@ GARBAGE_LIMIT_THRESHOLD = 1e6
 # Move-completion polling
 # ---------------------------------------------------------------------------
 #
-# DEBUG PATCH (branch debug/e415117-no-cross-node-group): confirmed on
-# hardware 2026-07-31 that polling MIF in a tight loop while a coordinated
+# Confirmed on hardware 2026-07-31: that polling MIF in a tight loop while a coordinated
 # group move is in flight destabilizes this controller. A C1 INI/BMT
 # oscillation test polling C1 MIF every 0.05s failed reproducibly on its
 # 6th move (~13s in) — the Pi-side agent logged a >5s serial read timeout
@@ -285,7 +284,7 @@ class IOMap:
 # Command interface
 # ---------------------------------------------------------------------------
 
-# DEBUG PATCH (branch debug/e415117-no-cross-node-group): blocking motion
+# blocking motion
 # primitives (MVT/MVB, single-axis and group) are banned outright — they
 # hold the wire's request/response round trip open until the firmware
 # reports the physical move complete, for however long that takes,

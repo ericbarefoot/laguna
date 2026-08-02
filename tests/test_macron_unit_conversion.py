@@ -38,7 +38,7 @@ class TestPositionConversion:
         assert result == 150.0
 
     def test_begin_move_to_converts_absolute_position(self):
-        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): move_to()
+        # move_to()
         # (blocking MVT) is banned — see TestBannedBlockingMotion below —
         # so conversion coverage moves to its non-blocking replacement,
         # begin_move_to() (BMT), which shares the same _pos_to_raw plumbing.
@@ -63,7 +63,7 @@ class TestPositionConversion:
 
 
 class TestBannedBlockingMotion:
-    """DEBUG PATCH (branch debug/e415117-no-cross-node-group): blocking
+    """blocking
     motion primitives hold the wire open until the physical move completes
     — including a zero-distance move to an already-current position, which
     is exactly what caused GantryController.move_to()'s old Theta branch to
@@ -126,8 +126,11 @@ class TestGroupMotionConversion:
         assert cmd.group_set_speed(30.0) == 30.0
         assert conn.sent == ["C1 SPD 2"]
 
-    def test_default_group_axes_is_xyz(self):
-        conn = FakeSnapConnection({"C1 BMT 1 1 1": "0"})
-        cmd = MMCCommands(conn)  # defaults: mm_per_unit=1.0, group_axes=(X,Y,Z)
-        cmd.group_begin_move_to(1.0, 1.0, 1.0)
-        assert conn.sent == ["C1 BMT 1 1 1"]
+    def test_default_group_axes_is_xy(self):
+        # group_axes defaults to (X, Y) only — confirmed on hardware that Z
+        # can't join the coordinated group (C1 INI 1 2 5 fails with error
+        # 1010; see GCodeExecutor's "Z/XY node split" note in gcode.py).
+        conn = FakeSnapConnection({"C1 BMT 1 1": "0"})
+        cmd = MMCCommands(conn)  # defaults: mm_per_unit=1.0, group_axes=(X,Y)
+        cmd.group_begin_move_to(1.0, 1.0)
+        assert conn.sent == ["C1 BMT 1 1"]

@@ -29,6 +29,26 @@ G2/G3 arcs are tessellated here into a sequence of short straight-line
 moves, each individually fence-checked and executed as an ordinary
 coordinated group move. This fully supports arc G-code without sending any
 command whose semantics aren't verified.
+
+Z/XY node split: confirmed on hardware that the coordinated-group command
+cannot include Z — `C1 INI 1 2` (X, Y — the commander) succeeds, `C1 INI 1
+2 5` (adding Z — the responder, a separate networked PLC node) fails with
+error 1010. So a LINEAR move that changes both Z and X/Y can't be sent as
+one simultaneous 3D move at all on this hardware; _split_cross_node_moves
+(run in GCodeExecutor.plan(), before fence-checking) splits any such move
+into a Z-only leg followed by an XY-only leg, Z-first. Z-first was chosen
+for this gantry's actual use (subtractive CNC / sensor positioning, not
+additive/layer deposition) — Z reaches its target (e.g. retracting/
+diving to a probe height) before XY travels, rather than the other way
+round. This means a G-code program authored for genuine simultaneous 3D
+motion (e.g. a helical G2/G3, or slicer layer-change lines combining an
+XY travel with a Z step) is only ever approximated here as a Z-then-XY
+zigzag, and the two legs' timing no longer reflects the original line's
+vector feed rate (each leg runs at the full nominal F, not a fraction of
+it) — this is a hard hardware limitation, not a bug to route around.
+Splitting happens before the fence check specifically so the checked
+waypoints match the path that is actually executed (an L-shaped path, not
+the nominal diagonal) — see _split_cross_node_moves.
 """
 
 from __future__ import annotations
@@ -483,25 +503,18 @@ class GCodeExecutor:
 
     plan() is the only way to obtain a CheckedTrajectory; execute() only
     accepts the exact CheckedTrajectory object plan() returned for the same
-    program (checked by identity).
+    program (checked by identity), so the straight-line segments that were
+    fence-checked are the ones actually followed.
 
-    Only X/Y/Z are driven (fences.py only checks XYZ spatially, and this
-    initial G-code subset has no rotary/Theta motion concept).
-
-    DEBUG PATCH (branch debug/e415117-no-cross-node-group): a coordinated
-    group move spanning axes[2] (Z, the responder-node axis on this
-    hardware) alongside axes[0]/axes[1] (X/Y, the commander-node axes) was
-    sent manually on the bench as `C1 INI 1 2 5` and returned error 1010 —
-    unconfirmed whether that alone is what corrupted a responder node
-    during earlier testing (see notes/2026-07-30-responder-node-incident.md,
-    itself an unconfirmed write-up), but regardless, the group command
-    never needs to include Z: this executor now inits the group over only
-    axes[0]/axes[1] and always drives axes[2] as an independent, separately
-    polled single-axis move (Z-first, since a LINEAR move's target always
-    carries all three resolved coordinates whether or not Z actually
-    changed — see GCodeParser._resolve_target). This is a deliberately
-    narrow patch on top of e415117 to unblock exercising the high-level API
-    without adopting the rest of the later cross-node-split rework.
+    X/Y drive via the coordinated group (fences.py checks XYZ spatially,
+    and this G-code subset has no rotary/Theta motion concept); Z drives
+    via a separate single-axis command, never simultaneously with X/Y —
+    see the module docstring's "Z/XY node split" note for why (Z lives on
+    a different networked PLC node than X/Y, and this firmware's
+    coordinated-group feature can't span that boundary). plan() splits any
+    move that would need both into a Z-only leg followed by an XY-only
+    leg before fence-checking, so what gets checked matches what actually
+    runs.
     """
 
     def __init__(
@@ -754,7 +767,7 @@ class GCodeExecutor:
     def _poll_axis_move_finished(self, axis: Axis, timeout_s: float = 30.0, predicted_s: float = 0.0) -> None:
         """Block until a single axis's move-finished flag is set, aborting the move on timeout.
 
-        DEBUG PATCH: mirrors _poll_group_move_finished, but for the
+        mirrors _poll_group_move_finished, but for the
         independent Z leg _execute_linear now issues instead of folding Z
         into the coordinated group. See GCodeExecutor's class docstring.
         Polls sparsely for the same reason (see commands.py) — single-axis

@@ -201,7 +201,7 @@ class TestMoveTo:
 
     def test_vector_move_routes_through_fence_checked_gcode_path(self):
         # X=150mm, Y=0, Z=0 (raw 10 0 0 at mm_per_unit=15), Theta=0 (unconverted).
-        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): the group
+        # the group
         # never spans Z (the responder node) — see GCodeExecutor's class
         # docstring — and Z is unchanged here, so no Z leg is sent at all.
         # Theta is read live (A6 ACP) and, since it's already at 0, no
@@ -263,7 +263,7 @@ class TestMoveTo:
     def test_theta_only_keyword_move_does_not_touch_cartesian_axes(self):
         # A pure Theta move must not query, move, or otherwise touch X/Y/Z
         # at all — no ACP reads for X/Y/Z, no C1 group commands.
-        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): Theta now
+        # Theta now
         # reads its live position first (A6 ACP) and moves non-blocking
         # (A6 BMT + A6 MIF poll) instead of a blocking A6 MVT — move_to()
         # is banned; see commands.py.
@@ -274,7 +274,7 @@ class TestMoveTo:
         assert conn.sent == ["A6 ACP", "A6 BMT 90", "A6 MIF"]
 
     def test_theta_move_skipped_entirely_when_already_at_target(self):
-        # DEBUG PATCH: the vector move_to() form always passes a Theta
+        # the vector move_to() form always passes a Theta
         # value (0.0 if the caller doesn't care) — if Theta is already
         # there, no move (blocking or not) should be sent at all.
         controller, conn = self._make_controller({"A6 ACP": "0"})

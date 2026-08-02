@@ -200,7 +200,7 @@ class TestExecutorTypeGuard:
 
 class TestExecutorLinearMoves:
     def test_executes_group_init_then_moves(self):
-        # DEBUG PATCH (branch debug/e415117-no-cross-node-group): group init
+        # group init
         # no longer spans Z (the responder node) — see GCodeExecutor's class
         # docstring. X10 with Z unchanged means no Z leg is sent at all.
         responses = {
@@ -215,7 +215,7 @@ class TestExecutorLinearMoves:
         assert conn.sent == ["C1 INI 1 2", "C1 SPD 20", "C1 BMT 10 0", "C1 MIF"]
 
     def test_group_init_is_sent_once_not_per_execute(self):
-        """DEBUG PATCH: INI is remembered across execute() calls — a 40-move
+        """INI is remembered across execute() calls — a 40-move
         run was re-sending an identical `C1 INI 1 2` 40 times."""
         responses = {
             "C1 INI 1 2": "0",

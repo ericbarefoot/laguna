@@ -71,7 +71,7 @@ WTT12L_PDIN_PORT = 7
 
 # --- Motion AND scanning are off by default. Flip this only when you've
 #     decided to actually move something. ---
-ALLOW_MOTION = False
+ALLOW_MOTION = True
 
 
 def build_lab() -> FlumeLab:
@@ -248,4 +248,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    pass

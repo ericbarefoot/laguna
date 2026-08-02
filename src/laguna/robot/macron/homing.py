@@ -135,7 +135,7 @@ class HomingProcedure:
             axis.name, trip_pos,
         )
 
-        # Move to standoff. DEBUG PATCH (branch debug/e415117-no-cross-node-group):
+        # Move to standoff. Hardware-driven change, 2026-07/08:
         # non-blocking begin_move_to + poll, like the backoff move above —
         # move_to() (blocking MVT) is banned; see commands.py. Distance is
         # measured from the just-rezeroed frame, in which the trip point is
@@ -238,7 +238,7 @@ class HomingProcedure:
     def _wait_for_move_finished(self, axis: Axis, timeout_s: float, predicted_s: float = 0.0) -> None:
         """Wait for a single-axis move to finish, warning (not raising) on timeout.
 
-        DEBUG PATCH (branch debug/e415117-no-cross-node-group): polls
+        polls
         sparsely via commands.poll_until_move_finished rather than at
         config.poll_interval_s — see that function's module note. Callers
         that know the move's distance/speed pass `predicted_s` so most of
