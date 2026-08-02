@@ -169,7 +169,7 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None):
     )
     homing = HomingProcedure(cmd, homing_config, io_map=io_map)
     executor = GCodeExecutor(
-        cmd, checker, homing=homing, axes=(X_AXIS, Y_AXIS, Z_AXIS),
+        cmd, checker, homing=homing, axes=(X_AXIS, Y_AXIS), z_axis=Z_AXIS,
         dry_run=dry_run, confirm_cb=confirm_cb,
     )
     return executor, conn
@@ -260,15 +260,16 @@ class TestExecutorLinearMoves:
         assert conn.sent.count("C1 MIF") == 3
 
     def test_moves_z_independently_of_the_xy_group(self):
-        """DEBUG PATCH: a move touching both Z and X/Y never sends a single
-        3-axis group command (that's `C1 INI 1 2 5`, confirmed on the bench
-        to return error 1010) — Z goes out as its own single-axis leg,
-        polled separately, before the XY group leg."""
+        """A move touching both Z and X/Y is split at plan() time into a
+        Z-only leg then an XY-only leg, so it never sends a 3-axis group
+        command (`C1 INI 1 2 5`, confirmed on the bench to return error
+        1010). Group init is lazy — it lands on the XY leg, after the Z
+        leg has already run."""
         responses = {
-            "C1 INI 1 2": "0",
             "A5 SPD 10": "10",
             "A5 BMT 3": "0",
             "A5 MIF": "1",
+            "C1 INI 1 2": "0",
             "C1 SPD 10": "10",
             "C1 BMT 10 0": "0",
             "C1 MIF": "1",
@@ -277,11 +278,25 @@ class TestExecutorLinearMoves:
         trajectory = executor.plan("G1 X10 Z3 F600")
         executor.execute(trajectory)
         assert conn.sent == [
-            "C1 INI 1 2",
             "A5 SPD 10", "A5 BMT 3", "A5 MIF",
-            "C1 SPD 10", "C1 BMT 10 0", "C1 MIF",
+            "C1 INI 1 2", "C1 SPD 10", "C1 BMT 10 0", "C1 MIF",
         ]
         assert "C1 INI 1 2 5" not in conn.sent
+
+    def test_split_happens_before_fence_checking(self):
+        """The split runs in plan(), so the waypoints that get fence-checked
+        are the L-shaped path actually executed — not the nominal diagonal.
+        A fence the diagonal would miss but the L-path enters must still be
+        caught."""
+        from laguna.robot.macron.fences import BoxFence
+        # Straight diagonal (0,0,0)->(10,10,5) misses this box; the split
+        # path goes (0,0,0)->(0,0,5)->(10,10,5), whose second leg crosses it.
+        executor, conn = _make_executor(
+            {}, fences=[BoxFence("post", 4, 6, 4, 6, 4, 6)]
+        )
+        with pytest.raises(FenceViolation):
+            executor.plan("G1 X10 Y10 Z5 F600")
+        assert conn.sent == []
 
     def test_dry_run_sends_nothing(self):
         executor, conn = _make_executor({}, dry_run=True)

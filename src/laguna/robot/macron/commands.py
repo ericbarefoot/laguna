@@ -954,3 +954,227 @@ class MMCCommands:
                 self.set_motor(axis, False)
             except SnapMotionError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Per-axis convenience handle
+# ---------------------------------------------------------------------------
+
+
+class AxisHandle:
+    """Binds one configured Axis to MMCCommands, exposed as lab.gantry.<name>
+    (and lab.gantry.axis("<Name>")) by GantryController — see controller.py.
+
+    Pure delegation to the matching MMCCommands method (same axis-prefixed
+    ASCII commands, same units/conversion) — this class adds no new wire
+    behavior. The one exception is motion-starting calls (move_to/move_by/
+    begin_move_to/begin_move_by/jog), which check is_safe_mode() and raise
+    before issuing anything: PiGantryConnection/SafeModeConnection already
+    gate motion at the transport, but RS232Connection/EthernetConnection
+    (the ethernet/rs232 transports built by _build_transport in
+    controller.py) are deliberately dumb passthroughs with no gate of their
+    own, so this is the only check standing between a bare
+    lab.gantry.y.move_to(...) and the wire on those transports.
+    """
+
+    def __init__(
+        self,
+        cmd: MMCCommands,
+        axis: Axis,
+        is_safe_mode: Callable[[], bool],
+        io_map: Optional[IOMap] = None,
+    ):
+        self._cmd = cmd
+        self._axis = axis
+        self._is_safe_mode = is_safe_mode
+        self._io_map = io_map or IOMap()
+
+    @property
+    def name(self) -> str:
+        return self._axis.name
+
+    @property
+    def index(self) -> int:
+        return self._axis.index
+
+    def _check_motion_allowed(self, description: str) -> None:
+        if self._is_safe_mode():
+            raise SnapMotionError(
+                0,
+                f"{description} blocked by safe_mode (axis={self._axis.name!r}) "
+                "— no-motion restriction active",
+            )
+
+    # -- speed / accel / decel -----------------------------------------
+
+    def get_speed(self) -> float:
+        return self._cmd.get_speed(self._axis)
+
+    def set_speed(self, value: float) -> float:
+        return self._cmd.set_speed(self._axis, value)
+
+    def get_accel(self) -> float:
+        return self._cmd.get_accel(self._axis)
+
+    def set_accel(self, value: float) -> float:
+        return self._cmd.set_accel(self._axis, value)
+
+    def get_decel(self) -> float:
+        return self._cmd.get_decel(self._axis)
+
+    def set_decel(self, value: float) -> float:
+        return self._cmd.set_decel(self._axis, value)
+
+    # -- position --------------------------------------------------------
+
+    def get_position(self) -> float:
+        return self._cmd.get_actual_position(self._axis)
+
+    def get_commanded_position(self) -> float:
+        return self._cmd.get_commanded_position(self._axis)
+
+    def get_destination_position(self) -> float:
+        return self._cmd.get_destination_position(self._axis)
+
+    def get_encoder_position(self) -> float:
+        return self._cmd.get_encoder_position(self._axis)
+
+    # -- motor -------------------------------------------------------------
+    # No enable/disable-drive (ENA) counterpart: addressing ENA on a
+    # responder-node axis crashes the controller — see _ENA_BANNED. MTR is
+    # the whole story here, and the axes are drive-enabled at power-up by
+    # the controller's own DSM program anyway.
+
+    def enable(self) -> None:
+        """Turn this axis's motor drive on (MTR). Does not send ENA."""
+        self._cmd.set_motor(self._axis, True)
+
+    def disable(self) -> None:
+        """Turn this axis's motor drive off (MTR). Does not send ENA."""
+        self._cmd.set_motor(self._axis, False)
+
+    def get_motor(self) -> bool:
+        """True if this axis's motor drive (MTR) is currently on."""
+        return self._cmd.get_motor(self._axis)
+
+    # -- motion (safe_mode-gated) -------------------------------------
+
+    def move_to(self, position: float, timeout: float = 30.0) -> None:
+        """Move to an absolute position (real mm), blocking until it finishes.
+
+        Issues a non-blocking begin_move_to (BMT) and polls, rather than
+        the firmware's blocking MVT — MVT withholds its wire response until
+        the physical move completes, so a move slower than the transport's
+        fixed per-command read timeout would spuriously error even though
+        the move is legitimately in progress. (MMCCommands.move_to is
+        banned outright for that reason.) Polling keeps every wire
+        round-trip short, while `timeout` governs how long this call waits
+        for the move itself.
+
+        Raises:
+            SnapMotionError: If the move doesn't finish within `timeout`
+                (the move is aborted before raising).
+        """
+        self._check_motion_allowed("move_to")
+        distance = abs(position - self.get_position())
+        self._cmd.begin_move_to(self._axis, position)
+        self._poll_move_finished(timeout, predicted_s=predicted_move_s(distance, self._last_speed()))
+
+    def move_by(self, delta: float, timeout: float = 30.0) -> None:
+        """Relative move (real mm), blocking until it finishes. See move_to()
+        for why this polls internally rather than using the blocking MVB."""
+        self._check_motion_allowed("move_by")
+        self._cmd.begin_move_by(self._axis, delta)
+        self._poll_move_finished(timeout, predicted_s=predicted_move_s(delta, self._last_speed()))
+
+    def begin_move_to(self, position: float) -> None:
+        """Non-blocking absolute move (BMT); poll is_move_finished() to wait."""
+        self._check_motion_allowed("begin_move_to")
+        self._cmd.begin_move_to(self._axis, position)
+
+    def begin_move_by(self, delta: float) -> None:
+        """Non-blocking relative move (BMB); poll is_move_finished() to wait."""
+        self._check_motion_allowed("begin_move_by")
+        self._cmd.begin_move_by(self._axis, delta)
+
+    def _last_speed(self) -> Optional[float]:
+        """This axis's configured speed (SPD), for predicting move duration.
+
+        Returns None if the query fails, which just means polling starts
+        immediately instead of sleeping through a prediction — see
+        poll_until_move_finished.
+        """
+        try:
+            return self.get_speed()
+        except SnapMotionError:
+            return None
+
+    def _poll_move_finished(self, timeout: float, predicted_s: float = 0.0) -> None:
+        """Wait for this axis's move, querying MIF as little as possible.
+
+        Uses the shared sparse poller rather than a tight loop — see the
+        "Move-completion polling" note at the top of this module for why
+        tight polling is actively harmful on this controller.
+        """
+        if not poll_until_move_finished(
+            lambda: self._cmd.move_is_finished(self._axis),
+            predicted_s=predicted_s,
+            timeout_s=timeout,
+        ):
+            self._cmd.abort(self._axis)
+            raise SnapMotionError(
+                0, f"{self._axis.name} move did not finish within {timeout:.0f}s — aborted"
+            )
+
+    def jog(self, speed: float) -> float:
+        """Continuous velocity motion (JOG); pass 0 to stop (not gated)."""
+        if speed != 0:
+            self._check_motion_allowed("jog")
+        return self._cmd.jog(self._axis, speed)
+
+    def stop(self) -> None:
+        """Immediate stop (STP) — never gated; stopping is always allowed."""
+        self._cmd.stop(self._axis)
+
+    def abort(self) -> None:
+        """Immediate stop with no decel ramp (ABT) — never gated."""
+        self._cmd.abort(self._axis)
+
+    def is_move_finished(self) -> bool:
+        return self._cmd.move_is_finished(self._axis)
+
+    def state(self) -> AxisState:
+        """Read all readable axis properties in one batch of queries."""
+        return self._cmd.read_axis_state(self._axis)
+
+    # -- brakes (Y/Z only) -------------------------------------------------
+
+    def _require_brake(self) -> None:
+        if self._axis not in (Y_AXIS, Z_AXIS):
+            raise ValueError(
+                f"Axis {self._axis.name!r} has no brake — only Y and Z do "
+                "(see IOMap in commands.py)"
+            )
+
+    def disengage_brake(self) -> None:
+        """Disengage this axis's electromagnetic brake. Raises ValueError if
+        this axis has no brake (X/Theta), or if the underlying IOMap channel
+        hasn't been configured yet — see MMCCommands.disengage_brake."""
+        self._require_brake()
+        self._cmd.disengage_brake(self._axis, self._io_map)
+
+    def engage_brake(self) -> None:
+        """Engage this axis's electromagnetic brake. Raises ValueError if
+        this axis has no brake (X/Theta), or if the underlying IOMap channel
+        hasn't been configured yet — see MMCCommands.engage_brake."""
+        self._require_brake()
+        self._cmd.engage_brake(self._axis, self._io_map)
+
+    def brake_is_disengaged(self) -> bool:
+        """True if this axis's brake is currently disengaged (released).
+        Raises ValueError if this axis has no brake (X/Theta), or if the
+        underlying IOMap channel hasn't been configured/probed yet — see
+        MMCCommands.brake_is_disengaged (also: Z's status feedback is not
+        reachable via ASCII at all on this hardware, see that method)."""
+        self._require_brake()
+        return self._cmd.brake_is_disengaged(self._axis, self._io_map)
