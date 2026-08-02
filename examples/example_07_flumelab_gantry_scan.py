@@ -20,12 +20,12 @@ gantry connection, handled automatically below from the same flag).
 --- Background you need before setting ALLOW_MOTION = True ---
 
 1. Requires the pi_agent transport (gantry_agent.py running on the Pi,
-   reached via PiGantryConnection) — the default socket_bridge transport
-   in config/example_config.yaml can't scan. This script forces
-   transport: pi_agent below rather than requiring you to edit your local
-   config file first, purely so this example is runnable standalone; a
-   real experiment script would instead just set that in
-   config/example_config.yaml directly. See docs/MACRON_GANTRY.md and
+   reached via PiGantryConnection). That is the default in
+   config/example_config.yaml; the retired socket_bridge transport could
+   not scan at all. This script sets transport: pi_agent explicitly below
+   so it stays runnable standalone against an older local config file; a
+   real experiment script would just rely on the config default. See
+   docs/MACRON_GANTRY.md and
    examples/example_05_gantry_single_axis.py.
 2. Requires both rangefinders wired through the AL1342 IO-Link master —
    see docs/MQTT_AL1342_SETUP.md (OD2000) and

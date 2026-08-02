@@ -27,7 +27,7 @@ class TestConfig:
         config = Config()
         gantry_config = config.get("gantry")
 
-        assert gantry_config["transport"] == "socket_bridge"
+        assert gantry_config["transport"] == "pi_agent"
         assert gantry_config["host"] == "red.dyn.ucr.edu"
         assert len(gantry_config["axes"]) == 4
         axis_names = [a["name"] for a in gantry_config["axes"]]

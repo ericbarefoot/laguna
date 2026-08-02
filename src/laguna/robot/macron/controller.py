@@ -411,12 +411,17 @@ class GantryController:
 
 
 def _build_transport(config: Dict[str, Any]) -> SnapConnection:
-    transport = config.get("transport", "socket_bridge")
+    transport = config.get("transport", "pi_agent")
 
     if transport == "socket_bridge":
-        # Default path: the existing raw TCP<->serial passthrough already
-        # running on the Pi (serial_bridge.py) — no Pi-side laguna code
-        # needed. pyserial's serial_for_url() understands socket:// URLs.
+        # Retired path (2026-08-02): a raw TCP<->serial passthrough
+        # (serial_bridge.py) hand-started on the Pi. Still buildable if
+        # configured explicitly, but no longer the default and nothing
+        # should start that bridge again — it exposed an unauthenticated
+        # port straight to the controller's ASCII interpreter, and could
+        # hold the serial port alongside gantry_agent.py without either
+        # noticing. See docs/MACRON_GANTRY.md, "Retired: serial_bridge.py".
+        # pyserial's serial_for_url() understands socket:// URLs.
         host = config["host"]
         port = config.get("bridge_port", 9700)
         return RS232Connection(

@@ -401,6 +401,16 @@ crashing). `TopographicProfiler` takes an `al1342_host` constructor arg
 
 ## Step 7: serial_bridge.py Port Conflict
 
+> **Obsolete as of 2026-08-02 — kept as a record of the investigation.**
+> `serial_bridge.py` is retired (see `docs/MACRON_GANTRY.md`, "Retired:
+> `serial_bridge.py`") and `scan_runner.py` no longer exists — scans run
+> inside `gantry_agent.py`, which owns the serial port for its whole
+> session. None of the SIGSTOP/SIGCONT workarounds below are needed or
+> should be used. Note also that the premise "they cannot coexist" was
+> **wrong**: nothing prevented both from holding the port at once, which
+> is precisely why the bridge was retired rather than merely scheduled
+> around.
+
 `serial_bridge.py` (port 9700 on the Pi) provides a raw TCP↔RS232 passthrough
 to the BLC motion controller. `scan_runner.py` needs the same serial device
 directly via pyserial — they cannot coexist.

@@ -11,6 +11,10 @@ from laguna.robot.macron.fences import BoxFence
 from laguna.robot.macron.pi_bridge import PiGantryConnection
 from tests.macron_fixtures import FakeSnapConnection
 
+# Deliberately still socket_bridge: that transport is retired as the *default*
+# (pi_agent is now, see src/laguna/config.py) but the code path remains
+# supported, and it's the cheapest fixture here — it builds an RS232Connection
+# without needing SSH parameters, and no test below actually connects.
 BASE_CONFIG = {
     "transport": "socket_bridge",
     "host": "red.dyn.ucr.edu",
