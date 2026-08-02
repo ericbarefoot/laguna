@@ -302,3 +302,49 @@ class TestEnaBanned:
         })
         MMCCommands(conn).read_axis_state(Z_AXIS)
         assert not any("ENA" in c for c in conn.sent)
+
+
+class TestReadAxisStateResilience:
+    """read_axis_state() queries each register independently so one failing
+    query does not blow away every other field that already succeeded.
+    Ported from e5f8a95 (plan step 3) — this is what made it possible to
+    see, live, that a stalled Y axis's stepper-side bookkeeping (ACP/COP/
+    DEP/MTR/MIF) was fine while its encoder/capture registers had gone
+    unreachable."""
+
+    ALL_OK = {
+        "A1 ACP": "1", "A1 COP": "2", "A1 DEP": "3", "A1 ENP": "4",
+        "A1 SPD": "5", "A1 ACL": "6", "A1 DCL": "7", "A1 MTR": "1",
+        "A1 MIF": "1", "A1 CAB": "0", "A1 CAP": "8", "A1 CAT": "0",
+        "A1 NLT": "-9", "A1 PLT": "9",
+    }
+
+    def test_happy_path_populates_every_field_and_no_errors(self):
+        state = MMCCommands(FakeSnapConnection(self.ALL_OK)).read_axis_state(X_AXIS)
+        assert state.actual_position == 1.0
+        assert state.positive_limit == 9.0
+        assert state.errors == {}
+
+    def test_one_failing_query_does_not_lose_the_others(self):
+        responses = dict(self.ALL_OK)
+        responses["A1 ENP"] = SnapMotionError(70)      # encoder unreachable
+        state = MMCCommands(FakeSnapConnection(responses)).read_axis_state(X_AXIS)
+        assert "encoder_position" in state.errors      # recorded...
+        assert state.encoder_position == 0.0           # ...and left at its default
+        assert state.actual_position == 1.0            # everything else survived
+        assert state.positive_limit == 9.0
+
+    def test_several_failures_are_all_recorded_by_field_name(self):
+        responses = dict(self.ALL_OK)
+        for cmd in ("A1 ENP", "A1 CAB", "A1 CAP", "A1 CAT"):
+            responses[cmd] = SnapMotionError(70)
+        state = MMCCommands(FakeSnapConnection(responses)).read_axis_state(X_AXIS)
+        assert set(state.errors) == {
+            "encoder_position", "capture_bit", "capture_position", "capture_has_tripped",
+        }
+        assert state.actual_position == 1.0            # stepper side still readable
+
+    def test_still_never_queries_ena(self):
+        conn = FakeSnapConnection(self.ALL_OK)
+        MMCCommands(conn).read_axis_state(X_AXIS)
+        assert not any("ENA" in c for c in conn.sent)
