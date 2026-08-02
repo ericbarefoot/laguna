@@ -237,6 +237,8 @@ class PiGantryConnection(SnapConnection):
         finally:
             sftp.close()
 
+        self._warn_about_stale_port_holders(client)
+
         safe_flag = "" if self.safe_mode else " --allow-motion"
         remote_cmd = (
             f"python3 {REMOTE_AGENT_PATH} "
@@ -279,6 +281,37 @@ class PiGantryConnection(SnapConnection):
         self._reader_thread.start()
 
         logger.info("Connected to gantry agent on %s via SSH", self.host)
+
+    def _warn_about_stale_port_holders(self, client) -> None:
+        """Log a warning if anything already holds the remote serial port.
+
+        A session killed abruptly (Ctrl-C in a REPL, dropped SSH, an exception
+        before disconnect()) never delivers the "close" op, so its agent
+        lingers holding the port. The new agent now refuses to open it in that
+        case (exclusive=True in gantry_agent.SerialBridge), which is a clean
+        failure — but naming the holder turns a confusing "failed to open
+        serial port" into an obvious one.
+
+        Checks the device itself via fuser rather than only pattern-matching
+        process names, so it also catches holders that aren't agents at all
+        (e.g. a tio terminal left open). Purely diagnostic — never blocks
+        connecting, and never raises.
+        """
+        try:
+            _, out, _ = client.exec_command(
+                f"fuser {self.remote_serial_device} 2>/dev/null; "
+                "ps -eo pid,args | grep '[l]aguna_gantry_agent' || true"
+            )
+            holders = out.read().decode().strip()
+            if holders:
+                logger.warning(
+                    "Something already holds %s on %s before we launch the agent:\n%s\n"
+                    "Two writers on one controller interleave bytes mid-command and can "
+                    "corrupt it. Stop the holder before reconnecting.",
+                    self.remote_serial_device, self.host, holders,
+                )
+        except Exception as exc:  # never block connecting on a diagnostic
+            logger.debug("Could not check for stale serial-port holders: %s", exc)
 
     def _await_ready(self) -> None:
         deadline = time.monotonic() + READY_TIMEOUT

@@ -374,8 +374,24 @@ class SerialBridge:
     """
 
     def __init__(self, port: str, baud: int, timeout: float = 5.0):
+        # exclusive=True is load-bearing, not hygiene. Linux does not lock tty
+        # devices by default, so without it a second agent opens the same port
+        # happily and both write to the controller. Their bytes interleave
+        # mid-command, so the PLC's ASCII interpreter sees spliced garbage like
+        # "A5 ACC1 INI 1 2 5" — and this interpreter is already known to have
+        # at least one input it handles by corrupting the responder's program.
+        # Failing loudly on the second open is enormously preferable.
+        #
+        # Scope, precisely: pyserial implements this as
+        # fcntl.flock(LOCK_EX|LOCK_NB), which is *advisory* — it conflicts only
+        # with other flock holders. It therefore protects against a second
+        # gantry_agent.py, but NOT against a process that opens the device
+        # without taking a lock (the retired serial_bridge.py did exactly
+        # that, which is why retiring it was the actual fix — see
+        # docs/MACRON_GANTRY.md, "Retired: serial_bridge.py").
         self._ser = serial.Serial(
             port, baudrate=baud, bytesize=8, parity="N", stopbits=1, timeout=timeout,
+            exclusive=True,
         )
         self._ser.reset_input_buffer()
         self._lock = threading.Lock()
@@ -642,6 +658,18 @@ def main() -> None:
     try:
         bridge = SerialBridge(args.port, args.baud)
     except Exception as exc:
+        # The overwhelmingly common cause is another process already holding
+        # the port — a stale agent orphaned by an interrupted session, or a
+        # tio terminal left open. Say so, and say how to find it: the
+        # alternative is two writers splicing bytes into the controller
+        # (see SerialBridge.__init__).
+        _log(f"FAILED to open serial port: {exc}")
+        _log(
+            "If this is a lock/busy error, another process already owns the "
+            "port. Find it with:  fuser <device>  or  ps -eo pid,cmd | grep "
+            "'[g]antry_agent'  — and stop it before reconnecting. Never run "
+            "two writers against the same controller."
+        )
         _emit({"error": f"failed to open serial port: {exc}"})
         sys.exit(1)
     _log("Serial port open.")

@@ -444,3 +444,63 @@ class TestSendBlockedDuringScan:
         channel.queue_line({"id": 2, "raw": "0 7.000 >"})
         result = conn.send("A1 ACP")
         assert result == "7.000"
+
+
+class TestStaleSerialPortHolderWarning:
+    """connect() checks whether anything already holds the remote serial
+    port before launching an agent. A stale agent left by an interrupted
+    session (or a tio terminal) makes the new agent's exclusive open fail;
+    naming the holder turns a confusing error into an obvious one.
+    Diagnostic only — must never block connecting or raise."""
+
+    class _FakeSSHClient:
+        def __init__(self, output="", raises=None):
+            self._output = output
+            self._raises = raises
+            self.commands = []
+
+        def exec_command(self, cmd):
+            self.commands.append(cmd)
+            if self._raises is not None:
+                raise self._raises
+
+            class _Out:
+                def __init__(self, data):
+                    self._data = data
+
+                def read(self):
+                    return self._data.encode()
+
+            return None, _Out(self._output), None
+
+    def _conn(self):
+        return PiGantryConnection(
+            host="red.lab", ssh_user="oak", remote_serial_device="/dev/ttyFAKE"
+        )
+
+    def test_warns_when_something_holds_the_port(self, caplog):
+        conn = self._conn()
+        client = self._FakeSSHClient(output="/dev/ttyFAKE:  4242\n")
+        with caplog.at_level("WARNING"):
+            conn._warn_about_stale_port_holders(client)
+        assert "4242" in caplog.text
+        assert "/dev/ttyFAKE" in caplog.text
+
+    def test_silent_when_port_is_free(self, caplog):
+        conn = self._conn()
+        client = self._FakeSSHClient(output="   \n")
+        with caplog.at_level("WARNING"):
+            conn._warn_about_stale_port_holders(client)
+        assert caplog.text == ""
+
+    def test_checks_the_configured_device(self):
+        conn = self._conn()
+        client = self._FakeSSHClient()
+        conn._warn_about_stale_port_holders(client)
+        assert "/dev/ttyFAKE" in client.commands[0]
+
+    def test_never_raises_if_the_check_itself_fails(self):
+        """A diagnostic must not be able to break connecting."""
+        conn = self._conn()
+        client = self._FakeSSHClient(raises=RuntimeError("ssh exploded"))
+        conn._warn_about_stale_port_holders(client)  # must not raise

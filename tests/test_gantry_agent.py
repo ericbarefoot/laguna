@@ -836,3 +836,36 @@ class TestRunScanWtt12lPowerprox:
         assert laser_calls == []  # never got as far as turning it on
         assert any("scan_error" in msg for msg in emitted)
         assert not any("scan_done" in msg for msg in emitted)
+
+
+class TestSerialBridgeExclusiveOpen:
+    """The port must be opened exclusively so a second agent fails loudly
+    rather than silently becoming a second writer — two writers interleave
+    bytes mid-command and leave the controller's ASCII interpreter parsing
+    spliced garbage. See SerialBridge.__init__."""
+
+    def test_opens_port_with_exclusive_flag(self, monkeypatch):
+        captured = {}
+
+        class FakeSerial:
+            def __init__(self, port, **kwargs):
+                captured["port"] = port
+                captured.update(kwargs)
+
+            def reset_input_buffer(self):
+                pass
+
+        monkeypatch.setattr(ga.serial, "Serial", FakeSerial)
+        ga.SerialBridge("/dev/ttyFAKE", 9600)
+        assert captured["exclusive"] is True
+
+    def test_busy_port_propagates_rather_than_being_swallowed(self, monkeypatch):
+        """A second agent must not start on a port someone else holds."""
+
+        class BusySerial:
+            def __init__(self, *a, **kw):
+                raise ga.serial.SerialException("Could not exclusively lock port")
+
+        monkeypatch.setattr(ga.serial, "Serial", BusySerial)
+        with pytest.raises(ga.serial.SerialException):
+            ga.SerialBridge("/dev/ttyFAKE", 9600)
