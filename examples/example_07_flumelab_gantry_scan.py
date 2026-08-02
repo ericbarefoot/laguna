@@ -71,7 +71,7 @@ WTT12L_PDIN_PORT = 7
 
 # --- Motion AND scanning are off by default. Flip this only when you've
 #     decided to actually move something. ---
-ALLOW_MOTION = True
+ALLOW_MOTION = False
 
 
 def build_lab() -> FlumeLab:
@@ -185,8 +185,18 @@ def main():
     # ------------------------------------------------------------------
 
     print()
-    print("Do not home gantry...")
-    # lab.gantry.home()
+    # Homing is temporarily disabled: physical obstructions currently block
+    # several of the limit switches the routine depends on, so
+    # lab.gantry.home() raises NotImplementedError rather than jogging into
+    # them (see HomingProcedure.home_all). Until that is cleared, declare
+    # the reference frame instead — set_position() tells the controller
+    # where the gantry already is, and commands no motion:
+    #
+    #     lab.gantry.set_position([0.0, 0.0, 0.0, 0.0])
+    #
+    # This example assumes the gantry is already referenced and just moves
+    # from wherever it is.
+    print("Skipping homing (temporarily disabled — see comment above).")
 
     print("Moving to (100, 50, 10, 0) mm...")
     lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0)
@@ -227,7 +237,10 @@ def main():
     )
     print(f"  -> {wtt12l_result.path} ({wtt12l_result.metadata.get('samples')} samples)")
 
-    print("returning to home")
+    # Park at the origin so repeated runs start from a known place. Note
+    # this is the controller's zero, not wherever this run happened to
+    # start.
+    print("Returning to the origin...")
     lab.gantry.move_to([0.0, 0.0, 0.0, 0.0], speed=10.0)
 
     lab.disconnect_all()

@@ -76,7 +76,7 @@ from laguna.robot.macron.pi_bridge import PiGantryConnection
 # --- Connection settings — adjust for your setup ---
 PI_HOST = "red.lab"
 PI_USER = "oak"
-PI_KEY = "/home/eric/.ssh/id_ed25519"
+PI_KEY = "~/.ssh/id_ed25519"
 REMOTE_SERIAL_DEVICE = "/dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0"
 REMOTE_BAUD = 9600
 
