@@ -355,6 +355,47 @@ class GocatorScanner(GocatorSettingsMixin):
         self._is_running = False
         logger.info("Gocator acquisition stopped")
 
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Abort any in-flight scan and discard the partial surface.
+
+        A surface captured across a decelerating pass is quietly wrong rather
+        than obviously broken: Y spacing is travel_speed / frame_rate, which
+        assumes constant velocity, so the travel axis comes out distorted.
+        Better to throw it away and log that we did.
+
+        Never raises, and deliberately does NOT go through
+        _require_connected() — a safety verb that needs the hardware to be
+        reachable is no use in the situation it exists for.
+        """
+        if not self._is_running:
+            return
+        logger.warning(
+            "Aborting an in-flight Gocator scan and discarding the partial "
+            "surface (a pass interrupted mid-travel is distorted along Y)"
+        )
+        try:
+            if self._lib is not None and self._system is not None:
+                self._lib.call("GoSystem_Stop", self._system)
+        except Exception as exc:
+            logger.error("Could not stop Gocator acquisition: %s", exc)
+        finally:
+            self._is_running = False
+
+    def resume(self) -> None:
+        """Nothing to restore — the discarded scan is not resumable.
+
+        Acquisition restarts on the next scan(), which re-triggers from a
+        known start rather than trying to splice onto an aborted pass.
+        """
+
+    def estop(self) -> None:
+        """Same as pause: stop acquiring, discard, never raise."""
+        self.pause()
+
     def receive_surface(
         self,
         timeout_s: float = DEFAULT_RECEIVE_TIMEOUT_S,

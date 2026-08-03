@@ -75,6 +75,53 @@ class FlowController(ABC):
         ...
 
     @abstractmethod
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Stop the pump, remembering the setpoint so resume() can restore it.
+
+        Pausing a flume stops the water: the hydraulic condition is part of
+        the experiment, so leaving the pump running would mean the experiment
+        continues while everything else is held. The cost is that resuming
+        needs a re-stabilisation period — that is inherent, not a defect.
+
+        Never raises; a pause that throws leaves the rest of the rig running.
+        """
+        self._paused_flowrate = self._current_flowrate
+        try:
+            self.stop()
+        except Exception as exc:
+            logger.error("Could not stop the pump for pause: %s", exc)
+
+    def resume(self) -> None:
+        """Restore the setpoint captured by pause() and restart the pump."""
+        target = getattr(self, "_paused_flowrate", None)
+        try:
+            if target:
+                self.set_flowrate(target)
+            self.start()
+        except Exception as exc:
+            logger.error("Could not restart the pump on resume: %s", exc)
+
+    def estop(self) -> None:
+        """Pump off and both valves closed, each attempted independently.
+
+        Every step is guarded separately: a failure closing qin must not
+        prevent qaux from being closed, and neither must prevent the pump
+        being stopped. Never raises.
+        """
+        for label, action in (
+            ("stop the pump", lambda: self.stop()),
+            ("close qin", lambda: setattr(self, "qin", False)),
+            ("close qaux", lambda: setattr(self, "qaux", False)),
+        ):
+            try:
+                action()
+            except Exception as exc:
+                logger.error("ESTOP: could not %s: %s", label, exc)
+
     def clear_faults(self) -> bool:
         """Clear any latched VFD fault/alarm state.
 
@@ -255,6 +302,53 @@ class SaflFlowController(FlowController):
         """
         self._require_connected()
         return self._vfd.stop()
+
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Stop the pump, remembering the setpoint so resume() can restore it.
+
+        Pausing a flume stops the water: the hydraulic condition is part of
+        the experiment, so leaving the pump running would mean the experiment
+        continues while everything else is held. The cost is that resuming
+        needs a re-stabilisation period — that is inherent, not a defect.
+
+        Never raises; a pause that throws leaves the rest of the rig running.
+        """
+        self._paused_flowrate = self._current_flowrate
+        try:
+            self.stop()
+        except Exception as exc:
+            logger.error("Could not stop the pump for pause: %s", exc)
+
+    def resume(self) -> None:
+        """Restore the setpoint captured by pause() and restart the pump."""
+        target = getattr(self, "_paused_flowrate", None)
+        try:
+            if target:
+                self.set_flowrate(target)
+            self.start()
+        except Exception as exc:
+            logger.error("Could not restart the pump on resume: %s", exc)
+
+    def estop(self) -> None:
+        """Pump off and both valves closed, each attempted independently.
+
+        Every step is guarded separately: a failure closing qin must not
+        prevent qaux from being closed, and neither must prevent the pump
+        being stopped. Never raises.
+        """
+        for label, action in (
+            ("stop the pump", lambda: self.stop()),
+            ("close qin", lambda: setattr(self, "qin", False)),
+            ("close qaux", lambda: setattr(self, "qaux", False)),
+        ):
+            try:
+                action()
+            except Exception as exc:
+                logger.error("ESTOP: could not %s: %s", label, exc)
 
     def clear_faults(self) -> bool:
         """Clear any latched VFD alarm state.

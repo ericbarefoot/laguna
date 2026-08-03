@@ -689,6 +689,38 @@ class GantryController:
                 logger.error("Error soft-stopping %s: %s", axis.name, exc)
         self._persist_position()
 
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Decelerate to a stop on each axis's own ramp, recoverably.
+
+        Routes to soft_stop() (BST), which leaves brakes and motors alone so
+        the gantry is immediately ready to move again — no re-enable cycle.
+        Deliberately NOT stop(), which is the hard abort.
+        """
+        self.soft_stop()
+
+    def resume(self) -> None:
+        """Nothing to undo — pause() left brakes and motors untouched.
+
+        Present so the gantry satisfies the Quiescible protocol uniformly;
+        motion is re-commanded by the caller, not resumed implicitly.
+        """
+
+    def estop(self) -> None:
+        """Hard abort: zero-decel stop, brakes engaged, motors disabled.
+
+        This is stop()'s existing behaviour — the gantry has always had the
+        right hard path, it just shared a name with three much gentler ones
+        on other subsystems. Never raises: stop() already swallows and logs.
+
+        Recovery needs an explicit re-arm (enable() + disengage_brake(), or
+        connect()/set_safe_mode(False), which do both) — see FlumeLab.rearm().
+        """
+        self.stop()
+
     def set_safe_mode(self, enabled: bool) -> bool:
         """Enable or disable safe_mode, reconnecting the transport if needed
         so the change actually takes effect, and syncing Y/Z's brakes to match.
