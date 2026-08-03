@@ -12,6 +12,7 @@ import time
 
 from .config import Config
 from .frames import FrameRegistry
+from .run_context import RunContext
 from .safety import (
     DEFAULT_SENTINELS,
     CallableTrigger,
@@ -78,8 +79,18 @@ class FlumeLab:
         self._safety_state = SafetyState.RUNNING
         self.safety_monitor = SafetyMonitor(on_trip=self._on_safety_trigger)
 
+        # Ties this run's outputs together and records the piecewise
+        # runtime<->wall mapping. run_dir defaults to None, which leaves every
+        # subsystem writing exactly where it always did — see laguna.run_context.
+        self.run = RunContext(root=self.config.get_value("timing.run_dir"))
+
         # Timing subsystem — always present
         self.clock = ExperimentClock()
+        # Observe every pause/resume, whoever caused it. Scheduler.stop()
+        # pauses the clock directly, so recording only in FlumeLab.pause()
+        # silently missed those intervals and left the saved timeline wrong.
+        self.clock.on_pause = self.run.paused
+        self.clock.on_resume = self.run.resumed
         self.event_log = EventLog(
             self.config.get_value("timing.event_log", "./experiment_events.csv")
         )
@@ -207,12 +218,19 @@ class FlumeLab:
         store = CheckpointStore(cp_path, resume=resume)
 
         self.clock.start()
-        self.event_log.log(0.0, "flume_lab", "experiment_start")
+        self.run.started()
+        self.event_log.log(
+            0.0, "flume_lab", "experiment_start", notes=f"run_id={self.run.run_id}"
+        )
         try:
             yield self.clock
         finally:
             self.clock.stop()
-            self.event_log.log(self.clock.elapsed(), "flume_lab", "experiment_stop")
+            self.run.ended()
+            self.event_log.log(
+                self.clock.elapsed(), "flume_lab", "experiment_stop",
+                notes=f"run_id={self.run.run_id}",
+            )
             self.event_log.close()
 
     # ------------------------------------------------------------------

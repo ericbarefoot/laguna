@@ -1,7 +1,10 @@
 """Experiment clock — tracks wall time and experiment runtime simultaneously."""
 
+import logging
 import time
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class ExperimentClock:
@@ -22,6 +25,13 @@ class ExperimentClock:
     """
 
     def __init__(self) -> None:
+        #: Called on every pause/resume transition, whoever caused it.
+        #: RunContext subscribes so the piecewise runtime<->wall mapping is
+        #: recorded no matter which code path paused the clock — Scheduler.
+        #: stop() pauses it directly, so a FlumeLab-only hook silently missed
+        #: those intervals and left the saved timeline wrong.
+        self.on_pause: Optional[Callable[[], None]] = None
+        self.on_resume: Optional[Callable[[], None]] = None
         self._start_wall: Optional[float] = None
         self._pause_offset: float = 0.0      # total seconds spent paused
         self._pause_start: Optional[float] = None
@@ -58,6 +68,7 @@ class ExperimentClock:
             return
         self._pause_start = time.time()
         self._paused = True
+        self._notify(self.on_pause)
 
     def resume(self) -> None:
         """Unfreeze the runtime counter after a pause()."""
@@ -68,6 +79,17 @@ class ExperimentClock:
         self._pause_offset += time.time() - self._pause_start
         self._pause_start = None
         self._paused = False
+        self._notify(self.on_resume)
+
+    @staticmethod
+    def _notify(hook: Optional[Callable[[], None]]) -> None:
+        """Fire an observer, never letting it break the clock."""
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Clock observer failed")
 
     # ------------------------------------------------------------------
     # Reading time
