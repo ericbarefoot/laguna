@@ -175,3 +175,120 @@ class TestSimulatedScanner:
         scanner.start()
         note = scanner.pause()
         assert note and "DISCARD" in note.upper()
+
+
+class TestClockAcceleration:
+    """A rehearsal is only useful if it finishes sooner than the run it
+    rehearses — but only if it still fires the same events in the same order.
+    """
+
+    def test_speed_factor_scales_runtime(self):
+        import time
+
+        from laguna.timing import ExperimentClock
+
+        clock = ExperimentClock(speed_factor=100.0)
+        clock.start()
+        time.sleep(0.05)
+        # 0.05 real seconds at 100x is ~5 experiment seconds.
+        assert clock.elapsed() == pytest.approx(5.0, rel=0.35)
+
+    def test_default_is_real_time(self):
+        from laguna.timing import ExperimentClock
+
+        assert ExperimentClock().speed_factor == 1.0
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0])
+    def test_non_positive_speed_rejected(self, bad):
+        from laguna.timing import ExperimentClock
+
+        with pytest.raises(ValueError, match="must be positive"):
+            ExperimentClock(speed_factor=bad)
+
+    def test_pause_still_freezes_an_accelerated_clock(self):
+        import time
+
+        from laguna.timing import ExperimentClock
+
+        clock = ExperimentClock(speed_factor=50.0)
+        clock.start()
+        time.sleep(0.02)
+        clock.pause()
+        during = clock.elapsed()
+        time.sleep(0.05)
+        assert clock.elapsed() == pytest.approx(during, rel=0.01)
+
+    def test_acceleration_needs_simulate(self):
+        """Real hardware cannot be sped up — a gantry takes as long as it
+        takes — so accelerating a live run would just make the schedule
+        outrun the machine."""
+        with pytest.raises(ValueError, match="only applies to simulate"):
+            FlumeLab(simulate=False, speed_factor=10.0)
+
+    def test_the_same_events_fire_as_in_real_time(self):
+        """The property that makes acceleration trustworthy: it changes how
+        fast, not what happens."""
+        import time
+
+        def run(simulate, speed):
+            lab = FlumeLab(simulate=simulate, speed_factor=speed)
+            seen = []
+            lab.scheduler.repeat(every=1, subsystem="t",
+                                 action=lambda: seen.append(round(lab.clock.elapsed())))
+            lab.scheduler.at(runtime_s=2, subsystem="t",
+                             action=lambda: seen.append("oneshot"))
+            lab.clock.start()
+            started = time.time()
+            lab.scheduler.run(duration=3.0)
+            return seen, time.time() - started
+
+        # Real time as the reference, then the same schedule accelerated.
+        slow, slow_wall = run(True, 1.0)
+        fast, fast_wall = run(True, 20.0)
+        assert fast == slow, "acceleration changed the event sequence"
+        assert fast_wall < slow_wall / 5
+
+    def test_recurring_events_do_not_drift(self):
+        """_next used to rebase on the observed time, so every firing drifted
+        late by however far the poll overshot, and the error accumulated."""
+        lab = FlumeLab(simulate=True, speed_factor=200.0)
+        seen = []
+        lab.scheduler.repeat(every=10, subsystem="t",
+                             action=lambda: seen.append(lab.clock.elapsed()))
+        lab.clock.start()
+        lab.scheduler.run(duration=100.0)
+        assert len(seen) >= 5
+        for i, t in enumerate(seen, start=1):
+            assert t == pytest.approx(i * 10, abs=1.5), f"firing {i} drifted to {t}"
+
+    def test_a_fast_clock_does_not_swallow_firings(self):
+        """At high speed the clock advances several intervals per poll. Firing
+        once per poll would silently under-report what the real run does."""
+        lab = FlumeLab(simulate=True, speed_factor=200.0)
+        seen = []
+        lab.scheduler.repeat(every=1, subsystem="t", action=lambda: seen.append(1))
+        lab.clock.start()
+        lab.scheduler.run(duration=50.0)
+        # 50 experiment-seconds at 1s intervals: expect ~49-50, not ~5.
+        assert len(seen) >= 40, f"only {len(seen)} firings; the backlog was dropped"
+
+    def test_the_manifest_stays_truthful_when_accelerated(self):
+        """An accelerated run's file timestamps must still convert to the
+        right experiment runtime, or the manifest lies about the rehearsal."""
+        import time
+
+        lab = FlumeLab(simulate=True, speed_factor=40.0)
+        lab.clock.start()
+        lab.run.started()
+        time.sleep(0.05)
+        wall, runtime = lab.clock.now()
+        assert lab.run.runtime_at(wall) == pytest.approx(runtime, rel=0.05)
+
+    def test_speed_factor_is_recorded_in_the_manifest(self, tmp_path):
+        """A file written during a rehearsal is otherwise indistinguishable
+        from a real run's, and its timestamps would convert wrongly."""
+        from laguna.run_context import RunContext
+
+        ctx = RunContext(root=str(tmp_path), run_id="R", speed_factor=25.0)
+        ctx.started()
+        assert RunContext.load(str(tmp_path / "R")).speed_factor == 25.0

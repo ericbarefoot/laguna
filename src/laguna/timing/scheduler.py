@@ -24,7 +24,9 @@ class Scheduler:
         scheduler.run(duration=300)   # blocks for 5 experiment-minutes
     """
 
-    _POLL = 0.05  # seconds between schedule checks
+    _POLL = 0.05        # real seconds between schedule checks at speed 1.0
+    _MIN_POLL = 0.001   # floor, so a fast clock doesn't spin the CPU
+    _MAX_CATCHUP = 100  # firings per poll before declaring the backlog lost
 
     def __init__(
         self,
@@ -94,6 +96,12 @@ class Scheduler:
         for entry in self._recurring:
             entry["_next"] = current + entry["every"]
 
+        # Keep the *effective* time resolution constant however fast the
+        # clock runs, so an accelerated rehearsal schedules like the real run
+        # rather than in coarse jumps. Floored so a very high speed factor
+        # doesn't turn this into a spin loop.
+        poll = max(self._MIN_POLL, self._POLL / self._clock.speed_factor)
+
         while not self._stop_event.is_set():
             now = self._clock.elapsed()
 
@@ -101,8 +109,25 @@ class Scheduler:
                 break
 
             for entry in self._recurring:
-                if now >= entry["_next"]:
+                # Advance by `every` rather than rebasing on `now`. Rebasing
+                # made every firing drift late by however long the poll
+                # happened to overshoot, and the error accumulated over a
+                # run. The while-loop catches up when more than one interval
+                # elapsed between polls — otherwise a fast clock silently
+                # fires fewer times than the real run would, which would make
+                # a rehearsal under-report.
+                fired = 0
+                while now >= entry["_next"] and fired < self._MAX_CATCHUP:
                     self._fire(entry["action"], entry["subsystem"], entry["name"], now)
+                    entry["_next"] += entry["every"]
+                    fired += 1
+                if fired >= self._MAX_CATCHUP:
+                    logger.warning(
+                        "%s/%s fell more than %d intervals behind; skipping the "
+                        "backlog. The schedule is denser than this machine can "
+                        "dispatch — lower speed_factor or lengthen the interval.",
+                        entry["subsystem"], entry["name"], self._MAX_CATCHUP,
+                    )
                     entry["_next"] = now + entry["every"]
 
             for entry in self._oneshot:
@@ -110,7 +135,7 @@ class Scheduler:
                     self._fire(entry["action"], entry["subsystem"], entry["name"], now)
                     entry["_fired"] = True
 
-            time.sleep(self._POLL)
+            time.sleep(poll)
 
         _natural = not self._stop_event.is_set()
         self.stop()

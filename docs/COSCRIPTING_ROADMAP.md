@@ -250,7 +250,8 @@ dropped:**
 ## Workstream 4 — Offline rehearsal
 
 > **Implemented.** `src/laguna/simulation.py` and
-> `src/laguna/scanner/simulation.py`, behind `FlumeLab(simulate=True)`.
+> `src/laguna/scanner/simulation.py`, behind
+> `FlumeLab(simulate=True, speed_factor=...)`.
 
 A `simulate=True` flag on `FlumeLab`/`setup_run()` swapping in fake transports, so a
 whole experiment script — schedule, survey plan, timing — can be validated with no

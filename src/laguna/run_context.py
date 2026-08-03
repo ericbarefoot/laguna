@@ -75,8 +75,14 @@ class RunContext:
         self,
         root: Optional[str] = None,
         run_id: Optional[str] = None,
+        speed_factor: float = 1.0,
     ) -> None:
         self.run_id = run_id or new_run_id()
+        #: Experiment seconds per real second, so runtime_at()/wall_at() stay
+        #: correct for an accelerated rehearsal. Recorded in the manifest
+        #: because a file written during one is otherwise indistinguishable
+        #: from a real run's, and its timestamps would convert wrongly.
+        self.speed_factor = float(speed_factor)
         self.root = Path(root) if root else None
         self.started_wall: Optional[float] = None
         self.ended_wall: Optional[float] = None
@@ -157,7 +163,7 @@ class RunContext:
         """
         if self.started_wall is None:
             raise RuntimeError("this run has no recorded start time")
-        return wall - self.started_wall - self.paused_before(wall)
+        return (wall - self.started_wall - self.paused_before(wall)) * self.speed_factor
 
     def wall_at(self, runtime_s: float) -> float:
         """Wall-clock instant corresponding to an experiment runtime.
@@ -169,7 +175,7 @@ class RunContext:
         """
         if self.started_wall is None:
             raise RuntimeError("this run has no recorded start time")
-        wall = self.started_wall + runtime_s
+        wall = self.started_wall + runtime_s / self.speed_factor
         for start, end in self.pauses:
             if start >= wall:
                 break
@@ -212,6 +218,7 @@ class RunContext:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
+            "speed_factor": self.speed_factor,
             "started_wall": self.started_wall,
             "ended_wall": self.ended_wall,
             "pauses": [list(p) for p in self.pauses],
@@ -251,7 +258,8 @@ class RunContext:
         if p.is_dir():
             p = p / MANIFEST_NAME
         data = json.loads(p.read_text())
-        ctx = cls(root=str(p.parent.parent), run_id=data["run_id"])
+        ctx = cls(root=str(p.parent.parent), run_id=data["run_id"],
+                  speed_factor=data.get("speed_factor", 1.0))
         ctx.started_wall = data.get("started_wall")
         ctx.ended_wall = data.get("ended_wall")
         ctx.pauses = [list(x) for x in data.get("pauses", [])]
