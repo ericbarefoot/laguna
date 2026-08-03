@@ -145,7 +145,11 @@ def setup_run(
         logger.info("Loaded schedule from %s (%d time points)", schedule,
                     len(exp_schedule._df))
 
-    # Validate scheduling config for all present sections
+    # Validate scheduling config for all present sections. "gantry" has no
+    # scheduled action of its own — it only ever moves as part of a scan —
+    # but interval_s/trigger_at/use_schedule under a gantry: block would be
+    # silently ignored without this, so it's validated here too rather than
+    # left to fail confusingly later.
     for section in ("gauge", "weir", "flow", "pi_cameras", "dslr_cameras",
                     "gantry", "gocator"):
         if section in cfg:

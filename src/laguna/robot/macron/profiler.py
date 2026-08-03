@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..motion_arbiter import DEFAULT_ARBITER
+
 logger = logging.getLogger(__name__)
 
 
@@ -118,24 +120,30 @@ class TopographicProfiler:
         local_csv = self._output_dir / f"profile_{timestamp}.csv"
         local_meta = self._output_dir / f"profile_{timestamp}_meta.json"
 
-        logger.info("Starting scan: %s -> %.3f mm at %.3f mm/s (sensor=%s)",
-                    axis, end_mm, feed_rate_mm_s, self._sensor)
-        ack = self._gantry.connection.start_scan(
-            axis, end_mm, feed_rate_mm_s, self._al1342_host, self._pdin_port, remote_csv,
-            sensor=self._sensor,
-        )
-        start_pos_mm = ack.get("start_pos_mm", 0.0)
-        logger.info(
-            "Scan started; start_pos=%.3f mm, accel=%.3f, decel=%.3f",
-            start_pos_mm, ack.get("accel_mm_s2", 0), ack.get("decel_mm_s2", 0),
-        )
+        # Held for the whole physical traverse, not just the individual
+        # commands the transport already serialises — see motion_arbiter.
+        # Without this, a scheduled Gocator scan (which holds the same
+        # arbiter via scan_with_gantry()) could command the gantry mid-pass.
+        arbiter = getattr(self._gantry, "arbiter", DEFAULT_ARBITER)
+        with arbiter.hold(f"topographic scan {axis} -> {end_mm:.1f}mm"):
+            logger.info("Starting scan: %s -> %.3f mm at %.3f mm/s (sensor=%s)",
+                        axis, end_mm, feed_rate_mm_s, self._sensor)
+            ack = self._gantry.connection.start_scan(
+                axis, end_mm, feed_rate_mm_s, self._al1342_host, self._pdin_port, remote_csv,
+                sensor=self._sensor,
+            )
+            start_pos_mm = ack.get("start_pos_mm", 0.0)
+            logger.info(
+                "Scan started; start_pos=%.3f mm, accel=%.3f, decel=%.3f",
+                start_pos_mm, ack.get("accel_mm_s2", 0), ack.get("decel_mm_s2", 0),
+            )
 
-        distance_mm = abs(end_mm - start_pos_mm)
-        move_timeout = (distance_mm / feed_rate_mm_s if feed_rate_mm_s > 0 else 120.0) + 30.0
+            distance_mm = abs(end_mm - start_pos_mm)
+            move_timeout = (distance_mm / feed_rate_mm_s if feed_rate_mm_s > 0 else 120.0) + 30.0
 
-        result = self._gantry.connection.wait_for_scan_result(timeout=move_timeout)
-        if "scan_error" in result:
-            raise RuntimeError(f"scan error: {result['scan_error']}")
+            result = self._gantry.connection.wait_for_scan_result(timeout=move_timeout)
+            if "scan_error" in result:
+                raise RuntimeError(f"scan error: {result['scan_error']}")
 
         logger.info(
             "Scan complete: %d samples, %.1f -> %.1f mm",

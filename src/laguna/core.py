@@ -472,6 +472,7 @@ class FlumeLab:
             KeyError: If no config section exists for `instrument`.
         """
         from laguna.robot.macron.profiler import TopographicProfiler
+        from laguna.robot.motion_arbiter import DEFAULT_ARBITER
 
         gantry = self._subsystems.get("gantry")
         if gantry is None:
@@ -481,41 +482,47 @@ class FlumeLab:
         if feed_rate_mm_s is None:
             raise ValueError("acquire_scan() requires feed_rate_mm_s — no default for a hardware move")
 
-        if start is not None:
-            self.move_to(start)
+        # Held across the pre-position move() and the scan pass itself, not
+        # just move_to() individually — a scheduled Gocator scan (which holds
+        # the same arbiter via scan_with_gantry()) must not be able to
+        # command the gantry in between the two.
+        arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
+        with arbiter.hold(f"acquire_scan {instrument} -> {end}"):
+            if start is not None:
+                self.move_to(start)
 
-        axis_names = [axis.name for axis in gantry._axes]
-        if start is None:
-            start = [gantry.cmd.get_actual_position(axis) for axis in gantry._axes]
-        if len(start) != len(axis_names) or len(end) != len(axis_names):
-            raise ValueError(
-                f"start/end must have {len(axis_names)} values (one per configured axis: {axis_names})"
+            axis_names = [axis.name for axis in gantry._axes]
+            if start is None:
+                start = [gantry.cmd.get_actual_position(axis) for axis in gantry._axes]
+            if len(start) != len(axis_names) or len(end) != len(axis_names):
+                raise ValueError(
+                    f"start/end must have {len(axis_names)} values (one per configured axis: {axis_names})"
+                )
+
+            differing = [name for name, s, e in zip(axis_names, start, end) if abs(e - s) > 1e-9]
+            if len(differing) != 1:
+                raise ValueError(
+                    "acquire_scan() infers the scan axis as the single component where "
+                    f"start and end differ; got {len(differing)} differing axes: {differing}"
+                )
+            scan_axis = next(axis for axis in gantry._axes if axis.name == differing[0])
+            end_mm = end[axis_names.index(differing[0])]
+
+            sensor = "wtt12l_powerprox" if instrument in ("wtt12l", "wtt12l_powerprox") else instrument
+            rf_config = self.config.get(instrument)
+            gantry_config = self.config.get("gantry")
+
+            profiler = TopographicProfiler(
+                gantry=gantry,
+                pi_host=gantry_config.get("host"),
+                pi_user=gantry_config.get("ssh_user", "oak"),
+                pi_key=gantry_config.get("ssh_key"),
+                pdin_port=rf_config.get("pdin_port", 1),
+                al1342_host=rf_config.get("al1342_host"),
+                output_dir=str(Path(output).parent) if output else "/tmp",
+                sensor=sensor,
             )
-
-        differing = [name for name, s, e in zip(axis_names, start, end) if abs(e - s) > 1e-9]
-        if len(differing) != 1:
-            raise ValueError(
-                "acquire_scan() infers the scan axis as the single component where "
-                f"start and end differ; got {len(differing)} differing axes: {differing}"
-            )
-        scan_axis = next(axis for axis in gantry._axes if axis.name == differing[0])
-        end_mm = end[axis_names.index(differing[0])]
-
-        sensor = "wtt12l_powerprox" if instrument in ("wtt12l", "wtt12l_powerprox") else instrument
-        rf_config = self.config.get(instrument)
-        gantry_config = self.config.get("gantry")
-
-        profiler = TopographicProfiler(
-            gantry=gantry,
-            pi_host=gantry_config.get("host"),
-            pi_user=gantry_config.get("ssh_user", "oak"),
-            pi_key=gantry_config.get("ssh_key"),
-            pdin_port=rf_config.get("pdin_port", 1),
-            al1342_host=rf_config.get("al1342_host"),
-            output_dir=str(Path(output).parent) if output else "/tmp",
-            sensor=sensor,
-        )
-        result = profiler.scan(axis=scan_axis.token(), end_mm=end_mm, feed_rate_mm_s=feed_rate_mm_s)
+            result = profiler.scan(axis=scan_axis.token(), end_mm=end_mm, feed_rate_mm_s=feed_rate_mm_s)
 
         if output:
             output_path = Path(output)

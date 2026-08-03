@@ -857,19 +857,25 @@ class GocatorScanner(GocatorSettingsMixin):
         formats = spec.pop("formats", None)
         start = gantry.axis(spec["axis"]).get_position() if return_to_start else None
 
-        scan = self.scan_with_gantry(
-            gantry,
-            axis=spec["axis"],
-            end_mm=float(spec["end_mm"]),
-            feed_rate_mm_s=float(spec["feed_rate_mm_s"]),
-            settle_s=float(spec.get("settle_s", 0.5)),
-        )
-        if formats:
-            self.save_scan(scan, formats=tuple(formats))
-        if return_to_start and start is not None:
-            # Repeat scans of the same transect need the axis back where it
-            # began, or each pass starts further along than the last.
-            gantry.move_to(**{spec["axis"]: start})
+        # Held across the scan AND the return-to-start move, not just the
+        # scan — otherwise the arbiter is released between the two and
+        # another scheduled action could move the axis in that gap before
+        # the return move starts.
+        arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
+        with arbiter.hold(f"gocator acquire {spec['axis']} -> {spec['end_mm']}"):
+            scan = self.scan_with_gantry(
+                gantry,
+                axis=spec["axis"],
+                end_mm=float(spec["end_mm"]),
+                feed_rate_mm_s=float(spec["feed_rate_mm_s"]),
+                settle_s=float(spec.get("settle_s", 0.5)),
+            )
+            if formats:
+                self.save_scan(scan, formats=tuple(formats))
+            if return_to_start:
+                # Repeat scans of the same transect need the axis back where
+                # it began, or each pass starts further along than the last.
+                gantry.move_to(**{spec["axis"]: start})
         return scan
 
     # ------------------------------------------------------------------

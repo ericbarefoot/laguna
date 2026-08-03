@@ -1,5 +1,7 @@
 """Test suite for core FlumeLab orchestrator."""
 
+import time
+
 import pytest
 from laguna import FlumeLab
 from laguna.frames import FrameRegistry
@@ -76,9 +78,12 @@ class FakeGantry:
     subsystem_name = "gantry"
 
     def __init__(self, positions=None):
+        from laguna.robot.motion_arbiter import MotionArbiter
+
         self._axes = (FakeAxis("X", 1), FakeAxis("Y", 2), FakeAxis("Z", 5), FakeAxis("Theta", 6))
         self.cmd = FakeGantryCmd(positions or {"X": 0.0, "Y": 0.0, "Z": 0.0, "Theta": 0.0})
         self.move_to_calls = []
+        self.arbiter = MotionArbiter(timeout_s=0.2)
 
     def move_to(self, vector=None, **axes):
         self.move_to_calls.append((vector, axes))
@@ -257,3 +262,65 @@ class TestAcquireScan:
         assert result.path == desired_output
         assert desired_output.exists()
         assert (tmp_path / "named" / "myscan_meta.json").exists()
+
+    def test_holds_the_motion_arbiter_across_the_scan(self, lab, monkeypatch, tmp_path):
+        """A scheduled Gocator scan holds the same arbiter via
+        scan_with_gantry() — acquire_scan() must too, or the two could
+        command the gantry at the same time."""
+        gantry = FakeGantry()
+        lab.add(gantry)
+        held_during_scan = []
+
+        class FakeProfiler:
+            def __init__(self, **kwargs):
+                pass
+
+            def scan(self, axis, end_mm, feed_rate_mm_s):
+                held_during_scan.append(gantry.arbiter.is_held)
+                from laguna.robot.macron.profiler import ProfileResult
+
+                csv_path = tmp_path / "profile_20260101_000000.csv"
+                csv_path.write_text("wall_time_unix,pos_mm\n")
+                return ProfileResult(path=csv_path, metadata={}, df=None)
+
+        monkeypatch.setattr("laguna.robot.macron.profiler.TopographicProfiler", FakeProfiler)
+
+        lab.acquire_scan("od2000", end=[100, 0, 0, 0], feed_rate_mm_s=5.0)
+
+        assert held_during_scan == [True]
+        assert gantry.arbiter.is_held is False, "arbiter must be released afterward"
+
+    def test_refuses_to_start_while_the_gantry_is_already_held(self, lab, monkeypatch):
+        """A concurrently-held arbiter (e.g. a scheduled Gocator scan already
+        in flight, on another thread) must make acquire_scan() fail loudly
+        rather than let both callers command the gantry. MotionArbiter is a
+        re-entrant lock, so contention only shows up across threads — the
+        same thread re-entering its own hold is fine by design."""
+        import threading
+
+        from laguna.robot.motion_arbiter import MotionBusyError
+
+        gantry = FakeGantry()
+        lab.add(gantry)
+        monkeypatch.setattr(
+            "laguna.robot.macron.profiler.TopographicProfiler", lambda **kwargs: None
+        )
+
+        released = threading.Event()
+
+        def hold_from_another_thread():
+            with gantry.arbiter.hold("someone else's scan"):
+                released.wait(timeout=5.0)
+
+        holder = threading.Thread(target=hold_from_another_thread)
+        holder.start()
+        try:
+            deadline = time.time() + 5.0
+            while gantry.arbiter.holder != "someone else's scan" and time.time() < deadline:
+                time.sleep(0.005)
+            assert gantry.arbiter.holder == "someone else's scan", "holder thread never acquired"
+            with pytest.raises(MotionBusyError):
+                lab.acquire_scan("od2000", end=[100, 0, 0, 0], feed_rate_mm_s=5.0)
+        finally:
+            released.set()
+            holder.join(timeout=5.0)
