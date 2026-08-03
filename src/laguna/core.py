@@ -5,7 +5,7 @@ with lab.add(subsystem). This avoids hardcoding hardware assumptions in the core
 """
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional
 import logging
 import threading
 import time
@@ -13,6 +13,10 @@ import time
 from .config import Config
 from .frames import FrameRegistry
 from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
+
+if TYPE_CHECKING:
+    from .rangefinder import OD2000Rangefinder, WTT12LRangefinder
+    from .robot.macron.controller import GantryController
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +31,11 @@ class FlumeLab:
     Creates a timing backbone immediately; hardware subsystems are registered
     explicitly via ``lab.add(subsystem)``.
 
+    Attributes:
+        gantry: Registered gantry controller when present.
+        od2000: Registered OD2000 rangefinder when present.
+        wtt12l: Registered WTT12L rangefinder when present.
+
     Example::
 
         lab = FlumeLab("config.yaml")
@@ -40,6 +49,10 @@ class FlumeLab:
         scheduler:  Action scheduler tied to the experiment clock
         event_log:  Append-only CSV event log
     """
+
+    gantry: "GantryController"
+    od2000: "OD2000Rangefinder"
+    wtt12l: "WTT12LRangefinder"
 
     def __init__(self, config_file: Optional[str] = None) -> None:
         logger.info("Initializing FlumeLab system...")
@@ -70,6 +83,15 @@ class FlumeLab:
     # ------------------------------------------------------------------
     # Opt-in subsystem registration
     # ------------------------------------------------------------------
+
+    def __getattr__(self, name: str) -> Any:
+        """Return a registered subsystem by name when accessed as an attribute."""
+        if name.startswith("_"):
+            raise AttributeError(name)
+        subsystem = self._subsystems.get(name)
+        if subsystem is None:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+        return subsystem
 
     def add(self, subsystem: Any) -> "FlumeLab":
         """Register a hardware subsystem by its ``subsystem_name`` attribute.
@@ -494,13 +516,29 @@ class FlumeLab:
         rf_config = self.config.get(instrument)
         gantry_config = self.config.get("gantry")
 
+        gantry_host = gantry_config.get("host")
+        if not isinstance(gantry_host, str):
+            raise ValueError("gantry.host must be configured as a string")
+
+        gantry_ssh_user = gantry_config.get("ssh_user", "oak")
+        if not isinstance(gantry_ssh_user, str):
+            raise ValueError("gantry.ssh_user must be configured as a string")
+
+        gantry_ssh_key = gantry_config.get("ssh_key")
+        if gantry_ssh_key is not None and not isinstance(gantry_ssh_key, str):
+            raise ValueError("gantry.ssh_key must be configured as a string when provided")
+
+        al1342_host = rf_config.get("al1342_host")
+        if not isinstance(al1342_host, str):
+            raise ValueError("instrument.al1342_host must be configured as a string")
+
         profiler = TopographicProfiler(
             gantry=gantry,
-            pi_host=gantry_config.get("host"),
-            pi_user=gantry_config.get("ssh_user", "oak"),
-            pi_key=gantry_config.get("ssh_key"),
+            pi_host=gantry_host,
+            pi_user=gantry_ssh_user,
+            pi_key=gantry_ssh_key,
             pdin_port=rf_config.get("pdin_port", 1),
-            al1342_host=rf_config.get("al1342_host"),
+            al1342_host=al1342_host,
             output_dir=str(Path(output).parent) if output else "/tmp",
             sensor=sensor,
         )
@@ -528,14 +566,18 @@ class FlumeLab:
             self.clock.pause()
         self.disconnect_all()
 
-    def open_ocean_control_gui(self, gui_script_path: str = None) -> None:
+    def open_ocean_control_gui(self, gui_script_path: Optional[str] = None) -> None:
         """Launch the OceanControl GUI as a subprocess."""
         import subprocess
         import sys
 
-        path = gui_script_path or self.config.get("ocean_control", {}).get(
-            "gui_path",
-            "/home/eric/Desktop/safl-ocean-control/OceanControl/Python Controls/SAFL_OceanControl.py",
+        configured_path = self.config.get_value("ocean_control.gui_path")
+        if gui_script_path is None:
+            gui_script_path = configured_path if isinstance(configured_path, str) else None
+
+        path = gui_script_path or (
+            "/home/eric/Desktop/safl-ocean-control/OceanControl/Python Controls/"
+            "SAFL_OceanControl.py"
         )
         path = Path(path)
         if not path.exists():

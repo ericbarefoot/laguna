@@ -42,6 +42,11 @@ class TestFlumeLab:
         with pytest.raises(ValueError):
             lab.add(object())
 
+    def test_getattr_returns_registered_subsystem(self, lab):
+        sub = FakeSubsystem()
+        lab.add(sub)
+        assert lab.__getattr__("fake") is sub
+
     def test_get_system_status_contains_only_timing_with_no_subsystems(self, lab):
         status = lab.get_system_status()
         assert list(status.keys()) == ["timing"]

@@ -90,6 +90,11 @@ class GantryController:
 
     subsystem_name = "gantry"
 
+    x: AxisHandle
+    y: AxisHandle
+    z: AxisHandle
+    theta: AxisHandle
+
     def __init__(
         self,
         connection: SnapConnection,
@@ -173,6 +178,15 @@ class GantryController:
         by TopographicProfiler) can reach them directly.
         """
         return self._connection
+
+    def __getattr__(self, name: str) -> Any:
+        """Return a dynamically exposed axis handle for configured axes."""
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._axis_handles[name]
+        except KeyError as exc:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}") from exc
 
     def axis(self, name: str) -> AxisHandle:
         """Return the AxisHandle for a configured axis by name (case-sensitive,
