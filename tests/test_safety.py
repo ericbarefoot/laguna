@@ -11,8 +11,9 @@ import pytest
 from laguna import FlumeLab
 from laguna.safety import (
     CallableTrigger,
-    EstopMonitor,
+    SafetyMonitor,
     SafetyState,
+    SafetyTier,
     SentinelFileTrigger,
 )
 
@@ -35,6 +36,9 @@ class RecordingSubsystem:
 
     def resume(self):
         self._record("resume")
+
+    def stop(self):
+        self._record("stop")
 
     def estop(self):
         self._record("estop")
@@ -69,7 +73,7 @@ class LegacySubsystem:
 class TestTriggers:
     def test_sentinel_file_trips_only_while_present(self, tmp_path):
         path = tmp_path / "ESTOP"
-        trigger = SentinelFileTrigger(str(path))
+        trigger = SentinelFileTrigger(str(path), tier=SafetyTier.ESTOP)
         assert trigger.is_tripped() is False
         path.touch()
         assert trigger.is_tripped() is True
@@ -98,19 +102,20 @@ class TestTriggers:
     def test_monitor_reports_the_first_tripped_trigger(self, tmp_path):
         a = tmp_path / "a"
         b = tmp_path / "b"
-        monitor = EstopMonitor(
-            [SentinelFileTrigger(str(a), name="a"), SentinelFileTrigger(str(b), name="b")]
+        monitor = SafetyMonitor(
+            [SentinelFileTrigger(str(a), tier=SafetyTier.ESTOP, name="a"),
+             SentinelFileTrigger(str(b), tier=SafetyTier.ESTOP, name="b")]
         )
-        assert monitor.tripped_by() is None
+        assert monitor.tripped() is None
         b.touch()
-        assert monitor.tripped_by() == "b"
+        assert monitor.tripped()[1] == "b"
 
     def test_monitor_fires_once_not_once_per_poll(self, tmp_path):
         """A sentinel that stays on disk must not re-fire continuously."""
         path = tmp_path / "ESTOP"
         fired = []
-        monitor = EstopMonitor(
-            [SentinelFileTrigger(str(path))], on_trip=fired.append, poll_s=0.01
+        monitor = SafetyMonitor(
+            [SentinelFileTrigger(str(path), tier=SafetyTier.ESTOP)], on_trip=lambda tier, name: fired.append(name), poll_s=0.01
         )
         path.touch()
         monitor.start()
@@ -123,7 +128,7 @@ class TestTriggers:
         assert len(fired) == 1
 
     def test_monitor_with_no_triggers_does_not_start(self):
-        monitor = EstopMonitor([])
+        monitor = SafetyMonitor([])
         monitor.start()
         assert monitor._thread is None
 
@@ -166,7 +171,7 @@ class TestSafetyVerbs:
         lab = self._lab(a)
         lab.clock.start()
         lab.pause()
-        lab.resume_from_pause()
+        assert lab.resume_from_pause() is True
         assert a.calls == ["pause", "resume"]
         assert lab.clock.is_paused is False
         assert lab.safety_state is SafetyState.RUNNING
@@ -220,12 +225,14 @@ class TestSafetyVerbs:
         lab.pause()
         assert after.calls == ["pause"]
 
-    def test_legacy_subsystem_still_gets_stopped(self):
-        """A subsystem predating the protocol must not be silently skipped."""
+    def test_subsystem_without_estop_is_simply_skipped(self):
+        """Every real subsystem implements all four verbs now, so there is no
+        legacy fallback to maintain — a double lacking estop() is just
+        skipped rather than silently mis-stopped."""
         legacy = LegacySubsystem("weir")
         lab = self._lab(legacy)
         lab.estop()
-        assert legacy.calls == ["stop"]
+        assert legacy.calls == []
 
     def test_emergency_stop_is_a_deprecated_alias(self):
         a = RecordingSubsystem()
@@ -248,7 +255,7 @@ class TestRearm:
         lab = FlumeLab()
         if gantry is not None:
             lab.add(gantry)
-        lab.watch_for_estop(sentinel=str(tmp_path / "ESTOP"))
+        lab.watch_for_safety(sentinels={"estop": str(tmp_path / "ESTOP")})
         return lab
 
     def test_refuses_while_a_trigger_is_still_asserted(self, tmp_path):
@@ -260,7 +267,7 @@ class TestRearm:
             assert lab.rearm() is False, "re-armed into a live emergency"
             assert lab.safety_state is SafetyState.ESTOPPED
         finally:
-            lab.estop_monitor.stop()
+            lab.safety_monitor.stop()
 
     def test_succeeds_once_the_trigger_is_cleared(self, tmp_path):
         sentinel = tmp_path / "ESTOP"
@@ -272,7 +279,7 @@ class TestRearm:
             assert lab.rearm() is True
             assert lab.safety_state is SafetyState.RUNNING
         finally:
-            lab.estop_monitor.stop()
+            lab.safety_monitor.stop()
 
     def test_rearm_re_enables_the_gantry(self, tmp_path):
         class FakeGantry(RecordingSubsystem):
@@ -292,7 +299,7 @@ class TestRearm:
             # False re-enables motors and releases Y/Z brakes, in that order.
             assert gantry.safe_mode_calls == [False]
         finally:
-            lab.estop_monitor.stop()
+            lab.safety_monitor.stop()
 
     def test_stays_estopped_if_the_gantry_cannot_be_re_armed(self, tmp_path):
         class StubbornGantry(RecordingSubsystem):
@@ -308,7 +315,7 @@ class TestRearm:
             assert lab.rearm() is False
             assert lab.safety_state is SafetyState.ESTOPPED
         finally:
-            lab.estop_monitor.stop()
+            lab.safety_monitor.stop()
 
     def test_cannot_resume_from_an_estop(self, tmp_path):
         lab = self._lab(tmp_path)
@@ -317,7 +324,7 @@ class TestRearm:
             with pytest.raises(RuntimeError, match="call rearm"):
                 lab.resume_from_pause()
         finally:
-            lab.estop_monitor.stop()
+            lab.safety_monitor.stop()
 
 
 class TestEstopMonitorIntegration:
@@ -329,8 +336,8 @@ class TestEstopMonitorIntegration:
         subsystem = RecordingSubsystem("gantry")
         lab = FlumeLab()
         lab.add(subsystem)
-        lab.estop_monitor._poll_s = 0.01
-        lab.watch_for_estop(sentinel=str(sentinel))
+        lab.safety_monitor._poll_s = 0.01
+        lab.watch_for_safety(sentinels={"estop": str(sentinel)})
         try:
             sentinel.touch()
             deadline = time.time() + 2.0
@@ -339,7 +346,7 @@ class TestEstopMonitorIntegration:
             assert lab.safety_state is SafetyState.ESTOPPED
             assert subsystem.calls == ["estop"]
         finally:
-            lab.estop_monitor.stop()
+            lab.safety_monitor.stop()
 
     def test_vfd_hardware_estop_is_propagated(self, tmp_path):
         """The pump drive has a real e-stop circuit; software should follow
@@ -348,8 +355,189 @@ class TestEstopMonitorIntegration:
         flow.get_status = lambda: {"is_connected": True, "vfd_estop": True}
         lab = FlumeLab()
         lab.add(flow)
-        lab.watch_for_estop(sentinel=None)
+        lab.watch_for_safety(sentinels={})
         try:
-            assert lab.estop_monitor.tripped_by() == "vfd_hardware_estop"
+            assert lab.safety_monitor.tripped_by() == "vfd_hardware_estop"
         finally:
-            lab.estop_monitor.stop()
+            lab.safety_monitor.stop()
+
+
+class TestDiscardsAreRecorded:
+    """Silently missing scan data can invalidate an experiment as thoroughly
+    as bad data can, so a discarded surface has to be visible in the one
+    record an analyst reads afterwards — not just the Python log."""
+
+    def test_a_subsystem_note_lands_in_the_event_log(self, tmp_path):
+        log = tmp_path / "events.csv"
+
+        class Discarder(RecordingSubsystem):
+            def pause(self):
+                self.calls.append("pause")
+                return "DISCARDED a part-captured surface"
+
+        lab = FlumeLab()
+        lab.event_log = __import__(
+            "laguna.timing", fromlist=["EventLog"]
+        ).EventLog(str(log))
+        lab.add(Discarder("gocator"))
+        lab.clock.start()
+        lab.pause()
+
+        text = log.read_text()
+        assert "DISCARDED" in text, "the discard never reached the event log"
+        assert "gocator" in text
+
+    def test_gocator_reports_the_discard(self):
+        from laguna.scanner import GocatorScanner
+
+        scanner = GocatorScanner({"ip": "1.2.3.4"})
+        scanner._is_running = True
+        note = scanner.pause()
+        assert note and "DISCARD" in note.upper()
+        assert "no scan file was written" in note.lower()
+
+    def test_no_note_when_nothing_was_in_flight(self):
+        from laguna.scanner import GocatorScanner
+
+        scanner = GocatorScanner({"ip": "1.2.3.4"})
+        assert scanner.pause() is None
+
+
+class TestAllTiersArePollable:
+    """Polling isn't just for estop. A health check that spots the scanner
+    or a camera failing can `touch PAUSE` and halt the run gracefully before
+    more perishable data is lost."""
+
+    def _lab(self, tmp_path, subsystem=None):
+        lab = FlumeLab()
+        if subsystem is not None:
+            lab.add(subsystem)
+        lab.safety_monitor._poll_s = 0.01
+        lab.watch_for_safety(sentinels={
+            "pause": str(tmp_path / "PAUSE"),
+            "stop": str(tmp_path / "STOP"),
+            "estop": str(tmp_path / "ESTOP"),
+        })
+        return lab
+
+    def _wait(self, lab, state, timeout=2.0):
+        import time
+
+        deadline = time.time() + timeout
+        while lab.safety_state is not state and time.time() < deadline:
+            time.sleep(0.01)
+        return lab.safety_state is state
+
+    def test_pause_file_pauses_the_whole_experiment(self, tmp_path):
+        sub = RecordingSubsystem("gocator")
+        lab = self._lab(tmp_path, sub)
+        try:
+            (tmp_path / "PAUSE").touch()
+            assert self._wait(lab, SafetyState.PAUSED)
+            assert sub.calls == ["pause"]
+        finally:
+            lab.safety_monitor.stop()
+
+    def test_stop_file_ends_the_run(self, tmp_path):
+        sub = RecordingSubsystem("flow")
+        lab = self._lab(tmp_path, sub)
+        try:
+            (tmp_path / "STOP").touch()
+            assert self._wait(lab, SafetyState.STOPPED)
+            assert sub.calls == ["stop"]
+        finally:
+            lab.safety_monitor.stop()
+
+    def test_estop_file_still_estops(self, tmp_path):
+        sub = RecordingSubsystem("gantry")
+        lab = self._lab(tmp_path, sub)
+        try:
+            (tmp_path / "ESTOP").touch()
+            assert self._wait(lab, SafetyState.ESTOPPED)
+            assert sub.calls == ["estop"]
+        finally:
+            lab.safety_monitor.stop()
+
+    def test_the_most_severe_trigger_wins(self, tmp_path):
+        lab = self._lab(tmp_path)
+        try:
+            (tmp_path / "PAUSE").touch()
+            (tmp_path / "ESTOP").touch()
+            assert self._wait(lab, SafetyState.ESTOPPED)
+        finally:
+            lab.safety_monitor.stop()
+
+    def test_a_lingering_pause_cannot_downgrade_an_estop(self, tmp_path):
+        """Escalate only — once ESTOP has fired, a PAUSE file left on disk
+        must not quietly bring the rig back to merely paused."""
+        import time
+
+        lab = self._lab(tmp_path)
+        try:
+            (tmp_path / "ESTOP").touch()
+            assert self._wait(lab, SafetyState.ESTOPPED)
+            (tmp_path / "ESTOP").unlink()
+            (tmp_path / "PAUSE").touch()
+            time.sleep(0.1)
+            assert lab.safety_state is SafetyState.ESTOPPED
+        finally:
+            lab.safety_monitor.stop()
+
+    def test_resume_refuses_while_the_pause_file_remains(self, tmp_path):
+        lab = self._lab(tmp_path)
+        try:
+            (tmp_path / "PAUSE").touch()
+            assert self._wait(lab, SafetyState.PAUSED)
+            assert lab.resume_from_pause() is False
+            (tmp_path / "PAUSE").unlink()
+            assert lab.resume_from_pause() is True
+        finally:
+            lab.safety_monitor.stop()
+
+    def test_a_health_check_callable_can_demand_a_pause(self, tmp_path):
+        """The motivating case: no file needed, just a predicate that goes
+        true when an instrument stops producing data."""
+        from laguna.safety import CallableTrigger, SafetyTier
+
+        failing = {"healthy": True}
+        sub = RecordingSubsystem("gocator")
+        lab = FlumeLab()
+        lab.add(sub)
+        lab.safety_monitor._poll_s = 0.01
+        lab.watch_for_safety(
+            sentinels={},
+            extra_triggers=[
+                CallableTrigger(
+                    lambda: not failing["healthy"],
+                    tier=SafetyTier.PAUSE,
+                    name="scanner_health",
+                )
+            ],
+        )
+        try:
+            failing["healthy"] = False
+            assert self._wait(lab, SafetyState.PAUSED)
+            assert sub.calls == ["pause"]
+        finally:
+            lab.safety_monitor.stop()
+
+
+class TestEscalation:
+    def test_escalate_pauses_by_default(self):
+        sub = RecordingSubsystem("gantry")
+        lab = FlumeLab()
+        lab.add(sub)
+        lab.clock.start()
+        lab.escalate("gantry was busy when a scheduled move came due")
+        assert lab.safety_state is SafetyState.PAUSED
+        assert sub.calls == ["pause"]
+
+    def test_escalate_can_demand_a_harder_tier(self):
+        from laguna.safety import SafetyTier
+
+        sub = RecordingSubsystem("flow")
+        lab = FlumeLab()
+        lab.add(sub)
+        lab.escalate("unrecoverable", tier=SafetyTier.ESTOP)
+        assert lab.safety_state is SafetyState.ESTOPPED
+        assert sub.calls == ["estop"]

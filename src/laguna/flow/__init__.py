@@ -79,7 +79,7 @@ class FlowController(ABC):
     # Safety verbs (see laguna.safety)
     # ------------------------------------------------------------------
 
-    def pause(self) -> None:
+    def pause(self) -> Optional[str]:
         """Stop the pump, remembering the setpoint so resume() can restore it.
 
         Pausing a flume stops the water: the hydraulic condition is part of
@@ -91,11 +91,13 @@ class FlowController(ABC):
         """
         self._paused_flowrate = self._current_flowrate
         try:
-            self.stop()
+            self._vfd_stop()
         except Exception as exc:
             logger.error("Could not stop the pump for pause: %s", exc)
+            return f"pump may still be running: {exc}"
+        return f"pump stopped, setpoint {self._paused_flowrate} L/min held for resume"
 
-    def resume(self) -> None:
+    def resume(self) -> Optional[str]:
         """Restore the setpoint captured by pause() and restart the pump."""
         target = getattr(self, "_paused_flowrate", None)
         try:
@@ -104,16 +106,32 @@ class FlowController(ABC):
             self.start()
         except Exception as exc:
             logger.error("Could not restart the pump on resume: %s", exc)
+            return f"pump did not restart: {exc}"
+        return None
 
-    def estop(self) -> None:
+    def stop(self) -> Optional[str]:
+        """End cleanly: stop the pump, leave the valves as they are.
+
+        The valve positions are part of the experiment's configuration, not a
+        hazard on their own — only estop() forces them shut.
+        """
+        try:
+            self._vfd_stop()
+        except Exception as exc:
+            logger.error("Could not stop the pump: %s", exc)
+            return f"pump may still be running: {exc}"
+        return None
+
+    def estop(self) -> Optional[str]:
         """Pump off and both valves closed, each attempted independently.
 
         Every step is guarded separately: a failure closing qin must not
         prevent qaux from being closed, and neither must prevent the pump
         being stopped. Never raises.
         """
+        problems = []
         for label, action in (
-            ("stop the pump", lambda: self.stop()),
+            ("stop the pump", lambda: self._vfd_stop()),
             ("close qin", lambda: setattr(self, "qin", False)),
             ("close qaux", lambda: setattr(self, "qaux", False)),
         ):
@@ -121,6 +139,8 @@ class FlowController(ABC):
                 action()
             except Exception as exc:
                 logger.error("ESTOP: could not %s: %s", label, exc)
+                problems.append(label)
+        return f"could not: {', '.join(problems)}" if problems else None
 
     def clear_faults(self) -> bool:
         """Clear any latched VFD fault/alarm state.
@@ -294,12 +314,8 @@ class SaflFlowController(FlowController):
         self._require_connected()
         return self._vfd.start()
 
-    def stop(self) -> bool:
-        """Stop the pump.
-
-        Raises:
-            RuntimeError: If not connected.
-        """
+    def _vfd_stop(self) -> bool:
+        """Stop the pump drive itself. See stop() for the safety verb."""
         self._require_connected()
         return self._vfd.stop()
 
@@ -307,7 +323,7 @@ class SaflFlowController(FlowController):
     # Safety verbs (see laguna.safety)
     # ------------------------------------------------------------------
 
-    def pause(self) -> None:
+    def pause(self) -> Optional[str]:
         """Stop the pump, remembering the setpoint so resume() can restore it.
 
         Pausing a flume stops the water: the hydraulic condition is part of
@@ -319,11 +335,13 @@ class SaflFlowController(FlowController):
         """
         self._paused_flowrate = self._current_flowrate
         try:
-            self.stop()
+            self._vfd_stop()
         except Exception as exc:
             logger.error("Could not stop the pump for pause: %s", exc)
+            return f"pump may still be running: {exc}"
+        return f"pump stopped, setpoint {self._paused_flowrate} L/min held for resume"
 
-    def resume(self) -> None:
+    def resume(self) -> Optional[str]:
         """Restore the setpoint captured by pause() and restart the pump."""
         target = getattr(self, "_paused_flowrate", None)
         try:
@@ -332,16 +350,32 @@ class SaflFlowController(FlowController):
             self.start()
         except Exception as exc:
             logger.error("Could not restart the pump on resume: %s", exc)
+            return f"pump did not restart: {exc}"
+        return None
 
-    def estop(self) -> None:
+    def stop(self) -> Optional[str]:
+        """End cleanly: stop the pump, leave the valves as they are.
+
+        The valve positions are part of the experiment's configuration, not a
+        hazard on their own — only estop() forces them shut.
+        """
+        try:
+            self._vfd_stop()
+        except Exception as exc:
+            logger.error("Could not stop the pump: %s", exc)
+            return f"pump may still be running: {exc}"
+        return None
+
+    def estop(self) -> Optional[str]:
         """Pump off and both valves closed, each attempted independently.
 
         Every step is guarded separately: a failure closing qin must not
         prevent qaux from being closed, and neither must prevent the pump
         being stopped. Never raises.
         """
+        problems = []
         for label, action in (
-            ("stop the pump", lambda: self.stop()),
+            ("stop the pump", lambda: self._vfd_stop()),
             ("close qin", lambda: setattr(self, "qin", False)),
             ("close qaux", lambda: setattr(self, "qaux", False)),
         ):
@@ -349,6 +383,8 @@ class SaflFlowController(FlowController):
                 action()
             except Exception as exc:
                 logger.error("ESTOP: could not %s: %s", label, exc)
+                problems.append(label)
+        return f"could not: {', '.join(problems)}" if problems else None
 
     def clear_faults(self) -> bool:
         """Clear any latched VFD alarm state.

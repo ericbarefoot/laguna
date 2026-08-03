@@ -13,10 +13,11 @@ import time
 from .config import Config
 from .frames import FrameRegistry
 from .safety import (
-    DEFAULT_SENTINEL,
+    DEFAULT_SENTINELS,
     CallableTrigger,
-    EstopMonitor,
+    SafetyMonitor,
     SafetyState,
+    SafetyTier,
     SentinelFileTrigger,
 )
 from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
@@ -62,7 +63,7 @@ class FlumeLab:
         # Safety lifecycle — see laguna.safety. The monitor is created here
         # but stays idle until watch_for_estop() adds triggers and starts it.
         self._safety_state = SafetyState.RUNNING
-        self.estop_monitor = EstopMonitor(on_trip=lambda name: self.estop(reason=f"trigger:{name}"))
+        self.safety_monitor = SafetyMonitor(on_trip=self._on_safety_trigger)
 
         # Timing subsystem — always present
         self.clock = ExperimentClock()
@@ -338,7 +339,7 @@ class FlumeLab:
         that implements pause(), and pauses the clock. Kept as an alias
         because existing scripts and run_blocking() call it.
         """
-        self.pause()
+        self.pause(reason="lab.stop()")
 
     def resume(self, remaining_s: Optional[float] = None) -> threading.Thread:
         """Resume after stop(): restart scheduler loop in background thread.
@@ -545,10 +546,15 @@ class FlumeLab:
     def _for_each_subsystem(self, verb: str, order: tuple = ()) -> List[str]:
         """Call `verb` on every subsystem that has it, guarded individually.
 
-        Returns the names that raised. This is the fix for the defect where
-        emergency_stop() called stop() unguarded in a loop: GocatorScanner.
-        stop() raised when disconnected, aborting the loop, so every
-        subsystem registered after it was never stopped at all.
+        Notes returned by a subsystem go to the **event log**, not just the
+        Python logger — above all when data was discarded. Silently missing
+        scan data can invalidate an experiment as thoroughly as bad data can,
+        so it has to land in the one record an analyst reads afterwards.
+
+        Returns the names that raised. Guarding each call individually is the
+        fix for the defect where emergency_stop() called stop() unguarded in
+        a loop: GocatorScanner.stop() raised when disconnected, aborting the
+        loop, so every subsystem registered after it was never stopped.
         """
         names = list(order) + [n for n in self._subsystems if n not in order]
         failed: List[str] = []
@@ -560,31 +566,56 @@ class FlumeLab:
             if action is None:
                 continue
             try:
-                action()
+                note = action()
             except Exception as exc:
                 failed.append(name)
                 logger.error("%s.%s() failed: %s", name, verb, exc)
+                self.event_log.log(
+                    self.clock.elapsed(), name, verb, result=f"error: {exc}"
+                )
+                continue
+            if note:
+                logger.warning("%s.%s(): %s", name, verb, note)
+                self.event_log.log(
+                    self.clock.elapsed(), name, verb, result="ok", notes=str(note)
+                )
         return failed
 
-    def pause(self) -> None:
+    def _on_safety_trigger(self, tier: SafetyTier, name: str) -> None:
+        """Dispatch a monitor trip to the matching verb."""
+        {
+            SafetyTier.PAUSE: lambda: self.pause(reason=f"trigger:{name}"),
+            SafetyTier.STOP: lambda: self.end_run(reason=f"trigger:{name}"),
+            SafetyTier.ESTOP: lambda: self.estop(reason=f"trigger:{name}"),
+        }[tier]()
+
+    def pause(self, reason: str = "manual") -> None:
         """Pause the experiment — everything quiesces, nothing disconnects.
 
-        Halts the scheduler, quiesces every subsystem that implements
-        ``pause()`` (gantry decelerates on its own ramp, pump stops with its
-        setpoint remembered, acquisition aborts), and **pauses the experiment
-        clock**, so runtime measures time under experimental conditions
-        rather than wall time. Recover with :meth:`resume`.
+        Halts the scheduler, pauses every subsystem, and **pauses the
+        experiment clock**, so runtime measures time under experimental
+        conditions rather than wall time. Recover with :meth:`resume_from_pause`.
+
+        Anything a subsystem discarded to get here — a part-finished scan,
+        most importantly — is written to the event log by
+        :meth:`_for_each_subsystem`.
         """
-        logger.info("Pausing experiment...")
-        self.event_log.log(self.clock.elapsed(), "flume_lab", "experiment_pause")
+        logger.info("Pausing experiment (%s)...", reason)
+        self.event_log.log(
+            self.clock.elapsed(), "flume_lab", "experiment_pause", notes=reason
+        )
         self.scheduler.stop()
         self._for_each_subsystem("pause")
         if self.clock.is_running and not self.clock.is_paused:
             self.clock.pause()
         self._safety_state = SafetyState.PAUSED
 
-    def resume_from_pause(self) -> None:
+    def resume_from_pause(self) -> bool:
         """Undo :meth:`pause` — restart the clock and restore setpoints.
+
+        Refuses while a pause trigger is still asserted, so the rig cannot be
+        resumed straight back into whatever tripped it. Clear the sentinel
+        (or fix the failing health check) first.
 
         Named to avoid colliding with :meth:`resume`, which resumes the
         *scheduler* for the remainder of a run and predates this.
@@ -594,21 +625,49 @@ class FlumeLab:
                 "Cannot resume from an estop — call rearm() instead, once the "
                 "condition that tripped it has been cleared."
             )
+        still = self.safety_monitor.tripped_by()
+        if still is not None:
+            logger.error(
+                "Refusing to resume: safety trigger %r is still asserted. "
+                "Clear it first (e.g. remove the sentinel file).", still,
+            )
+            return False
+
         logger.info("Resuming from pause...")
         if self.clock.is_paused:
             self.clock.resume()
         self._for_each_subsystem("resume")
+        self.safety_monitor.rearm()
         self.event_log.log(self.clock.elapsed(), "flume_lab", "experiment_resume")
         self._safety_state = SafetyState.RUNNING
+        return True
+
+    def end_run(self, reason: str = "manual") -> None:
+        """Stop cleanly — quiesce everything into a disconnectable state.
+
+        The middle tier: harder than a pause (not resumable), gentler than an
+        estop (controlled deceleration, no stalling against brakes). Named
+        end_run() because ``FlumeLab.stop()`` has always meant "pause" to
+        existing scripts and to run_blocking()'s signal handlers.
+        """
+        logger.info("Stopping run (%s)...", reason)
+        self.event_log.log(
+            self.clock.elapsed(), "flume_lab", "experiment_stop_requested", notes=reason
+        )
+        self.scheduler.stop()
+        self._for_each_subsystem("stop", order=self._ESTOP_ORDER)
+        if self.clock.is_running and not self.clock.is_paused:
+            self.clock.pause()
+        self._safety_state = SafetyState.STOPPED
 
     def estop(self, reason: str = "manual") -> None:
         """Emergency stop — bring everything to a halt as fast as possible.
 
-        Gantry hard abort (zero-decel, brakes engaged, motors disabled), pump
+        Gantry zero-decel abort with brakes engaged and motors disabled, pump
         off, both valves closed, acquisition aborted and any partial scan
         discarded. Motion is stopped first, then hydraulics.
 
-        Never raises, and never stops early: each subsystem is guarded
+        Never raises and never stops early: each subsystem is guarded
         individually, so one that fails or is disconnected cannot prevent the
         others from being made safe.
 
@@ -625,20 +684,6 @@ class FlumeLab:
             logger.error("Could not stop the scheduler during estop: %s", exc)
 
         failed = self._for_each_subsystem("estop", order=self._ESTOP_ORDER)
-        # Anything with no estop() at all still gets its hard stop, so a
-        # subsystem predating this protocol is not silently skipped.
-        for name, subsystem in self._subsystems.items():
-            if hasattr(subsystem, "estop"):
-                continue
-            stopper = getattr(subsystem, "stop", None) or getattr(subsystem, "disconnect", None)
-            if stopper is None:
-                continue
-            try:
-                stopper()
-            except Exception as exc:
-                failed.append(name)
-                logger.error("%s legacy stop failed during estop: %s", name, exc)
-
         if self.clock.is_running and not self.clock.is_paused:
             self.clock.pause()
         self._safety_state = SafetyState.ESTOPPED
@@ -652,30 +697,24 @@ class FlumeLab:
     def rearm(self) -> bool:
         """Return from ESTOPPED to RUNNING, if it is safe to do so.
 
-        Refuses while any estop trigger is still asserted — a sentinel file
-        still on disk, the VFD's hardware e-stop still latched — so the rig
-        cannot be brought back up into a live emergency. Clear the cause
-        first, then call this.
+        Refuses while any trigger is still asserted — a sentinel still on
+        disk, the VFD's hardware e-stop still latched — so the rig cannot be
+        brought back up into a live emergency. Clear the cause first.
 
         Re-enables motors and releases brakes via the gantry's own
         ``set_safe_mode(False)`` path, which does motor-on then brake-release
         in that order and never the reverse.
 
         If this cannot clear the controller — a PLC that needed a power cycle
-        — fall back to a full ``disconnect_all()`` / ``connect_all()``, and
-        note that a reconnect loses the gantry's position reference unless
+        — fall back to a full ``disconnect_all()``/``connect_all()``, noting
+        that a reconnect loses the gantry's position reference unless
         ``restore_last_position()`` is used (see issue #23).
-
-        Returns:
-            True if re-armed. False if a trigger is still asserted, or if a
-            subsystem could not be brought back.
         """
-        tripped = self.estop_monitor.tripped_by()
+        tripped = self.safety_monitor.tripped_by()
         if tripped is not None:
             logger.error(
-                "Refusing to re-arm: estop trigger %r is still asserted. "
-                "Clear it first (e.g. remove the ESTOP sentinel file).",
-                tripped,
+                "Refusing to re-arm: safety trigger %r is still asserted. "
+                "Clear it first (e.g. remove the ESTOP sentinel file).", tripped,
             )
             return False
 
@@ -684,13 +723,12 @@ class FlumeLab:
         ok = True
         if gantry is not None and hasattr(gantry, "set_safe_mode"):
             try:
-                # False re-enables motors and releases Y/Z brakes in order.
                 ok = bool(gantry.set_safe_mode(False))
             except Exception as exc:
                 logger.error("Could not re-arm the gantry: %s", exc)
                 ok = False
 
-        self.estop_monitor.rearm()
+        self.safety_monitor.rearm()
         self._safety_state = SafetyState.RUNNING if ok else SafetyState.ESTOPPED
         self.event_log.log(
             self.clock.elapsed(), "flume_lab", "rearm",
@@ -704,41 +742,63 @@ class FlumeLab:
             )
         return ok
 
-    def watch_for_estop(
+    def escalate(self, problem: str, tier: SafetyTier = SafetyTier.PAUSE) -> None:
+        """Bring the experiment down because something went wrong elsewhere.
+
+        The hook for "this is worse than one failed action". A scan that could
+        not run, an instrument that has gone unreachable, or a scheduled move
+        that found the gantry already busy all mean the scripted plan is no
+        longer being followed — and letting the run continue collects
+        perishable data under conditions nobody recorded.
+
+        Defaults to a pause, which is recoverable once the cause is fixed.
+        """
+        logger.error("Escalating to %s: %s", tier.name, problem)
+        self._on_safety_trigger(tier, problem)
+
+    def watch_for_safety(
         self,
-        sentinel: Optional[str] = DEFAULT_SENTINEL,
+        sentinels: Optional[dict] = None,
         extra_triggers: Optional[list] = None,
     ) -> "FlumeLab":
-        """Start watching for external estop demands.
+        """Start watching for externally-demanded pause / stop / estop.
+
+        All three tiers, not just estop: a health check that notices the
+        scanner has stopped returning surfaces, or a camera has stopped
+        producing frames, can ``touch PAUSE`` and halt the run gracefully
+        before more perishable data is lost — no code changes needed.
 
         Polls on a background thread rather than using a signal handler:
         Python delivers signals only in the main thread between bytecodes, so
         a signal cannot interrupt a blocking serial read or SDK call.
 
         Args:
-            sentinel: Path whose existence trips an estop. ``touch ESTOP``
-                from any terminal fires it; a physical button wired to create
-                the file needs no further software support. None to skip.
+            sentinels: ``{tier_name: path}``, defaulting to
+                ``./PAUSE``, ``./STOP``, ``./ESTOP``. Pass ``{}`` to skip.
             extra_triggers: Additional trigger objects (see laguna.safety).
 
         Returns:
             self, so this chains off the constructor.
         """
-        if sentinel:
-            self.estop_monitor.add(SentinelFileTrigger(sentinel))
+        paths = DEFAULT_SENTINELS if sentinels is None else sentinels
+        for tier_name, path in (paths or {}).items():
+            self.safety_monitor.add(
+                SentinelFileTrigger(path, tier=SafetyTier(tier_name))
+            )
         for trigger in extra_triggers or []:
-            self.estop_monitor.add(trigger)
+            self.safety_monitor.add(trigger)
         # The flow controller's VFD reports a real hardware e-stop circuit;
-        # propagate it rather than pretending software is the only authority.
+        # follow it rather than pretending software is the only authority.
         flow = self._subsystems.get("flow")
         if flow is not None:
-            self.estop_monitor.add(
+            self.safety_monitor.add(
                 CallableTrigger(
                     lambda: bool(flow.get_status().get("vfd_estop", False)),
+                    tier=SafetyTier.ESTOP,
                     name="vfd_hardware_estop",
                 )
             )
-        self.estop_monitor.start()
+        self.safety_monitor.start()
         return self
 
     def emergency_stop(self) -> None:

@@ -324,19 +324,33 @@ class SaflWeirController(WeirController):
     # Safety verbs (see laguna.safety)
     # ------------------------------------------------------------------
 
-    def pause(self) -> None:
-        """Halt any in-progress elevation move. Never raises."""
+    def _halt(self) -> Optional[str]:
+        """Halt any in-progress move. Never raises — shared by every tier,
+        because the weir holds its elevation mechanically and so has exactly
+        one safe action regardless of severity."""
         try:
-            self.stop()
+            self._require_connected()
+            self._motor.stop()
         except Exception as exc:
-            logger.error("Could not halt the weir for pause: %s", exc)
+            logger.error("Could not halt the weir: %s", exc)
+            return f"weir may still be moving: {exc}"
+        return None
 
-    def resume(self) -> None:
+    def pause(self) -> Optional[str]:
+        """Halt any in-progress elevation move."""
+        return self._halt()
+
+    def resume(self) -> Optional[str]:
         """Nothing to restore — the weir holds its elevation mechanically."""
+        return None
 
-    def estop(self) -> None:
+    def stop(self) -> Optional[str]:
         """Halt the move. Same action as pause: the weir has one stop."""
-        self.pause()
+        return self._halt()
+
+    def estop(self) -> Optional[str]:
+        """Halt the move. Same action as pause: the weir has one stop."""
+        return self._halt()
 
     def get_status(self) -> Dict[str, Any]:
         """Return connection state, current elevation, and raw motor status.

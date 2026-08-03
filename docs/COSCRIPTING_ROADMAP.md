@@ -64,7 +64,10 @@ And `FlumeLab.stop()` (`core.py:320`) is really a *pause* — it logs
 
 | Decision | Choice |
 |---|---|
-| Vocabulary | Three tiers: `pause()` / `stop()` / `estop()` |
+| Vocabulary | Three tiers: `pause()` / `stop()` / `estop()`, **identical on every subsystem** |
+| API stability | Deliberately sacrificed — `GantryController.stop()` changed from hard abort to clean stop |
+| Discarded data | Written to the **event log**, not just the Python log |
+| Trigger tiers | All three pollable, not just estop — so a health check can `touch PAUSE` |
 | Pause & hydraulics | Quiesce **everything**, pump included |
 | Estop & hydraulics | Kill everything — pump off, both valves closed |
 | Mid-scan pause/estop | Abort immediately, **discard** the partial surface, log it |
