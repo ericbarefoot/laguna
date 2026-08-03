@@ -146,7 +146,8 @@ def setup_run(
                     len(exp_schedule._df))
 
     # Validate scheduling config for all present sections
-    for section in ("gauge", "weir", "flow", "pi_cameras", "dslr_cameras"):
+    for section in ("gauge", "weir", "flow", "pi_cameras", "dslr_cameras",
+                    "gantry", "gocator"):
         if section in cfg:
             _validate_trigger_config(section, cfg[section])
 
@@ -203,6 +204,22 @@ def setup_run(
             main_yaml_path=lab_config,
         )
         lab.add(dslr)
+
+    # The survey half of the rig. Until now gantry/gocator were hand-scripted
+    # in examples only — they were absent from this function entirely, so a
+    # scan could not be part of a scheduled experiment. See
+    # docs/COSCRIPTING_ROADMAP.md.
+    gantry = None
+    if "gantry" in cfg:
+        from laguna.robot.macron.controller import GantryController
+        gantry = GantryController.from_config(cfg["gantry"])
+        lab.add(gantry)
+
+    gocator = None
+    if "gocator" in cfg:
+        from laguna.scanner import GocatorScanner
+        gocator = GocatorScanner.from_config(cfg["gocator"])
+        lab.add(gocator)
 
     # ------------------------------------------------------------------ #
     # Connect                                                              #
@@ -388,6 +405,35 @@ def setup_run(
     if dslr is not None:
         _register_action(lab, cfg.get("dslr_cameras", {}), "dslr_cameras", "capture",
                          action=_capture_dslr, exp_schedule=exp_schedule, schedule_col="dslr_cameras")
+
+    def _scan_gocator():
+        """One coordinated Gocator pass, logged to the event log.
+
+        Never raises: a failed scan must not take down a running experiment
+        that is also driving hydraulics and cameras. The scheduler would log
+        the exception anyway, but then the event log would carry no record of
+        what was attempted.
+        """
+        try:
+            scan = gocator.acquire(gantry=gantry)
+        except Exception as exc:
+            lab.event_log.log(lab.clock.elapsed(), "gocator", "scan",
+                              result=f"error: {exc}")
+            logger.error("Scheduled Gocator scan failed: %s", exc)
+            return
+        if scan is None:
+            return
+        path = (gocator._last_saved_path if hasattr(gocator, "_last_saved_path") else None)
+        lab.event_log.log(
+            lab.clock.elapsed(), "gocator", "scan",
+            result=f"points={scan.valid_count}",
+            notes=f"file={path}" if path else "",
+        )
+
+    if gocator is not None:
+        _register_action(lab, cfg.get("gocator", {}), "gocator", "scan",
+                         action=_scan_gocator, exp_schedule=exp_schedule,
+                         schedule_col="gocator")
 
     return lab
 

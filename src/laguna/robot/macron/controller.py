@@ -30,6 +30,7 @@ from .connection import EthernetConnection, RS232Connection, SnapConnection, Sna
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
 from .gcode import GCodeExecutor
 from .homing import HomingConfig, HomingProcedure
+from ..motion_arbiter import DEFAULT_ARBITER
 from .pi_bridge import PiGantryConnection
 from .position_store import GantryPositionStore
 
@@ -109,8 +110,11 @@ class GantryController:
         mm_per_unit: float = 1.0,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
         position_checkpoint_file: Optional[str] = None,
+        arbiter: Optional[Any] = None,
     ):
         self._connection = connection
+        #: Shared gantry lock — see laguna.robot.motion_arbiter.
+        self.arbiter = arbiter or DEFAULT_ARBITER
         self._axes = axes
         self._group_index = group_index
         self._io_map = io_map or IOMap()
@@ -549,6 +553,25 @@ class GantryController:
                 gantry, or neither vector nor any keyword was given.
             FenceViolation: If the X/Y/Z path would enter an exclusion zone.
         """
+        # Serialise whole operations, not just individual commands. The
+        # transport already locks per request/response pair, but a move is
+        # many commands with a physical traverse in between — nothing else
+        # stops a scheduled scan landing in the middle of one. Re-entrant,
+        # so nesting inside scan_with_gantry() is fine. See motion_arbiter.
+        with self.arbiter.hold(f"{type(self).__name__}.move_to"):
+            return self._move_to(vector, X=X, Y=Y, Z=Z, Theta=Theta, speed=speed)
+
+    def _move_to(
+        self,
+        vector: Optional[List[float]] = None,
+        *,
+        X: Optional[float] = None,
+        Y: Optional[float] = None,
+        Z: Optional[float] = None,
+        Theta: Optional[float] = None,
+        speed: Optional[float] = None,
+    ) -> bool:
+        """Body of move_to(), with the arbiter already held."""
         axes_by_name = {axis.name: axis for axis in self._axes}
 
         if vector is not None:
