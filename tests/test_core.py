@@ -33,6 +33,13 @@ class TestFlumeLab:
         assert lab.fake is sub
         assert "fake" in lab._subsystems
 
+    def test_getattr_falls_back_to_registered_subsystems(self, lab):
+        sub = FakeSubsystem()
+        lab.add(sub)
+        delattr(lab, "fake")
+
+        assert lab.fake is sub
+
     def test_add_returns_self_for_chaining(self, lab):
         sub = FakeSubsystem()
         result = lab.add(sub)
