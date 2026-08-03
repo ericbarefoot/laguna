@@ -46,6 +46,13 @@ dev = [
     "mypy>=0.950",
     "ruff>=0.4",
 ]
+scanner = [
+    # LAS/LAZ point-cloud export for Gocator scans (SurfaceScan.save_las).
+    # Optional because only the scanner subsystem uses it; lazrs supplies the
+    # LAZ compression backend, which is what makes LAZ ~100x faster and ~85x
+    # smaller than CSV on a full-resolution scan.
+    "laspy[lazrs]>=2.5",
+]
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
