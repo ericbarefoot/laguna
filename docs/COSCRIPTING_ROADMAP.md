@@ -1,8 +1,8 @@
 # Roadmap: co-scripting the survey instruments with the rest of FlumeLab
 
-> Status: **designed, not started.** Written 2026-08-03 alongside the Gocator
-> integration work. Each section below is intended as its own PR. Nothing here
-> has been implemented.
+> Status: **Workstream 0 implemented** (see `src/laguna/safety.py`); 1-4 still
+> designed only. Written 2026-08-03 alongside the Gocator integration work.
+> Each section below is its own PR.
 
 ## Why
 
