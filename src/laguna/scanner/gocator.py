@@ -359,42 +359,59 @@ class GocatorScanner(GocatorSettingsMixin):
     # Safety verbs (see laguna.safety)
     # ------------------------------------------------------------------
 
-    def pause(self) -> None:
-        """Abort any in-flight scan and discard the partial surface.
+    def _abort_acquisition(self) -> Optional[str]:
+        """Stop acquiring and discard anything part-captured.
 
         A surface captured across a decelerating pass is quietly wrong rather
         than obviously broken: Y spacing is travel_speed / frame_rate, which
         assumes constant velocity, so the travel axis comes out distorted.
-        Better to throw it away and log that we did.
+
+        Returns a note naming the discard when one happened, because the
+        caller writes it to the experiment event log. Silently missing scan
+        data can invalidate a whole experiment — an analyst has to be able to
+        see that a scan was attempted and thrown away, not just find a gap.
 
         Never raises, and deliberately does NOT go through
-        _require_connected() — a safety verb that needs the hardware to be
+        _require_connected(): a safety verb that needs the hardware to be
         reachable is no use in the situation it exists for.
         """
         if not self._is_running:
-            return
-        logger.warning(
-            "Aborting an in-flight Gocator scan and discarding the partial "
-            "surface (a pass interrupted mid-travel is distorted along Y)"
+            return None
+        note = (
+            "DISCARDED a part-captured surface — a pass interrupted mid-travel "
+            "is distorted along Y (Y spacing assumes constant velocity), so it "
+            "is not usable data. No scan file was written for this attempt."
         )
+        logger.warning("Gocator: %s", note)
         try:
             if self._lib is not None and self._system is not None:
                 self._lib.call("GoSystem_Stop", self._system)
         except Exception as exc:
             logger.error("Could not stop Gocator acquisition: %s", exc)
+            note += f" (acquisition may still be running: {exc})"
         finally:
             self._is_running = False
+        return note
 
-    def resume(self) -> None:
+    def pause(self) -> Optional[str]:
+        """Abort any in-flight scan and discard the partial surface."""
+        return self._abort_acquisition()
+
+    def resume(self) -> Optional[str]:
         """Nothing to restore — the discarded scan is not resumable.
 
         Acquisition restarts on the next scan(), which re-triggers from a
-        known start rather than trying to splice onto an aborted pass.
+        known start rather than splicing onto an aborted pass.
         """
+        return None
 
-    def estop(self) -> None:
-        """Same as pause: stop acquiring, discard, never raise."""
-        self.pause()
+    def stop(self) -> Optional[str]:
+        """End cleanly: stop acquiring, discarding anything part-captured."""
+        return self._abort_acquisition()
+
+    def estop(self) -> Optional[str]:
+        """Same as stop: there is no harder halt available to a passive sensor."""
+        return self._abort_acquisition()
 
     def receive_surface(
         self,
