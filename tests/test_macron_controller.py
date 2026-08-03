@@ -9,6 +9,7 @@ from laguna.robot.macron.connection import EthernetConnection, RS232Connection
 from laguna.robot.macron.controller import GantryController
 from laguna.robot.macron.fences import BoxFence
 from laguna.robot.macron.pi_bridge import PiGantryConnection
+from laguna.robot.macron.position_store import GantryPositionStore
 from tests.macron_fixtures import FakeSnapConnection
 
 # Deliberately still socket_bridge: that transport is retired as the *default*
@@ -491,6 +492,120 @@ class TestSoftStop:
         controller, conn = self._make_controller({})  # every command unscripted
         controller.soft_stop()                        # must not raise
         assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+
+
+class TestPositionPersistence:
+    """position_checkpoint_file (issue #23): last-known axis positions are
+    written at the end of move_to()/set_position()/stop()/soft_stop(), so a
+    power cycle (which wipes the PLC's ACP registers) can be recovered from
+    via restore_last_position() instead of requiring homing — currently
+    disabled while its limit switches are obstructed, see
+    HomingProcedure.home_all(). Off by default (position_checkpoint_file is
+    None), and every other test class in this file constructs its
+    controller(s) without it — see the passing exact conn.sent== assertions
+    elsewhere, which would break if persistence sent wire commands
+    unconditionally."""
+
+    def _make_controller(self, tmp_path, responses=None, connect=True):
+        path = str(tmp_path / "gantry_position.json")
+        conn = FakeSnapConnection(responses or {})
+        controller = GantryController(connection=conn, position_checkpoint_file=path)
+        if connect:
+            controller.connect()
+        return controller, conn, path
+
+    def test_disabled_by_default(self):
+        conn = FakeSnapConnection({})
+        controller = GantryController(connection=conn)  # no position_checkpoint_file
+        assert controller._position_store is None
+
+    def test_stop_persists_the_live_position(self, tmp_path):
+        responses = {f"A{i} ABT": "0" for i in (1, 2, 5, 6)}
+        responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)})
+        responses.update({"A1 ACP": "10", "A2 ACP": "20", "A5 ACP": "30", "A6 ACP": "40"})
+        controller, _conn, path = self._make_controller(tmp_path, responses)
+        controller.stop()
+
+        data = GantryPositionStore(path).load()
+        assert data is not None
+        assert data["positions"] == {"X": 10.0, "Y": 20.0, "Z": 30.0, "Theta": 40.0}
+
+    def test_soft_stop_persists_the_live_position(self, tmp_path):
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        responses.update({"A1 ACP": "1", "A2 ACP": "2", "A5 ACP": "3", "A6 ACP": "4"})
+        controller, _conn, path = self._make_controller(tmp_path, responses)
+        controller.soft_stop()
+
+        data = GantryPositionStore(path).load()
+        assert data["positions"] == {"X": 1.0, "Y": 2.0, "Z": 3.0, "Theta": 4.0}
+
+    def test_move_to_persists_all_axis_positions_not_just_the_moved_one(self, tmp_path):
+        # Theta-only move (see TestMoveTo.test_theta_only_keyword_move...):
+        # persistence still reads and saves every configured axis, not just
+        # the one this call moved.
+        responses = {
+            "A6 ACP": "5", "A6 BMT 90": "0", "A6 MIF": "1",
+            "A1 ACP": "1", "A2 ACP": "2", "A5 ACP": "3",
+        }
+        controller, _conn, path = self._make_controller(tmp_path, responses)
+        assert controller.move_to(Theta=90.0) is True
+
+        data = GantryPositionStore(path).load()
+        assert data["positions"] == {"X": 1.0, "Y": 2.0, "Z": 3.0, "Theta": 5.0}
+
+    def test_set_position_persists(self, tmp_path):
+        responses = {
+            "A1 ACP 10": "10",
+            "A1 ACP": "10", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
+        }
+        controller, _conn, path = self._make_controller(tmp_path, responses)
+        assert controller.set_position(X=10.0) is True
+
+        data = GantryPositionStore(path).load()
+        assert data["positions"] == {"X": 10.0, "Y": 0.0, "Z": 0.0, "Theta": 0.0}
+
+    def test_not_persisted_when_disconnected(self, tmp_path):
+        controller, _conn, path = self._make_controller(tmp_path, responses={}, connect=False)
+        controller.stop()  # cmd.shutdown() hits unscripted commands but stop() never raises
+        assert GantryPositionStore(path).load() is None
+
+    def test_restore_last_position_applies_the_saved_positions(self, tmp_path):
+        path = str(tmp_path / "gantry_position.json")
+        GantryPositionStore(path).save({"X": 11.0, "Y": 22.0, "Z": 33.0, "Theta": 44.0})
+        responses = {
+            "A1 ACP 11": "11", "A2 ACP 22": "22", "A5 ACP 33": "33", "A6 ACP 44": "44",
+            # set_position()'s own end-of-call persistence re-reads every axis:
+            "A1 ACP": "11", "A2 ACP": "22", "A5 ACP": "33", "A6 ACP": "44",
+        }
+        conn = FakeSnapConnection(responses)
+        controller = GantryController(connection=conn, position_checkpoint_file=path)
+        controller.connect()
+
+        assert controller.restore_last_position() is True
+        assert conn.sent[:4] == ["A1 ACP 11", "A2 ACP 22", "A5 ACP 33", "A6 ACP 44"]
+
+    def test_restore_last_position_false_when_no_store_configured(self):
+        conn = FakeSnapConnection({})
+        controller = GantryController(connection=conn)  # no position_checkpoint_file
+        controller.connect()
+        assert controller.restore_last_position() is False
+
+    def test_restore_last_position_false_when_no_checkpoint_exists_yet(self, tmp_path):
+        controller, _conn, _path = self._make_controller(tmp_path, responses={})
+        assert controller.restore_last_position() is False
+
+    def test_restore_last_position_never_sends_ena(self, tmp_path):
+        path = str(tmp_path / "gantry_position.json")
+        GantryPositionStore(path).save({"X": 1.0, "Y": 2.0, "Z": 3.0, "Theta": 4.0})
+        responses = {
+            "A1 ACP 1": "1", "A2 ACP 2": "2", "A5 ACP 3": "3", "A6 ACP 4": "4",
+            "A1 ACP": "1", "A2 ACP": "2", "A5 ACP": "3", "A6 ACP": "4",
+        }
+        conn = FakeSnapConnection(responses)
+        controller = GantryController(connection=conn, position_checkpoint_file=path)
+        controller.connect()
+        controller.restore_last_position()
+        assert not any("ENA" in c for c in conn.sent)
 
 
 class TestConnectBrakeRelease:

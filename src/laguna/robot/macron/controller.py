@@ -31,6 +31,7 @@ from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChe
 from .gcode import GCodeExecutor
 from .homing import HomingConfig, HomingProcedure
 from .pi_bridge import PiGantryConnection
+from .position_store import GantryPositionStore
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class GantryController:
         safe_mode: bool = True,
         mm_per_unit: float = 1.0,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
+        position_checkpoint_file: Optional[str] = None,
     ):
         self._connection = connection
         self._axes = axes
@@ -109,6 +111,14 @@ class GantryController:
         self._io_map = io_map or IOMap()
         self._safe_mode = safe_mode
         self._is_connected = False
+        # See position_store.py / restore_last_position() — off (None) unless
+        # a path is configured, since it's a stopgap for the obstructed-
+        # limit-switch homing situation, not something every gantry needs.
+        self._position_store = (
+            GantryPositionStore(position_checkpoint_file)
+            if position_checkpoint_file
+            else None
+        )
 
         self.cmd = MMCCommands(
             connection,
@@ -242,6 +252,7 @@ class GantryController:
             # nothing else needs to change.
             mm_per_unit=config.get("mm_per_acp_unit", 1.0),
             coordinate_offset_mm=config.get("coordinate_offset"),
+            position_checkpoint_file=config.get("position_checkpoint_file"),
         )
 
     # ------------------------------------------------------------------
@@ -363,6 +374,97 @@ class GantryController:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry shutdown: %s", exc)
+        self._persist_position()
+
+    def _persist_position(self) -> None:
+        """Best-effort snapshot of every axis's live position to the position
+        checkpoint file, if one is configured (position_checkpoint_file — see
+        position_store.py). Never raises: a persistence failure must not
+        break the caller's actual operation.
+
+        Called at the end of move_to(), set_position(), stop(), and
+        soft_stop() — deliberately including the two stop paths, not just
+        successful moves, so a move cancelled or aborted mid-flight persists
+        wherever the gantry actually ended up, not the destination it was
+        headed for (or nothing at all).
+
+        Note for stop()/soft_stop(): ABT/BST are not blocking — soft_stop()
+        in particular decelerates over its own accel/decel ramp rather than
+        halting instantly, so a read taken immediately after issuing it
+        reflects position at the moment the stop was commanded, not the
+        final rest position a moment later. Deliberately not waited out
+        here: stop() is the emergency path and must return fast, and
+        soft_stop() is documented as non-blocking everywhere else already.
+        Good enough for this store's purpose — see position_store.py.
+        """
+        if self._position_store is None or not self._is_connected:
+            return
+        positions: Dict[str, float] = {}
+        for axis in self._axes:
+            try:
+                positions[axis.name] = self.cmd.get_actual_position(axis)
+            except SnapMotionError as exc:
+                logger.debug("Not persisting %s's position: %s", axis.name, exc)
+        if not positions:
+            return
+        try:
+            self._position_store.save(positions)
+        except OSError as exc:
+            logger.warning("Could not write gantry position checkpoint: %s", exc)
+
+    def restore_last_position(self) -> bool:
+        """Re-reference every axis from the last position checkpoint.
+
+        Applies whatever _persist_position() (called at the end of
+        move_to(), set_position(), stop(), and soft_stop()) most recently
+        wrote, via set_position() — the same non-motion register
+        recalibration described in its docstring. This is the recovery path
+        for issue #23: a power cycle wipes the PLC's ACP registers entirely,
+        and physical homing is currently disabled (obstructed limit
+        switches — see HomingProcedure.home_all()), so without this there is
+        no way to re-reference position at all short of measuring by hand.
+
+        Deliberately NOT called automatically by connect() — unlike a fresh
+        physical home, a checkpoint file only proves "this was the position
+        the last time this process wrote it," not "this is where the axis
+        is now." If anything moved an axis by hand while the power was off,
+        or the file is simply stale, applying it silently would be actively
+        wrong — worse than leaving position unreferenced and visibly so.
+        Call this explicitly, only once you've confirmed nothing moved, and
+        check the logged checkpoint age first.
+
+        Returns:
+            True if a checkpoint was found and applied, False if no
+            position_checkpoint_file is configured, none exists yet, or it
+            has no axes in common with this gantry's configured axes.
+        """
+        if self._position_store is None:
+            logger.warning(
+                "restore_last_position() called but no position_checkpoint_file "
+                "is configured — nothing to restore."
+            )
+            return False
+        data = self._position_store.load()
+        if data is None:
+            logger.warning("No gantry position checkpoint found to restore.")
+            return False
+        axes_by_name = {axis.name: axis for axis in self._axes}
+        restorable = {
+            name: value for name, value in data["positions"].items() if name in axes_by_name
+        }
+        if not restorable:
+            logger.warning(
+                "Position checkpoint has no axes matching this gantry's "
+                "configured axes (%s) — nothing restored.",
+                [a.name for a in self._axes],
+            )
+            return False
+        age_s = time.time() - data.get("wall_time", time.time())
+        logger.info(
+            "Restoring gantry position from a %.0fs-old checkpoint: %s",
+            age_s, restorable,
+        )
+        return self.set_position(**restorable)
 
     # ------------------------------------------------------------------
     # Simple verbs (mirrors laguna.weir.SaflWeirController's shape) —
@@ -482,6 +584,7 @@ class GantryController:
                     predicted_s=predicted_move_s(theta_value - current_theta, speed),
                 )
 
+        self._persist_position()
         return True
 
     def set_position(
@@ -549,6 +652,7 @@ class GantryController:
 
         for name, value in target_by_name.items():
             self.cmd.set_actual_position(axes_by_name[name], value)
+        self._persist_position()
         return True
 
     def soft_stop(self) -> None:
@@ -569,6 +673,7 @@ class GantryController:
                 self.cmd.begin_stop(axis)
             except Exception as exc:
                 logger.error("Error soft-stopping %s: %s", axis.name, exc)
+        self._persist_position()
 
     def set_safe_mode(self, enabled: bool) -> bool:
         """Enable or disable safe_mode, reconnecting the transport if needed

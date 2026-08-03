@@ -65,8 +65,17 @@ env/
 
 # Project specific
 config/local_config.yaml
+config/config_line_scan.yaml
 data/raw/
 data/processed/
+# Gocator scans — a single full-resolution surface is ~30 MB as .npz and
+# ~1.2 GB as .csv, so these must never reach the repo (see
+# GocatorScanner.save_scan / docs/subsystems/scanner.md).
+data/scans/
+*.npz
+*.laz
+*.las
+*.ply
 logs/
 *.log
 

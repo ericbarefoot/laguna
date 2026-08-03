@@ -136,7 +136,7 @@ def add_real_world_columns(
 
 
 def run_scan(
-    conn: PiGantryConnection,
+    gantry: GantryController,
     axis: str,
     distance_mm: float,
     rate_mm_s: float,
@@ -159,13 +159,13 @@ def run_scan(
     pi_bridge.py's background reader thread for why this single connection
     stays responsive to profiler.stop() while scan() blocks elsewhere.
     """
+    conn = gantry.connection
     start_raw = float(conn.send(f"{axis} ACP"))
     start_mm = start_raw * MM_PER_ACP_UNIT
     target_mm = start_mm + distance_mm
     print(f"Current position: {start_mm:.3f} mm ({start_raw:.3f} raw units)")
     print(f"Scan target ({distance_mm:+.3f} mm): {target_mm:.3f} mm")
 
-    gantry = GantryController(connection=conn)
     profiler = TopographicProfiler(
         gantry=gantry,
         pi_host=PI_HOST,
@@ -277,11 +277,28 @@ def main() -> None:
         safe_mode=False,  # required: scan_start is gated like any motion command
     )
 
+    # Connect through GantryController, NOT conn.connect() directly.
+    #
+    # This used to call conn.connect(), which opens the transport but does
+    # nothing else — so _enable_and_release_brakes() never ran and a Y scan
+    # (A2, brake_output 4) drove the motor straight into an engaged brake.
+    # X has no brake, which is why it went unnoticed. Stalling against a
+    # brake is what corrupted Y's encoder feedback on 2026-07-30 and needed
+    # a power cycle to clear; see GantryController._enable_and_release_brakes.
+    #
+    # safe_mode=False is required for the controller to release them at all
+    # (connect() checks it), and matches the flag already set on the
+    # connection above for the same reason.
     print(f"Connecting to gantry agent on {PI_HOST}...")
-    conn.connect()
+    gantry = GantryController(
+        connection=conn, safe_mode=False, mm_per_unit=MM_PER_ACP_UNIT
+    )
+    if not gantry.connect():
+        print("Could not connect to the gantry — see the errors above.")
+        return
 
     try:
-        result = run_scan(conn, axis, args.distance_mm, args.rate_mm_s, args.output_dir,
+        result = run_scan(gantry, axis, args.distance_mm, args.rate_mm_s, args.output_dir,
                            args.sensor, pdin_port)
 
         print()
@@ -332,7 +349,7 @@ def main() -> None:
                 print("(matplotlib not installed — skipping plot; CSVs are still available above)")
 
     finally:
-        conn.disconnect()
+        gantry.disconnect()
         print()
         print("Disconnected.")
 

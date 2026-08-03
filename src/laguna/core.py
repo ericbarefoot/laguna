@@ -11,6 +11,7 @@ import threading
 import time
 
 from .config import Config
+from .frames import FrameRegistry
 from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
 
 logging.basicConfig(
@@ -44,6 +45,12 @@ class FlumeLab:
         logger.info("Initializing FlumeLab system...")
 
         self.config = Config(config_file=config_file)
+
+        # Instrument mounts + the experiment's reference frame. Always
+        # present; an absent 'frames:' section yields identity transforms and
+        # zero offsets, so a rig without one behaves exactly as before.
+        # See laguna.frames.
+        self.frames = FrameRegistry.from_config(self.config.get_value("frames"))
 
         # Timing subsystem — always present
         self.clock = ExperimentClock()
@@ -368,6 +375,48 @@ class FlumeLab:
         if gantry is None:
             raise RuntimeError("move_to() requires a 'gantry' subsystem — lab.add(GantryController(...))")
         return gantry.move_to(vector, **axes)
+
+    def place(
+        self,
+        instrument: str,
+        experiment_point: list,
+        speed: Optional[float] = None,
+    ) -> bool:
+        """Move so `instrument` measures at a point in the *experiment* frame.
+
+        The counterpart to move_to(): name the place you want measured rather
+        than the robot position that gets you there. Because each instrument
+        is mounted somewhere different, the same experiment point yields a
+        different gantry command per instrument — which is exactly what lets
+        you re-run a transect with a second sensor::
+
+            lab.place("od2000", [100, 200, 0])     # OD2000's dot on the target
+            lab.place("wtt12l", [100, 200, 0])     # WTT12L's dot on the SAME spot
+
+        Offsets and the experiment frame come from ``lab.frames`` (the
+        ``frames:`` config section). An instrument with no configured frame is
+        assumed to measure at the gantry's commanded point, so this reduces to
+        move_to() on an unconfigured rig.
+
+        Args:
+            instrument: Instrument key, e.g. ``"od2000"``.
+            experiment_point: [x, y, z] in experiment coordinates.
+            speed: Optional feed rate, mm/s.
+
+        Returns:
+            True if a move was issued.
+
+        Raises:
+            RuntimeError: If no 'gantry' subsystem is registered.
+        """
+        target = self.frames.gantry_target_for(instrument, experiment_point)
+        logger.info(
+            "place(%s, %s) -> gantry %s",
+            instrument, list(experiment_point), [round(v, 3) for v in target],
+        )
+        # Theta is outside the Cartesian frame model — leave it untouched by
+        # using the keyword form rather than a full vector.
+        return self.move_to(X=target[0], Y=target[1], Z=target[2], speed=speed)
 
     def acquire_scan(
         self,

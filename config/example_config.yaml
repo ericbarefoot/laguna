@@ -5,19 +5,19 @@ timing:
   checkpoint_file: ./experiment_checkpoint.json
   event_log: ./experiment_events.csv
 
-gauge:
-  port: /dev/ttyUSB2          # Massa M-5000 ultrasonic sensor
-  sensor_ids: [0]
-  offset_mm: 0.0
-  interval_s: 5               # read every 5 s
+# gauge:
+#   port: /dev/ttyUSB2          # Massa M-5000 ultrasonic sensor
+#   sensor_ids: [0]
+#   offset_mm: 0.0
+#   interval_s: 5               # read every 5 s
 
-weir:
-  port: /dev/ttyUSB1          # Teknic ClearCore motor controller
-  baudrate: 9600
-  home_offset_mm: 0.0
-  # Scheduling (choose one):
-  interval_s: 20              # poll status every 20 s (read-only, no motor motion)
-  # use_schedule: true        # follow schedule CSV (calls go_to_elevation); requires --schedule
+# weir:
+#   port: /dev/ttyUSB1          # Teknic ClearCore motor controller
+#   baudrate: 9600
+#   home_offset_mm: 0.0
+#   # Scheduling (choose one):
+#   interval_s: 20              # poll status every 20 s (read-only, no motor motion)
+#   # use_schedule: true        # follow schedule CSV (calls go_to_elevation); requires --schedule
 
 # Flow controller (Fuji VFD pump + solenoid valves). Omit section to disable.
 # flow:
@@ -32,19 +32,42 @@ weir:
 #   # interval_s: 20          # poll status every 20 s (read-only)
 #   # use_schedule: true      # follow schedule CSV (pump_flow_lpm, qin_open, qaux_open columns)
 
-pi_cameras:
-  hosts:
-    - pi1.local               # SSH hostnames or IPs of Pi camera nodes
-    - pi2.local
-  ssh_user: ucrs
-  ssh_key: ~/.ssh/id_ed25519
-  lead_time: 5.0
-  output_dir: ./captures/pi
-  # Scheduling (choose one):
-  interval_s: 30              # capture every 30 s
-  # trigger_at: [60, 120, 180]   # capture at these specific runtime seconds
-  # use_schedule: true            # fire at schedule CSV time_s rows;
-  #                               # add a pi_cameras column (1/0) to filter which rows trigger
+# pi_cameras:
+#   hosts:
+#     - pi1.local               # SSH hostnames or IPs of Pi camera nodes
+#     - pi2.local
+#   ssh_user: ucrs
+#   ssh_key: ~/.ssh/id_ed25519
+#   lead_time: 5.0
+#   output_dir: ./captures/pi
+#   # Scheduling (choose one):
+#   interval_s: 30              # capture every 30 s
+#   # trigger_at: [60, 120, 180]   # capture at these specific runtime seconds
+#   # use_schedule: true            # fire at schedule CSV time_s rows;
+#   #                               # add a pi_cameras column (1/0) to filter which rows trigger
+
+# Reference frames: bring every instrument's data into one coordinate system,
+# and let you name a PLACE instead of a robot position. Omit entirely for
+# identity transforms and zero offsets (i.e. exactly the old behaviour).
+# See docs/subsystems/frames.md and src/laguna/frames.py.
+# frames:
+#   experiment:                 # gantry -> experiment frame, applied to all output
+#     translation: [500, 300, 0]  # e.g. put the origin at a flume corner so every
+#                                 # coordinate comes out positive
+#     rotation_deg: 0             # about Z, optional
+#   instruments:                # where each instrument measures, relative to the
+#                               # gantry's COMMANDED point. Measure these once when
+#                               # the rig is built; they are what make
+#                               # lab.place("od2000", pt) and lab.place("wtt12l", pt)
+#                               # land on the same physical spot.
+#     gocator:
+#       translation: [0, 0, -325]   # translation ONLY — the sensor's 90-deg rotation
+#                                   # belongs in gocator.mounting below, and setting
+#                                   # it in both places would rotate the data twice.
+#     od2000:
+#       translation: [52.0, -18.0, 0]
+#     wtt12l:
+#       translation: [52.0, 31.0, 0]
 
 gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII protocol). Omit to disable.
   transport: pi_agent         # pi_agent (default) | ethernet | rs232 | socket_bridge (retired)
@@ -53,8 +76,8 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
                               # topographic scanning. socket_bridge is retired — it depended on
                               # serial_bridge.py, a hand-started Pi-side script; see
                               # docs/MACRON_GANTRY.md "Retired: serial_bridge.py".
-  host: red.dyn.ucr.edu       # Pi hostname, next to the controller
-  bridge_port: 9700           # only used by the retired socket_bridge transport
+  host: red.lab       # Pi hostname, next to the controller
+  # bridge_port: 9700           # only used by the retired socket_bridge transport
   ssh_user: oak               # for the pi_agent transport
   ssh_key: ~/.ssh/id_ed25519
   remote_serial_device: /dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0
@@ -62,6 +85,13 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
   group_index: 1
   safe_mode: true              # client-side query-only allowlist enforced — do not disable
                                 # without explicit authorization to command motion
+  # position_checkpoint_file: ./gantry_position.json
+                                # Last-known axis positions, written at the end of every
+                                # move_to()/set_position()/stop()/soft_stop() call. Omit to
+                                # disable. Restore explicitly after a power cycle with
+                                # gantry.restore_last_position() — never automatic, see its
+                                # docstring. Stopgap for home_all() being disabled while its
+                                # limit switches are obstructed — see issue #23.
   axes:                        # 8 axis slots are physically present, split across two PLC nodes:
                                 # commander (1-4: X, Y, encoder, encoder) and responder (5-8: Z,
                                 # Theta, encoder, encoder). Slots 3/4/7/8 are encoder-only, not
@@ -105,22 +135,105 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
 #   al1342_host: 192.168.1.251
 #   calibration_file: null      # fitted against current_ma, not distance_mm — see that script
 
-dslr_cameras:
-  dualcam_path: /path/to/dualcam-timelapse  # path to dualcam-timelapse repo
-  # Scheduling (choose one):
-  interval_s: 20
-  # trigger_at: [20, 40, 60]
-  # use_schedule: true
-  cameras:
-    Camera1:
-      port: usb:001,001       # auto-detected if wrong; updated in-place after connect
-      iso: "1600"
-      aperture: "5.6"
-      shutter: "1/125"
-      output_dir: ./captures/Camera1
-    Camera2:
-      port: usb:001,002
-      iso: "1600"
-      aperture: "5.6"
-      shutter: "1/125"
-      output_dir: ./captures/Camera2
+# LMI Gocator 2690 line-laser 3D scanner. Unlike the rangefinders above it is a
+# plain Ethernet device on the laguna PC's own network — no Pi, no IO-Link, no
+# MQTT. Encoderless: the gantry supplies constant-velocity motion and we
+# bracket the pass with a software trigger. See docs/subsystems/scanner.md.
+gocator:
+  ip: 192.168.1.10            # raw IP; the sensor's web UI is on port 80
+  travel_speed_mm_s: 20.0     # MUST match the gantry feed rate used to scan —
+                               # this is what scales the Y (travel) axis, since
+                               # there is no encoder. Writes to sensor flash,
+                               # so laguna only pushes it when it changes.
+  frame_rate_hz: 140          # profile trigger rate. Mutually exclusive with
+                               # frame_rate_max below — set one or the other,
+                               # not both. Y spacing = travel_speed / frame_rate
+                               # (20 mm/s at 140 Hz = 0.143 mm between profiles).
+                               # NOT the datasheet's 10 kHz headline: the real
+                               # ceiling is FOV/exposure-dependent AND dynamic.
+                               # Measured on this unit 2026-07-30: 443.127 Hz
+                               # with max-frame-rate mode on, but 221.563 Hz
+                               # once an explicit rate is set. Stay under ~220,
+                               # or use frame_rate_max to let the sensor pick.
+                               # laguna re-validates after flushing and raises
+                               # if the sensor can't deliver the requested
+                               # rate — see docs/subsystems/scanner.md.
+  # frame_rate_max: true       # Use the sensor's current max instead of frame_rate_hz
+                               # above (comment that out if you set this). Explicitly
+                               # (re-)enables max-frame-rate mode and reads back
+                               # whatever rate the sensor reports — unlike just
+                               # omitting frame_rate_hz, this works even after a
+                               # previous run set an explicit rate (which leaves
+                               # max-frame-rate mode disabled in sensor flash).
+  fixed_length_mm: 200.0      # surface length along travel; cover the scan distance
+  exposure_us: null           # laser exposure; omit to leave the sensor's setting
+  uniform_spacing: null       # Selects WHAT THE SENSOR SENDS, not just formatting:
+                               #   true  -> resampled UNIFORM_SURFACE heightmap (Z only,
+                               #            X implied by column index)
+                               #   false -> SURFACE_POINT_CLOUD, an explicit x/y/z per
+                               #            point at native non-uniform X spacing —
+                               #            i.e. a true point cloud
+                               # omit to leave as-is. Disabling it also raises the max
+                               # scan rate. See docs/subsystems/scanner.md.
+  # mounting:                 # How the sensor's OWN axes sit on the gantry. The
+  #   scan_x: -Y              # sensor names X = across the laser line, Y = travel,
+  #   scan_y: +X              # Z = range — these are NOT the gantry's axes. On this
+  #   scan_z: +Z              # rig the sensor is rotated 90 deg about Z, so a gantry
+                               # move along X appears as the sensor's Y (confirmed from
+                               # scans on 2026-08-02: axis="X" for 200/300mm gave
+                               # sensor-Y spans of 199.8/299.9mm).
+                               # Uncomment to get scans reported in GANTRY coordinates
+                               # (to_points() and every export). Left commented, the
+                               # default is the identity map = raw sensor frame.
+                               # VERIFY THE SIGN before trusting it: the axis pairing
+                               # is confirmed from data, but whether sensor +X points
+                               # to gantry +Y or -Y is not — scan something asymmetric
+                               # and check it isn't 180-deg rotated. A mirroring map
+                               # (a bare swap, no sign flip) is rejected outright.
+                               # See docs/subsystems/scanner.md and scanner/mounting.py.
+  # active_area:              # Sensor region of interest, mm. THE main lever for
+  #   z: 400                  # scan speed: a smaller area (above all in Z) means
+  #   height: 200             # fewer camera rows per profile, so a much higher
+  #   width: 600              # frame-rate ceiling. Fields: x/y/z (origin) and
+  #   x: 0                    # width/length/height (extents) — set any subset.
+                               # Applied BEFORE frame_rate_hz so the rate validates
+                               # against the resulting (raised) ceiling. Anything
+                               # outside the area is simply not measured, so leave
+                               # margin for the tallest feature and any Z wander.
+                               # Read live values/limits with get_active_area().
+  # subsampling:              # Resolution dividers. Works in BOTH uniform and
+  #   x: 2                    # point-cloud modes. x=2/x=4 multiply the frame-rate
+  #   z: 1                    # ceiling by exactly 2.00x/4.00x (measured), costing
+                               # X resolution (0.124 -> 0.248 -> 0.496 mm). z has NO
+                               # measurable effect on rate — leave it at 1.
+  # spacing_interval:         # X resampling bin size. UNIFORM SPACING ONLY.
+  #   type: balanced          # max_res | balanced | max_speed | custom
+  #   value_mm: 0.25          # only with type: custom
+  # filters:                  # Post-processing. UNIFORM SPACING ONLY — setting any
+  #   x_smoothing: 1.5        # of these with uniform_spacing: false raises.
+  #   y_median: true          # false = off, true = on (keep window), number = window mm
+  #   x_gap_filling: false    # names: {x,y}_{smoothing,median,decimation,gap_filling}
+  output_dir: ./data/scans
+  sdk_lib_dir: null           # dir holding libGoSdk.so/libkApi.so. Omit to use
+                               # $LAGUNA_GOSDK_LIB_DIR or a conventional path —
+                               # build them first with scripts/build_gosdk.sh
+
+# dslr_cameras:
+#   dualcam_path: /path/to/dualcam-timelapse  # path to dualcam-timelapse repo
+#   # Scheduling (choose one):
+#   interval_s: 20
+#   # trigger_at: [20, 40, 60]
+#   # use_schedule: true
+#   cameras:
+#     Camera1:
+#       port: usb:001,001       # auto-detected if wrong; updated in-place after connect
+#       iso: "1600"
+#       aperture: "5.6"
+#       shutter: "1/125"
+#       output_dir: ./captures/Camera1
+#     Camera2:
+#       port: usb:001,002
+#       iso: "1600"
+#       aperture: "5.6"
+#       shutter: "1/125"
+#       output_dir: ./captures/Camera2
