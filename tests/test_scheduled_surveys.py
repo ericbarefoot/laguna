@@ -40,6 +40,15 @@ class FakeGantry:
         self.arbiter = MotionArbiter()
         self._handles = {n: FakeAxisHandle(n, self.calls, position) for n in ("X", "Y")}
 
+    def connect(self):
+        return True
+
+    def disconnect(self):
+        pass
+
+    def get_status(self):
+        return {}
+
     def axis(self, name):
         try:
             return self._handles[name]
@@ -175,18 +184,120 @@ class TestAcquireIsSchedulable:
         scanner.acquire(gantry=gantry)
         assert not any(c[0] == "move_to" for c in gantry.calls)
 
+    def test_arbiter_held_continuously_through_the_return_move(self):
+        """The scan and the return-to-start move must be one continuous
+        hold — releasing in between would let another scheduled action move
+        the axis before the return move starts."""
+        scanner = StubScanner({
+            "ip": "1.2.3.4",
+            "scan": {"axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0,
+                     "return_to_start": True},
+        })
+        gantry = FakeGantry(position=15.0)
+        held_during_return = []
+        original_move_to = gantry.move_to
+
+        def move_to_spy(**axes):
+            held_during_return.append(gantry.arbiter.is_held)
+            return original_move_to(**axes)
+
+        gantry.move_to = move_to_spy
+        scanner.acquire(gantry=gantry)
+
+        assert held_during_return == [True]
+        assert gantry.arbiter.is_held is False
+
 
 class TestRunnerKnowsAboutSurveyInstruments:
-    def test_survey_sections_are_recognised(self):
-        """The hardcoded five-section tuple is what kept the survey half out
-        of scheduled experiments entirely."""
-        import inspect
+    """Behavioral coverage for setup_run() actually wiring gantry/gocator in
+    — not just source-text matching, which would pass even if the section
+    were recognised but never instantiated, connected, or scheduled."""
 
-        from laguna.experiment import runner
+    def _config_path(self, tmp_path, gocator_scan_cfg=None):
+        import yaml
 
-        source = inspect.getsource(runner.setup_run)
-        for section in ("gantry", "gocator"):
-            assert f'"{section}"' in source, f"{section} still absent from setup_run"
+        cfg = {
+            "gantry": {"host": "gantry.lab", "type": "pi"},
+            "gocator": {
+                "ip": "192.168.1.10",
+                "interval_s": 30,
+                **(gocator_scan_cfg or {}),
+            },
+        }
+        path = tmp_path / "experiment_config.yaml"
+        path.write_text(yaml.safe_dump(cfg))
+        return str(path)
+
+    def _patch_survey_subsystems(self, monkeypatch, gantry, scanner):
+        monkeypatch.setattr(
+            "laguna.robot.macron.controller.GantryController.from_config",
+            classmethod(lambda cls, config: gantry),
+        )
+        monkeypatch.setattr(
+            "laguna.scanner.GocatorScanner.from_config",
+            classmethod(lambda cls, config: scanner),
+        )
+
+    def test_gantry_and_gocator_are_actually_instantiated_and_registered(
+        self, tmp_path, monkeypatch
+    ):
+        """Not just recognised in setup_run's source — actually built via
+        from_config() and added to the lab as real subsystems."""
+        gantry = FakeGantry()
+        scanner = StubScanner({"ip": "192.168.1.10", "scan": {
+            "axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0,
+        }})
+        self._patch_survey_subsystems(monkeypatch, gantry, scanner)
+
+        from laguna.experiment.runner import setup_run
+
+        lab = setup_run(self._config_path(tmp_path))
+
+        assert lab.gantry is gantry
+        assert lab.gocator is scanner
+
+    def test_gocator_interval_actually_registers_a_recurring_action(
+        self, tmp_path, monkeypatch
+    ):
+        """The point of this workstream: a Gocator scan reaches the
+        scheduler's real _recurring list, the same mechanism every other
+        scheduled subsystem uses — not a parallel code path."""
+        gantry = FakeGantry()
+        scanner = StubScanner({"ip": "192.168.1.10", "scan": {
+            "axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0,
+        }})
+        self._patch_survey_subsystems(monkeypatch, gantry, scanner)
+
+        from laguna.experiment.runner import setup_run
+
+        lab = setup_run(self._config_path(tmp_path))
+
+        gocator_actions = [e for e in lab.scheduler._recurring if e["subsystem"] == "gocator"]
+        assert len(gocator_actions) == 1
+        assert gocator_actions[0]["every"] == 30
+        assert gocator_actions[0]["name"] == "scan"
+
+    def test_the_registered_action_actually_triggers_a_scan_when_fired(
+        self, tmp_path, monkeypatch
+    ):
+        """Firing the registered action must reach GocatorScanner.acquire()
+        — proving it's a live callable, not a stub that happens to satisfy
+        the section/name bookkeeping."""
+        gantry = FakeGantry()
+        scanner = StubScanner({"ip": "192.168.1.10", "scan": {
+            "axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0,
+        }})
+        self._patch_survey_subsystems(monkeypatch, gantry, scanner)
+
+        from laguna.experiment.runner import setup_run
+
+        lab = setup_run(self._config_path(tmp_path))
+        action = next(
+            e["action"] for e in lab.scheduler._recurring if e["subsystem"] == "gocator"
+        )
+        action()
+
+        assert len(scanner.scans) == 1
 
     def test_scheduling_keys_are_validated_for_gocator(self):
         from laguna.experiment.runner import _validate_trigger_config
@@ -194,16 +305,6 @@ class TestRunnerKnowsAboutSurveyInstruments:
         # Mutually exclusive, same rule as every other section.
         with pytest.raises(ValueError):
             _validate_trigger_config("gocator", {"interval_s": 10, "trigger_at": [5]})
-
-    def test_register_action_is_reused_not_reimplemented(self):
-        """_register_action was already subsystem-agnostic; the point of this
-        workstream was to use it, not to write a parallel mechanism."""
-        import inspect
-
-        from laguna.experiment import runner
-
-        source = inspect.getsource(runner.setup_run)
-        assert source.count("_register_action(lab, cfg.get(\"gocator\"") == 1
 
 
 class TestFailuresEscalateRatherThanSkip:

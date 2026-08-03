@@ -167,7 +167,7 @@ spec. Mirrors `RangefinderSubsystem.read_mm()` (`rangefinder/__init__.py:286`) a
 
 **`experiment/runner.py`:**
 - Extend the section tuple (`runner.py:149`) and instantiation chain
-  (`runner.py:172-205`) to cover `gantry`, `gocator`, `od2000`, `wtt12l`.
+  (`runner.py:172-205`) to cover `gantry`, `gocator`.
 - Add action closures beside the existing `_capture_pi`/`_log_gauge` ones
   (`runner.py:229-346`), each writing an event-log row.
 - **Reuse `_register_action()` as-is** (`runner.py:47`) — already subsystem-agnostic,
@@ -176,6 +176,14 @@ spec. Mirrors `RangefinderSubsystem.read_mm()` (`rangefinder/__init__.py:286`) a
 
 **Config:** scheduling keys plus a scan spec in the `gocator:` section, and a
 `gocator` boolean column in the schedule CSV (same idiom as `pi_cameras`).
+
+**`od2000`/`wtt12l` scheduling is deliberately out of scope here.** The stated goal
+was a Gocator scan being schedulable exactly like a camera capture; the rangefinder
+line-scan path (`FlumeLab.acquire_scan()`) is a separate, synchronous entry point,
+not driven through `setup_run()`'s section/schedule machinery. Adding `od2000`/
+`wtt12l` sections would need their own scan-spec shape (a rangefinder pass has no
+Gocator-style `uniform_spacing`/filters to configure) and is a candidate for a
+follow-up workstream, not a silent gap in this one.
 
 ---
 
