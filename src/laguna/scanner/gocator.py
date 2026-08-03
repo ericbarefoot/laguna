@@ -151,6 +151,8 @@ class GocatorScanner(GocatorSettingsMixin):
         self._scan_spec = config.get("scan") or None
         self._data_capacity_bytes = config.get("data_capacity_bytes")
         self._sdk_lib_dir = config.get("sdk_lib_dir")
+        #: Rehearsal mode — synthetic surfaces, no SDK and no sensor.
+        self._simulated = bool(config.get("simulated", False))
         self._output_dir = Path(config.get("output_dir", "./data/scans"))
 
         self._lib: Optional[GoSdkLib] = None
@@ -182,8 +184,14 @@ class GocatorScanner(GocatorSettingsMixin):
         if self._is_connected:
             return True
         try:
-            self._lib = GoSdkLib(self._sdk_lib_dir)
-            logger.info("Loaded GoSdk from %s", self._lib.lib_dir)
+            if self._simulated:
+                from .simulation import SimulatedGoSdkLib
+
+                self._lib = SimulatedGoSdkLib()
+                logger.info("Gocator running SIMULATED — no SDK, no sensor")
+            else:
+                self._lib = GoSdkLib(self._sdk_lib_dir)
+                logger.info("Loaded GoSdk from %s", self._lib.lib_dir)
 
             api = _g.kObject()
             self._lib.call("GoSdk_Construct", byref(api))
@@ -367,21 +375,27 @@ class GocatorScanner(GocatorSettingsMixin):
         lib.call("GoSensor_Trigger", self._sensor)
         logger.info("Gocator software trigger fired")
 
-    def _end_acquisition(self) -> None:
-        """Stop acquisition normally, after a complete surface was received.
-
-        This is the silent counterpart to `_abort_acquisition()` — cleanup
-        after success, not a safety verb, so it does not write a discard
-        note. Kept separate so callers can't accidentally shadow the other.
-        """
-        lib = self._require_connected()
-        lib.call("GoSystem_Stop", self._system)
-        self._is_running = False
-        logger.info("Gocator acquisition stopped")
-
     # ------------------------------------------------------------------
     # Safety verbs (see laguna.safety)
     # ------------------------------------------------------------------
+
+    def _end_acquisition(self) -> None:
+        """Close the data channel after a scan that completed normally.
+
+        Deliberately separate from the safety verbs: those exist to report
+        that data was THROWN AWAY, and a normal completion has thrown away
+        nothing. Sharing one method made every successful scan log a discard,
+        which would drown the real ones in the event log.
+        """
+        if not self._is_running:
+            return
+        try:
+            if self._lib is not None and self._system is not None:
+                self._lib.call("GoSystem_Stop", self._system)
+        except Exception as exc:
+            logger.warning("Error closing the Gocator data channel: %s", exc)
+        finally:
+            self._is_running = False
 
     def _abort_acquisition(self) -> Optional[str]:
         """Stop acquiring and discard anything part-captured.

@@ -881,6 +881,13 @@ class GantryController:
 def _build_transport(config: Dict[str, Any]) -> SnapConnection:
     transport = config.get("transport", "pi_agent")
 
+    if transport == "simulated":
+        # Offline rehearsal — no serial port, no Pi, no PLC. See
+        # laguna.simulation for what this does and does not prove.
+        from ...simulation import SimulatedSnapConnection
+
+        return SimulatedSnapConnection()
+
     if transport == "socket_bridge":
         # Retired path (2026-08-02): a raw TCP<->serial passthrough
         # (serial_bridge.py) hand-started on the Pi. Still buildable if

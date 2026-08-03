@@ -1,9 +1,8 @@
 # Roadmap: co-scripting the survey instruments with the rest of FlumeLab
 
-> Status: **Workstreams 0-3 implemented** (`safety.py`, `motion_arbiter.py`,
-> `run_context.py`, `survey.py`); Workstream 4 still designed only. Written
-> 2026-08-03 alongside the Gocator integration work. Each section below is
-> its own PR.
+> Status: **all five workstreams implemented**, each as its own PR in a
+> stack off `develop`. Written 2026-08-03 alongside the Gocator integration
+> work. None has been validated against hardware yet.
 
 ## Why
 
@@ -249,6 +248,9 @@ dropped:**
 ---
 
 ## Workstream 4 — Offline rehearsal
+
+> **Implemented.** `src/laguna/simulation.py` and
+> `src/laguna/scanner/simulation.py`, behind `FlumeLab(simulate=True)`.
 
 A `simulate=True` flag on `FlumeLab`/`setup_run()` swapping in fake transports, so a
 whole experiment script — schedule, survey plan, timing — can be validated with no
