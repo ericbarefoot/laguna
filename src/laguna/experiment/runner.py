@@ -223,6 +223,11 @@ def setup_run(
     if "gocator" in cfg:
         from laguna.scanner import GocatorScanner
         gocator = GocatorScanner.from_config(cfg["gocator"])
+        if lab.run.root is not None:
+            # Route scans under the run directory rather than the bare
+            # configured output_dir, so a run's whole output tree is one
+            # self-contained artifact — see laguna.run_context.
+            gocator._output_dir = lab.run.path_for("gocator", str(gocator._output_dir))
         lab.add(gocator)
 
     # ------------------------------------------------------------------ #
@@ -421,7 +426,16 @@ def setup_run(
         from laguna.robot.motion_arbiter import MotionBusyError
         from laguna.scanner import ScanNotPossibleError
 
-        gocator._run_stamp = lab.run.stamp(lab.clock.elapsed())
+        # One runtime_s for this whole scan, taken at the start — a pass
+        # takes real time, so "start" and "completion" would otherwise be
+        # two different numbers describing the same scan depending which
+        # artifact you read (scan.metadata's stamp vs. run.json's outputs
+        # vs. the event log). This has to be the start time specifically
+        # because save_scan() reads gocator._run_stamp mid-acquire() to
+        # build the filename and embed it in the surface's own metadata —
+        # it cannot be computed after the fact.
+        runtime_s = lab.clock.elapsed()
+        gocator._run_stamp = lab.run.stamp(runtime_s)
         try:
             scan = gocator.acquire(gantry=gantry)
         except (ScanNotPossibleError, MotionBusyError) as exc:
@@ -429,23 +443,20 @@ def setup_run(
             # all, or something moved the gantry outside the scripted plan —
             # both mean the run is no longer doing what it was told, and
             # continuing just accumulates data under unrecorded conditions.
-            lab.event_log.log(lab.clock.elapsed(), "gocator", "scan",
-                              result=f"error: {exc}")
+            lab.event_log.log(runtime_s, "gocator", "scan", result=f"error: {exc}")
             lab.escalate(f"gocator scan could not run: {exc}")
             return
         except Exception as exc:
-            lab.event_log.log(lab.clock.elapsed(), "gocator", "scan",
-                              result=f"error: {exc}")
+            lab.event_log.log(runtime_s, "gocator", "scan", result=f"error: {exc}")
             lab.escalate(f"gocator scan failed unexpectedly: {exc}")
             return
         if scan is None:
             return
         path = getattr(gocator, "_last_saved_path", None)
         if path:
-            lab.run.record_output("gocator", path, lab.clock.elapsed(),
-                                  points=scan.valid_count)
+            lab.run.record_output("gocator", path, runtime_s, points=scan.valid_count)
         lab.event_log.log(
-            lab.clock.elapsed(), "gocator", "scan",
+            runtime_s, "gocator", "scan",
             result=f"points={scan.valid_count}",
             notes=f"file={path}" if path else "",
         )

@@ -1521,6 +1521,26 @@ class TestSaveScan:
         )
         scanner.save_scan(scan, formats=("npz",))
 
+    def test_two_scans_in_the_same_second_do_not_collide(self, tmp_path, monkeypatch):
+        """Auto-generated names used to have only second resolution — two
+        scans saved within the same wall-clock second silently overwrote
+        each other. Exercised for real (no name= given), not just checked
+        for a '%f' in the format string.
+
+        Resolution is milliseconds, not microseconds (see save_scan()), so a
+        short sleep guarantees the two calls land in different milliseconds
+        — without it this is a race between two back-to-back in-memory
+        writes and the boundary they need to cross.
+        """
+        import time
+
+        scanner = self._scanner(tmp_path, monkeypatch)
+        first = scanner.save_scan(make_scan(), formats=("npz",))
+        time.sleep(0.005)
+        second = scanner.save_scan(make_scan(), formats=("npz",))
+        assert first["npz"] != second["npz"]
+        assert first["npz"].exists() and second["npz"].exists()
+
 
 class TestSurfaceScan:
     def test_to_points_drops_invalid_by_default(self):

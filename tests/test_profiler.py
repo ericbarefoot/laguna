@@ -323,6 +323,24 @@ class TestProfilerScan:
         assert held_during["start"] is True
         assert gantry.arbiter.is_held is False, "must release once the scan completes"
 
+    def test_two_scans_in_the_same_second_do_not_collide(self, tmp_path):
+        """Auto-generated names used to have only second resolution — two
+        scans saved within the same wall-clock second silently overwrote
+        each other. Exercised for real, not just checked for a '%f' in the
+        format string.
+
+        Resolution is milliseconds, not microseconds, so a short sleep
+        guarantees the two runs land in different milliseconds — without it
+        this is a race against the boundary they need to cross.
+        """
+        import time
+
+        first, _, _ = self._run_scan(tmp_path)
+        time.sleep(0.005)
+        second, _, _ = self._run_scan(tmp_path)
+        assert first.path != second.path
+        assert first.path.exists() and second.path.exists()
+
 
 class TestProfilerStop:
     def test_stop_calls_stop_scan(self):
