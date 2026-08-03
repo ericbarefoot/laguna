@@ -68,6 +68,13 @@ kIP_VERSION_4 = 4  # Io/kNetwork.h:28
 
 GO_ROLE_MAIN = 0  # GoSdkDef.h:202
 
+# GoSpacingIntervalType — the X-resampling bin-size presets the web UI shows
+# as Resolution / Balanced / Speed, plus an explicit custom value.
+GO_SPACING_INTERVAL_TYPE_MAX_RES = 0
+GO_SPACING_INTERVAL_TYPE_BALANCED = 1
+GO_SPACING_INTERVAL_TYPE_MAX_SPEED = 2
+GO_SPACING_INTERVAL_TYPE_CUSTOM = 3
+
 # GoMode
 GO_MODE_SURFACE = 3  # GoSdkDef.h:281
 
@@ -309,6 +316,62 @@ class GoSdkLib:
         sig(go, "GoSetup_EnableUniformSpacing", kStatus, kObject, kBool)
         sig(go, "GoSetup_UniformSpacingEnabled", kBool, kObject)
         sig(go, "GoSetup_SurfaceGeneration", kObject, kObject)
+
+        # Active area — the sensor's region of interest, in mm. Shrinking it
+        # (especially in Z) is the documented way to raise the frame-rate
+        # ceiling, since fewer camera rows have to be read out per profile.
+        # Every one of these takes a GoRole (GO_ROLE_MAIN); introduced in
+        # firmware 4.0.10.27.
+        for _axis in ("X", "Y", "Z", "Width", "Length", "Height"):
+            sig(go, f"GoSetup_SetActiveArea{_axis}", kStatus, kObject, k32s, k64f)
+            sig(go, f"GoSetup_ActiveArea{_axis}", k64f, kObject, k32s)
+            sig(go, f"GoSetup_ActiveArea{_axis}LimitMin", k64f, kObject, k32s)
+            sig(go, f"GoSetup_ActiveArea{_axis}LimitMax", k64f, kObject, k32s)
+
+        # Subsampling — the x/z resolution divider (1 = full, 2 = half,
+        # 4 = quarter). Fewer pixels read out per profile, so like the active
+        # area this raises the frame-rate ceiling. OptionCount/OptionAt
+        # enumerate the divisors this sensor actually supports, so callers
+        # never have to guess. Role-taking, unlike the filters below.
+        for _axis in ("X", "Z"):
+            sig(go, f"GoSetup_Set{_axis}Subsampling", kStatus, kObject, k32s, k32u)
+            sig(go, f"GoSetup_{_axis}Subsampling", k32u, kObject, k32s)
+            sig(go, f"GoSetup_{_axis}SubsamplingOptionCount", kSize, kObject, k32s)
+            sig(go, f"GoSetup_{_axis}SubsamplingOptionAt", k32u, kObject, k32s, kSize)
+            sig(go, f"GoSetup_{_axis}SubsamplingUsed", kBool, kObject, k32s)
+            sig(go, f"GoSetup_{_axis}SubsamplingSystemValue", k32u, kObject, k32s)
+
+        # Spacing interval — the X resampling bin size used when uniform
+        # spacing is on. Type selects the MAX_RES/BALANCED/MAX_SPEED presets
+        # or CUSTOM (then SetSpacingInterval gives the explicit value, mm).
+        # NOTE the header marks SetSpacingInterval "Supported with G3"; this
+        # 2690 is G2, so treat availability as a live question, not a given —
+        # GoSetup_SpacingIntervalUsed answers it.
+        sig(go, "GoSetup_SetSpacingInterval", kStatus, kObject, k32s, k64f)
+        sig(go, "GoSetup_SpacingInterval", k64f, kObject, k32s)
+        sig(go, "GoSetup_SpacingIntervalLimitMin", k64f, kObject, k32s)
+        sig(go, "GoSetup_SpacingIntervalLimitMax", k64f, kObject, k32s)
+        sig(go, "GoSetup_SpacingIntervalUsed", kBool, kObject, k32s)
+        sig(go, "GoSetup_SpacingIntervalSystemValue", k64f, kObject, k32s)
+        sig(go, "GoSetup_SetSpacingIntervalType", kStatus, kObject, k32s, k32s)
+        sig(go, "GoSetup_SpacingIntervalType", k32s, kObject, k32s)
+        sig(go, "GoSetup_SpacingIntervalTypeUsed", kBool, kObject, k32s)
+
+        # Filters. These operate on the resampled grid, so they only apply
+        # with uniform spacing on — GoSetup_*Used reports exactly that
+        # ("whether <filter> can be used for the current scan mode and device
+        # family"), which is what GocatorScanner checks before writing.
+        # Windows are in mm. NOTE: unlike everything above, these take NO
+        # GoRole — an easy signature to get wrong.
+        for _axis in ("X", "Y"):
+            for _filt in ("Smoothing", "Median", "Decimation", "GapFilling"):
+                sig(go, f"GoSetup_Enable{_axis}{_filt}", kStatus, kObject, kBool)
+                sig(go, f"GoSetup_{_axis}{_filt}Enabled", kBool, kObject)
+                sig(go, f"GoSetup_{_axis}{_filt}Used", kBool, kObject)
+                sig(go, f"GoSetup_Set{_axis}{_filt}Window", kStatus, kObject, k64f)
+                sig(go, f"GoSetup_{_axis}{_filt}Window", k64f, kObject)
+                sig(go, f"GoSetup_{_axis}{_filt}WindowLimitMin", k64f, kObject)
+                sig(go, f"GoSetup_{_axis}{_filt}WindowLimitMax", k64f, kObject)
 
         # --- GoTransform.h (travel speed for encoderless scanning) ---
         sig(go, "GoTransform_SetSpeed", kStatus, kObject, k64f)

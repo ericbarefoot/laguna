@@ -23,13 +23,15 @@ assumption is wrong, not the test):
 from __future__ import annotations
 
 import ctypes
+import re
 import time
 
 import numpy as np
 import pytest
 
 from laguna.scanner import gosdk as g
-from laguna.scanner.gocator import GocatorScanner
+from laguna.scanner.gocator import GocatorScanner, UniformSpacingRequiredError
+from laguna.scanner.mounting import SensorMounting
 from laguna.scanner.pointcloud import SurfaceScan
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,7 @@ class FakeGo:
         # Sensor-side state the subsystem reads back.
         self.travel_speed = 0.0
         self.frame_rate = 0.0
+        self.max_frame_rate_enabled = False
         self.trigger_source = -1
         self.scan_mode = -1
         self.generation_type = -1
@@ -72,6 +75,33 @@ class FakeGo:
         # FOV/exposure), not the datasheet headline rate.
         self.frame_rate_limit_min = 0.001
         self.frame_rate_limit_max = 443.127
+        # Active area (mm): origin + extents, plus per-field limits. Roughly
+        # the 2690's full field of view, so shrinking it in tests is realistic.
+        self.active_area = {
+            "x": 0.0, "y": 0.0, "z": 500.0,
+            "width": 2000.0, "length": 200.0, "height": 1550.0,
+        }
+        # Subsampling: the divider options this "sensor" offers, matching the
+        # real 2690 read on 2026-08-02 (X: 1/2/4, Z: 1/2/4/8).
+        self.x_subsampling = 1
+        self.z_subsampling = 1
+        self.x_subsampling_options = [1, 2, 4]
+        self.z_subsampling_options = [1, 2, 4, 8]
+        self.uniform_spacing_enabled = True
+        self.spacing_interval = 0.124
+        self.spacing_interval_type = g.GO_SPACING_INTERVAL_TYPE_MAX_RES
+        self.spacing_interval_limits = (0.123, 1.1)
+        # filter name -> [enabled, window_mm]; limits mirror the real unit's.
+        self.filters = {
+            f"{a}{k}": [False, 5.0]
+            for a in ("X", "Y")
+            for k in ("Smoothing", "Median", "Decimation", "GapFilling")
+        }
+        self.filter_window_limits = (0.261, 2001.087)
+        self.active_area_limits = {
+            "x": (-1000.0, 1000.0), "y": (-1000.0, 1000.0), "z": (0.0, 2000.0),
+            "width": (1.0, 2000.0), "length": (1.0, 5000.0), "height": (1.0, 1550.0),
+        }
         #: Datasets to serve from GoSystem_ReceiveData, one per call.
         self.datasets: list = []
         self._dataset_index = 0
@@ -81,13 +111,180 @@ class FakeGo:
     def _record(self, name, args):
         self._owner.calls.append((name, args))
 
+    # -- uniform spacing / subsampling / spacing interval / filters --------
+
+    def GoSetup_EnableUniformSpacing(self, setup, enabled):
+        self._record("GoSetup_EnableUniformSpacing", (setup, enabled))
+        self.uniform_spacing_enabled = bool(_val(enabled))
+        return g.kOK
+
+    def GoSetup_UniformSpacingEnabled(self, setup):
+        return g.kTRUE if self.uniform_spacing_enabled else g.kFALSE
+
+    def GoSetup_SetXSubsampling(self, setup, role, value):
+        self._record("GoSetup_SetXSubsampling", (setup, role, value))
+        self.x_subsampling = int(_val(value))
+        return g.kOK
+
+    def GoSetup_SetZSubsampling(self, setup, role, value):
+        self._record("GoSetup_SetZSubsampling", (setup, role, value))
+        self.z_subsampling = int(_val(value))
+        return g.kOK
+
+    def GoSetup_XSubsampling(self, setup, role):
+        return self.x_subsampling
+
+    def GoSetup_ZSubsampling(self, setup, role):
+        return self.z_subsampling
+
+    def GoSetup_XSubsamplingOptionCount(self, setup, role):
+        return len(self.x_subsampling_options)
+
+    def GoSetup_ZSubsamplingOptionCount(self, setup, role):
+        return len(self.z_subsampling_options)
+
+    def GoSetup_XSubsamplingOptionAt(self, setup, role, index):
+        return self.x_subsampling_options[int(_val(index))]
+
+    def GoSetup_ZSubsamplingOptionAt(self, setup, role, index):
+        return self.z_subsampling_options[int(_val(index))]
+
+    def GoSetup_XSubsamplingSystemValue(self, setup, role):
+        return 1
+
+    def GoSetup_ZSubsamplingSystemValue(self, setup, role):
+        return 1
+
+    def GoSetup_SetSpacingInterval(self, setup, role, value):
+        self._record("GoSetup_SetSpacingInterval", (setup, role, value))
+        self.spacing_interval = float(_val(value))
+        return g.kOK
+
+    def GoSetup_SpacingInterval(self, setup, role):
+        return self.spacing_interval
+
+    def GoSetup_SetSpacingIntervalType(self, setup, role, value):
+        self._record("GoSetup_SetSpacingIntervalType", (setup, role, value))
+        self.spacing_interval_type = int(_val(value))
+        return g.kOK
+
+    def GoSetup_SpacingIntervalType(self, setup, role):
+        return self.spacing_interval_type
+
+    def GoSetup_SpacingIntervalLimitMin(self, setup, role):
+        return self.spacing_interval_limits[0]
+
+    def GoSetup_SpacingIntervalLimitMax(self, setup, role):
+        return self.spacing_interval_limits[1]
+
+    def GoSetup_SpacingIntervalSystemValue(self, setup, role):
+        return 0.261
+
+    def GoSetup_SpacingIntervalUsed(self, setup, role):
+        return g.kFALSE
+
     def __getattr__(self, name):
         # Only reached for names not defined below.
+        active_area = self._active_area_accessor(name)
+        if active_area is not None:
+            return active_area
+
+        filt = self._filter_accessor(name)
+        if filt is not None:
+            return filt
+
         def stub(*args):
             self._record(name, args)
             return g.kOK
 
         return stub
+
+    def _filter_accessor(self, name):
+        """Serve the 56 GoSetup_*<filter>* entry points from a dict.
+
+        Crucially, ``*Used`` tracks uniform spacing — that is the real
+        sensor's behaviour (measured 2026-08-02: every Used flag flips 0 -> 1
+        with uniform spacing), and it's what the scanner's guard relies on.
+        Note these take NO GoRole, unlike subsampling/active area.
+        """
+        m = re.fullmatch(
+            r"GoSetup_(Enable|Set)?(X|Y)(Smoothing|Median|Decimation|GapFilling)"
+            r"(Enabled|Used|Window|WindowLimitMin|WindowLimitMax)?",
+            name,
+        )
+        if not m:
+            return None
+        verb, axis, kind, prop = m.groups()
+        key = f"{axis}{kind}"
+
+        if verb == "Enable" and prop is None:
+            def enable(setup, enabled):
+                self._record(name, (setup, enabled))
+                self.filters[key][0] = bool(_val(enabled))
+                return g.kOK
+
+            return enable
+
+        if verb == "Set" and prop == "Window":
+            def set_window(setup, window):
+                self._record(name, (setup, window))
+                self.filters[key][1] = float(_val(window))
+                return g.kOK
+
+            return set_window
+
+        if verb is not None:
+            return None
+
+        def getter(setup):
+            if prop == "Enabled":
+                return g.kTRUE if self.filters[key][0] else g.kFALSE
+            if prop == "Used":
+                return g.kTRUE if self.uniform_spacing_enabled else g.kFALSE
+            if prop == "Window":
+                return self.filters[key][1]
+            if prop == "WindowLimitMin":
+                return self.filter_window_limits[0]
+            if prop == "WindowLimitMax":
+                return self.filter_window_limits[1]
+            return None
+
+        return getter if prop else None
+
+    def _active_area_accessor(self, name):
+        """Serve the 24 GoSetup_*ActiveArea* entry points from a dict.
+
+        Six fields x {set, get, limit min, limit max} is a lot of near-identical
+        stubs; matching the name keeps the fake honest about the real SDK's
+        shape (every one takes a GoRole and works in mm) without the bulk.
+        """
+        m = re.fullmatch(
+            r"GoSetup_(Set)?ActiveArea(X|Y|Z|Width|Length|Height)(LimitMin|LimitMax)?",
+            name,
+        )
+        if not m:
+            return None
+        is_setter, field, limit = m.group(1), m.group(2).lower(), m.group(3)
+
+        if is_setter:
+            if limit:  # no such thing as a settable limit
+                return None
+
+            def setter(setup, role, value):
+                self._record(name, (setup, role, value))
+                self.active_area[field] = float(_val(value))
+                return g.kOK
+
+            return setter
+
+        def getter(setup, role):
+            if limit == "LimitMin":
+                return self.active_area_limits[field][0]
+            if limit == "LimitMax":
+                return self.active_area_limits[field][1]
+            return self.active_area[field]
+
+        return getter
 
     # -- handle accessors ------------------------------------------------
 
@@ -118,6 +315,15 @@ class FakeGo:
     def GoSetup_SetFrameRate(self, setup, rate):
         self._record("GoSetup_SetFrameRate", (setup, rate))
         self.frame_rate = float(_val(rate))
+        return g.kOK
+
+    def GoSetup_EnableMaxFrameRate(self, setup, enabled):
+        self._record("GoSetup_EnableMaxFrameRate", (setup, enabled))
+        self.max_frame_rate_enabled = bool(_val(enabled))
+        if self.max_frame_rate_enabled:
+            # Mirrors real hardware: enabling max-frame-rate mode snaps the
+            # sensor's actual rate to its current ceiling.
+            self.frame_rate = self.frame_rate_limit_max
         return g.kOK
 
     def GoTransform_SetSpeed(self, transform, value):
@@ -487,6 +693,63 @@ class TestConfigure:
         applied = scanner.configure(frame_rate_hz=200.0)
         assert applied["frame_rate_hz"] == pytest.approx(180.0)
 
+    def test_frame_rate_max_enables_mode_and_reads_back_achieved_rate(self, scanner):
+        """frame_rate_max=True must explicitly (re-)enable max-frame-rate
+        mode rather than assume it's already on, and use whatever the
+        sensor reports afterward for Y-spacing bookkeeping — not a fixed
+        assumed number, since the ceiling is dynamic."""
+        applied = scanner.configure(frame_rate_max=True)
+        assert scanner._fake.go.max_frame_rate_enabled is True
+        assert applied["frame_rate_max"] is True
+        assert applied["frame_rate_hz"] == pytest.approx(
+            scanner._fake.go.frame_rate_limit_max
+        )
+        assert not any(
+            name == "GoSetup_SetFrameRate" for name in scanner._fake.call_names()
+        )
+
+    def test_frame_rate_max_reflected_in_status(self, scanner):
+        scanner.configure(frame_rate_max=True)
+        status = scanner.get_status()
+        assert status["frame_rate_max"] is True
+
+    def test_frame_rate_max_overrides_a_prior_explicit_rate(self, scanner):
+        """A previous configure(frame_rate_hz=...) call must not leak into a
+        later frame_rate_max=True call via self._frame_rate_hz."""
+        scanner.configure(frame_rate_hz=300.0)
+        applied = scanner.configure(frame_rate_max=True)
+        assert applied["frame_rate_max"] is True
+        assert applied["frame_rate_hz"] == pytest.approx(
+            scanner._fake.go.frame_rate_limit_max
+        )
+
+    def test_frame_rate_hz_and_frame_rate_max_are_mutually_exclusive(self, scanner):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            scanner.configure(frame_rate_hz=200.0, frame_rate_max=True)
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_uniform_spacing_kwarg_reaches_the_sensor(self, scanner, enabled):
+        """uniform_spacing selects the message type the sensor emits —
+        UNIFORM_SURFACE (resampled heightmap) vs SURFACE_POINT_CLOUD (native
+        per-point x/y/z) — so it must be settable per call, not config-only."""
+        scanner.configure(uniform_spacing=enabled)
+        calls = dict(
+            (name, args)
+            for name, args in scanner._fake.calls
+            if name == "GoSetup_EnableUniformSpacing"
+        )
+        assert _val(calls["GoSetup_EnableUniformSpacing"][1]) == (
+            g.kTRUE if enabled else g.kFALSE
+        )
+        assert scanner.get_status()["uniform_spacing"] is enabled
+
+    def test_uniform_spacing_untouched_when_not_given(self, scanner):
+        scanner.configure()
+        assert not any(
+            name == "GoSetup_EnableUniformSpacing"
+            for name, _ in scanner._fake.calls
+        )
+
     def test_flush_pushes_config_last(self, scanner):
         """GoSensor_Flush must come after the setters that need pushing."""
         scanner.configure()
@@ -693,6 +956,29 @@ class TestScanWithGantry:
         assert scanner._fake.go.travel_speed == pytest.approx(7.5)
         assert gantry.calls[0] == ("set_speed", "X", 7.5)
 
+    def test_fixed_length_derived_from_end_mm_and_start_position(self, scanner):
+        """fixed_length_mm must track the actual commanded distance, not
+        whatever gocator.fixed_length_mm the config happened to have — the
+        fixture's config default is 200.0, FakeGantry starts every axis at
+        0.0, so end_mm=80.0 implies 80.0 mm of travel and must override it."""
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry()
+        scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=80.0, feed_rate_mm_s=20.0, settle_s=0.0
+        )
+        assert scanner._fake.go.fixed_length == pytest.approx(80.0)
+
+    def test_explicit_fixed_length_overrides_derivation(self, scanner):
+        """An explicit fixed_length_mm wins over the end_mm-derived value —
+        for deliberately scanning only part of a longer traverse."""
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry()
+        scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0,
+            fixed_length_mm=50.0,
+        )
+        assert scanner._fake.go.fixed_length == pytest.approx(50.0)
+
     def test_unknown_axis_rejected(self, scanner):
         gantry = FakeGantry()
         with pytest.raises(KeyError, match="not configured"):
@@ -789,6 +1075,440 @@ def make_scan(**meta) -> SurfaceScan:
     )
 
 
+class TestActiveArea:
+    """Active area (region of interest) — the main lever for scan speed.
+
+    Shrinking it, especially in Z, raises the frame-rate ceiling because the
+    camera reads out fewer rows per profile. GoSetup_*ActiveArea* takes a
+    GoRole and works in mm; introduced in firmware 4.0.10.27.
+    """
+
+    def test_get_reports_values_and_live_limits(self, scanner):
+        area = scanner.get_active_area()
+        assert area["height_mm"] == pytest.approx(1550.0)
+        assert area["z_mm"] == pytest.approx(500.0)
+        # Limits must come from the sensor, not a hardcoded datasheet figure.
+        assert area["height_limit_max"] == pytest.approx(1550.0)
+        assert area["width_limit_min"] == pytest.approx(1.0)
+
+    def test_set_writes_only_the_given_fields(self, scanner):
+        scanner.set_active_area(height=200.0, z=300.0)
+        names = scanner._fake.call_names()
+        assert "GoSetup_SetActiveAreaHeight" in names
+        assert "GoSetup_SetActiveAreaZ" in names
+        assert "GoSetup_SetActiveAreaWidth" not in names
+        assert scanner._fake.go.active_area["height"] == pytest.approx(200.0)
+        assert scanner._fake.go.active_area["width"] == pytest.approx(2000.0)
+
+    def test_set_passes_go_role_main(self, scanner):
+        """Every active-area entry point takes a GoRole; the main sensor is 0."""
+        scanner.set_active_area(height=100.0)
+        args = dict(
+            (name, a) for name, a in scanner._fake.calls
+            if name == "GoSetup_SetActiveAreaHeight"
+        )["GoSetup_SetActiveAreaHeight"]
+        assert _val(args[1]) == g.GO_ROLE_MAIN
+
+    def test_set_flushes_by_default(self, scanner):
+        scanner.set_active_area(height=100.0)
+        assert "GoSensor_Flush" in scanner._fake.call_names()
+
+    def test_set_can_defer_the_flush(self, scanner):
+        scanner.set_active_area(height=100.0, flush=False)
+        assert "GoSensor_Flush" not in scanner._fake.call_names()
+
+    def test_value_outside_sensor_limits_rejected(self, scanner):
+        with pytest.raises(ValueError, match="outside the sensor's supported range"):
+            scanner.set_active_area(height=5000.0)   # limit max is 1550
+
+    def test_nothing_written_when_any_value_is_invalid(self, scanner):
+        """Validate all fields before writing any — a half-applied ROI would
+        silently clip the scan instead of failing outright."""
+        with pytest.raises(ValueError):
+            scanner.set_active_area(height=200.0, width=99999.0)
+        assert not any(
+            n.startswith("GoSetup_SetActiveArea") for n in scanner._fake.call_names()
+        )
+        assert scanner._fake.go.active_area["height"] == pytest.approx(1550.0)
+
+    def test_no_fields_given_raises(self, scanner):
+        with pytest.raises(ValueError, match="at least one of"):
+            scanner.set_active_area()
+
+    def test_returns_the_readback_not_the_request(self, scanner):
+        applied = scanner.set_active_area(height=250.0)
+        assert applied["height_mm"] == pytest.approx(250.0)
+        assert "height_limit_max" in applied
+
+    def test_configure_applies_active_area_from_kwarg(self, scanner):
+        scanner.configure(active_area={"height": 150.0, "z": 400.0})
+        assert scanner._fake.go.active_area["height"] == pytest.approx(150.0)
+        assert scanner._fake.go.active_area["z"] == pytest.approx(400.0)
+
+    def test_configure_applies_active_area_from_config(self, monkeypatch):
+        fake = FakeLib()
+        monkeypatch.setattr(
+            "laguna.scanner.gocator.GoSdkLib", lambda lib_dir=None: fake
+        )
+        s = GocatorScanner(
+            {"ip": "192.168.1.10", "active_area": {"height": 120.0}}
+        )
+        assert s.connect() is True
+        s.configure()
+        assert fake.go.active_area["height"] == pytest.approx(120.0)
+
+    def test_configure_sets_active_area_before_frame_rate(self, scanner):
+        """The frame-rate ceiling depends on the active area, so validating
+        the rate against a pre-shrink limit would check the wrong number."""
+        scanner.configure(active_area={"height": 100.0}, frame_rate_hz=300.0)
+        names = scanner._fake.call_names()
+        assert names.index("GoSetup_SetActiveAreaHeight") < names.index(
+            "GoSetup_SetFrameRate"
+        )
+
+    def test_configure_leaves_active_area_alone_when_unset(self, scanner):
+        scanner.configure()
+        assert not any(
+            n.startswith("GoSetup_SetActiveArea") for n in scanner._fake.call_names()
+        )
+
+    def test_status_reports_the_active_area(self, scanner):
+        """It governs the frame-rate ceiling status already reports, so the
+        two belong together."""
+        scanner.set_active_area(height=180.0)
+        area = scanner.get_status()["sensor_active_area_mm"]
+        assert area["height"] == pytest.approx(180.0)
+        assert set(area) == {"x", "y", "z", "width", "length", "height"}
+
+
+class TestSubsampling:
+    """X/Z resolution dividers. Measured on hardware 2026-08-02: x=2 and x=4
+    scale the frame-rate ceiling by exactly 2.000x/4.000x, in BOTH uniform
+    and point-cloud modes; z subsampling had no effect on rate at all."""
+
+    def test_get_reports_current_and_supported_options(self, scanner):
+        sub = scanner.get_subsampling()
+        assert sub["x"] == 1
+        assert sub["x_options"] == [1, 2, 4]
+        assert sub["z_options"] == [1, 2, 4, 8]
+
+    def test_set_applies_dividers(self, scanner):
+        scanner.set_subsampling(x=4, z=2)
+        assert scanner._fake.go.x_subsampling == 4
+        assert scanner._fake.go.z_subsampling == 2
+
+    def test_unsupported_divider_rejected_against_live_options(self, scanner):
+        with pytest.raises(ValueError, match="not offered by this sensor"):
+            scanner.set_subsampling(x=3)
+
+    def test_works_in_point_cloud_mode(self, scanner):
+        """Deliberately NOT gated on uniform spacing — confirmed on hardware
+        to scale the ceiling with uniform spacing off too."""
+        scanner.configure(uniform_spacing=False)
+        scanner.set_subsampling(x=2)
+        assert scanner._fake.go.x_subsampling == 2
+
+    def test_no_args_raises(self, scanner):
+        with pytest.raises(ValueError, match="needs x="):
+            scanner.set_subsampling()
+
+    def test_configure_applies_subsampling(self, scanner):
+        scanner.configure(subsampling={"x": 4})
+        assert scanner._fake.go.x_subsampling == 4
+
+
+class TestSpacingInterval:
+    def test_get_reports_type_as_words_and_limits(self, scanner):
+        si = scanner.get_spacing_interval()
+        assert si["type"] == "max_res"
+        assert si["limit_max"] == pytest.approx(1.1)
+        assert si["available"] is True
+
+    def test_set_preset_type(self, scanner):
+        applied = scanner.set_spacing_interval(type="max_speed")
+        assert applied["type"] == "max_speed"
+
+    def test_value_implies_custom_type(self, scanner):
+        applied = scanner.set_spacing_interval(value_mm=0.5)
+        assert applied["type"] == "custom"
+        assert applied["value_mm"] == pytest.approx(0.5)
+
+    def test_value_outside_limits_rejected(self, scanner):
+        with pytest.raises(ValueError, match="outside the sensor's supported range"):
+            scanner.set_spacing_interval(value_mm=99.0)
+
+    def test_unknown_type_rejected(self, scanner):
+        with pytest.raises(ValueError, match="unknown"):
+            scanner.set_spacing_interval(type="turbo")
+
+    def test_raises_in_point_cloud_mode(self, scanner):
+        scanner.configure(uniform_spacing=False)
+        with pytest.raises(UniformSpacingRequiredError, match="point-cloud mode"):
+            scanner.set_spacing_interval(type="balanced")
+
+
+class TestFilters:
+    """All eight filters run on the resampled X grid, so all require uniform
+    spacing. The sensor's own GoSetup_*Used flag reports that, and flips 0->1
+    with uniform spacing (verified on hardware 2026-08-02)."""
+
+    def test_get_reports_every_filter_with_windows_and_limits(self, scanner):
+        f = scanner.get_filters()
+        assert set(f) == {
+            "x_smoothing", "x_median", "x_decimation", "x_gap_filling",
+            "y_smoothing", "y_median", "y_decimation", "y_gap_filling",
+        }
+        assert f["x_smoothing"]["available"] is True
+        assert f["x_smoothing"]["enabled"] is False
+        assert f["y_median"]["window_limit_max"] == pytest.approx(2001.087)
+
+    def test_bool_enables_keeping_window(self, scanner):
+        before = scanner.get_filters()["x_median"]["window_mm"]
+        applied = scanner.set_filters(x_median=True)
+        assert applied["x_median"]["enabled"] is True
+        assert applied["x_median"]["window_mm"] == pytest.approx(before)
+
+    def test_number_enables_and_sets_window(self, scanner):
+        applied = scanner.set_filters(y_smoothing=2.5)
+        assert applied["y_smoothing"]["enabled"] is True
+        assert applied["y_smoothing"]["window_mm"] == pytest.approx(2.5)
+
+    def test_false_disables(self, scanner):
+        scanner.set_filters(x_gap_filling=True)
+        applied = scanner.set_filters(x_gap_filling=False)
+        assert applied["x_gap_filling"]["enabled"] is False
+
+    def test_several_at_once(self, scanner):
+        applied = scanner.set_filters(x_smoothing=1.0, y_median=True)
+        assert applied["x_smoothing"]["enabled"] is True
+        assert applied["y_median"]["enabled"] is True
+
+    def test_window_outside_limits_rejected(self, scanner):
+        with pytest.raises(ValueError, match="outside the sensor's supported range"):
+            scanner.set_filters(x_smoothing=99999.0)
+
+    def test_nothing_written_when_any_window_invalid(self, scanner):
+        with pytest.raises(ValueError):
+            scanner.set_filters(x_smoothing=1.0, y_median=99999.0)
+        assert scanner._fake.go.filters["XSmoothing"][0] is False
+
+    def test_unknown_filter_name_rejected(self, scanner):
+        with pytest.raises(ValueError, match="unknown filter"):
+            scanner.set_filters(x_sharpening=True)
+
+    def test_no_filters_given_raises(self, scanner):
+        with pytest.raises(ValueError, match="at least one of"):
+            scanner.set_filters()
+
+    def test_raises_in_point_cloud_mode(self, scanner):
+        scanner.configure(uniform_spacing=False)
+        with pytest.raises(UniformSpacingRequiredError, match="point-cloud mode"):
+            scanner.set_filters(x_smoothing=1.0)
+
+    def test_unavailable_when_uniform_spacing_off(self, scanner):
+        scanner.configure(uniform_spacing=False)
+        assert scanner.get_filters()["x_smoothing"]["available"] is False
+
+
+class TestUniformSpacingGuardInConfigure:
+    """configure() must reject uniform-spacing-only settings against the
+    value THIS call applies, not the sensor's current state — otherwise
+    turning uniform spacing off and passing filters in one call slips past."""
+
+    def test_filters_with_uniform_spacing_false_raises(self, scanner):
+        with pytest.raises(UniformSpacingRequiredError, match="filters"):
+            scanner.configure(uniform_spacing=False, filters={"x_smoothing": 1.0})
+
+    def test_spacing_interval_with_uniform_spacing_false_raises(self, scanner):
+        with pytest.raises(UniformSpacingRequiredError, match="spacing_interval"):
+            scanner.configure(
+                uniform_spacing=False, spacing_interval={"type": "balanced"}
+            )
+
+    def test_reports_both_conflicts_at_once(self, scanner):
+        with pytest.raises(UniformSpacingRequiredError, match="filters and spacing_interval"):
+            scanner.configure(
+                uniform_spacing=False,
+                filters={"x_smoothing": 1.0},
+                spacing_interval={"type": "balanced"},
+            )
+
+    def test_guard_fires_before_any_write(self, scanner):
+        """Not even the unrelated parts of the recipe (scan mode, trigger
+        source) should land — the call must be rejected outright, not
+        half-applied."""
+        with pytest.raises(UniformSpacingRequiredError):
+            scanner.configure(uniform_spacing=False, filters={"x_smoothing": 1.0})
+        wrote = [n for n in scanner._fake.call_names() if n.startswith("GoSetup_")]
+        assert wrote == []
+        assert "GoSensor_Flush" not in scanner._fake.call_names()
+
+    def test_config_level_uniform_spacing_false_also_guarded(self, monkeypatch):
+        """The conflict can come from config rather than the call."""
+        fake = FakeLib()
+        monkeypatch.setattr(
+            "laguna.scanner.gocator.GoSdkLib", lambda lib_dir=None: fake
+        )
+        s = GocatorScanner({"ip": "1.2.3.4", "uniform_spacing": False})
+        assert s.connect() is True
+        with pytest.raises(UniformSpacingRequiredError):
+            s.configure(filters={"x_smoothing": 1.0})
+
+    def test_subsampling_is_not_guarded(self, scanner):
+        """Subsampling works in both modes — gating it would be wrong."""
+        applied = scanner.configure(
+            uniform_spacing=False, subsampling={"x": 4}
+        )
+        assert applied["uniform_spacing"] is False
+        assert scanner._fake.go.x_subsampling == 4
+
+    def test_filters_applied_after_uniform_spacing_is_enabled(self, scanner):
+        """Enabling uniform spacing and setting filters in one call must
+        work: the filters' own availability check has to see the new state."""
+        applied = scanner.configure(
+            uniform_spacing=True, filters={"x_smoothing": 1.5}
+        )
+        assert applied["uniform_spacing"] is True
+        assert scanner._fake.go.filters["XSmoothing"] == [True, 1.5]
+        names = scanner._fake.call_names()
+        assert names.index("GoSetup_EnableUniformSpacing") < names.index(
+            "GoSetup_EnableXSmoothing"
+        )
+
+
+class TestSolveScanRates:
+    """feed_rate = frame_rate * y_spacing. Give any two, get the third;
+    give fewer and the sensor fills in the rest."""
+
+    def test_solves_feed_rate_from_frame_rate_and_spacing(self, scanner):
+        r = scanner.solve_scan_rates(frame_rate_hz=200.0, y_spacing_mm=0.1)
+        assert r["feed_rate_mm_s"] == pytest.approx(20.0)
+
+    def test_solves_frame_rate_from_feed_and_spacing(self, scanner):
+        r = scanner.solve_scan_rates(feed_rate_mm_s=20.0, y_spacing_mm=0.1)
+        assert r["frame_rate_hz"] == pytest.approx(200.0)
+
+    def test_solves_spacing_from_feed_and_frame_rate(self, scanner):
+        r = scanner.solve_scan_rates(feed_rate_mm_s=20.0, frame_rate_hz=200.0)
+        assert r["y_spacing_mm"] == pytest.approx(0.1)
+
+    def test_no_args_gives_fastest_isotropic_feed(self, scanner):
+        """Default: Y spacing == X resolution at the live ceiling, which is
+        the fastest feed that still samples travel at least as finely as
+        across the laser."""
+        r = scanner.solve_scan_rates()
+        ceiling = scanner._fake.go.frame_rate_limit_max
+        x_res = scanner._fake.go.spacing_interval
+        assert r["frame_rate_hz"] == pytest.approx(ceiling)
+        assert r["y_spacing_mm"] == pytest.approx(x_res)
+        assert r["feed_rate_mm_s"] == pytest.approx(ceiling * x_res)
+        assert r["isotropic"] is True
+
+    def test_feed_only_uses_the_live_ceiling(self, scanner):
+        r = scanner.solve_scan_rates(feed_rate_mm_s=20.0)
+        assert r["frame_rate_hz"] == pytest.approx(
+            scanner._fake.go.frame_rate_limit_max
+        )
+
+    def test_reports_the_gantry_travel_axis_not_sensor_y(self, scanner):
+        """The returned feed rate is commanded on a gantry axis, so it must
+        say which one — with the rig's mounting that's X, not Y."""
+        scanner._mounting = SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z")
+        assert scanner.solve_scan_rates()["travel_axis"] == "X"
+
+    def test_default_travel_axis_is_y(self, scanner):
+        assert scanner.solve_scan_rates()["travel_axis"] == "Y"
+
+    def test_frame_rate_above_live_ceiling_rejected(self, scanner):
+        with pytest.raises(ValueError, match="exceeds the sensor's live ceiling"):
+            scanner.solve_scan_rates(frame_rate_hz=99999.0, y_spacing_mm=0.1)
+
+    def test_inconsistent_triple_rejected(self, scanner):
+        with pytest.raises(ValueError, match="inconsistent"):
+            scanner.solve_scan_rates(
+                feed_rate_mm_s=1.0, frame_rate_hz=10.0, y_spacing_mm=5.0
+            )
+
+    def test_consistent_triple_accepted(self, scanner):
+        r = scanner.solve_scan_rates(
+            feed_rate_mm_s=20.0, frame_rate_hz=200.0, y_spacing_mm=0.1
+        )
+        assert r["y_spacing_mm"] == pytest.approx(0.1)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"feed_rate_mm_s": -1.0}, {"frame_rate_hz": 0.0}, {"y_spacing_mm": -0.5}],
+    )
+    def test_non_positive_values_rejected(self, scanner, kwargs):
+        with pytest.raises(ValueError, match="must be positive"):
+            scanner.solve_scan_rates(**kwargs)
+
+    def test_aspect_ratio_flags_anisotropic_sampling(self, scanner):
+        x_res = scanner._fake.go.spacing_interval
+        r = scanner.solve_scan_rates(frame_rate_hz=100.0, y_spacing_mm=x_res * 4)
+        assert r["aspect_ratio"] == pytest.approx(4.0)
+        assert r["isotropic"] is False
+
+    def test_explicit_x_resolution_overrides_the_sensor(self, scanner):
+        r = scanner.solve_scan_rates(frame_rate_hz=100.0, x_resolution_mm=0.5)
+        assert r["x_resolution_mm"] == pytest.approx(0.5)
+        assert r["y_spacing_mm"] == pytest.approx(0.5)
+
+
+class TestSaveScan:
+    """GocatorScanner.save_scan() format dispatch."""
+
+    def _scanner(self, tmp_path, monkeypatch):
+        fake = FakeLib()
+        monkeypatch.setattr(
+            "laguna.scanner.gocator.GoSdkLib", lambda lib_dir=None: fake
+        )
+        return GocatorScanner({"ip": "192.168.1.10", "output_dir": str(tmp_path)})
+
+    def test_default_formats_are_npz_and_laz(self, tmp_path, monkeypatch):
+        """CSV used to be in example_08's default set: ~55 s and 1.2 GB for a
+        24M-point scan, versus ~0.5 s and 14 MB for LAZ."""
+        pytest.importorskip("laspy")
+        pytest.importorskip("lazrs")
+        written = self._scanner(tmp_path, monkeypatch).save_scan(make_scan())
+        assert set(written) == {"npz", "laz"}
+        assert all(p.exists() for p in written.values())
+
+    def test_unknown_format_rejected_before_writing_anything(
+        self, tmp_path, monkeypatch
+    ):
+        """Validate up front — a bad name in the list must not leave a
+        half-written set of files behind."""
+        scanner = self._scanner(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="Unknown scan format"):
+            scanner.save_scan(make_scan(), formats=("npz", "nope"))
+        assert list(tmp_path.glob("*")) == []
+
+    def test_point_formats_share_one_to_points_call(self, tmp_path, monkeypatch):
+        """The flattened array runs to hundreds of MB on a real scan, so it
+        must be built once and passed to each writer, not per format."""
+        scanner = self._scanner(tmp_path, monkeypatch)
+        scan = make_scan()
+        calls = {"n": 0}
+        original = scan.to_points
+
+        def counting(*a, **kw):
+            calls["n"] += 1
+            return original(*a, **kw)
+
+        scan.to_points = counting
+        scanner.save_scan(scan, formats=("npz", "ply", "csv"))
+        assert calls["n"] == 1
+
+    def test_npz_only_skips_building_points_entirely(self, tmp_path, monkeypatch):
+        scanner = self._scanner(tmp_path, monkeypatch)
+        scan = make_scan()
+        scan.to_points = lambda *a, **kw: pytest.fail(
+            "npz writes the grid directly; it must not flatten to points"
+        )
+        scanner.save_scan(scan, formats=("npz",))
+
+
 class TestSurfaceScan:
     def test_to_points_drops_invalid_by_default(self):
         points = make_scan().to_points()
@@ -834,6 +1554,71 @@ class TestSurfaceScan:
         loaded = np.load(path, allow_pickle=True)
         assert loaded["z_mm"].shape == (2, 2)
         assert np.isnan(loaded["z_mm"][1, 0])
+
+    def test_to_points_matches_the_meshgrid_path_it_replaced(self):
+        """to_points() indexes x/y by valid cell instead of building full
+        meshgrids and masking after. Pin the equivalence, since the old way
+        is the obviously-correct-but-memory-hungry reference."""
+        scan = make_scan()
+        expected = np.column_stack(
+            [
+                np.meshgrid(scan.x_mm, scan.y_mm)[0].ravel(),
+                np.meshgrid(scan.x_mm, scan.y_mm)[1].ravel(),
+                scan.z_mm.ravel(),
+            ]
+        )
+        expected = expected[~np.isnan(expected[:, 2])]
+        np.testing.assert_array_equal(scan.to_points(), expected)
+
+    def test_to_points_honours_dtype(self):
+        assert make_scan().to_points(dtype=np.float32).dtype == np.float32
+        assert make_scan().to_points().dtype == np.float64
+
+    def test_to_points_on_a_non_uniform_point_cloud(self):
+        """A SURFACE_POINT_CLOUD scan carries per-cell 2-D x/y, so those are
+        masked directly rather than indexed by row/column."""
+        scan = SurfaceScan(
+            z_mm=np.array([[1.0, np.nan], [3.0, 4.0]]),
+            x_mm=np.array([[10.0, 11.0], [12.0, 13.0]]),
+            y_mm=np.array([[20.0, 21.0], [22.0, 23.0]]),
+            is_uniform=False,
+        )
+        points = scan.to_points()
+        assert points.shape == (3, 3)
+        # The NaN cell (row 0, col 1) and its x/y must both be dropped.
+        assert 11.0 not in points[:, 0]
+        np.testing.assert_array_equal(points[0], [10.0, 20.0, 1.0])
+
+    def test_save_las_roundtrips_through_laspy(self, tmp_path):
+        laspy = pytest.importorskip("laspy")
+        scan = make_scan()
+        path = scan.save_las(tmp_path / "scan.las")
+        back = laspy.read(str(path))
+        assert len(back.x) == 3
+        got = np.column_stack([back.x, back.y, back.z])
+        # Sorted compare: LAS preserves order, but the quantisation makes an
+        # exact elementwise compare fragile — assert within the 1e-4 mm scale.
+        np.testing.assert_allclose(got, scan.to_points(), atol=1e-4)
+
+    def test_save_las_infers_compression_from_suffix(self, tmp_path):
+        pytest.importorskip("lazrs")
+        laspy = pytest.importorskip("laspy")
+        path = make_scan().save_las(tmp_path / "scan.laz")
+        assert path.suffix == ".laz"
+        # A readable LAZ proves compression actually engaged.
+        assert len(laspy.read(str(path)).x) == 3
+
+    def test_save_las_handles_an_empty_cloud(self, tmp_path):
+        """min() over zero points would raise — an all-NaN scan must still
+        produce a valid (empty) file rather than blowing up the save."""
+        pytest.importorskip("laspy")
+        scan = SurfaceScan(
+            z_mm=np.full((2, 2), np.nan),
+            x_mm=np.array([0.0, 1.0]),
+            y_mm=np.array([0.0, 1.0]),
+        )
+        path = scan.save_las(tmp_path / "empty.las")
+        assert path.exists()
 
     def test_rescale_y_scales_travel_axis(self):
         """Correcting the assumed velocity rescales Y without a re-scan."""
