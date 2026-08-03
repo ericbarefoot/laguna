@@ -151,6 +151,8 @@ class GocatorScanner(GocatorSettingsMixin):
         self._scan_spec = config.get("scan") or None
         self._data_capacity_bytes = config.get("data_capacity_bytes")
         self._sdk_lib_dir = config.get("sdk_lib_dir")
+        #: Rehearsal mode — synthetic surfaces, no SDK and no sensor.
+        self._simulated = bool(config.get("simulated", False))
         self._output_dir = Path(config.get("output_dir", "./data/scans"))
 
         self._lib: Optional[GoSdkLib] = None
@@ -182,8 +184,14 @@ class GocatorScanner(GocatorSettingsMixin):
         if self._is_connected:
             return True
         try:
-            self._lib = GoSdkLib(self._sdk_lib_dir)
-            logger.info("Loaded GoSdk from %s", self._lib.lib_dir)
+            if self._simulated:
+                from .simulation import SimulatedGoSdkLib
+
+                self._lib = SimulatedGoSdkLib()
+                logger.info("Gocator running SIMULATED — no SDK, no sensor")
+            else:
+                self._lib = GoSdkLib(self._sdk_lib_dir)
+                logger.info("Loaded GoSdk from %s", self._lib.lib_dir)
 
             api = _g.kObject()
             self._lib.call("GoSdk_Construct", byref(api))
@@ -225,11 +233,7 @@ class GocatorScanner(GocatorSettingsMixin):
 
     def disconnect(self) -> None:
         """Stop acquisition if running, then release SDK handles."""
-        if self._is_running:
-            try:
-                self.stop()
-            except GoSdkError as e:
-                logger.warning("Error stopping Gocator during disconnect: %s", e)
+        self._end_acquisition()
         if self._lib and self._sensor is not None:
             try:
                 self._lib.call("GoSensor_Disconnect", self._sensor)
@@ -377,6 +381,24 @@ class GocatorScanner(GocatorSettingsMixin):
     # ------------------------------------------------------------------
     # Safety verbs (see laguna.safety)
     # ------------------------------------------------------------------
+
+    def _end_acquisition(self) -> None:
+        """Close the data channel after a scan that completed normally.
+
+        Deliberately separate from the safety verbs: those exist to report
+        that data was THROWN AWAY, and a normal completion has thrown away
+        nothing. Sharing one method made every successful scan log a discard,
+        which would drown the real ones in the event log.
+        """
+        if not self._is_running:
+            return
+        try:
+            if self._lib is not None and self._system is not None:
+                self._lib.call("GoSystem_Stop", self._system)
+        except Exception as exc:
+            logger.warning("Error closing the Gocator data channel: %s", exc)
+        finally:
+            self._is_running = False
 
     def _abort_acquisition(self) -> Optional[str]:
         """Stop acquiring and discard anything part-captured.
@@ -603,11 +625,8 @@ class GocatorScanner(GocatorSettingsMixin):
             self.trigger()
             return self.receive_surface(timeout_s=timeout_s, metadata=metadata)
         finally:
-            if started_here and self._is_running:
-                try:
-                    self.stop()
-                except GoSdkError as e:
-                    logger.warning("Error stopping after scan: %s", e)
+            if started_here:
+                self._end_acquisition()
 
     def _default_timeout_s(self) -> float:
         """Time for the configured length at the configured speed, +50%."""
@@ -787,11 +806,7 @@ class GocatorScanner(GocatorSettingsMixin):
             self.trigger()
             return self.receive_surface(timeout_s=timeout_s, metadata=meta)
         finally:
-            if self._is_running:
-                try:
-                    self.stop()
-                except GoSdkError as e:
-                    logger.warning("Error stopping after gantry scan: %s", e)
+            self._end_acquisition()
 
     def acquire(self, gantry=None, **overrides: Any) -> Optional[SurfaceScan]:
         """Run one configured scan — a zero-argument entry point for schedulers.

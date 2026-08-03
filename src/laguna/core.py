@@ -50,10 +50,29 @@ class FlumeLab:
         event_log:  Append-only CSV event log
     """
 
-    def __init__(self, config_file: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        config_file: Optional[str] = None,
+        simulate: bool = False,
+    ) -> None:
         logger.info("Initializing FlumeLab system...")
 
         self.config = Config(config_file=config_file)
+
+        #: Rehearsal mode. The scheduler, clock, event log, manifest, frames,
+        #: survey planner and safety verbs are all real — only the wire is
+        #: simulated. See laguna.simulation for what this can and cannot
+        #: catch.
+        self.simulate = simulate
+        if simulate:
+            from .simulation import simulate_config
+
+            self.config.config_dict = simulate_config(self.config.config_dict)
+            logger.warning(
+                "SIMULATION MODE — no hardware will be contacted. Structural "
+                "mistakes (schedules, survey extents, missing config) surface; "
+                "physical ones (mounting signs, unreachable targets) do not."
+            )
 
         # Instrument mounts + the experiment's reference frame. Always
         # present; an absent 'frames:' section yields identity transforms and
