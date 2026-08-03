@@ -19,20 +19,28 @@ the package and wires them to one switch::
 What is real and what is not
 ----------------------------
 **Real:** the scheduler, the clock, the event log, the run manifest, the
-frame transforms, the survey planner, the safety verbs, and every decision
-your config makes. Timing is real too — a 300-second run takes 300 seconds
-unless you speed the clock up.
+frame transforms, the survey planner, and the safety verbs. Timing is real
+too — a 300-second run takes 300 seconds unless you speed the clock up.
 
-**Simulated:** the wire. Serial commands are answered from a small model of
-the controller rather than a PLC, and the Gocator returns synthetic surfaces
-of the right shape and dtype.
+**Simulated (gantry, gocator only):** the wire. Serial commands are answered
+from a small model of the controller rather than a PLC, and the Gocator
+returns synthetic surfaces of the right shape and dtype.
 
-So this catches structural mistakes — a schedule that never fires, a survey
-that overruns, a scan spec missing a key, a subsystem that fails to
-quiesce — and cannot catch physical ones: a mounting sign, a feed rate the
-gantry cannot actually hold, or a target outside the work envelope. It is a
-rehearsal, not a simulator, and the distinction is worth keeping in mind
-when a rehearsed script meets real hardware.
+**Not present at all (weir, flow, gauge, pi_cameras, dslr_cameras,
+od2000/wtt12l):** there is no simulated Modbus VFD, serial stepper, ultrasonic
+sensor, or SSH camera agent yet. ``simulate_config()`` drops these sections
+from the config rather than constructing the real hardware controllers for
+them — a fail-closed guard against a "rehearsal" silently commanding real
+hydraulics, not a simulation of what they would do. A schedule that depends
+on one of these firing is not exercised by simulate=True today.
+
+So this catches structural mistakes in the gantry/gocator half — a schedule
+that never fires, a survey that overruns, a scan spec missing a key, a
+subsystem that fails to quiesce — and cannot catch physical ones (a mounting
+sign, a feed rate the gantry cannot actually hold, a target outside the work
+envelope) or anything involving the dropped subsystems. It is a rehearsal of
+part of the rig, not a simulator of all of it, and the distinction is worth
+keeping in mind when a rehearsed script meets real hardware.
 """
 
 from __future__ import annotations
@@ -167,11 +175,34 @@ def simulated_gocator_lib() -> Any:
     return SimulatedGoSdkLib()
 
 
+#: Config sections with a real simulated transport (see SimulatedSnapConnection
+#: and SimulatedGoSdkLib). Anything else has no simulated backend at all.
+_SIMULATED_SECTIONS = ("gantry", "gocator")
+
+#: Sections that would otherwise construct a real hardware controller with no
+#: simulated backend to fall back to — a Modbus VFD, a serial stepper motor,
+#: an ultrasonic sensor, SSH to a Pi. Dropped under simulate=True rather than
+#: silently connecting to real hardware during what is supposed to be a
+#: rehearsal — a fail-closed guard, not a simulation of what they would do.
+_NO_SIMULATED_BACKEND = ("weir", "flow", "gauge", "pi_cameras", "dslr_cameras",
+                          "od2000", "wtt12l", "wtt12l_powerprox")
+
+
 def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Rewrite a config so every subsystem builds a simulated transport.
 
-    Deliberately does **not** remove subsystems: a rehearsal must exercise
-    the same set the real run would, or it proves nothing about the schedule.
+    Deliberately does **not** remove the gantry/gocator subsystems, which do
+    have simulated backends: a rehearsal must exercise the same set the real
+    run would, or it proves nothing about the schedule.
+
+    Every other subsystem section (weir, flow, gauge, pi_cameras,
+    dslr_cameras, the rangefinders) has **no simulated backend at all** —
+    there is no simulated VFD, stepper, ultrasonic sensor, or SSH camera
+    agent. Constructing the real controller classes for these under
+    simulate=True would silently contact real hardware during what is
+    supposed to be a hardware-free rehearsal, so they are dropped from the
+    config entirely rather than exercised for real. This is a fail-closed
+    guard, not equivalent coverage — see module docstring.
     """
     out = dict(config)
     if "gantry" in out:
@@ -185,6 +216,17 @@ def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         gocator = dict(out["gocator"])
         gocator["simulated"] = True
         out["gocator"] = gocator
+
+    dropped = [s for s in _NO_SIMULATED_BACKEND if s in out]
+    for section in dropped:
+        del out[section]
+    if dropped:
+        logger.warning(
+            "SIMULATION MODE: dropped section(s) %s — no simulated backend "
+            "exists for them yet, so they are excluded rather than "
+            "connecting to real hardware. The rehearsal does not exercise "
+            "their schedules.", dropped,
+        )
     return out
 
 

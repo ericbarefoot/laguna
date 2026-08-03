@@ -74,16 +74,92 @@ class TestSimulateConfig:
     def test_gocator_is_marked_simulated(self):
         assert simulate_config({"gocator": {"ip": "1.2.3.4"}})["gocator"]["simulated"] is True
 
-    def test_subsystems_are_not_removed(self):
-        """A rehearsal must exercise the same set the real run would, or it
-        proves nothing about the schedule."""
-        cfg = {"gantry": {}, "gocator": {}, "weir": {}, "flow": {}}
-        assert set(simulate_config(cfg)) == set(cfg)
+    def test_gantry_and_gocator_are_kept(self):
+        """These have real simulated backends — a rehearsal must exercise
+        them, or it proves nothing about the schedule."""
+        cfg = {"gantry": {}, "gocator": {}}
+        assert set(simulate_config(cfg)) == {"gantry", "gocator"}
+
+    def test_subsystems_with_no_simulated_backend_are_dropped(self):
+        """weir/flow/gauge/cameras/rangefinders have no simulated transport —
+        a Modbus VFD, a serial stepper, an ultrasonic sensor, SSH to a Pi.
+        Constructing the real controller classes for these under
+        simulate=True would silently contact real hardware during what is
+        supposed to be a hardware-free rehearsal, so they must be dropped
+        rather than passed through untouched."""
+        cfg = {
+            "gantry": {}, "gocator": {}, "weir": {}, "flow": {}, "gauge": {},
+            "pi_cameras": {}, "dslr_cameras": {}, "od2000": {}, "wtt12l": {},
+        }
+        out = simulate_config(cfg)
+        assert set(out) == {"gantry", "gocator"}
+
+    def test_no_hardware_sections_left_untouched(self):
+        """The specific defect: simulate_config() used to leave weir/flow (and
+        everything else without a simulated backend) byte-for-byte identical
+        to the input, so setup_run() built the real SaflWeirController/
+        SaflFlowController against real hardware during simulate=True."""
+        cfg = {"weir": {"port": "/dev/ttyUSB0"}}
+        assert "weir" not in simulate_config(cfg)
 
     def test_the_original_config_is_not_mutated(self):
         cfg = {"gantry": {"transport": "pi_agent"}}
         simulate_config(cfg)
         assert cfg["gantry"]["transport"] == "pi_agent"
+
+
+class TestSetupRunSimulation:
+    """setup_run() reads its own local raw-YAML dict to decide which
+    subsystems to build — a separate object from FlumeLab's own
+    lab.config.config_dict. simulate=True has to reach both, or the section
+    check here (`if "weir" in cfg`) still finds it and builds the real
+    controller against real hardware."""
+
+    def _config_path(self, tmp_path):
+        import yaml
+
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.safe_dump({
+            "gantry": {"transport": "pi_agent", "safe_mode": True,
+                       "axes": [{"name": "X", "index": 1}, {"name": "Y", "index": 2}]},
+            "gocator": {"ip": "192.168.1.10"},
+            "weir": {"port": "/dev/ttyUSB0"},
+            "flow": {"vfd_port": "/dev/ttyUSB1"},
+        }))
+        return str(path)
+
+    def test_simulate_flows_through_to_setup_runs_own_subsystem_construction(
+        self, tmp_path, monkeypatch
+    ):
+        from laguna.experiment.runner import setup_run
+
+        constructed = []
+        monkeypatch.setattr(
+            "laguna.weir.SaflWeirController.__init__",
+            lambda self, config: constructed.append("weir"),
+        )
+        monkeypatch.setattr(
+            "laguna.flow.SaflFlowController.__init__",
+            lambda self, config: constructed.append("flow"),
+        )
+
+        lab = setup_run(self._config_path(tmp_path), simulate=True)
+
+        assert constructed == [], "weir/flow must not be constructed under simulate=True"
+        assert "weir" not in lab._subsystems
+        assert "flow" not in lab._subsystems
+
+    def test_gantry_still_gets_simulated_config_through_setup_run(self, tmp_path):
+        from laguna.experiment.runner import setup_run
+
+        lab = setup_run(self._config_path(tmp_path), simulate=True)
+        assert lab.gantry.connect() is True  # succeeds with no hardware present
+
+    def test_speed_factor_requires_simulate(self, tmp_path):
+        from laguna.experiment.runner import setup_run
+
+        with pytest.raises(ValueError, match="simulate=True"):
+            setup_run(self._config_path(tmp_path), speed_factor=10.0)
 
 
 class TestFlumeLabSimulation:

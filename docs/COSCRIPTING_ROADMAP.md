@@ -250,18 +250,27 @@ dropped:**
 ## Workstream 4 — Offline rehearsal
 
 > **Implemented.** `src/laguna/simulation.py` and
-> `src/laguna/scanner/simulation.py`, behind
-> `FlumeLab(simulate=True, speed_factor=...)`.
+> `src/laguna/scanner/simulation.py`, behind `FlumeLab(simulate=True,
+> speed_factor=...)` and `setup_run(simulate=True, speed_factor=...)`. Only
+> gantry/gocator have a simulated backend — see `simulate_config()`'s
+> docstring for what that does and does not cover.
 
 A `simulate=True` flag on `FlumeLab`/`setup_run()` swapping in fake transports, so a
 whole experiment script — schedule, survey plan, timing — can be validated with no
 hardware.
 
-Strong fakes already exist and only need promoting out of `tests/`:
-`FakeSnapConnection` (`tests/macron_fixtures.py`), `FakeLib`/`FakeGo`
-(`tests/test_gocator_scanner.py`), and `GCodeExecutor(dry_run=True)`
-(`robot/macron/gcode.py:529`, currently not surfaced through `GantryController`,
-config, or `FlumeLab`).
+**What actually landed differs from the original plan in two ways, both
+narrower than described below:**
+- `SimulatedSnapConnection` is a fresh, purpose-built model of the OEM-2T
+  protocol (including group→member axis distribution for `C1 BMT`), not a
+  promotion of the test suite's `FakeSnapConnection`
+  (`tests/macron_fixtures.py`) — that fixture is a scripted lookup table,
+  fine for pinning specific command/response pairs in a unit test but not
+  for driving an actual rehearsal.
+- `GCodeExecutor(dry_run=True)` (`robot/macron/gcode.py:529`) was never
+  surfaced through `GantryController`, config, or `FlumeLab` — the
+  simulated-transport approach above replaced it rather than building on
+  it, so `dry_run` remains dead code today.
 
 Highest value per line of code for a rig where a bad schedule costs a flume day.
 
