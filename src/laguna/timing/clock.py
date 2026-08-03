@@ -24,7 +24,20 @@ class ExperimentClock:
         clock.resume()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, speed_factor: float = 1.0) -> None:
+        """
+        Args:
+            speed_factor: Experiment seconds per real second. 1.0 is real
+                time. Above 1.0 the clock runs fast, so an offline rehearsal
+                of a two-hour run finishes in minutes — see
+                laguna.simulation. Only sensible when nothing is waiting on
+                real hardware, since physical motion cannot be sped up.
+        """
+        if speed_factor <= 0:
+            raise ValueError(
+                f"speed_factor must be positive, got {speed_factor}"
+            )
+        self._speed = float(speed_factor)
         #: Called on every pause/resume transition, whoever caused it.
         #: RunContext subscribes so the piecewise runtime<->wall mapping is
         #: recorded no matter which code path paused the clock — Scheduler.
@@ -37,6 +50,11 @@ class ExperimentClock:
         self._pause_start: Optional[float] = None
         self._running: bool = False
         self._paused: bool = False
+
+    @property
+    def speed_factor(self) -> float:
+        """Experiment seconds per real second."""
+        return self._speed
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -101,10 +119,10 @@ class ExperimentClock:
             if self._start_wall is None:
                 return 0.0
             # clock was stopped — return final value
-            return time.time() - self._start_wall - self._pause_offset
+            return (time.time() - self._start_wall - self._pause_offset) * self._speed
         if self._paused:
-            return self._pause_start - self._start_wall - self._pause_offset
-        return time.time() - self._start_wall - self._pause_offset
+            return (self._pause_start - self._start_wall - self._pause_offset) * self._speed
+        return (time.time() - self._start_wall - self._pause_offset) * self._speed
 
     def wall_time(self) -> float:
         """Return current Unix wall time."""
@@ -116,9 +134,9 @@ class ExperimentClock:
         if not self._running or self._start_wall is None:
             return w, 0.0
         if self._paused:
-            rt = self._pause_start - self._start_wall - self._pause_offset
+            rt = (self._pause_start - self._start_wall - self._pause_offset) * self._speed
         else:
-            rt = w - self._start_wall - self._pause_offset
+            rt = (w - self._start_wall - self._pause_offset) * self._speed
         return w, rt
 
     @property

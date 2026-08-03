@@ -54,6 +54,7 @@ class FlumeLab:
         self,
         config_file: Optional[str] = None,
         simulate: bool = False,
+        speed_factor: Optional[float] = None,
     ) -> None:
         logger.info("Initializing FlumeLab system...")
 
@@ -64,6 +65,17 @@ class FlumeLab:
         #: simulated. See laguna.simulation for what this can and cannot
         #: catch.
         self.simulate = simulate
+        #: Experiment seconds per real second. Only honoured with
+        #: simulate=True: accelerating a run that is driving real hardware
+        #: would just make the schedule outrun the machine.
+        self.speed_factor = float(speed_factor or 1.0)
+        if speed_factor and not simulate:
+            raise ValueError(
+                "speed_factor only applies to simulate=True. Real hardware "
+                "cannot be sped up — a gantry takes as long as it takes — so "
+                "accelerating a live run would just make the schedule outrun "
+                "the machine."
+            )
         if simulate:
             from .simulation import simulate_config
 
@@ -73,6 +85,12 @@ class FlumeLab:
                 "mistakes (schedules, survey extents, missing config) surface; "
                 "physical ones (mounting signs, unreachable targets) do not."
             )
+            if self.speed_factor != 1.0:
+                logger.warning(
+                    "Clock running at %.0fx — a %.0f-second experiment finishes "
+                    "in %.1f real seconds.",
+                    self.speed_factor, 3600.0, 3600.0 / self.speed_factor,
+                )
 
         # Instrument mounts + the experiment's reference frame. Always
         # present; an absent 'frames:' section yields identity transforms and
@@ -88,10 +106,13 @@ class FlumeLab:
         # Ties this run's outputs together and records the piecewise
         # runtime<->wall mapping. run_dir defaults to None, which leaves every
         # subsystem writing exactly where it always did — see laguna.run_context.
-        self.run = RunContext(root=self.config.get_value("timing.run_dir"))
+        self.run = RunContext(
+            root=self.config.get_value("timing.run_dir"),
+            speed_factor=self.speed_factor,
+        )
 
         # Timing subsystem — always present
-        self.clock = ExperimentClock()
+        self.clock = ExperimentClock(speed_factor=self.speed_factor)
         # Observe every pause/resume, whoever caused it. Scheduler.stop()
         # pauses the clock directly, so recording only in FlumeLab.pause()
         # silently missed those intervals and left the saved timeline wrong.
