@@ -150,13 +150,22 @@ class FlumeLab:
         return ok
 
     def disconnect_all(self) -> None:
-        """Disconnect all registered subsystems."""
+        """Disconnect all registered subsystems.
+
+        Also closes out the run manifest if one was opened by start() and
+        not already closed — this is the guaranteed conclusion point for
+        the start()/resume() REPL flow and for run_blocking() (which calls
+        this in a finally block), unlike experiment(), which closes its own
+        run in the context manager's exit.
+        """
         logger.info("Disconnecting all subsystems...")
         for name, subsystem in self._subsystems.items():
             disconnector = getattr(subsystem, "disconnect", None) or getattr(subsystem, "stop", None)
             if disconnector:
                 disconnector()
         self.is_running = False
+        if self.run.started_wall is not None and self.run.ended_wall is None:
+            self.run.ended()
         logger.info("All subsystems disconnected")
 
     # ------------------------------------------------------------------
@@ -253,7 +262,10 @@ class FlumeLab:
         self._duration = duration
         self._start_wall = time.time()
         self.clock.start()
-        self.event_log.log(0.0, "flume_lab", "experiment_start")
+        self.run.started()
+        self.event_log.log(
+            0.0, "flume_lab", "experiment_start", notes=f"run_id={self.run.run_id}"
+        )
         thread = threading.Thread(
             target=self.scheduler.run,
             args=(duration,),

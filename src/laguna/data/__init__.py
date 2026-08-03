@@ -88,30 +88,26 @@ class DataProcessor:
     
     def save_data(self, filename: str, data: Optional[List[Dict[str, Any]]] = None) -> bool:
         """Save processed data to file.
-        
+
+        Not implemented — data streaming/packaging is deliberately out of
+        scope for the co-scripting work (see docs/COSCRIPTING_ROADMAP.md).
+        Raises rather than reporting success for a no-op, which used to
+        write nothing to disk while logging "Saved N data points" and
+        returning True — an active hazard for any caller trusting the
+        return value.
+
         Args:
             filename: Output filename (without path)
             data: Data to save (uses buffer if not provided)
-            
-        Returns:
-            True if save successful
+
+        Raises:
+            NotImplementedError: Always.
         """
-        try:
-            if data is None:
-                data = self.data_buffer
-            
-            output_path = self.output_directory / filename
-            
-            # TODO: Implement actual file saving
-            # - Support HDF5 format for large datasets
-            # - Support CSV for simple tabular data
-            # - Apply compression based on configuration
-            
-            logger.info(f"Saved {len(data)} data points to {output_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save data: {e}")
-            return False
+        raise NotImplementedError(
+            "DataProcessor.save_data() does not write anything yet — "
+            "HDF5/CSV export and compression are unimplemented. See "
+            "docs/COSCRIPTING_ROADMAP.md."
+        )
     
     def export_data(self, format: str = "csv") -> Optional[str]:
         """Export processed data in specified format.

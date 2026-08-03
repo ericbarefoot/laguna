@@ -194,9 +194,11 @@ spec. Mirrors `RangefinderSubsystem.read_mm()` (`rangefinder/__init__.py:286`) a
 - Fix second-resolution filename collisions in `save_scan()` (`gocator.py:1626`) and
   `profiler.py:115` — two outputs in the same second overwrite silently.
 
-Also fold in: `laguna.data.DataProcessor.save_data()` (`data/__init__.py:105`) returns
-`True` while writing nothing. Either implement it or raise `NotImplementedError` —
-reporting success for a silent no-op is an active hazard.
+**Done, narrowly:** `laguna.data.DataProcessor.save_data()` (`data/__init__.py:89`)
+used to return `True` while writing nothing. It now raises `NotImplementedError`
+instead — reporting success for a silent no-op was an active hazard. Actually
+implementing data streaming/packaging (HDF5/CSV export, compression) is still out
+of scope here and remains a future project.
 
 ---
 

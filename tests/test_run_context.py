@@ -197,6 +197,31 @@ class TestFlumeLabIntegration:
         wall, runtime = lab.clock.now()
         assert lab.run.runtime_at(wall) == pytest.approx(runtime, abs=0.03)
 
+    def test_start_opens_the_run_and_disconnect_all_closes_it(self, tmp_path):
+        """start()/disconnect_all() is the production entry point used by
+        run_blocking() — unlike experiment(), it never called run.started()/
+        ended() at all, leaving run.json permanently unanchored (started_wall
+        stayed None) for every real run.
+        """
+        lab = FlumeLab()
+        assert lab.run.started_wall is None
+
+        thread = lab.start(duration=0.05)
+        thread.join(timeout=5.0)
+        assert lab.run.started_wall is not None
+
+        lab.disconnect_all()
+        assert lab.run.ended_wall is not None
+
+    def test_disconnect_all_before_any_start_does_not_fabricate_a_run(self):
+        """disconnect_all() is also called defensively/for cleanup outside a
+        run (e.g. at the top of a script); it must not stamp ended_wall for
+        a run that never started."""
+        lab = FlumeLab()
+        lab.disconnect_all()
+        assert lab.run.started_wall is None
+        assert lab.run.ended_wall is None
+
     def test_run_id_appears_in_the_event_log(self, tmp_path):
         from laguna.timing import EventLog
 
@@ -209,20 +234,7 @@ class TestFlumeLabIntegration:
 
 
 class TestFilenameCollisions:
-    def test_scan_names_carry_milliseconds(self):
-        """Two scans in the same second used to produce the same filename and
-        silently overwrite each other."""
-        import inspect
-
-        from laguna.scanner import gocator
-
-        source = inspect.getsource(gocator.GocatorScanner.save_scan)
-        assert "%f" in source, "scan filenames still have second resolution"
-
-    def test_profile_names_carry_milliseconds(self):
-        import inspect
-
-        from laguna.robot.macron import profiler
-
-        source = inspect.getsource(profiler.TopographicProfiler.scan)
-        assert "%f" in source, "profile filenames still have second resolution"
+    """Behavioral coverage lives in TestSaveScan (test_gocator_scanner.py) and
+    TestProfilerScan (test_profiler.py) — each saves twice in quick
+    succession and asserts the two paths actually differ, rather than only
+    checking that a '%f' format specifier appears in the source."""
