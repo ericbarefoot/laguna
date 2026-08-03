@@ -1,7 +1,7 @@
 """Pump flow control subsystem."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 import logging
 
 logger = logging.getLogger(__name__)

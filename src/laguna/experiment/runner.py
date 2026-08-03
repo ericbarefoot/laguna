@@ -105,6 +105,8 @@ def setup_run(
     lab_config: str,
     schedule: Optional[str] = None,
     verbose_cameras: bool = False,
+    simulate: bool = False,
+    speed_factor: Optional[float] = None,
 ) -> FlumeLab:
     """Set up a FlumeLab from experiment_config.yaml.
 
@@ -126,12 +128,29 @@ def setup_run(
                   (weir_elevation_mm, pump_flow_lpm, qin_open, qaux_open) and
                   camera trigger columns (pi_cameras, dslr_cameras) are optional.
         verbose_cameras: Show full paramiko / SSH progress during Pi captures.
+        simulate: Rehearse with no hardware attached — see laguna.simulation.
+                  Only gantry/gocator have a simulated backend; every other
+                  section (weir, flow, gauge, cameras, rangefinders) is
+                  dropped rather than connecting to real hardware.
+        speed_factor: Experiment seconds per real second. Only valid with
+                      simulate=True (see FlumeLab.__init__).
 
     Returns:
         Configured FlumeLab. Call lab.start(duration) to begin.
     """
     cfg = _load_yaml(lab_config)
-    lab = FlumeLab(lab_config)
+    lab = FlumeLab(lab_config, simulate=simulate, speed_factor=speed_factor)
+    if simulate:
+        # setup_run() reads its own local `cfg` (raw YAML, not merged with
+        # Config's defaults) to decide which subsystems to construct — see
+        # the `if "weir" in cfg` pattern below. FlumeLab.__init__ already
+        # simulated lab.config.config_dict for lab.config.get(...) callers
+        # (acquire_scan(), survey passes), but that is a different dict; this
+        # `cfg` needs the same rewrite or the sections dropped there would
+        # still get built here, real hardware and all.
+        from laguna.simulation import simulate_config
+
+        cfg = simulate_config(cfg)
 
     if not verbose_cameras:
         logging.getLogger("paramiko").setLevel(logging.WARNING)
