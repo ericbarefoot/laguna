@@ -208,7 +208,7 @@ class GocatorScanner(GocatorSettingsMixin):
         """Stop acquisition if running, then release SDK handles."""
         if self._is_running:
             try:
-                self.stop()
+                self._end_acquisition()
             except GoSdkError as e:
                 logger.warning("Error stopping Gocator during disconnect: %s", e)
         if self._lib and self._sensor is not None:
@@ -348,8 +348,13 @@ class GocatorScanner(GocatorSettingsMixin):
         lib.call("GoSensor_Trigger", self._sensor)
         logger.info("Gocator software trigger fired")
 
-    def stop(self) -> None:
-        """Stop acquisition."""
+    def _end_acquisition(self) -> None:
+        """Stop acquisition normally, after a complete surface was received.
+
+        This is the silent counterpart to `_abort_acquisition()` — cleanup
+        after success, not a safety verb, so it does not write a discard
+        note. Kept separate so callers can't accidentally shadow the other.
+        """
         lib = self._require_connected()
         lib.call("GoSystem_Stop", self._system)
         self._is_running = False
@@ -586,7 +591,7 @@ class GocatorScanner(GocatorSettingsMixin):
         finally:
             if started_here and self._is_running:
                 try:
-                    self.stop()
+                    self._end_acquisition()
                 except GoSdkError as e:
                     logger.warning("Error stopping after scan: %s", e)
 
@@ -725,7 +730,7 @@ class GocatorScanner(GocatorSettingsMixin):
         finally:
             if self._is_running:
                 try:
-                    self.stop()
+                    self._end_acquisition()
                 except GoSdkError as e:
                     logger.warning("Error stopping after gantry scan: %s", e)
 

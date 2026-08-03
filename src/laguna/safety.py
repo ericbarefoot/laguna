@@ -140,6 +140,11 @@ class SentinelFileTrigger:
         self.tier = tier
         self.name = name or f"{tier.value}_file:{self.path.name}"
 
+    @property
+    def hint(self) -> str:
+        """How to clear this trigger, for use in refusal messages."""
+        return f"remove {self.path}"
+
     def is_tripped(self) -> bool:
         return self.path.exists()
 
@@ -175,10 +180,19 @@ class CallableTrigger:
         predicate: Callable[[], bool],
         tier: SafetyTier = SafetyTier.ESTOP,
         name: str = "callable",
+        hint: Optional[str] = None,
     ) -> None:
         self._predicate = predicate
         self.tier = tier
         self.name = name
+        self._hint = hint
+
+    @property
+    def hint(self) -> str:
+        """How to clear this trigger. Generic unless the caller supplied one —
+        a health-check predicate's remediation is caller-specific (e.g. a
+        VFD e-stop needs the physical button released, not a file removed)."""
+        return self._hint or f"resolve whatever '{self.name}' is checking"
 
     def is_tripped(self) -> bool:
         try:
@@ -248,6 +262,17 @@ class SafetyMonitor:
             except Exception:  # pragma: no cover - defensive
                 continue
         return None
+
+    def hint_for(self, name: str) -> str:
+        """Remediation text for a tripped trigger by name, for refusal messages.
+
+        Falls back to generic advice if the trigger can't be found (e.g. it
+        was removed from the monitor between the trip and this lookup).
+        """
+        for trigger in self.triggers:
+            if trigger.name == name:
+                return getattr(trigger, "hint", "clear whatever tripped it")
+        return "clear whatever tripped it"
 
     def start(self) -> None:
         """Begin polling. No-op if already running or there are no triggers."""

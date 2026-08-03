@@ -117,17 +117,29 @@ Failures in a scheduled action are caught and logged (`result="error:
 
 ### Pause / resume, not stop / restart
 
-`FlumeLab.stop()` pauses rather than tears down: it sets the scheduler's
-stop event (the polling loop exits on its next iteration), pauses the clock
-(elapsed runtime is preserved, not reset), and stops the weir's
-in-progress move if a weir subsystem is registered. It deliberately does
-**not** disconnect hardware or close the event log, so `FlumeLab.resume
-(remaining_s=None)` can restart the scheduler loop and continue
-mid-experiment — called with no argument, it computes the remaining time
-itself from the duration originally passed to `start()`.
-`FlumeLab.emergency_stop()` is the harder stop: it calls `stop()`/
-`disconnect()` on every registered subsystem, pauses the clock, and
-disconnects everything via `disconnect_all()`.
+FlumeLab has a three-tier safety vocabulary — `pause()`/`stop()` (aliased as
+`FlumeLab.stop()`, kept for existing scripts) / `estop()` — identical across
+every subsystem. See `laguna.safety` and `docs/COSCRIPTING_ROADMAP.md` for
+the full design; the short version:
+
+`FlumeLab.stop()` (really a pause) sets the scheduler's stop event (the
+polling loop exits on its next iteration), pauses the clock (elapsed runtime
+is preserved, not reset), and calls `pause()` on every registered subsystem
+— not just the weir. It deliberately does **not** disconnect hardware or
+close the event log, so `FlumeLab.resume(remaining_s=None)` can restart the
+scheduler loop and continue mid-experiment — called with no argument, it
+computes the remaining time itself from the duration originally passed to
+`start()`.
+
+`FlumeLab.estop()` (the old `emergency_stop()`, kept as a deprecated alias)
+is the hardest tier: it calls `estop()` on every subsystem, guarded
+individually so one failing or disconnected subsystem can never prevent the
+rest from being made safe, motion before hydraulics. Unlike the old
+`emergency_stop()`, it does **not** disconnect — the rig can be inspected
+and recovered with `rearm()` without losing state such as the gantry's
+position reference. Both `pause()`/`stop()`(-as-pause) refuse to run while
+the rig is already `ESTOPPED`, since that is the more severe tier; call
+`rearm()` first.
 
 `experiments/weir_gauge_camera_experiment.py`, via
 `laguna.experiment.runner.run_blocking()`, wraps the same `start()`/
@@ -359,7 +371,7 @@ Main logging configured in `core.py` at module load.
 - Errors logged with context
 - Methods return bool for success/failure
 - Critical errors don't crash entire system
-- Emergency stop available (`FlumeLab.emergency_stop()`)
+- Emergency stop available (`FlumeLab.estop()`; `emergency_stop()` kept as a deprecated alias)
 
 ### Recovery
 - Reconnect on communication failure

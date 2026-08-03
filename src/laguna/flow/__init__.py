@@ -1,7 +1,7 @@
 """Pump flow control subsystem."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -65,83 +65,36 @@ class FlowController(ABC):
         """
         ...
 
-    @abstractmethod
-    def stop(self) -> bool:
-        """Stop the pump.
-
-        Returns:
-            True if the stop command was sent successfully.
-        """
-        ...
-
-    @abstractmethod
     # ------------------------------------------------------------------
     # Safety verbs (see laguna.safety)
     # ------------------------------------------------------------------
+    # There is deliberately no abstract `stop() -> bool` pump primitive here:
+    # `stop()` belongs to the shared safety vocabulary, so how a backend
+    # actually stops its drive is its own private business (SaflFlowController
+    # uses `_vfd_stop()`). All four verbs must return a note about anything a
+    # human needs to know, or None, and must never raise.
 
+    @abstractmethod
     def pause(self) -> Optional[str]:
-        """Stop the pump, remembering the setpoint so resume() can restore it.
+        """Quiesce the pump, remembering the setpoint so resume() can restore it."""
+        ...
 
-        Pausing a flume stops the water: the hydraulic condition is part of
-        the experiment, so leaving the pump running would mean the experiment
-        continues while everything else is held. The cost is that resuming
-        needs a re-stabilisation period — that is inherent, not a defect.
-
-        Never raises; a pause that throws leaves the rest of the rig running.
-        """
-        self._paused_flowrate = self._current_flowrate
-        try:
-            self._vfd_stop()
-        except Exception as exc:
-            logger.error("Could not stop the pump for pause: %s", exc)
-            return f"pump may still be running: {exc}"
-        return f"pump stopped, setpoint {self._paused_flowrate} L/min held for resume"
-
+    @abstractmethod
     def resume(self) -> Optional[str]:
         """Restore the setpoint captured by pause() and restart the pump."""
-        target = getattr(self, "_paused_flowrate", None)
-        try:
-            if target:
-                self.set_flowrate(target)
-            self.start()
-        except Exception as exc:
-            logger.error("Could not restart the pump on resume: %s", exc)
-            return f"pump did not restart: {exc}"
-        return None
+        ...
 
+    @abstractmethod
     def stop(self) -> Optional[str]:
-        """End cleanly: stop the pump, leave the valves as they are.
+        """End cleanly: stop the pump, leaving the valves as they are."""
+        ...
 
-        The valve positions are part of the experiment's configuration, not a
-        hazard on their own — only estop() forces them shut.
-        """
-        try:
-            self._vfd_stop()
-        except Exception as exc:
-            logger.error("Could not stop the pump: %s", exc)
-            return f"pump may still be running: {exc}"
-        return None
-
+    @abstractmethod
     def estop(self) -> Optional[str]:
-        """Pump off and both valves closed, each attempted independently.
+        """Pump off and both valves closed, each step attempted independently."""
+        ...
 
-        Every step is guarded separately: a failure closing qin must not
-        prevent qaux from being closed, and neither must prevent the pump
-        being stopped. Never raises.
-        """
-        problems = []
-        for label, action in (
-            ("stop the pump", lambda: self._vfd_stop()),
-            ("close qin", lambda: setattr(self, "qin", False)),
-            ("close qaux", lambda: setattr(self, "qaux", False)),
-        ):
-            try:
-                action()
-            except Exception as exc:
-                logger.error("ESTOP: could not %s: %s", label, exc)
-                problems.append(label)
-        return f"could not: {', '.join(problems)}" if problems else None
-
+    @abstractmethod
     def clear_faults(self) -> bool:
         """Clear any latched VFD fault/alarm state.
 

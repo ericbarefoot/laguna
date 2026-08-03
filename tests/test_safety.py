@@ -90,6 +90,33 @@ class TestTriggers:
         state["tripped"] = True
         assert trigger.is_tripped() is True
 
+    def test_sentinel_file_hint_names_the_path(self, tmp_path):
+        path = tmp_path / "ESTOP"
+        trigger = SentinelFileTrigger(str(path), tier=SafetyTier.ESTOP)
+        assert str(path) in trigger.hint
+
+    def test_callable_trigger_hint_defaults_to_its_name(self):
+        trigger = CallableTrigger(lambda: True, name="vfd_hardware_estop")
+        assert "vfd_hardware_estop" in trigger.hint
+
+    def test_callable_trigger_accepts_an_explicit_hint(self):
+        trigger = CallableTrigger(
+            lambda: True, name="vfd_hardware_estop",
+            hint="release the physical e-stop button on the VFD",
+        )
+        assert trigger.hint == "release the physical e-stop button on the VFD"
+
+    def test_monitor_hint_for_looks_up_the_named_trigger(self, tmp_path):
+        path = tmp_path / "PAUSE"
+        monitor = SafetyMonitor(
+            triggers=[SentinelFileTrigger(str(path), tier=SafetyTier.PAUSE, name="pause_file")]
+        )
+        assert str(path) in monitor.hint_for("pause_file")
+
+    def test_monitor_hint_for_unknown_trigger_is_generic(self):
+        monitor = SafetyMonitor()
+        assert monitor.hint_for("nonexistent") == "clear whatever tripped it"
+
     def test_a_failing_predicate_does_not_trip(self):
         """A monitoring source that has itself broken must not be able to
         spuriously halt an experiment."""
@@ -249,6 +276,25 @@ class TestSafetyVerbs:
         lab.estop()
         assert "disconnect" not in a.calls
 
+    def test_pause_refuses_to_downgrade_an_estopped_rig(self):
+        """A direct lab.pause() call (not via a monitor trigger) must not be
+        able to quietly bring an ESTOPPED rig back down to merely paused —
+        something already decided the harder tier was needed."""
+        a = RecordingSubsystem()
+        lab = self._lab(a)
+        lab.estop()
+        lab.pause()
+        assert a.calls == ["estop"], "pause() must not have reached the subsystem"
+        assert lab.safety_state is SafetyState.ESTOPPED
+
+    def test_end_run_refuses_to_downgrade_an_estopped_rig(self):
+        a = RecordingSubsystem()
+        lab = self._lab(a)
+        lab.estop()
+        lab.end_run()
+        assert a.calls == ["estop"], "end_run() must not have reached the subsystem"
+        assert lab.safety_state is SafetyState.ESTOPPED
+
 
 class TestRearm:
     def _lab(self, tmp_path, gantry=None):
@@ -360,6 +406,32 @@ class TestEstopMonitorIntegration:
             assert lab.safety_monitor.tripped_by() == "vfd_hardware_estop"
         finally:
             lab.safety_monitor.stop()
+
+    def test_rearm_refuses_while_the_vfd_flag_is_still_latched(self):
+        """Clearing a sentinel file must not be enough to re-arm while the
+        pump's own hardware e-stop circuit is still physically tripped.
+
+        Adds the trigger directly (not via watch_for_safety()) so nothing
+        polls in the background — the monitor's own async firing is covered
+        by test_vfd_hardware_estop_is_propagated; this test is only about
+        rearm()'s synchronous refusal check.
+        """
+        flow_flag = {"vfd_estop": True}
+        lab = FlumeLab()
+        lab.safety_monitor.add(
+            CallableTrigger(
+                lambda: flow_flag["vfd_estop"],
+                tier=SafetyTier.ESTOP,
+                name="vfd_hardware_estop",
+            )
+        )
+        lab.estop()
+        assert lab.rearm() is False, "re-armed with the VFD e-stop still latched"
+        assert lab.safety_state is SafetyState.ESTOPPED
+
+        flow_flag["vfd_estop"] = False
+        assert lab.rearm() is True
+        assert lab.safety_state is SafetyState.RUNNING
 
 
 class TestDiscardsAreRecorded:

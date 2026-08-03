@@ -855,6 +855,19 @@ class TestScanLifecycle:
         assert scanner.get_status()["is_running"] is False
         assert scan.metadata["travel_speed_mm_s"] == pytest.approx(20.0)
 
+    def test_successful_scan_does_not_report_a_discard(self, scanner, monkeypatch):
+        """A completed scan's own cleanup must go through _end_acquisition(),
+        not the stop() safety verb — the two `def stop()` bodies used to
+        shadow each other, so every successful scan logged a false
+        "DISCARDED a part-captured surface" note via _abort_acquisition()."""
+        aborts = []
+        monkeypatch.setattr(
+            scanner, "_abort_acquisition", lambda: aborts.append(1) or None
+        )
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        scanner.scan(timeout_s=1.0)
+        assert aborts == [], "a successful scan must not go through _abort_acquisition()"
+
     def test_scan_stops_acquisition_even_on_timeout(self, scanner):
         """A failed scan must not leave the sensor running."""
         scanner._fake.go.datasets = []

@@ -90,10 +90,15 @@ Rationale for discarding a partial surface: `Y spacing = travel_speed / frame_ra
 assumes constant velocity, so a surface captured across a decelerating pass has a
 distorted travel axis. It would be quietly wrong data rather than useful data.
 
-**Critically, existing `stop()` methods keep their current meaning** and become
-internal details the new verbs call. `GantryController.stop()` stays the hard abort
-it is documented and tested as; `estop()` calls it, `pause()` calls `soft_stop()`
-(`controller.py:658`). Nothing silently changes behaviour.
+**`GantryController.stop()` changed meaning**, as the API-stability row above says.
+It used to be the zero-decel abort with motors disabled; that behaviour moved to
+`estop()` (`controller.py:711`), which now issues its own hard `shutdown()` rather
+than delegating to `stop()`. `stop()` (`controller.py:367`) is the tier below —
+`soft_stop()` (ramped deceleration, brakes/motors untouched) followed by parking
+the Y/Z brakes, safe to disconnect from. `pause()` (`controller.py:693`) calls
+`soft_stop()` directly, without the brake-park. Existing scripts calling
+`gantry.stop()` expecting the old hard-abort behaviour will need updating —
+that is the "deliberately sacrificed" API stability tradeoff.
 
 ### Work
 
