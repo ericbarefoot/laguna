@@ -73,6 +73,18 @@ _GENERATION_TYPES = {
 _START_TRIGGERS = {0: "sequential", 1: "digital", 2: "software"}
 
 
+class ScanNotPossibleError(RuntimeError):
+    """A scheduled scan could not run at all.
+
+    Raised rather than skipped. An experiment that quietly stops collecting
+    topography produces an incomplete record of conditions nobody can
+    reconstruct afterwards — missing data is as bad as a stationary gantry.
+    ``experiment.runner`` escalates this to a lab-wide pause, so the cause
+    can be fixed and the run resumed rather than continuing with a hole in
+    the data.
+    """
+
+
 class GocatorScanner(GocatorSettingsMixin):
     """Gocator 2690 surface scanner, shaped as a FlumeLab subsystem.
 
@@ -609,10 +621,10 @@ class GocatorScanner(GocatorSettingsMixin):
     def scan_with_gantry(
         self,
         gantry,
-        axis: str,
-        end_mm: float,
-        feed_rate_mm_s: float,
-        settle_s: float = 0.5,
+        axis: Optional[str] = None,
+        end_mm: Optional[float] = None,
+        feed_rate_mm_s: Optional[float] = None,
+        settle_s: Optional[float] = None,
         fixed_length_mm: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
         timeout_s: Optional[float] = None,
@@ -667,6 +679,28 @@ class GocatorScanner(GocatorSettingsMixin):
             KeyError: If `axis` isn't a configured axis on this gantry.
             SnapMotionError: If the gantry's safe_mode blocks the move.
         """
+        # Fall back to the configured scan spec for anything not given, so
+        # a rig configured once in file can scan without repeating itself —
+        # and so acquire() is a thin wrapper rather than a second code path.
+        spec = self._scan_spec or {}
+        axis = axis if axis is not None else spec.get("axis")
+        end_mm = end_mm if end_mm is not None else spec.get("end_mm")
+        feed_rate_mm_s = (
+            feed_rate_mm_s if feed_rate_mm_s is not None else spec.get("feed_rate_mm_s")
+        )
+        settle_s = settle_s if settle_s is not None else float(spec.get("settle_s", 0.5))
+        missing = [
+            n for n, v in (("axis", axis), ("end_mm", end_mm),
+                           ("feed_rate_mm_s", feed_rate_mm_s)) if v is None
+        ]
+        if missing:
+            raise ScanNotPossibleError(
+                f"scan_with_gantry() is missing {missing} and the gocator.scan: "
+                "config block does not supply it"
+            )
+        end_mm = float(end_mm)
+        feed_rate_mm_s = float(feed_rate_mm_s)
+
         # Hold the gantry for the whole pass. Without this, a second
         # scheduled action could move an axis mid-traverse and the surface
         # would be silently wrong — Y spacing assumes constant velocity.
@@ -783,35 +817,45 @@ class GocatorScanner(GocatorSettingsMixin):
             **overrides: Per-call overrides of the configured scan spec.
 
         Returns:
-            The captured SurfaceScan, or None if no scan spec is configured
-            (so an unconfigured scanner in a scheduled run logs and continues
-            rather than crashing the experiment).
+            The captured SurfaceScan.
 
         Raises:
-            ValueError: If a scan spec exists but is missing a required key,
-                or no gantry was supplied.
+            ScanNotPossibleError: If the scan cannot run at all — no spec, an
+                incomplete spec, no gantry, or a disconnected scanner. The
+                runner escalates this to a lab-wide pause rather than
+                skipping the scan, because an experiment that quietly stops
+                collecting topography leaves a hole nobody can reconstruct.
         """
         spec = dict(self._scan_spec or {})
         spec.update(overrides)
-        if not spec:
-            logger.warning(
-                "gocator.acquire() called with no 'scan:' config block and no "
-                "overrides — nothing to do. Add gocator.scan.{axis, end_mm, "
-                "feed_rate_mm_s} to schedule scans."
-            )
-            return None
 
+        # Every one of these is a reason to bring the run down rather than
+        # skip a scan. A scheduled experiment that quietly stops collecting
+        # topography is producing an incomplete record of conditions nobody
+        # will be able to reconstruct — missing data is as bad as a
+        # stationary gantry, and both are worse than a paused run.
+        if not spec:
+            raise ScanNotPossibleError(
+                "no 'scan:' config block and no overrides — the scanner cannot "
+                "run a scheduled pass. Add gocator.scan.{axis, end_mm, "
+                "feed_rate_mm_s}."
+            )
         missing = [k for k in ("axis", "end_mm", "feed_rate_mm_s") if spec.get(k) is None]
         if missing:
-            raise ValueError(
-                f"gocator scan spec is missing {missing}; needs axis, end_mm "
-                "and feed_rate_mm_s to run a coordinated pass"
+            raise ScanNotPossibleError(
+                f"scan spec is missing {missing}; needs axis, end_mm and "
+                "feed_rate_mm_s to run a coordinated pass"
             )
         if gantry is None:
-            raise ValueError(
-                "gocator.acquire() needs a connected gantry — a scan with no "
-                "motion produces a surface with no travel. Pass gantry=, or "
-                "register a 'gantry:' section so the runner can supply one."
+            raise ScanNotPossibleError(
+                "no connected gantry — a scan with no motion produces a "
+                "surface with no travel. Register a 'gantry:' section so the "
+                "runner can supply one."
+            )
+        if not self._is_connected:
+            raise ScanNotPossibleError(
+                f"scanner at {self._ip} is not connected, so this pass would "
+                "collect nothing"
             )
 
         return_to_start = spec.pop("return_to_start", False)

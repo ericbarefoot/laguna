@@ -21,7 +21,12 @@ Usage sketch — see ``docs/subsystems/scanner.md`` for the full guide::
     lab.gocator.save_scan(scan)
 """
 
-from .gocator import FILTER_NAMES, GocatorScanner, UniformSpacingRequiredError
+from .gocator import (
+    FILTER_NAMES,
+    GocatorScanner,
+    ScanNotPossibleError,
+    UniformSpacingRequiredError,
+)
 from .gosdk import GoSdkError, GoSdkLib, GoSdkTimeout
 from .pointcloud import (
     SurfaceScan,
@@ -32,6 +37,7 @@ from .pointcloud import (
 __all__ = [
     "GocatorScanner",
     "UniformSpacingRequiredError",
+    "ScanNotPossibleError",
     "FILTER_NAMES",
     "GoSdkLib",
     "GoSdkError",
