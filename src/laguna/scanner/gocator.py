@@ -162,6 +162,9 @@ class GocatorScanner(GocatorSettingsMixin):
         self._scan_count = 0
         self._last_scan_meta: Dict[str, Any] = {}
         self._last_saved_path: Optional[str] = None
+        #: Run id / runtime injected by FlumeLab so saved scans can be tied
+        #: back to the experiment that produced them — see laguna.run_context.
+        self._run_stamp: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Subsystem lifecycle
@@ -912,9 +915,13 @@ class GocatorScanner(GocatorSettingsMixin):
         import datetime as _dt
 
         if name is None:
+            # Millisecond resolution: two scans in the same second used to
+            # produce the same filename and silently overwrite each other.
             name = "scan_" + _dt.datetime.now(_dt.timezone.utc).strftime(
-                "%Y%m%d_%H%M%S"
-            )
+                "%Y%m%d_%H%M%S_%f"
+            )[:-3]
+            if self._run_stamp:
+                name = f"{name}_{self._run_stamp.get('run_id', '')}".rstrip("_")
         self._output_dir.mkdir(parents=True, exist_ok=True)
         base = self._output_dir / name
 
@@ -929,6 +936,12 @@ class GocatorScanner(GocatorSettingsMixin):
             if any(f in self._POINT_FORMATS for f in formats)
             else None
         )
+
+        # Stamp the run into the scan's own metadata, so a file found on its
+        # own is still attributable without the manifest beside it.
+        if self._run_stamp:
+            scan.metadata.setdefault("run_id", self._run_stamp.get("run_id"))
+            scan.metadata.setdefault("runtime_s", self._run_stamp.get("runtime_s"))
 
         written: Dict[str, Path] = {}
         for fmt in formats:

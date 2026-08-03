@@ -4,6 +4,13 @@
 timing:
   checkpoint_file: ./experiment_checkpoint.json
   event_log: ./experiment_events.csv
+  # run_dir: ./runs           # Group each run's outputs under runs/<run_id>/ and
+                               # write a run.json manifest recording the piecewise
+                               # runtime<->wall mapping (pauses shift them apart, so
+                               # a scan file's timestamp cannot otherwise be converted
+                               # back to experiment runtime once the process exits).
+                               # Omit to leave every subsystem writing exactly where
+                               # its own output_dir says — see laguna.run_context.
 
 # gauge:
 #   port: /dev/ttyUSB2          # Massa M-5000 ultrasonic sensor

@@ -112,7 +112,9 @@ class TopographicProfiler:
         except ImportError as e:
             raise ImportError(f"Missing dependency: {e}") from e
 
-        timestamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        # Millisecond resolution: two transects in the same second used to
+        # collide and silently overwrite.
+        timestamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")[:-3]
         remote_csv = f"/tmp/profile_{timestamp}.csv"
         remote_meta = f"/tmp/profile_{timestamp}_meta.json"
         local_csv = self._output_dir / f"profile_{timestamp}.csv"

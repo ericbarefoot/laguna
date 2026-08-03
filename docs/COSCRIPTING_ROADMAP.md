@@ -176,6 +176,9 @@ spec. Mirrors `RangefinderSubsystem.read_mm()` (`rangefinder/__init__.py:286`) a
 
 ## Workstream 2 — Run context & correlation
 
+> **Implemented.** `src/laguna/run_context.py`, clock pause/resume observers,
+> and run stamping in scan metadata.
+
 **New:** `src/laguna/run_context.py`.
 
 - A **run ID** (UTC timestamp + short random suffix) minted by

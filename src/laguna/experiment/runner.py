@@ -417,6 +417,7 @@ def setup_run(
         from laguna.robot.motion_arbiter import MotionBusyError
         from laguna.scanner import ScanNotPossibleError
 
+        gocator._run_stamp = lab.run.stamp(lab.clock.elapsed())
         try:
             scan = gocator.acquire(gantry=gantry)
         except (ScanNotPossibleError, MotionBusyError) as exc:
@@ -435,7 +436,10 @@ def setup_run(
             return
         if scan is None:
             return
-        path = (gocator._last_saved_path if hasattr(gocator, "_last_saved_path") else None)
+        path = getattr(gocator, "_last_saved_path", None)
+        if path:
+            lab.run.record_output("gocator", path, lab.clock.elapsed(),
+                                  points=scan.valid_count)
         lab.event_log.log(
             lab.clock.elapsed(), "gocator", "scan",
             result=f"points={scan.valid_count}",
