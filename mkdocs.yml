@@ -82,6 +82,7 @@ nav:
       - Gauge: subsystems/gauge.md
       - Rangefinder: subsystems/rangefinder.md
       - Scanner: subsystems/scanner.md
+      - Reference frames: subsystems/frames.md
       - Flow: subsystems/flow.md
       - Schedule: subsystems/schedule.md
       - Timing: subsystems/timing.md

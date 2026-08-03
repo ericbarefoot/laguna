@@ -1,0 +1,257 @@
+# Roadmap: co-scripting the survey instruments with the rest of FlumeLab
+
+> Status: **designed, not started.** Written 2026-08-03 alongside the Gocator
+> integration work. Each section below is intended as its own PR. Nothing here
+> has been implemented.
+
+## Why
+
+laguna has **two disjoint halves**.
+
+The *environmental* half — gauge, weir, flow, cameras — is fully config-driven.
+`experiment/runner.py::setup_run()` reads `interval_s`/`trigger_at`/`use_schedule`,
+registers scheduled actions, writes to the event log, and runs unattended via
+`run_blocking()` with signal-based pause/resume.
+
+The *survey* half — gantry, OD2000, WTT12L, Gocator — participates in **none** of
+it. It is hand-scripted in `examples/` and `scripts/run_line_scan.py`:
+
+- `setup_run()` has a hardcoded five-section tuple (`experiment/runner.py:149`);
+  `gocator` and `gantry` are absent. `docs/GANTRY_GUIDE.md:323` documents this as a
+  known gap for the gantry; nothing documented it for the scanner.
+- The Gocator has **no zero-arg "acquire now"** — `scan_with_gantry()` requires four
+  arguments including a gantry handle, so it cannot be handed to
+  `Scheduler.repeat(action=...)`.
+- Scans and transects **never touch the event log**, so the only cross-subsystem
+  index does not know they happened. There is no run ID, no run directory, and the
+  runtime↔wall-clock mapping dies with the process.
+
+**Goal:** a Gocator scan should be schedulable from a config file exactly like a
+camera capture, its output correlatable with everything else in the run, and the
+whole rig should have one coherent, externally-triggerable safety vocabulary.
+
+## Two latent defects to fix along the way
+
+1. **`Scheduler._fire()` (`timing/scheduler.py:148`) dispatches every action in its
+   own daemon thread with no coordination.** Latent today only because nothing
+   schedulable moves the gantry — the moment scans become schedulable, two threads
+   command motion concurrently.
+
+2. **`FlumeLab.emergency_stop()` (`core.py:520-529`) calls `stop()` unguarded in a
+   loop.** `GocatorScanner.stop()` begins with `_require_connected()`
+   (`scanner/gocator.py:924`), which **raises when disconnected** — aborting the loop
+   so every subsystem registered after it never gets stopped. `weir.stop()` and
+   `flow.stop()` have the same raising shape.
+
+---
+
+## Workstream 0 — Safety vocabulary (foundational, do first)
+
+Today `stop()` means four different severities:
+
+| Subsystem | `stop()` does | Severity |
+|---|---|---|
+| `GantryController` (`controller.py:367`) | zero-decel abort, brakes engaged, motors disabled — docstring calls it the emergency-stop path | **hard e-stop** |
+| `SaflWeirController` (`weir/__init__.py:314`) | halt in-progress move | moderate |
+| `SaflFlowController` (`flow/__init__.py:250`) | **stops the pump** | drains the experiment's hydraulic state |
+| `GocatorScanner` (`gocator.py:1262`) | stops the SDK data channel | benign |
+| gauge, rangefinders, pi cameras | *no `stop()` at all* | — |
+
+And `FlumeLab.stop()` (`core.py:320`) is really a *pause* — it logs
+`experiment_pause`, halts the scheduler, and hardcodes `weir.stop()`.
+
+### Settled semantics
+
+| Decision | Choice |
+|---|---|
+| Vocabulary | Three tiers: `pause()` / `stop()` / `estop()` |
+| Pause & hydraulics | Quiesce **everything**, pump included |
+| Estop & hydraulics | Kill everything — pump off, valves closed |
+| Mid-scan pause/estop | Abort immediately, **discard** the partial surface, log it |
+
+- **`pause()`** — temporary and resumable. Gantry `soft_stop()` (BST decel ramp,
+  brakes and motors untouched), pump ramped down via normal VFD stop, acquisition
+  stopped, everything stays *connected*. `resume()` restores the flow setpoint.
+- **`stop()`** — end the run cleanly. Quiesce as for pause, then disconnect.
+- **`estop()`** — screeching halt. Gantry hard abort (ABT + brakes + motors off),
+  pump off, valves closed, acquisition stopped. Requires **explicit re-arm**.
+
+Rationale for discarding a partial surface: `Y spacing = travel_speed / frame_rate`
+assumes constant velocity, so a surface captured across a decelerating pass has a
+distorted travel axis. It would be quietly wrong data rather than useful data.
+
+**Critically, existing `stop()` methods keep their current meaning** and become
+internal details the new verbs call. `GantryController.stop()` stays the hard abort
+it is documented and tested as; `estop()` calls it, `pause()` calls `soft_stop()`
+(`controller.py:658`). Nothing silently changes behaviour.
+
+### Work
+
+**New:** `src/laguna/safety.py` — a `SafetyState` enum
+(`RUNNING`/`PAUSED`/`STOPPED`/`ESTOPPED`) and a `Quiescible` protocol documenting the
+three verbs.
+
+**`src/laguna/core.py`:**
+- Add `FlumeLab.pause()` / `resume()` / `stop()` / `estop()`. Today's `stop()`
+  (`core.py:320`) becomes `pause()`, with a thin deprecated alias so existing scripts
+  keep working.
+- Every subsystem loop must be **individually guarded** (`try/except` per subsystem,
+  log and continue) — this is defect 2 above, and it applies to all four verbs.
+- Order on `estop`: motion first (gantry), then hydraulics, then acquisition.
+- Log every transition via the existing `EventLog.log()` (`timing/event_log.py:42`).
+
+**Per subsystem** — add `pause()`/`resume()`/`estop()`, delegating to what exists:
+
+| Subsystem | `pause()` | `estop()` |
+|---|---|---|
+| `GantryController` | `soft_stop()` | `stop()` |
+| `SaflFlowController` | remember setpoint, `stop()` pump | pump off + both valves closed |
+| `SaflWeirController` | `stop()` (halt move) | `stop()` |
+| `GocatorScanner` | abort + discard in-flight scan | same, plus **never raise** |
+| cameras / gauge / rangefinders | cease scheduled activity | same |
+
+`GocatorScanner` needs a safety path that does **not** call `_require_connected()`.
+
+### Estop triggers
+
+`src/laguna/safety.py`, designed as a **pluggable list of trigger sources**:
+
+1. **`SentinelFileTrigger`** — background thread polling for e.g. `./ESTOP` (~100 ms).
+   Works regardless of which thread is blocked.
+2. **Physical button** — wired to write the ESTOP sentinel file. *This needs no new
+   software infrastructure*: it reuses trigger 1 entirely, so the button is a wiring
+   task, not a code task.
+3. **`DigitalInputTrigger`** (optional, later) — poll a spare gantry PLC digital input
+   (see `IOMap` in `robot/macron/commands.py`) or an AL1342 IO-Link port, for a path
+   that does not depend on a filesystem write succeeding.
+4. Also poll the VFD's existing **hardware** `e_stop` flag (`flow/__init__.py:333`,
+   read-only) and propagate it — the pump drive already has a real e-stop circuit.
+
+**A signal-based trigger is deliberately not the primary path.** Python delivers
+signals only in the main thread between bytecodes, so a signal cannot interrupt a
+blocking serial read or SDK call — the halt would be deferred, not immediate.
+
+---
+
+## Workstream 1 — Schedulable surveys + motion arbiter
+
+**Motion arbiter** — new `src/laguna/robot/motion_arbiter.py`. A re-entrant lock with
+a timeout and a descriptive error naming the current holder. Acquired by every
+gantry-consuming operation: `GantryController.move_to`, `FlumeLab.place`,
+`FlumeLab.acquire_scan`, `GocatorScanner.scan_with_gantry`. **Prerequisite for
+everything else here** — without it, two scheduled actions command motion at once.
+
+**Zero-arg acquire verbs.** Give the Gocator a scheduler-compatible entry point:
+`GocatorScanner.acquire(gantry=None, **defaults)`, closing over a configured scan
+spec. Mirrors `RangefinderSubsystem.read_mm()` (`rangefinder/__init__.py:286`) and
+`CameraManager.trigger_capture()` (`camera/__init__.py:108`).
+
+**`experiment/runner.py`:**
+- Extend the section tuple (`runner.py:149`) and instantiation chain
+  (`runner.py:172-205`) to cover `gantry`, `gocator`, `od2000`, `wtt12l`.
+- Add action closures beside the existing `_capture_pi`/`_log_gauge` ones
+  (`runner.py:229-346`), each writing an event-log row.
+- **Reuse `_register_action()` as-is** (`runner.py:47`) — already subsystem-agnostic,
+  handling `interval_s`/`trigger_at`/`use_schedule` plus the schedule-CSV column
+  filter. This is the key existing utility; do not reimplement it.
+
+**Config:** scheduling keys plus a scan spec in the `gocator:` section, and a
+`gocator` boolean column in the schedule CSV (same idiom as `pi_cameras`).
+
+---
+
+## Workstream 2 — Run context & correlation
+
+**New:** `src/laguna/run_context.py`.
+
+- A **run ID** (UTC timestamp + short random suffix) minted by
+  `FlumeLab.experiment()`/`start()`.
+- A **run directory** — all outputs beneath it, so a run is one self-contained
+  artifact. Keep per-subsystem `output_dir` overrides working.
+- **Persist the runtime↔wall mapping** to a `run.json` manifest, including pause
+  intervals. `ExperimentClock` holds `_start_wall`/`_pause_offset` privately and they
+  die with the process, so after a pause the mapping is piecewise and cannot be
+  reconstructed from a single start time.
+- Stamp `run_id` + `runtime_s` into `SurfaceScan.metadata` and the profiler's
+  `_meta.json`; write an event-log row for every scan/transect, with the output path.
+- Fix second-resolution filename collisions in `save_scan()` (`gocator.py:1626`) and
+  `profiler.py:115` — two outputs in the same second overwrite silently.
+
+Also fold in: `laguna.data.DataProcessor.save_data()` (`data/__init__.py:105`) returns
+`True` while writing nothing. Either implement it or raise `NotImplementedError` —
+reporting success for a silent no-op is an active hazard.
+
+---
+
+## Workstream 3 — Survey / raster planner
+
+**New:** `src/laguna/survey.py`. Nothing multi-pass exists anywhere in the repo today.
+
+- `RasterSurvey` — tile a region with multiple Gocator passes, accounting for FOV
+  width and a configurable overlap; emits a pass list.
+- `RepeatTransect` — re-run a line on a cadence, optionally with a different
+  instrument.
+- Expressed in **experiment-frame coordinates**, building on `src/laguna/frames.py`:
+  `FrameRegistry.gantry_target_for()`, `retarget()`, `place_scan()`.
+- Use `GocatorScanner.solve_scan_rates()` to pick feed rate per pass, and
+  `CheckpointStore` (`timing/checkpoint.py`) so a long survey resumes after
+  interruption.
+- Stitching multiple placed surfaces is the natural follow-on; keep it out of scope
+  unless it falls out cheaply.
+
+---
+
+## Workstream 4 — Offline rehearsal
+
+A `simulate=True` flag on `FlumeLab`/`setup_run()` swapping in fake transports, so a
+whole experiment script — schedule, survey plan, timing — can be validated with no
+hardware.
+
+Strong fakes already exist and only need promoting out of `tests/`:
+`FakeSnapConnection` (`tests/macron_fixtures.py`), `FakeLib`/`FakeGo`
+(`tests/test_gocator_scanner.py`), and `GCodeExecutor(dry_run=True)`
+(`robot/macron/gcode.py:529`, currently not surfaced through `GantryController`,
+config, or `FlumeLab`).
+
+Highest value per line of code for a rig where a bad schedule costs a flume day.
+
+---
+
+## Sequencing
+
+1. Workstream 0 — safety vocabulary. Foundational; also fixes both latent defects.
+2. Workstream 1 — motion arbiter, then schedulable surveys.
+3. Workstream 2 — run context.
+4. Workstreams 3 and 4 — independent of each other; either order.
+
+## Verification
+
+- **Unit:** `python -m pytest -q`. New coverage for the three verbs per subsystem
+  (including that one failing subsystem does not abort the loop), arbiter contention,
+  `_register_action` wiring for the new sections, run-ID propagation into metadata,
+  and raster tiling geometry. In the `flumelab` conda env use `-o addopts=""` — that
+  env lacks `pytest-cov`.
+- **Offline:** once Workstream 4 lands, run a full multi-subsystem experiment with
+  `simulate=True` and assert the event log shows the expected interleaving.
+- **Hardware, staged, read-only first:**
+  1. Estop triggers with the gantry in `safe_mode: true` — confirm the sentinel file
+     fires and the state machine reaches `ESTOPPED`.
+  2. `pause()`/`resume()` with hydraulics only, no motion — confirm the flow setpoint
+     is restored.
+  3. A scheduled Gocator scan in a short run — confirm the event log shows it and the
+     output lands in the run directory with a matching `run_id`.
+  4. `pause()` mid-scan — confirm prompt abort, discarded surface, logged row.
+- **Correlation check:** after a run, load `run.json` + `experiment_events.csv` and
+  confirm a scan's wall-clock timestamp maps to the right experiment runtime *across
+  a pause*.
+
+## Open questions
+
+1. **Valve-closing on estop** — is slamming both valves shut hydraulically safe, or
+   should they be left as-is? Domain call.
+2. **Re-arm after estop** — an explicit `lab.rearm()`, or require a full reconnect?
+   The gantry already needs `enable()`/`disengage_brake()`, or
+   `connect()`/`set_safe_mode(False)`.
+3. **Should `pause()` also pause the experiment clock?** It would make runtime mean
+   "time under experimental conditions". `ExperimentClock` already supports it, but it
+   changes what schedule-CSV times refer to across a pause.

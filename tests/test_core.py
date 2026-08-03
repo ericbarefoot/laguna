@@ -2,6 +2,7 @@
 
 import pytest
 from laguna import FlumeLab
+from laguna.frames import FrameRegistry
 
 
 class FakeSubsystem:
@@ -113,6 +114,63 @@ class TestMoveTo:
         lab.add(gantry)
         lab.move_to(X=100, Z=5)
         assert gantry.move_to_calls == [(None, {"X": 100, "Z": 5})]
+
+
+class TestPlace:
+    """lab.place() names a measurement location instead of a robot position,
+    compensating for where each instrument is mounted."""
+
+    def _lab(self):
+        lab = FlumeLab()
+        lab.frames = FrameRegistry.from_config(
+            {
+                "experiment": {"translation": [500.0, 300.0, 0.0]},
+                "instruments": {
+                    "od2000": {"translation": [52.0, -18.0, 0.0]},
+                    "wtt12l": {"translation": [52.0, 31.0, 0.0]},
+                },
+            }
+        )
+        gantry = FakeGantry()
+        lab.add(gantry)
+        return lab, gantry
+
+    def test_compensates_for_the_instrument_offset(self):
+        lab, gantry = self._lab()
+        lab.place("od2000", [100.0, 200.0, 0.0])
+        _, axes = gantry.move_to_calls[0]
+        # experiment -> gantry is -500/-300, then subtract the mount offset
+        assert axes["X"] == pytest.approx(-452.0)
+        assert axes["Y"] == pytest.approx(-82.0)
+
+    def test_same_target_gives_different_commands_per_instrument(self):
+        lab, gantry = self._lab()
+        lab.place("od2000", [100.0, 200.0, 0.0])
+        lab.place("wtt12l", [100.0, 200.0, 0.0])
+        first, second = gantry.move_to_calls
+        assert first[1]["Y"] != second[1]["Y"]
+        assert first[1]["Y"] - second[1]["Y"] == pytest.approx(49.0)
+
+    def test_leaves_theta_untouched(self):
+        """Theta is outside the Cartesian frame model, so place() must use
+        the keyword form rather than a full vector."""
+        lab, gantry = self._lab()
+        lab.place("od2000", [0.0, 0.0, 0.0])
+        vector, axes = gantry.move_to_calls[0]
+        assert vector is None
+        assert "Theta" not in axes
+
+    def test_unconfigured_instrument_reduces_to_move_to(self):
+        lab = FlumeLab()
+        gantry = FakeGantry()
+        lab.add(gantry)
+        lab.place("mystery", [1.0, 2.0, 3.0])
+        _, axes = gantry.move_to_calls[0]
+        assert (axes["X"], axes["Y"], axes["Z"]) == (1.0, 2.0, 3.0)
+
+    def test_requires_gantry_subsystem(self):
+        with pytest.raises(RuntimeError):
+            FlumeLab().place("od2000", [0, 0, 0])
 
 
 class TestAcquireScan:
