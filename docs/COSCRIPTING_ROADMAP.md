@@ -1,8 +1,9 @@
 # Roadmap: co-scripting the survey instruments with the rest of FlumeLab
 
-> Status: **Workstream 0 implemented** (see `src/laguna/safety.py`); 1-4 still
-> designed only. Written 2026-08-03 alongside the Gocator integration work.
-> Each section below is its own PR.
+> Status: **Workstreams 0-3 implemented** (`safety.py`, `motion_arbiter.py`,
+> `run_context.py`, `survey.py`); Workstream 4 still designed only. Written
+> 2026-08-03 alongside the Gocator integration work. Each section below is
+> its own PR.
 
 ## Why
 
@@ -232,6 +233,18 @@ of scope here and remains a future project.
   interruption.
 - Stitching multiple placed surfaces is the natural follow-on; keep it out of scope
   unless it falls out cheaply.
+
+**Landed in this PR but two things are explicitly still open, not silently
+dropped:**
+- `solve_scan_rates()` is never called from `survey.py` — `Pass.feed_rate_mm_s`
+  is either the survey's fixed rate or `None` (falling back to the scanner's own
+  configured rate for `acquire()`). Picking a rate automatically per pass is a
+  real feature, not a one-line wiring job — needs its own follow-up.
+- `CheckpointStore.mark_complete(p.index, ...)` has no geometry fingerprint. If a
+  survey's YAML changes between runs (a different `origin`/`width_mm`/`swath_mm`),
+  a stale checkpoint would resume against pass indices that now mean something
+  else, with nothing to detect the mismatch. Needs a hash of the survey's
+  geometry fields stored alongside each completed index and checked on resume.
 
 ---
 

@@ -37,6 +37,10 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
+#: Cartesian axis name -> index into a 3-component [x, y, z] vector. Shared
+#: by RasterSurvey and SurveyRunner rather than each keeping its own copy.
+_AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
+
 
 @dataclass
 class Pass:
@@ -163,9 +167,9 @@ class RasterSurvey(Survey):
     instrument: str = "gocator"
     feed_rate_mm_s: Optional[float] = None
 
-    _AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
-
     def __post_init__(self) -> None:
+        if len(self.origin) != 3:
+            raise ValueError(f"origin must have 3 components [x, y, z], got {self.origin!r}")
         if self.swath_mm <= 0:
             raise ValueError(f"swath_mm must be positive, got {self.swath_mm}")
         if not 0.0 <= self.overlap < 1.0:
@@ -176,8 +180,8 @@ class RasterSurvey(Survey):
             )
         if self.length_mm <= 0 or self.width_mm <= 0:
             raise ValueError("length_mm and width_mm must be positive")
-        if self.axis not in self._AXIS_INDEX:
-            raise ValueError(f"axis must be one of {list(self._AXIS_INDEX)}")
+        if self.axis not in _AXIS_INDEX:
+            raise ValueError(f"axis must be one of {list(_AXIS_INDEX)}")
         if self.step_axis is None:
             self.step_axis = "Y" if self.axis == "X" else "X"
         if self.step_axis == self.axis:
@@ -189,12 +193,21 @@ class RasterSurvey(Survey):
         return self.swath_mm * (1.0 - self.overlap)
 
     def passes(self) -> List[Pass]:
-        travel_i = self._AXIS_INDEX[self.axis]
-        step_i = self._AXIS_INDEX[self.step_axis]
+        travel_i = _AXIS_INDEX[self.axis]
+        step_i = _AXIS_INDEX[self.step_axis]
 
-        # Round up: a region 2.5 swaths wide needs 3 passes, and the last one
-        # overlapping more than asked is fine — a gap is not.
-        count = max(1, math.ceil(self.width_mm / self.pitch_mm))
+        # A region no wider than one swath needs exactly one pass — anything
+        # else is duplicate, identical coverage (both the first and second
+        # pass's offset clamp to 0 via the max(0, width - swath) below, so
+        # the naive ceil(width / pitch) counted the same pass twice). Beyond
+        # that, round up: the first pass covers one swath, and each
+        # additional pass advances by one pitch — a region 2.5 swaths wide
+        # needs 3 passes, and the last one overlapping more than asked is
+        # fine, a gap is not.
+        if self.width_mm <= self.swath_mm:
+            count = 1
+        else:
+            count = math.ceil((self.width_mm - self.swath_mm) / self.pitch_mm) + 1
 
         out: List[Pass] = []
         for i in range(count):
@@ -224,7 +237,7 @@ class RasterSurvey(Survey):
     def coverage_mm(self) -> float:
         """Total width actually imaged, which may exceed `width_mm`."""
         passes = self.passes()
-        step_i = self._AXIS_INDEX[self.step_axis]
+        step_i = _AXIS_INDEX[self.step_axis]
         first = passes[0].start[step_i]
         last = passes[-1].start[step_i]
         return (last - first) + self.swath_mm
@@ -258,6 +271,10 @@ class RepeatTransect(Survey):
     feed_rate_mm_s: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if len(self.start) != 3:
+            raise ValueError(f"start must have 3 components [x, y, z], got {self.start!r}")
+        if len(self.end) != 3:
+            raise ValueError(f"end must have 3 components [x, y, z], got {self.end!r}")
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
         if not self.instruments:
@@ -344,31 +361,64 @@ class SurveyRunner:
         return done
 
     def _run_pass(self, p: Pass) -> None:
-        """Position for one pass and measure it."""
+        """Position for one pass and measure it.
+
+        Logs one event-log row per pass — success or failure — so a survey's
+        activity is traceable the same way every other scheduled action's is
+        (see laguna.core._for_each_subsystem's rationale: silently missing
+        data can invalidate an experiment as thoroughly as bad data can).
+        Re-raises after logging, since a failed pass mid-survey is exactly
+        the "run is no longer doing what it was told" case the rest of the
+        codebase escalates rather than silently continuing past.
+        """
         # place() puts the INSTRUMENT's measuring point on the target, which
         # is what makes one plan valid for several instruments.
         self.lab.place(p.instrument, list(p.start), speed=p.feed_rate_mm_s)
 
         scanner = getattr(self.lab, p.instrument, None)
-        if scanner is not None and hasattr(scanner, "acquire"):
-            gantry = getattr(self.lab, "gantry", None)
-            end_gantry = self.lab.frames.gantry_target_for(p.instrument, list(p.end))
-            axis_index = {"X": 0, "Y": 1, "Z": 2}[p.axis]
-            scanner.acquire(
-                gantry=gantry,
-                axis=p.axis,
-                end_mm=float(end_gantry[axis_index]),
-                **({"feed_rate_mm_s": p.feed_rate_mm_s} if p.feed_rate_mm_s else {}),
+        try:
+            if scanner is not None and hasattr(scanner, "acquire"):
+                gantry = getattr(self.lab, "gantry", None)
+                end_gantry = self.lab.frames.gantry_target_for(p.instrument, list(p.end))
+                axis_index = _AXIS_INDEX[p.axis]
+                scan = scanner.acquire(
+                    gantry=gantry,
+                    axis=p.axis,
+                    end_mm=float(end_gantry[axis_index]),
+                    **({"feed_rate_mm_s": p.feed_rate_mm_s} if p.feed_rate_mm_s else {}),
+                )
+                result_note = f"points={scan.valid_count}" if scan is not None else "no data"
+            else:
+                # No acquire() — a rangefinder transect goes through the
+                # profiler path instead, which has no per-instrument
+                # fallback rate the way GocatorScanner.acquire() does, so a
+                # survey/pass without one would otherwise fail deep inside
+                # FlumeLab.acquire_scan() with a message that doesn't name
+                # the pass.
+                if p.feed_rate_mm_s is None:
+                    raise ValueError(
+                        f"pass {p.index} ({p.instrument}) has no feed_rate_mm_s — "
+                        "set it on the Survey or override this Pass; unlike "
+                        "GocatorScanner.acquire(), the rangefinder profiler path "
+                        "has no configured-spec fallback to fall back to."
+                    )
+                result = self.lab.acquire_scan(
+                    p.instrument,
+                    start=None,
+                    end=list(self.lab.frames.gantry_target_for(p.instrument, list(p.end))),
+                    feed_rate_mm_s=p.feed_rate_mm_s,
+                )
+                result_note = f"file={result.path}"
+        except Exception as exc:
+            self.lab.event_log.log(
+                self.lab.clock.elapsed(), p.instrument, "survey_pass",
+                result=f"error: {exc}", notes=p.label or "",
             )
-        else:
-            # No acquire() — a rangefinder transect goes through the
-            # profiler path instead.
-            self.lab.acquire_scan(
-                p.instrument,
-                start=None,
-                end=list(self.lab.frames.gantry_target_for(p.instrument, list(p.end))),
-                feed_rate_mm_s=p.feed_rate_mm_s,
-            )
+            raise
+        self.lab.event_log.log(
+            self.lab.clock.elapsed(), p.instrument, "survey_pass",
+            result=result_note, notes=p.label or "",
+        )
 
 
 __all__ = ["Pass", "Survey", "RasterSurvey", "RepeatTransect", "SurveyRunner"]
