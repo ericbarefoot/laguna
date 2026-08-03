@@ -217,6 +217,8 @@ of scope here and remains a future project.
 
 ## Workstream 3 — Survey / raster planner
 
+> **Implemented.** `src/laguna/survey.py`.
+
 **New:** `src/laguna/survey.py`. Nothing multi-pass exists anywhere in the repo today.
 
 - `RasterSurvey` — tile a region with multiple Gocator passes, accounting for FOV
