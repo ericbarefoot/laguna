@@ -6,7 +6,7 @@ Configuration can be loaded from YAML files or passed as dictionaries.
 
 import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional, cast
 
 
 class Config:
@@ -189,7 +189,7 @@ class Config:
         """
         if subsystem not in self.config_dict:
             raise KeyError(f"Configuration for subsystem '{subsystem}' not found")
-        return self.config_dict[subsystem]
+        return cast(Dict[str, Any], self.config_dict[subsystem])
     
     def get_value(self, path: str, default: Any = None) -> Any:
         """Get a specific configuration value using dot notation.

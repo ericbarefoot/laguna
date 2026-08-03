@@ -33,6 +33,13 @@ class TestFlumeLab:
         assert lab.fake is sub
         assert "fake" in lab._subsystems
 
+    def test_getattr_falls_back_to_registered_subsystems(self, lab):
+        sub = FakeSubsystem()
+        lab.add(sub)
+        delattr(lab, "fake")
+
+        assert lab.fake is sub
+
     def test_add_returns_self_for_chaining(self, lab):
         sub = FakeSubsystem()
         result = lab.add(sub)
@@ -41,6 +48,11 @@ class TestFlumeLab:
     def test_add_requires_subsystem_name(self, lab):
         with pytest.raises(ValueError):
             lab.add(object())
+
+    def test_getattr_returns_registered_subsystem(self, lab):
+        sub = FakeSubsystem()
+        lab.add(sub)
+        assert lab.__getattr__("fake") is sub
 
     def test_get_system_status_contains_only_timing_with_no_subsystems(self, lab):
         status = lab.get_system_status()
