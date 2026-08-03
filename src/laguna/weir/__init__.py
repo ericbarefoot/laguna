@@ -1,7 +1,7 @@
 """Weir (tailgate) elevation control subsystem."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -105,9 +105,31 @@ class WeirController(ABC):
         """
         ...
 
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+    # The weir holds its elevation mechanically, so every tier reduces to the
+    # same action: halt any in-progress move. All four verbs must return a
+    # note about anything a human needs to know, or None, and never raise.
+
     @abstractmethod
-    def stop(self) -> None:
-        """Immediately halt any in-progress move."""
+    def pause(self) -> Optional[str]:
+        """Halt any in-progress elevation move."""
+        ...
+
+    @abstractmethod
+    def resume(self) -> Optional[str]:
+        """Nothing to restore — the weir holds its elevation mechanically."""
+        ...
+
+    @abstractmethod
+    def stop(self) -> Optional[str]:
+        """Halt the move. Same action as pause: the weir has one stop."""
+        ...
+
+    @abstractmethod
+    def estop(self) -> Optional[str]:
+        """Halt the move. Same action as pause: the weir has one stop."""
         ...
 
     @abstractmethod
@@ -310,15 +332,6 @@ class SaflWeirController(WeirController):
         """
         self._require_connected()
         return self._motor.find_home(home_position_mm=self._home_offset_mm)
-
-    def stop(self) -> None:
-        """Immediately halt any in-progress move.
-
-        Raises:
-            RuntimeError: If not connected.
-        """
-        self._require_connected()
-        self._motor.stop()
 
     # ------------------------------------------------------------------
     # Safety verbs (see laguna.safety)

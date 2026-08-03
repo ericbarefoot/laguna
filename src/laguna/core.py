@@ -637,7 +637,16 @@ class FlumeLab:
         Anything a subsystem discarded to get here — a part-finished scan,
         most importantly — is written to the event log by
         :meth:`_for_each_subsystem`.
+
+        Refuses to downgrade an active ESTOPPED state — a pause is milder
+        than an estop, and something already decided the rig needed the
+        harder stop. Call :meth:`rearm` first.
         """
+        if self._safety_state is SafetyState.ESTOPPED:
+            logger.error(
+                "Refusing to pause: the rig is ESTOPPED. Call rearm() first."
+            )
+            return
         logger.info("Pausing experiment (%s)...", reason)
         self.event_log.log(
             self.clock.elapsed(), "flume_lab", "experiment_pause", notes=reason
@@ -667,7 +676,7 @@ class FlumeLab:
         if still is not None:
             logger.error(
                 "Refusing to resume: safety trigger %r is still asserted. "
-                "Clear it first (e.g. remove the sentinel file).", still,
+                "Clear it first (%s).", still, self.safety_monitor.hint_for(still),
             )
             return False
 
@@ -687,7 +696,16 @@ class FlumeLab:
         estop (controlled deceleration, no stalling against brakes). Named
         end_run() because ``FlumeLab.stop()`` has always meant "pause" to
         existing scripts and to run_blocking()'s signal handlers.
+
+        Refuses to downgrade an active ESTOPPED state, for the same reason
+        as :meth:`pause`: an estop is the more severe tier, and something
+        already decided the rig needed it. Call :meth:`rearm` first.
         """
+        if self._safety_state is SafetyState.ESTOPPED:
+            logger.error(
+                "Refusing to end the run: the rig is ESTOPPED. Call rearm() first."
+            )
+            return
         logger.info("Stopping run (%s)...", reason)
         self.event_log.log(
             self.clock.elapsed(), "flume_lab", "experiment_stop_requested", notes=reason
@@ -752,7 +770,7 @@ class FlumeLab:
         if tripped is not None:
             logger.error(
                 "Refusing to re-arm: safety trigger %r is still asserted. "
-                "Clear it first (e.g. remove the ESTOP sentinel file).", tripped,
+                "Clear it first (%s).", tripped, self.safety_monitor.hint_for(tripped),
             )
             return False
 

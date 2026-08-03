@@ -102,6 +102,44 @@ class CameraManager:
             cam.stop()
 
     # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+    # Cameras have nothing hazardous to quiesce — no motion, no hydraulics —
+    # so every tier reduces to the same action: stop each local camera's
+    # capture loop. Scheduled captures already stop when FlumeLab halts the
+    # scheduler ahead of these calls; this only covers the persistent local
+    # capture thread, which keeps running independently of the scheduler.
+
+    def pause(self) -> Optional[str]:
+        """Stop local capture loops; resume() restarts them."""
+        return self._halt_local()
+
+    def resume(self) -> Optional[str]:
+        """Restart local capture loops stopped by pause()."""
+        try:
+            if not self.start():
+                return "one or more local cameras failed to restart"
+        except Exception as exc:
+            logger.error("Could not restart local cameras: %s", exc)
+            return f"local cameras may not have restarted: {exc}"
+        return None
+
+    def estop(self) -> Optional[str]:
+        """Same as stop: cameras have no harder halt available."""
+        return self._halt_local()
+
+    def _halt_local(self) -> Optional[str]:
+        """Stop every local camera, each attempted independently. Never raises."""
+        problems = []
+        for cam in self._local:
+            try:
+                cam.stop()
+            except Exception as exc:
+                logger.error("Could not stop local camera: %s", exc)
+                problems.append(str(exc))
+        return f"could not stop: {'; '.join(problems)}" if problems else None
+
+    # ------------------------------------------------------------------
     # Capture
     # ------------------------------------------------------------------
 
