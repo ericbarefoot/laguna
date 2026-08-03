@@ -66,15 +66,22 @@ And `FlumeLab.stop()` (`core.py:320`) is really a *pause* — it logs
 |---|---|
 | Vocabulary | Three tiers: `pause()` / `stop()` / `estop()` |
 | Pause & hydraulics | Quiesce **everything**, pump included |
-| Estop & hydraulics | Kill everything — pump off, valves closed |
+| Estop & hydraulics | Kill everything — pump off, both valves closed |
 | Mid-scan pause/estop | Abort immediately, **discard** the partial surface, log it |
+| Pause & the clock | The experiment clock pauses too |
+| Re-arm after estop | `lab.rearm()` normally, full reconnect as fallback |
 
 - **`pause()`** — temporary and resumable. Gantry `soft_stop()` (BST decel ramp,
   brakes and motors untouched), pump ramped down via normal VFD stop, acquisition
   stopped, everything stays *connected*. `resume()` restores the flow setpoint.
+  **The experiment clock pauses too**, so runtime means "time under experimental
+  conditions" and a schedule-CSV row at t=600 fires 600s of real experiment time
+  in however long the pause lasted. `ExperimentClock` already supports this; the
+  consequence is that runtime and wall clock diverge, which is exactly why
+  Workstream 2's `run.json` has to record the piecewise mapping.
 - **`stop()`** — end the run cleanly. Quiesce as for pause, then disconnect.
 - **`estop()`** — screeching halt. Gantry hard abort (ABT + brakes + motors off),
-  pump off, valves closed, acquisition stopped. Requires **explicit re-arm**.
+  pump off, **both valves closed**, acquisition stopped. Requires explicit re-arm.
 
 Rationale for discarding a partial surface: `Y spacing = travel_speed / frame_rate`
 assumes constant velocity, so a surface captured across a decelerating pass has a
@@ -245,13 +252,28 @@ Highest value per line of code for a rig where a bad schedule costs a flume day.
   confirm a scan's wall-clock timestamp maps to the right experiment runtime *across
   a pause*.
 
-## Open questions
+## Re-arming after an estop
 
-1. **Valve-closing on estop** — is slamming both valves shut hydraulically safe, or
-   should they be left as-is? Domain call.
-2. **Re-arm after estop** — an explicit `lab.rearm()`, or require a full reconnect?
-   The gantry already needs `enable()`/`disengage_brake()`, or
-   `connect()`/`set_safe_mode(False)`.
-3. **Should `pause()` also pause the experiment clock?** It would make runtime mean
-   "time under experimental conditions". `ExperimentClock` already supports it, but it
-   changes what schedule-CSV times refer to across a pause.
+Two paths, both supported:
+
+- **`lab.rearm()`** for the normal case — re-enables motors, releases brakes, and
+  returns state to `RUNNING` without dropping any connection, so recovery is fast.
+  It **refuses while a trigger is still asserted** (the ESTOP sentinel file still
+  present, the VFD's hardware `e_stop` flag still set), so the rig cannot be re-armed
+  back into a live emergency.
+- **A full disconnect/reconnect** as the documented fallback, for when the controller
+  is in a state `rearm()` cannot clear — a PLC that needed a power cycle, say.
+  `connect()` already performs motor-on then brake-release in the correct order.
+  Note this loses the gantry's position reference unless the #23 checkpoint is
+  restored with `restore_last_position()`.
+
+## When to start
+
+**Blocked on PR #28 merging to `develop`.** These workstreams branch from a clean
+`develop` rather than from the scanner branch: W0 and W2 both rewrite `core.py`,
+W1 and W4 both touch `experiment/runner.py`, and W0 and W1 both touch
+`scanner/gocator.py`, so branching them off an unmerged parent would put #28's
+commits in every diff and guarantee conflicts between them.
+
+Once #28 lands, each workstream gets its own branch off `develop` and its own draft
+PR, in the sequencing order above.
