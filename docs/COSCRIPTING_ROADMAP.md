@@ -145,6 +145,10 @@ blocking serial read or SDK call — the halt would be deferred, not immediate.
 
 ## Workstream 1 — Schedulable surveys + motion arbiter
 
+> **Implemented.** `src/laguna/robot/motion_arbiter.py`,
+> `GocatorScanner.acquire()`, and `gantry`/`gocator` sections in
+> `experiment/runner.py::setup_run()`.
+
 **Motion arbiter** — new `src/laguna/robot/motion_arbiter.py`. A re-entrant lock with
 a timeout and a descriptive error naming the current holder. Acquired by every
 gantry-consuming operation: `GantryController.move_to`, `FlumeLab.place`,

@@ -213,6 +213,18 @@ gocator:
   #   x_smoothing: 1.5        # of these with uniform_spacing: false raises.
   #   y_median: true          # false = off, true = on (keep window), number = window mm
   #   x_gap_filling: false    # names: {x,y}_{smoothing,median,decimation,gap_filling}
+  # scan:                     # Spec for the zero-arg acquire() entry point, which is
+  #   axis: X                 # what makes a scan SCHEDULABLE like a camera capture.
+  #   end_mm: 400             # Combine with interval_s / trigger_at / use_schedule
+  #   feed_rate_mm_s: 20      # below, exactly as the other subsystems do.
+  #   settle_s: 0.5           # delay after starting motion, to clear the accel ramp
+  #   return_to_start: true   # put the axis back afterwards — needed for repeat
+  #                           # scans of one transect, or each pass starts further along
+  #   formats: [npz, laz]     # omit to capture without saving
+  # Scheduling (choose one) — same keys as gauge/weir/flow/cameras:
+  # interval_s: 600           # scan every 10 minutes
+  # trigger_at: [0, 900, 1800]  # scan at these runtime seconds
+  # use_schedule: true        # scan at schedule CSV rows with a gocator column set
   output_dir: ./data/scans
   sdk_lib_dir: null           # dir holding libGoSdk.so/libkApi.so. Omit to use
                                # $LAGUNA_GOSDK_LIB_DIR or a conventional path —

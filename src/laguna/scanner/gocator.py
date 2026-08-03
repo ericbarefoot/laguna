@@ -36,6 +36,7 @@ import numpy as np
 
 from . import gosdk as _g
 from .gosdk import GoSdkError, GoSdkLib, GoSdkTimeout
+from ..robot.motion_arbiter import DEFAULT_ARBITER
 from .mounting import SensorMounting
 from .pointcloud import (
     SurfaceScan,
@@ -134,6 +135,8 @@ class GocatorScanner(GocatorSettingsMixin):
         self._subsampling = config.get("subsampling") or None
         self._spacing_interval = config.get("spacing_interval") or None
         self._filters = config.get("filters") or None
+        #: Scan spec for the zero-arg acquire() entry point — see that method.
+        self._scan_spec = config.get("scan") or None
         self._data_capacity_bytes = config.get("data_capacity_bytes")
         self._sdk_lib_dir = config.get("sdk_lib_dir")
         self._output_dir = Path(config.get("output_dir", "./data/scans"))
@@ -146,6 +149,7 @@ class GocatorScanner(GocatorSettingsMixin):
         self._is_running = False
         self._scan_count = 0
         self._last_scan_meta: Dict[str, Any] = {}
+        self._last_saved_path: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Subsystem lifecycle
@@ -658,6 +662,29 @@ class GocatorScanner(GocatorSettingsMixin):
             KeyError: If `axis` isn't a configured axis on this gantry.
             SnapMotionError: If the gantry's safe_mode blocks the move.
         """
+        # Hold the gantry for the whole pass. Without this, a second
+        # scheduled action could move an axis mid-traverse and the surface
+        # would be silently wrong — Y spacing assumes constant velocity.
+        # Re-entrant, so handle.begin_move_to() re-acquiring is fine.
+        arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
+        with arbiter.hold(f"gocator scan {axis} -> {end_mm:.1f}mm"):
+            return self._scan_with_gantry(
+                gantry, axis, end_mm, feed_rate_mm_s, settle_s,
+                fixed_length_mm, metadata, timeout_s,
+            )
+
+    def _scan_with_gantry(
+        self,
+        gantry,
+        axis: str,
+        end_mm: float,
+        feed_rate_mm_s: float,
+        settle_s: float,
+        fixed_length_mm: Optional[float],
+        metadata: Optional[Dict[str, Any]],
+        timeout_s: Optional[float],
+    ) -> SurfaceScan:
+        """Body of scan_with_gantry(), with the gantry already held."""
         handle = gantry.axis(axis)
 
         start_mm = None
@@ -729,6 +756,78 @@ class GocatorScanner(GocatorSettingsMixin):
                 except GoSdkError as e:
                     logger.warning("Error stopping after gantry scan: %s", e)
 
+    def acquire(self, gantry=None, **overrides: Any) -> Optional[SurfaceScan]:
+        """Run one configured scan — a zero-argument entry point for schedulers.
+
+        ``scan_with_gantry()`` needs four arguments including a gantry handle,
+        so it cannot be handed to ``Scheduler.repeat(action=...)`` or to
+        ``experiment.runner._register_action``. This closes over a scan spec
+        from config instead, so a Gocator pass can be scheduled exactly like a
+        camera capture.
+
+        The spec comes from the ``gocator.scan:`` config block — ``axis``,
+        ``end_mm``, ``feed_rate_mm_s``, and optionally ``settle_s``,
+        ``return_to_start`` and ``formats`` — with any of them overridable
+        per call.
+
+        Args:
+            gantry: A connected GantryController. Required for a coordinated
+                pass; without one this raises rather than silently triggering
+                on a stationary gantry, which would produce a surface with no
+                travel at all.
+            **overrides: Per-call overrides of the configured scan spec.
+
+        Returns:
+            The captured SurfaceScan, or None if no scan spec is configured
+            (so an unconfigured scanner in a scheduled run logs and continues
+            rather than crashing the experiment).
+
+        Raises:
+            ValueError: If a scan spec exists but is missing a required key,
+                or no gantry was supplied.
+        """
+        spec = dict(self._scan_spec or {})
+        spec.update(overrides)
+        if not spec:
+            logger.warning(
+                "gocator.acquire() called with no 'scan:' config block and no "
+                "overrides — nothing to do. Add gocator.scan.{axis, end_mm, "
+                "feed_rate_mm_s} to schedule scans."
+            )
+            return None
+
+        missing = [k for k in ("axis", "end_mm", "feed_rate_mm_s") if spec.get(k) is None]
+        if missing:
+            raise ValueError(
+                f"gocator scan spec is missing {missing}; needs axis, end_mm "
+                "and feed_rate_mm_s to run a coordinated pass"
+            )
+        if gantry is None:
+            raise ValueError(
+                "gocator.acquire() needs a connected gantry — a scan with no "
+                "motion produces a surface with no travel. Pass gantry=, or "
+                "register a 'gantry:' section so the runner can supply one."
+            )
+
+        return_to_start = spec.pop("return_to_start", False)
+        formats = spec.pop("formats", None)
+        start = gantry.axis(spec["axis"]).get_position() if return_to_start else None
+
+        scan = self.scan_with_gantry(
+            gantry,
+            axis=spec["axis"],
+            end_mm=float(spec["end_mm"]),
+            feed_rate_mm_s=float(spec["feed_rate_mm_s"]),
+            settle_s=float(spec.get("settle_s", 0.5)),
+        )
+        if formats:
+            self.save_scan(scan, formats=tuple(formats))
+        if return_to_start and start is not None:
+            # Repeat scans of the same transect need the axis back where it
+            # began, or each pass starts further along than the last.
+            gantry.move_to(**{spec["axis"]: start})
+        return scan
+
     # ------------------------------------------------------------------
     # Saving
     # ------------------------------------------------------------------
@@ -799,6 +898,10 @@ class GocatorScanner(GocatorSettingsMixin):
                 written["ply"] = scan.save_ply(base.with_suffix(".ply"), points=points)
             elif fmt == "csv":
                 written["csv"] = scan.save_csv(base.with_suffix(".csv"), points=points)
+        # Remembered so a scheduled run can put the output path in the event
+        # log — otherwise the only cross-subsystem index has no idea a scan
+        # happened. See experiment.runner and COSCRIPTING_ROADMAP workstream 2.
+        self._last_saved_path = str(next(iter(written.values()))) if written else None
         logger.info("Saved scan: %s", {k: str(v) for k, v in written.items()})
         return written
 
