@@ -9,7 +9,7 @@ a scheduler could call.
 import numpy as np
 import pytest
 
-from laguna.scanner import GocatorScanner
+from laguna.scanner import GocatorScanner, ScanNotPossibleError
 from laguna.scanner.pointcloud import SurfaceScan
 
 
@@ -68,6 +68,7 @@ class StubScanner(GocatorScanner):
         super().__init__(config)
         self.scans = []
         self.saved = []
+        self._is_connected = True   # acquire() refuses on a disconnected scanner
 
     def scan_with_gantry(self, gantry, axis, end_mm, feed_rate_mm_s, **kw):
         self.scans.append({"axis": axis, "end_mm": end_mm,
@@ -94,15 +95,17 @@ class TestAcquireIsSchedulable:
             {"axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0, "settle_s": 0.5}
         ]
 
-    def test_no_spec_returns_none_rather_than_raising(self):
-        """An unconfigured scanner in a scheduled run should log and let the
-        experiment continue, not crash it."""
+    def test_an_unconfigured_scanner_is_a_run_stopping_problem(self):
+        """Missing data is as bad as a stationary gantry. A scheduled scan
+        that cannot run must not be quietly skipped — the runner escalates
+        this to a lab-wide pause."""
         scanner = StubScanner({"ip": "1.2.3.4"})
-        assert scanner.acquire(gantry=FakeGantry()) is None
+        with pytest.raises(ScanNotPossibleError, match="no 'scan:' config"):
+            scanner.acquire(gantry=FakeGantry())
 
     def test_missing_required_key_is_rejected(self):
         scanner = StubScanner({"ip": "1.2.3.4", "scan": {"axis": "X"}})
-        with pytest.raises(ValueError, match="missing"):
+        with pytest.raises(ScanNotPossibleError, match="missing"):
             scanner.acquire(gantry=FakeGantry())
 
     def test_requires_a_gantry(self):
@@ -112,8 +115,19 @@ class TestAcquireIsSchedulable:
             "ip": "1.2.3.4",
             "scan": {"axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0},
         })
-        with pytest.raises(ValueError, match="needs a connected gantry"):
+        with pytest.raises(ScanNotPossibleError, match="no connected gantry"):
             scanner.acquire()
+
+    def test_an_unreachable_scanner_is_also_run_stopping(self):
+        """'If the scanner isn't configured or it's unreachable in any way,
+        this is cause to pause the run.'"""
+        scanner = StubScanner({
+            "ip": "1.2.3.4",
+            "scan": {"axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0},
+        })
+        scanner._is_connected = False
+        with pytest.raises(ScanNotPossibleError, match="not connected"):
+            scanner.acquire(gantry=FakeGantry())
 
     def test_overrides_beat_the_configured_spec(self):
         scanner = StubScanner({
@@ -190,3 +204,57 @@ class TestRunnerKnowsAboutSurveyInstruments:
 
         source = inspect.getsource(runner.setup_run)
         assert source.count("_register_action(lab, cfg.get(\"gocator\"") == 1
+
+
+class TestFailuresEscalateRatherThanSkip:
+    """A scheduled scan that cannot run, or a gantry that is already busy,
+    both mean the scripted plan is no longer being followed. Continuing just
+    accumulates data under conditions nobody recorded."""
+
+    def test_scan_config_uses_the_configured_spec_without_repeating_it(self):
+        """scan_with_gantry() falls back to gocator.scan:, so acquire() is a
+        thin wrapper rather than a second code path."""
+        scanner = StubScanner({
+            "ip": "1.2.3.4",
+            "scan": {"axis": "X", "end_mm": 300.0, "feed_rate_mm_s": 12.0},
+        })
+        # Call the real method (not the stub's override) to exercise defaulting.
+        spec = scanner._scan_spec
+        assert spec["axis"] == "X" and spec["end_mm"] == 300.0
+
+    def test_arbiter_contention_raises_rather_than_queueing(self):
+        """An errant move landing mid-motion hints something much bigger is
+        wrong, so it must surface, not silently serialise."""
+        import threading
+
+        from laguna.robot.motion_arbiter import MotionArbiter, MotionBusyError
+
+        arbiter = MotionArbiter()
+        started, release = threading.Event(), threading.Event()
+
+        def holder():
+            with arbiter.hold("scripted scan"):
+                started.set()
+                release.wait(timeout=2)
+
+        t = threading.Thread(target=holder, daemon=True)
+        t.start()
+        started.wait(timeout=2)
+        try:
+            with pytest.raises(MotionBusyError, match="scripted scan"):
+                with arbiter.hold("errant move", timeout_s=0.02):
+                    pass
+        finally:
+            release.set()
+            t.join(timeout=2)
+
+    def test_runner_escalates_a_failed_scan_to_a_lab_pause(self):
+        """The closure in setup_run() must call lab.escalate(), not swallow."""
+        import inspect
+
+        from laguna.experiment import runner
+
+        source = inspect.getsource(runner.setup_run)
+        assert "lab.escalate(" in source, "a failed scan is silently skipped"
+        assert "ScanNotPossibleError" in source
+        assert "MotionBusyError" in source

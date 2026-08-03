@@ -414,12 +414,24 @@ def setup_run(
         the exception anyway, but then the event log would carry no record of
         what was attempted.
         """
+        from laguna.robot.motion_arbiter import MotionBusyError
+        from laguna.scanner import ScanNotPossibleError
+
         try:
             scan = gocator.acquire(gantry=gantry)
+        except (ScanNotPossibleError, MotionBusyError) as exc:
+            # Not a skippable hiccup. Either the scanner cannot collect at
+            # all, or something moved the gantry outside the scripted plan —
+            # both mean the run is no longer doing what it was told, and
+            # continuing just accumulates data under unrecorded conditions.
+            lab.event_log.log(lab.clock.elapsed(), "gocator", "scan",
+                              result=f"error: {exc}")
+            lab.escalate(f"gocator scan could not run: {exc}")
+            return
         except Exception as exc:
             lab.event_log.log(lab.clock.elapsed(), "gocator", "scan",
                               result=f"error: {exc}")
-            logger.error("Scheduled Gocator scan failed: %s", exc)
+            lab.escalate(f"gocator scan failed unexpectedly: {exc}")
             return
         if scan is None:
             return
