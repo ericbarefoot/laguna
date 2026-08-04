@@ -18,6 +18,10 @@
   --md-primary-fg-color: #263238;
   --md-primary-fg-color--light: #37474f;
   --md-primary-fg-color--dark: #0d1417;
+  /* Body/TOC/headerlink color defaults to --md-primary-fg-color, which is a
+     near-black blue-grey in dark mode — unreadable until :hover/:focus swap
+     it for the accent color. Give links their own lighter tone instead. */
+  --md-typeset-a-color: #8fb2c2;
 }
 
 [data-md-color-accent="custom"] {
