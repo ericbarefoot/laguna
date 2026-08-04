@@ -43,6 +43,22 @@ mypy src/laguna
 4. Commit with a clear message
 5. Push and open a pull request
 
+## Releasing / Version Bumps
+
+`pyproject.toml`'s `version` field is the single source of truth —
+`laguna.__version__` reads it dynamically via `importlib.metadata`, it isn't a
+separate hardcoded string. As you make notable changes, add a bullet under the
+`## [Unreleased]` heading in `CHANGELOG.md`. When it's time to cut a version:
+
+```bash
+python scripts/bump_version.py patch   # or: minor, major, or an explicit X.Y.Z
+```
+
+This bumps `pyproject.toml`, rotates `CHANGELOG.md`'s `[Unreleased]` section
+into a dated release entry, and creates a local commit + annotated `vX.Y.Z`
+tag. It refuses to run against a dirty working tree, and never pushes —
+pushing the branch and tag is a separate, explicit step.
+
 ## Adding a New Subsystem
 
 `FlumeLab` is opt-in: subsystems are constructed independently and
