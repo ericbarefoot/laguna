@@ -288,6 +288,59 @@ class TestProfilerScan:
         assert result.metadata["end_mm"] == 500.0
         assert result.metadata["feed_rate_mm_s"] == 5.0
 
+    def test_holds_the_gantry_arbiter_for_the_whole_traverse(self, tmp_path):
+        """The transport already serialises individual commands, but nothing
+        stopped another thread's move_to()/scan_with_gantry() from landing
+        in between start_scan() and wait_for_scan_result(). scan() must hold
+        the same arbiter GantryController.move_to() and
+        GocatorScanner.scan_with_gantry() use — see laguna.robot.motion_arbiter.
+        """
+        from laguna.robot.motion_arbiter import MotionArbiter
+
+        class RealishGantry:
+            def __init__(self, connection):
+                self.connection = connection
+                self.arbiter = MotionArbiter()
+
+        conn = FakeGantryConnection()
+        gantry = RealishGantry(conn)
+        held_during = {}
+
+        def start_scan_spy(*args, **kwargs):
+            held_during["start"] = gantry.arbiter.is_held
+            return FakeGantryConnection.start_scan(conn, *args, **kwargs)
+
+        conn.start_scan = start_scan_spy
+
+        profiler = TopographicProfiler(
+            gantry=gantry, pi_host="red.lab", pi_user="oak",
+            pdin_port=2, al1342_host="192.168.1.251", output_dir=str(tmp_path),
+        )
+        fake_client = FakeSSHClient()
+        with patch("paramiko.SSHClient", return_value=fake_client):
+            profiler.scan(axis="A1", end_mm=500.0, feed_rate_mm_s=5.0)
+
+        assert held_during["start"] is True
+        assert gantry.arbiter.is_held is False, "must release once the scan completes"
+
+    def test_two_scans_in_the_same_second_do_not_collide(self, tmp_path):
+        """Auto-generated names used to have only second resolution — two
+        scans saved within the same wall-clock second silently overwrote
+        each other. Exercised for real, not just checked for a '%f' in the
+        format string.
+
+        Resolution is milliseconds, not microseconds, so a short sleep
+        guarantees the two runs land in different milliseconds — without it
+        this is a race against the boundary they need to cross.
+        """
+        import time
+
+        first, _, _ = self._run_scan(tmp_path)
+        time.sleep(0.005)
+        second, _, _ = self._run_scan(tmp_path)
+        assert first.path != second.path
+        assert first.path.exists() and second.path.exists()
+
 
 class TestProfilerStop:
     def test_stop_calls_stop_scan(self):

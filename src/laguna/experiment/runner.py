@@ -105,6 +105,8 @@ def setup_run(
     lab_config: str,
     schedule: Optional[str] = None,
     verbose_cameras: bool = False,
+    simulate: bool = False,
+    speed_factor: Optional[float] = None,
 ) -> FlumeLab:
     """Set up a FlumeLab from experiment_config.yaml.
 
@@ -126,12 +128,29 @@ def setup_run(
                   (weir_elevation_mm, pump_flow_lpm, qin_open, qaux_open) and
                   camera trigger columns (pi_cameras, dslr_cameras) are optional.
         verbose_cameras: Show full paramiko / SSH progress during Pi captures.
+        simulate: Rehearse with no hardware attached — see laguna.simulation.
+                  Only gantry/gocator have a simulated backend; every other
+                  section (weir, flow, gauge, cameras, rangefinders) is
+                  dropped rather than connecting to real hardware.
+        speed_factor: Experiment seconds per real second. Only valid with
+                      simulate=True (see FlumeLab.__init__).
 
     Returns:
         Configured FlumeLab. Call lab.start(duration) to begin.
     """
     cfg = _load_yaml(lab_config)
-    lab = FlumeLab(lab_config)
+    lab = FlumeLab(lab_config, simulate=simulate, speed_factor=speed_factor)
+    if simulate:
+        # setup_run() reads its own local `cfg` (raw YAML, not merged with
+        # Config's defaults) to decide which subsystems to construct — see
+        # the `if "weir" in cfg` pattern below. FlumeLab.__init__ already
+        # simulated lab.config.config_dict for lab.config.get(...) callers
+        # (acquire_scan(), survey passes), but that is a different dict; this
+        # `cfg` needs the same rewrite or the sections dropped there would
+        # still get built here, real hardware and all.
+        from laguna.simulation import simulate_config
+
+        cfg = simulate_config(cfg)
 
     if not verbose_cameras:
         logging.getLogger("paramiko").setLevel(logging.WARNING)
@@ -145,8 +164,13 @@ def setup_run(
         logger.info("Loaded schedule from %s (%d time points)", schedule,
                     len(exp_schedule._df))
 
-    # Validate scheduling config for all present sections
-    for section in ("gauge", "weir", "flow", "pi_cameras", "dslr_cameras"):
+    # Validate scheduling config for all present sections. "gantry" has no
+    # scheduled action of its own — it only ever moves as part of a scan —
+    # but interval_s/trigger_at/use_schedule under a gantry: block would be
+    # silently ignored without this, so it's validated here too rather than
+    # left to fail confusingly later.
+    for section in ("gauge", "weir", "flow", "pi_cameras", "dslr_cameras",
+                    "gantry", "gocator"):
         if section in cfg:
             _validate_trigger_config(section, cfg[section])
 
@@ -203,6 +227,27 @@ def setup_run(
             main_yaml_path=lab_config,
         )
         lab.add(dslr)
+
+    # The survey half of the rig. Until now gantry/gocator were hand-scripted
+    # in examples only — they were absent from this function entirely, so a
+    # scan could not be part of a scheduled experiment. See
+    # docs/COSCRIPTING_ROADMAP.md.
+    gantry = None
+    if "gantry" in cfg:
+        from laguna.robot.macron.controller import GantryController
+        gantry = GantryController.from_config(cfg["gantry"])
+        lab.add(gantry)
+
+    gocator = None
+    if "gocator" in cfg:
+        from laguna.scanner import GocatorScanner
+        gocator = GocatorScanner.from_config(cfg["gocator"])
+        if lab.run.root is not None:
+            # Route scans under the run directory rather than the bare
+            # configured output_dir, so a run's whole output tree is one
+            # self-contained artifact — see laguna.run_context.
+            gocator._output_dir = lab.run.path_for("gocator", str(gocator._output_dir))
+        lab.add(gocator)
 
     # ------------------------------------------------------------------ #
     # Connect                                                              #
@@ -388,6 +433,57 @@ def setup_run(
     if dslr is not None:
         _register_action(lab, cfg.get("dslr_cameras", {}), "dslr_cameras", "capture",
                          action=_capture_dslr, exp_schedule=exp_schedule, schedule_col="dslr_cameras")
+
+    def _scan_gocator():
+        """One coordinated Gocator pass, logged to the event log.
+
+        Never raises: a failed scan must not take down a running experiment
+        that is also driving hydraulics and cameras. The scheduler would log
+        the exception anyway, but then the event log would carry no record of
+        what was attempted.
+        """
+        from laguna.robot.motion_arbiter import MotionBusyError
+        from laguna.scanner import ScanNotPossibleError
+
+        # One runtime_s for this whole scan, taken at the start — a pass
+        # takes real time, so "start" and "completion" would otherwise be
+        # two different numbers describing the same scan depending which
+        # artifact you read (scan.metadata's stamp vs. run.json's outputs
+        # vs. the event log). This has to be the start time specifically
+        # because save_scan() reads gocator._run_stamp mid-acquire() to
+        # build the filename and embed it in the surface's own metadata —
+        # it cannot be computed after the fact.
+        runtime_s = lab.clock.elapsed()
+        gocator._run_stamp = lab.run.stamp(runtime_s)
+        try:
+            scan = gocator.acquire(gantry=gantry)
+        except (ScanNotPossibleError, MotionBusyError) as exc:
+            # Not a skippable hiccup. Either the scanner cannot collect at
+            # all, or something moved the gantry outside the scripted plan —
+            # both mean the run is no longer doing what it was told, and
+            # continuing just accumulates data under unrecorded conditions.
+            lab.event_log.log(runtime_s, "gocator", "scan", result=f"error: {exc}")
+            lab.escalate(f"gocator scan could not run: {exc}")
+            return
+        except Exception as exc:
+            lab.event_log.log(runtime_s, "gocator", "scan", result=f"error: {exc}")
+            lab.escalate(f"gocator scan failed unexpectedly: {exc}")
+            return
+        if scan is None:
+            return
+        path = getattr(gocator, "_last_saved_path", None)
+        if path:
+            lab.run.record_output("gocator", path, runtime_s, points=scan.valid_count)
+        lab.event_log.log(
+            runtime_s, "gocator", "scan",
+            result=f"points={scan.valid_count}",
+            notes=f"file={path}" if path else "",
+        )
+
+    if gocator is not None:
+        _register_action(lab, cfg.get("gocator", {}), "gocator", "scan",
+                         action=_scan_gocator, exp_schedule=exp_schedule,
+                         schedule_col="gocator")
 
     return lab
 

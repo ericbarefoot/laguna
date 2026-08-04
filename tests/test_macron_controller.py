@@ -179,19 +179,45 @@ class TestSubsystemInterface:
         status = controller.get_status()
         assert status["positions"] == {"X": 1.0, "Y": 2.0, "Z": 5.0, "Theta": 6.0}
 
-    def test_stop_aborts_all_axes(self):
+    def test_estop_aborts_all_axes(self):
+        """estop() is the zero-decel abort. This used to be what stop() did;
+        the unified safety vocabulary moved it here (see laguna.safety)."""
         responses = {f"A{i} ABT": "0" for i in (1, 2, 5, 6)}
         responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)})
         controller, conn = self._make_controller(responses)
         controller.connect()
-        controller.stop()
+        controller.estop()
         assert "A1 ABT" in conn.sent
         assert "A5 ABT" in conn.sent
 
-    def test_stop_never_raises_even_on_errors(self):
-        controller, _conn = self._make_controller({})  # every command hits an unscripted response
+    def test_stop_decelerates_rather_than_aborting(self):
+        """stop() is now the CLEAN stop: decelerate on each axis's own ramp
+        and park the brakes, so nothing stalls and the encoder isn't
+        disturbed. No ABT."""
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        responses.update({"SOB 4 0": "0", "SOB 5 0": "0"})
+        controller, conn = self._make_controller(responses)
         controller.connect()
-        controller.stop()  # must not propagate
+        controller.stop()
+        assert "A1 BST" in conn.sent
+        assert not any("ABT" in c for c in conn.sent), "stop() must not hard-abort"
+
+    def test_pause_decelerates_without_touching_brakes(self):
+        """pause() has to be cheap enough to use liberally — the gantry stays
+        immediately movable, with no re-enable cycle."""
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        controller, conn = self._make_controller(responses)
+        controller.connect()
+        controller.pause()
+        assert "A1 BST" in conn.sent
+        assert not any("SOB" in c or "ABT" in c for c in conn.sent)
+
+    def test_safety_verbs_never_raise_even_on_errors(self):
+        controller, _conn = self._make_controller({})  # every command unscripted
+        controller.connect()
+        controller.pause()
+        controller.stop()
+        controller.estop()   # none may propagate
 
 
 class TestMoveTo:
@@ -520,8 +546,8 @@ class TestPositionPersistence:
         assert controller._position_store is None
 
     def test_stop_persists_the_live_position(self, tmp_path):
-        responses = {f"A{i} ABT": "0" for i in (1, 2, 5, 6)}
-        responses.update({f"A{i} MTR 0": "0" for i in (1, 2, 5, 6)})
+        responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        responses.update({"SOB 4 0": "0", "SOB 5 0": "0"})
         responses.update({"A1 ACP": "10", "A2 ACP": "20", "A5 ACP": "30", "A6 ACP": "40"})
         controller, _conn, path = self._make_controller(tmp_path, responses)
         controller.stop()
@@ -566,7 +592,7 @@ class TestPositionPersistence:
 
     def test_not_persisted_when_disconnected(self, tmp_path):
         controller, _conn, path = self._make_controller(tmp_path, responses={}, connect=False)
-        controller.stop()  # cmd.shutdown() hits unscripted commands but stop() never raises
+        controller.stop()  # hits unscripted commands, but safety verbs never raise
         assert GantryPositionStore(path).load() is None
 
     def test_restore_last_position_applies_the_saved_positions(self, tmp_path):

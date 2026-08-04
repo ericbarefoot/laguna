@@ -36,6 +36,7 @@ import numpy as np
 
 from . import gosdk as _g
 from .gosdk import GoSdkError, GoSdkLib, GoSdkTimeout
+from ..robot.motion_arbiter import DEFAULT_ARBITER
 from .mounting import SensorMounting
 from .pointcloud import (
     SurfaceScan,
@@ -70,6 +71,18 @@ _GENERATION_TYPES = {
     3: "rotational",
 }
 _START_TRIGGERS = {0: "sequential", 1: "digital", 2: "software"}
+
+
+class ScanNotPossibleError(RuntimeError):
+    """A scheduled scan could not run at all.
+
+    Raised rather than skipped. An experiment that quietly stops collecting
+    topography produces an incomplete record of conditions nobody can
+    reconstruct afterwards — missing data is as bad as a stationary gantry.
+    ``experiment.runner`` escalates this to a lab-wide pause, so the cause
+    can be fixed and the run resumed rather than continuing with a hole in
+    the data.
+    """
 
 
 class GocatorScanner(GocatorSettingsMixin):
@@ -134,8 +147,12 @@ class GocatorScanner(GocatorSettingsMixin):
         self._subsampling = config.get("subsampling") or None
         self._spacing_interval = config.get("spacing_interval") or None
         self._filters = config.get("filters") or None
+        #: Scan spec for the zero-arg acquire() entry point — see that method.
+        self._scan_spec = config.get("scan") or None
         self._data_capacity_bytes = config.get("data_capacity_bytes")
         self._sdk_lib_dir = config.get("sdk_lib_dir")
+        #: Rehearsal mode — synthetic surfaces, no SDK and no sensor.
+        self._simulated = bool(config.get("simulated", False))
         self._output_dir = Path(config.get("output_dir", "./data/scans"))
 
         self._lib: Optional[GoSdkLib] = None
@@ -146,6 +163,10 @@ class GocatorScanner(GocatorSettingsMixin):
         self._is_running = False
         self._scan_count = 0
         self._last_scan_meta: Dict[str, Any] = {}
+        self._last_saved_path: Optional[str] = None
+        #: Run id / runtime injected by FlumeLab so saved scans can be tied
+        #: back to the experiment that produced them — see laguna.run_context.
+        self._run_stamp: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Subsystem lifecycle
@@ -163,8 +184,14 @@ class GocatorScanner(GocatorSettingsMixin):
         if self._is_connected:
             return True
         try:
-            self._lib = GoSdkLib(self._sdk_lib_dir)
-            logger.info("Loaded GoSdk from %s", self._lib.lib_dir)
+            if self._simulated:
+                from .simulation import SimulatedGoSdkLib
+
+                self._lib = SimulatedGoSdkLib()
+                logger.info("Gocator running SIMULATED — no SDK, no sensor")
+            else:
+                self._lib = GoSdkLib(self._sdk_lib_dir)
+                logger.info("Loaded GoSdk from %s", self._lib.lib_dir)
 
             api = _g.kObject()
             self._lib.call("GoSdk_Construct", byref(api))
@@ -208,7 +235,7 @@ class GocatorScanner(GocatorSettingsMixin):
         """Stop acquisition if running, then release SDK handles."""
         if self._is_running:
             try:
-                self.stop()
+                self._end_acquisition()
             except GoSdkError as e:
                 logger.warning("Error stopping Gocator during disconnect: %s", e)
         if self._lib and self._sensor is not None:
@@ -348,12 +375,81 @@ class GocatorScanner(GocatorSettingsMixin):
         lib.call("GoSensor_Trigger", self._sensor)
         logger.info("Gocator software trigger fired")
 
-    def stop(self) -> None:
-        """Stop acquisition."""
-        lib = self._require_connected()
-        lib.call("GoSystem_Stop", self._system)
-        self._is_running = False
-        logger.info("Gocator acquisition stopped")
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+
+    def _end_acquisition(self) -> None:
+        """Close the data channel after a scan that completed normally.
+
+        Deliberately separate from the safety verbs: those exist to report
+        that data was THROWN AWAY, and a normal completion has thrown away
+        nothing. Sharing one method made every successful scan log a discard,
+        which would drown the real ones in the event log.
+        """
+        if not self._is_running:
+            return
+        try:
+            if self._lib is not None and self._system is not None:
+                self._lib.call("GoSystem_Stop", self._system)
+        except Exception as exc:
+            logger.warning("Error closing the Gocator data channel: %s", exc)
+        finally:
+            self._is_running = False
+
+    def _abort_acquisition(self) -> Optional[str]:
+        """Stop acquiring and discard anything part-captured.
+
+        A surface captured across a decelerating pass is quietly wrong rather
+        than obviously broken: Y spacing is travel_speed / frame_rate, which
+        assumes constant velocity, so the travel axis comes out distorted.
+
+        Returns a note naming the discard when one happened, because the
+        caller writes it to the experiment event log. Silently missing scan
+        data can invalidate a whole experiment — an analyst has to be able to
+        see that a scan was attempted and thrown away, not just find a gap.
+
+        Never raises, and deliberately does NOT go through
+        _require_connected(): a safety verb that needs the hardware to be
+        reachable is no use in the situation it exists for.
+        """
+        if not self._is_running:
+            return None
+        note = (
+            "DISCARDED a part-captured surface — a pass interrupted mid-travel "
+            "is distorted along Y (Y spacing assumes constant velocity), so it "
+            "is not usable data. No scan file was written for this attempt."
+        )
+        logger.warning("Gocator: %s", note)
+        try:
+            if self._lib is not None and self._system is not None:
+                self._lib.call("GoSystem_Stop", self._system)
+        except Exception as exc:
+            logger.error("Could not stop Gocator acquisition: %s", exc)
+            note += f" (acquisition may still be running: {exc})"
+        finally:
+            self._is_running = False
+        return note
+
+    def pause(self) -> Optional[str]:
+        """Abort any in-flight scan and discard the partial surface."""
+        return self._abort_acquisition()
+
+    def resume(self) -> Optional[str]:
+        """Nothing to restore — the discarded scan is not resumable.
+
+        Acquisition restarts on the next scan(), which re-triggers from a
+        known start rather than splicing onto an aborted pass.
+        """
+        return None
+
+    def stop(self) -> Optional[str]:
+        """End cleanly: stop acquiring, discarding anything part-captured."""
+        return self._abort_acquisition()
+
+    def estop(self) -> Optional[str]:
+        """Same as stop: there is no harder halt available to a passive sensor."""
+        return self._abort_acquisition()
 
     def receive_surface(
         self,
@@ -528,7 +624,7 @@ class GocatorScanner(GocatorSettingsMixin):
         finally:
             if started_here and self._is_running:
                 try:
-                    self.stop()
+                    self._end_acquisition()
                 except GoSdkError as e:
                     logger.warning("Error stopping after scan: %s", e)
 
@@ -542,10 +638,10 @@ class GocatorScanner(GocatorSettingsMixin):
     def scan_with_gantry(
         self,
         gantry,
-        axis: str,
-        end_mm: float,
-        feed_rate_mm_s: float,
-        settle_s: float = 0.5,
+        axis: Optional[str] = None,
+        end_mm: Optional[float] = None,
+        feed_rate_mm_s: Optional[float] = None,
+        settle_s: Optional[float] = None,
         fixed_length_mm: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
         timeout_s: Optional[float] = None,
@@ -600,6 +696,51 @@ class GocatorScanner(GocatorSettingsMixin):
             KeyError: If `axis` isn't a configured axis on this gantry.
             SnapMotionError: If the gantry's safe_mode blocks the move.
         """
+        # Fall back to the configured scan spec for anything not given, so
+        # a rig configured once in file can scan without repeating itself —
+        # and so acquire() is a thin wrapper rather than a second code path.
+        spec = self._scan_spec or {}
+        axis = axis if axis is not None else spec.get("axis")
+        end_mm = end_mm if end_mm is not None else spec.get("end_mm")
+        feed_rate_mm_s = (
+            feed_rate_mm_s if feed_rate_mm_s is not None else spec.get("feed_rate_mm_s")
+        )
+        settle_s = settle_s if settle_s is not None else float(spec.get("settle_s", 0.5))
+        missing = [
+            n for n, v in (("axis", axis), ("end_mm", end_mm),
+                           ("feed_rate_mm_s", feed_rate_mm_s)) if v is None
+        ]
+        if missing:
+            raise ScanNotPossibleError(
+                f"scan_with_gantry() is missing {missing} and the gocator.scan: "
+                "config block does not supply it"
+            )
+        end_mm = float(end_mm)
+        feed_rate_mm_s = float(feed_rate_mm_s)
+
+        # Hold the gantry for the whole pass. Without this, a second
+        # scheduled action could move an axis mid-traverse and the surface
+        # would be silently wrong — Y spacing assumes constant velocity.
+        # Re-entrant, so handle.begin_move_to() re-acquiring is fine.
+        arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
+        with arbiter.hold(f"gocator scan {axis} -> {end_mm:.1f}mm"):
+            return self._scan_with_gantry(
+                gantry, axis, end_mm, feed_rate_mm_s, settle_s,
+                fixed_length_mm, metadata, timeout_s,
+            )
+
+    def _scan_with_gantry(
+        self,
+        gantry,
+        axis: str,
+        end_mm: float,
+        feed_rate_mm_s: float,
+        settle_s: float,
+        fixed_length_mm: Optional[float],
+        metadata: Optional[Dict[str, Any]],
+        timeout_s: Optional[float],
+    ) -> SurfaceScan:
+        """Body of scan_with_gantry(), with the gantry already held."""
         handle = gantry.axis(axis)
 
         start_mm = None
@@ -667,9 +808,97 @@ class GocatorScanner(GocatorSettingsMixin):
         finally:
             if self._is_running:
                 try:
-                    self.stop()
+                    self._end_acquisition()
                 except GoSdkError as e:
                     logger.warning("Error stopping after gantry scan: %s", e)
+
+    def acquire(self, gantry=None, **overrides: Any) -> Optional[SurfaceScan]:
+        """Run one configured scan — a zero-argument entry point for schedulers.
+
+        ``scan_with_gantry()`` needs four arguments including a gantry handle,
+        so it cannot be handed to ``Scheduler.repeat(action=...)`` or to
+        ``experiment.runner._register_action``. This closes over a scan spec
+        from config instead, so a Gocator pass can be scheduled exactly like a
+        camera capture.
+
+        The spec comes from the ``gocator.scan:`` config block — ``axis``,
+        ``end_mm``, ``feed_rate_mm_s``, and optionally ``settle_s``,
+        ``return_to_start`` and ``formats`` — with any of them overridable
+        per call.
+
+        Args:
+            gantry: A connected GantryController. Required for a coordinated
+                pass; without one this raises rather than silently triggering
+                on a stationary gantry, which would produce a surface with no
+                travel at all.
+            **overrides: Per-call overrides of the configured scan spec.
+
+        Returns:
+            The captured SurfaceScan.
+
+        Raises:
+            ScanNotPossibleError: If the scan cannot run at all — no spec, an
+                incomplete spec, no gantry, or a disconnected scanner. The
+                runner escalates this to a lab-wide pause rather than
+                skipping the scan, because an experiment that quietly stops
+                collecting topography leaves a hole nobody can reconstruct.
+        """
+        spec = dict(self._scan_spec or {})
+        spec.update(overrides)
+
+        # Every one of these is a reason to bring the run down rather than
+        # skip a scan. A scheduled experiment that quietly stops collecting
+        # topography is producing an incomplete record of conditions nobody
+        # will be able to reconstruct — missing data is as bad as a
+        # stationary gantry, and both are worse than a paused run.
+        if not spec:
+            raise ScanNotPossibleError(
+                "no 'scan:' config block and no overrides — the scanner cannot "
+                "run a scheduled pass. Add gocator.scan.{axis, end_mm, "
+                "feed_rate_mm_s}."
+            )
+        missing = [k for k in ("axis", "end_mm", "feed_rate_mm_s") if spec.get(k) is None]
+        if missing:
+            raise ScanNotPossibleError(
+                f"scan spec is missing {missing}; needs axis, end_mm and "
+                "feed_rate_mm_s to run a coordinated pass"
+            )
+        if gantry is None:
+            raise ScanNotPossibleError(
+                "no connected gantry — a scan with no motion produces a "
+                "surface with no travel. Register a 'gantry:' section so the "
+                "runner can supply one."
+            )
+        if not self._is_connected:
+            raise ScanNotPossibleError(
+                f"scanner at {self._ip} is not connected, so this pass would "
+                "collect nothing"
+            )
+
+        return_to_start = spec.pop("return_to_start", False)
+        formats = spec.pop("formats", None)
+        start = gantry.axis(spec["axis"]).get_position() if return_to_start else None
+
+        # Held across the scan AND the return-to-start move, not just the
+        # scan — otherwise the arbiter is released between the two and
+        # another scheduled action could move the axis in that gap before
+        # the return move starts.
+        arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
+        with arbiter.hold(f"gocator acquire {spec['axis']} -> {spec['end_mm']}"):
+            scan = self.scan_with_gantry(
+                gantry,
+                axis=spec["axis"],
+                end_mm=float(spec["end_mm"]),
+                feed_rate_mm_s=float(spec["feed_rate_mm_s"]),
+                settle_s=float(spec.get("settle_s", 0.5)),
+            )
+            if formats:
+                self.save_scan(scan, formats=tuple(formats))
+            if return_to_start:
+                # Repeat scans of the same transect need the axis back where
+                # it began, or each pass starts further along than the last.
+                gantry.move_to(**{spec["axis"]: start})
+        return scan
 
     # ------------------------------------------------------------------
     # Saving
@@ -711,9 +940,13 @@ class GocatorScanner(GocatorSettingsMixin):
         import datetime as _dt
 
         if name is None:
+            # Millisecond resolution: two scans in the same second used to
+            # produce the same filename and silently overwrite each other.
             name = "scan_" + _dt.datetime.now(_dt.timezone.utc).strftime(
-                "%Y%m%d_%H%M%S"
-            )
+                "%Y%m%d_%H%M%S_%f"
+            )[:-3]
+            if self._run_stamp:
+                name = f"{name}_{self._run_stamp.get('run_id', '')}".rstrip("_")
         self._output_dir.mkdir(parents=True, exist_ok=True)
         base = self._output_dir / name
 
@@ -729,6 +962,12 @@ class GocatorScanner(GocatorSettingsMixin):
             else None
         )
 
+        # Stamp the run into the scan's own metadata, so a file found on its
+        # own is still attributable without the manifest beside it.
+        if self._run_stamp:
+            scan.metadata.setdefault("run_id", self._run_stamp.get("run_id"))
+            scan.metadata.setdefault("runtime_s", self._run_stamp.get("runtime_s"))
+
         written: Dict[str, Path] = {}
         for fmt in formats:
             if fmt == "npz":
@@ -741,6 +980,10 @@ class GocatorScanner(GocatorSettingsMixin):
                 written["ply"] = scan.save_ply(base.with_suffix(".ply"), points=points)
             elif fmt == "csv":
                 written["csv"] = scan.save_csv(base.with_suffix(".csv"), points=points)
+        # Remembered so a scheduled run can put the output path in the event
+        # log — otherwise the only cross-subsystem index has no idea a scan
+        # happened. See experiment.runner and COSCRIPTING_ROADMAP workstream 2.
+        self._last_saved_path = str(next(iter(written.values()))) if written else None
         logger.info("Saved scan: %s", {k: str(v) for k, v in written.items()})
         return written
 

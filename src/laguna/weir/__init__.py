@@ -1,7 +1,7 @@
 """Weir (tailgate) elevation control subsystem."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -105,9 +105,31 @@ class WeirController(ABC):
         """
         ...
 
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+    # The weir holds its elevation mechanically, so every tier reduces to the
+    # same action: halt any in-progress move. All four verbs must return a
+    # note about anything a human needs to know, or None, and never raise.
+
     @abstractmethod
-    def stop(self) -> None:
-        """Immediately halt any in-progress move."""
+    def pause(self) -> Optional[str]:
+        """Halt any in-progress elevation move."""
+        ...
+
+    @abstractmethod
+    def resume(self) -> Optional[str]:
+        """Nothing to restore — the weir holds its elevation mechanically."""
+        ...
+
+    @abstractmethod
+    def stop(self) -> Optional[str]:
+        """Halt the move. Same action as pause: the weir has one stop."""
+        ...
+
+    @abstractmethod
+    def estop(self) -> Optional[str]:
+        """Halt the move. Same action as pause: the weir has one stop."""
         ...
 
     @abstractmethod
@@ -311,14 +333,37 @@ class SaflWeirController(WeirController):
         self._require_connected()
         return self._motor.find_home(home_position_mm=self._home_offset_mm)
 
-    def stop(self) -> None:
-        """Immediately halt any in-progress move.
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
 
-        Raises:
-            RuntimeError: If not connected.
-        """
-        self._require_connected()
-        self._motor.stop()
+    def _halt(self) -> Optional[str]:
+        """Halt any in-progress move. Never raises — shared by every tier,
+        because the weir holds its elevation mechanically and so has exactly
+        one safe action regardless of severity."""
+        try:
+            self._require_connected()
+            self._motor.stop()
+        except Exception as exc:
+            logger.error("Could not halt the weir: %s", exc)
+            return f"weir may still be moving: {exc}"
+        return None
+
+    def pause(self) -> Optional[str]:
+        """Halt any in-progress elevation move."""
+        return self._halt()
+
+    def resume(self) -> Optional[str]:
+        """Nothing to restore — the weir holds its elevation mechanically."""
+        return None
+
+    def stop(self) -> Optional[str]:
+        """Halt the move. Same action as pause: the weir has one stop."""
+        return self._halt()
+
+    def estop(self) -> Optional[str]:
+        """Halt the move. Same action as pause: the weir has one stop."""
+        return self._halt()
 
     def get_status(self) -> Dict[str, Any]:
         """Return connection state, current elevation, and raw motor status.

@@ -30,6 +30,7 @@ from .connection import EthernetConnection, RS232Connection, SnapConnection, Sna
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
 from .gcode import GCodeExecutor
 from .homing import HomingConfig, HomingProcedure
+from ..motion_arbiter import DEFAULT_ARBITER
 from .pi_bridge import PiGantryConnection
 from .position_store import GantryPositionStore
 
@@ -109,8 +110,11 @@ class GantryController:
         mm_per_unit: float = 1.0,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
         position_checkpoint_file: Optional[str] = None,
+        arbiter: Optional[Any] = None,
     ):
         self._connection = connection
+        #: Shared gantry lock — see laguna.robot.motion_arbiter.
+        self.arbiter = arbiter or DEFAULT_ARBITER
         self._axes = axes
         self._group_index = group_index
         self._io_map = io_map or IOMap()
@@ -378,17 +382,28 @@ class GantryController:
         status["positions"] = positions
         return status
 
-    def stop(self) -> None:
-        """Abort all axes and engage Y/Z brakes (if their channels are configured).
+    def stop(self) -> Optional[str]:
+        """End cleanly: decelerate on each axis's ramp, then park the brakes.
 
-        Called by FlumeLab.emergency_stop() for every registered subsystem
-        that has a stop() method — this is the gantry's emergency-stop path.
+        **This changed meaning.** It used to be the zero-decel abort with
+        motors disabled; that is now estop(), where the unified vocabulary
+        says it belongs (see laguna.safety). stop() is the tier below —
+        controlled deceleration into a state safe to disconnect from, with
+        no stall against a brake and no encoder disturbance.
         """
-        try:
-            self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
-        except Exception as exc:
-            logger.error("Error during gantry shutdown: %s", exc)
+        self.soft_stop()
+        for axis in self._axes:
+            if axis not in (Y_AXIS, Z_AXIS):
+                continue
+            try:
+                self._axis_handles[axis.name].engage_brake()
+            except Exception as exc:
+                # Broad on purpose: a safety verb must never propagate. A
+                # brake that would not park is worth logging, not worth
+                # aborting the rest of the shutdown for.
+                logger.warning("Could not park %s's brake: %s", axis.name, exc)
         self._persist_position()
+        return None
 
     def _persist_position(self) -> None:
         """Best-effort snapshot of every axis's live position to the position
@@ -538,6 +553,25 @@ class GantryController:
                 gantry, or neither vector nor any keyword was given.
             FenceViolation: If the X/Y/Z path would enter an exclusion zone.
         """
+        # Serialise whole operations, not just individual commands. The
+        # transport already locks per request/response pair, but a move is
+        # many commands with a physical traverse in between — nothing else
+        # stops a scheduled scan landing in the middle of one. Re-entrant,
+        # so nesting inside scan_with_gantry() is fine. See motion_arbiter.
+        with self.arbiter.hold(f"{type(self).__name__}.move_to"):
+            return self._move_to(vector, X=X, Y=Y, Z=Z, Theta=Theta, speed=speed)
+
+    def _move_to(
+        self,
+        vector: Optional[List[float]] = None,
+        *,
+        X: Optional[float] = None,
+        Y: Optional[float] = None,
+        Z: Optional[float] = None,
+        Theta: Optional[float] = None,
+        speed: Optional[float] = None,
+    ) -> bool:
+        """Body of move_to(), with the arbiter already held."""
         axes_by_name = {axis.name: axis for axis in self._axes}
 
         if vector is not None:
@@ -689,6 +723,42 @@ class GantryController:
                 logger.error("Error soft-stopping %s: %s", axis.name, exc)
         self._persist_position()
 
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+
+    def pause(self) -> Optional[str]:
+        """Decelerate on each axis's own ramp, leaving brakes and motors alone.
+
+        The gantry is immediately ready to move again with no re-enable
+        cycle, which is what makes a pause cheap enough to use liberally.
+        """
+        self.soft_stop()
+        self._persist_position()
+        return None
+
+    def resume(self) -> Optional[str]:
+        """Nothing to undo — pause() left brakes and motors untouched.
+
+        Motion is re-commanded by the caller, not resumed implicitly: the
+        gantry has no notion of an interrupted move to pick back up.
+        """
+        return None
+
+    def estop(self) -> Optional[str]:
+        """Zero-decel abort, brakes engaged, motors disabled. Never raises.
+
+        This is what stop() used to do. Recovery needs an explicit re-arm
+        (enable() + disengage_brake(), or connect()/set_safe_mode(False),
+        which do both) — see FlumeLab.rearm().
+        """
+        try:
+            self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
+        except Exception as exc:
+            logger.error("Error during gantry emergency stop: %s", exc)
+        self._persist_position()
+        return None
+
     def set_safe_mode(self, enabled: bool) -> bool:
         """Enable or disable safe_mode, reconnecting the transport if needed
         so the change actually takes effect, and syncing Y/Z's brakes to match.
@@ -810,6 +880,13 @@ class GantryController:
 
 def _build_transport(config: Dict[str, Any]) -> SnapConnection:
     transport = config.get("transport", "pi_agent")
+
+    if transport == "simulated":
+        # Offline rehearsal — no serial port, no Pi, no PLC. See
+        # laguna.simulation for what this does and does not prove.
+        from ...simulation import SimulatedSnapConnection
+
+        return SimulatedSnapConnection()
 
     if transport == "socket_bridge":
         # Retired path (2026-08-02): a raw TCP<->serial passthrough

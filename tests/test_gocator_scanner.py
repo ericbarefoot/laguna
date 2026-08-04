@@ -855,6 +855,19 @@ class TestScanLifecycle:
         assert scanner.get_status()["is_running"] is False
         assert scan.metadata["travel_speed_mm_s"] == pytest.approx(20.0)
 
+    def test_successful_scan_does_not_report_a_discard(self, scanner, monkeypatch):
+        """A completed scan's own cleanup must go through _end_acquisition(),
+        not the stop() safety verb — the two `def stop()` bodies used to
+        shadow each other, so every successful scan logged a false
+        "DISCARDED a part-captured surface" note via _abort_acquisition()."""
+        aborts = []
+        monkeypatch.setattr(
+            scanner, "_abort_acquisition", lambda: aborts.append(1) or None
+        )
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        scanner.scan(timeout_s=1.0)
+        assert aborts == [], "a successful scan must not go through _abort_acquisition()"
+
     def test_scan_stops_acquisition_even_on_timeout(self, scanner):
         """A failed scan must not leave the sensor running."""
         scanner._fake.go.datasets = []
@@ -1507,6 +1520,26 @@ class TestSaveScan:
             "npz writes the grid directly; it must not flatten to points"
         )
         scanner.save_scan(scan, formats=("npz",))
+
+    def test_two_scans_in_the_same_second_do_not_collide(self, tmp_path, monkeypatch):
+        """Auto-generated names used to have only second resolution — two
+        scans saved within the same wall-clock second silently overwrote
+        each other. Exercised for real (no name= given), not just checked
+        for a '%f' in the format string.
+
+        Resolution is milliseconds, not microseconds (see save_scan()), so a
+        short sleep guarantees the two calls land in different milliseconds
+        — without it this is a race between two back-to-back in-memory
+        writes and the boundary they need to cross.
+        """
+        import time
+
+        scanner = self._scanner(tmp_path, monkeypatch)
+        first = scanner.save_scan(make_scan(), formats=("npz",))
+        time.sleep(0.005)
+        second = scanner.save_scan(make_scan(), formats=("npz",))
+        assert first["npz"] != second["npz"]
+        assert first["npz"].exists() and second["npz"].exists()
 
 
 class TestSurfaceScan:
