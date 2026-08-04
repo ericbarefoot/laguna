@@ -30,25 +30,85 @@ moves, each individually fence-checked and executed as an ordinary
 coordinated group move. This fully supports arc G-code without sending any
 command whose semantics aren't verified.
 
-Z/XY node split: confirmed on hardware that the coordinated-group command
-cannot include Z — `C1 INI 1 2` (X, Y — the commander) succeeds, `C1 INI 1
-2 5` (adding Z — the responder, a separate networked PLC node) fails with
-error 1010. So a LINEAR move that changes both Z and X/Y can't be sent as
-one simultaneous 3D move at all on this hardware; _split_cross_node_moves
-(run in GCodeExecutor.plan(), before fence-checking) splits any such move
-into a Z-only leg followed by an XY-only leg, Z-first. Z-first was chosen
-for this gantry's actual use (subtractive CNC / sensor positioning, not
-additive/layer deposition) — Z reaches its target (e.g. retracting/
-diving to a probe height) before XY travels, rather than the other way
-round. This means a G-code program authored for genuine simultaneous 3D
-motion (e.g. a helical G2/G3, or slicer layer-change lines combining an
-XY travel with a Z step) is only ever approximated here as a Z-then-XY
-zigzag, and the two legs' timing no longer reflects the original line's
-vector feed rate (each leg runs at the full nominal F, not a fraction of
-it) — this is a hard hardware limitation, not a bug to route around.
-Splitting happens before the fence check specifically so the checked
-waypoints match the path that is actually executed (an L-shaped path, not
-the nominal diagonal) — see _split_cross_node_moves.
+Node topology and the A (Theta) word: this hardware has two PLC nodes —
+commander (X=1, Y=2) and responder (Z=5, Theta=6, the rotary axis). A
+coordinated-group command cannot span both: `C1 INI 1 2` (X, Y) succeeds,
+`C1 INI 1 2 5` (adding Z) fails with error 1010. Since Z and Theta share
+the responder node, they *can* form their own group (`C2 INI 5 6`) —
+this module accepts an optional `A` word (RepRap/CNC convention for a
+rotary axis) on `G0`/`G1` lines, resolved into `GCodeMove.theta` exactly
+like X/Y/Z, and represents Theta motion through the same LINEAR move
+Z/X/Y already use, rather than as a separate concept.
+
+Concurrent responder/commander legs: when one LINEAR move changes both
+X/Y (commander) and Z and/or Theta (responder), `GCodeExecutor` cannot
+send it as a single group command (the node-boundary limit above), but it
+does not have to run the two halves sequentially either. Since Z and
+Theta already share a node, `GCodeExecutor._execute_concurrent_pair`
+fires the responder leg's `BMT` (single-axis, or the `C2` Z/Theta group
+if both are moving) and the commander leg's `C1` `BMT` back-to-back,
+non-blocking, then polls both to completion — the two legs genuinely
+interpolate at the same time on hardware, which is a much closer
+approximation of true multi-axis coordination than running one leg fully
+to completion before starting the next.
+
+Matched trapezoids, not just matched start times: firing two BMTs
+together only makes them *start* together — with no further adjustment,
+a short leg (say Z dips 5mm while X/Y travels 500mm) would reach its
+target almost immediately and then sit idle while the other leg finishes
+alone, which is barely better than the old sequential split. So before
+issuing either BMT, `_execute_concurrent_pair` compares the two legs'
+distances: whichever is shorter has its speed *and* accel/decel scaled
+down by the same ratio `k` (short distance ÷ long distance), read fresh
+from whichever the long leg's controller-configured ramp is at that
+moment. Scaling every rate by `k` scales every phase's distance by `k`
+but leaves every phase's *duration* unchanged (`t = v/a` and the
+accel-phase distance `v²/(2a)` both cancel the common factor the same
+way), so the shorter leg's whole trapezoid — ramp-up, cruise, ramp-down —
+takes exactly as long as the longer leg's, at every instant covering
+exactly `k` times the longer leg's progress. The two legs accelerate
+together, cruise together, and decelerate together, not just start
+together. The longer leg is left entirely alone (nominal commanded feed
+rate, whatever accel/decel it already had) — only the shorter leg's
+numbers change, and even those are restored to their own pre-scaling
+values once both legs finish: this driver otherwise never touches
+ACL/DCL (every other move leaves it at whatever the controller already
+has), so a scaled-down ramp must not outlive the one move it was
+computed for — left stale, it would silently slow every later move on
+that axis, including pause()/stop()'s deceleration.
+
+For a Z+Theta responder leg specifically, "distance" is
+`max(|delta Z|, |delta Theta|)`, not Z alone — Z (mm) and Theta (raw
+controller units) aren't truly commensurate, and there's no verified
+hardware data on how the shared `C<theta_group_index>` SPD/ACL/DCL
+actually governs a combined interpolation (see
+`MMCCommands.group_set_speed`'s "assumes uniform mm_per_unit across the
+group" docstring, known false for this pairing). Using Z alone let a
+Theta-dominated move (a big rotation with a tiny Z step) get scaled down
+to a crawl on the assumption it was short, badly undershooting the
+default 30s poll timeout on what should have been an ordinary move;
+max() is a conservative stand-in that avoids silently discounting
+whichever axis is actually doing the work.
+
+This still isn't a guaranteed diagonal, for two reasons neither leg's
+own timing can fix: the commander and responder are two independent
+node-local interpolators with no verified guarantee of simultaneous
+start at the motor level (the responder is reached over a separate
+networked link), and a G-code program authored for genuine simultaneous
+N-axis motion still won't reproduce an exact vector path — this is a
+hard hardware limitation (no cross-node group support), not a bug to
+route around.
+
+Because of that residual uncertainty, the actual swept path can't be
+assumed to be a single line or a single L-shaped elbow — the only thing
+guaranteed is that each axis moves monotonically from start to end at
+its own rate, so the true envelope is the bounding box between start and
+end. Rather than adding bounding-box-vs-fence geometry to fences.py,
+`GCodeExecutor.plan()` conservatively fence-checks *both* possible elbow
+orderings (Z-first and XY-first — the two extreme corners of that box)
+through the existing `TrajectoryChecker`, via `GCodeProgram.to_waypoints`'s
+`z_first` parameter, before allowing the move. See `GCodeExecutor.plan()`
+and `_execute_concurrent_pair`.
 """
 
 from __future__ import annotations
@@ -61,7 +121,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .commands import (
-    Axis, MMCCommands, X_AXIS, Y_AXIS, Z_AXIS,
+    Axis, MMCCommands, THETA_AXIS, X_AXIS, Y_AXIS, Z_AXIS,
     poll_until_move_finished, predicted_move_s,
 )
 from .connection import SnapMotionError
@@ -104,12 +164,23 @@ def _parse_words(line: str) -> Dict[str, float]:
     return {letter.upper(): float(number) for letter, number in _WORD_RE.findall(line)}
 
 
+# Tolerance for deciding whether a position actually changed. Needed because
+# mm values round-trip through raw controller units and back — exact float
+# equality is too fragile against that rounding noise.
+_POSITION_EPSILON_MM = 1e-3
+
+
+def _moved(a: float, b: float) -> bool:
+    return abs(a - b) > _POSITION_EPSILON_MM
+
+
 @dataclass
 class GCodeMove:
     """One resolved, ready-to-execute step of a parsed G-code program."""
 
     kind: str  # "LINEAR" | "HOME" | "DWELL" | "PAUSE"
     target: Optional[Point3D] = None
+    theta: Optional[float] = None
     feed_mm_s: Optional[float] = None
     dwell_s: Optional[float] = None
     source_line: str = ""
@@ -121,19 +192,33 @@ class GCodeProgram:
 
     moves: List[GCodeMove] = field(default_factory=list)
 
-    def to_waypoints(self, start: Point3D) -> List[Point3D]:
+    def to_waypoints(self, start: Point3D, z_first: bool = True) -> List[Point3D]:
         """Expand this program into the flat XYZ waypoint list TrajectoryChecker expects.
 
         Only LINEAR and HOME moves contribute waypoints (DWELL/PAUSE don't
-        move). G28's landing point is assumed to be the conventional origin
-        for pre-flight checking purposes — the real homed position is
-        whatever HomingProcedure actually finds, but this is only used to
-        validate what happens *after* the G28 in the same program.
+        move; Theta never does — fences.py only checks XYZ). G28's landing
+        point is assumed to be the conventional origin for pre-flight
+        checking purposes — the real homed position is whatever
+        HomingProcedure actually finds, but this is only used to validate
+        what happens *after* the G28 in the same program.
+
+        A move that changes both Z and X/Y runs as two concurrent legs, not
+        a single line (see the module docstring's "concurrent responder/
+        commander legs" note) — its true swept path is the bounding box
+        between start and end, not one line. `z_first` picks which of that
+        box's two extreme corners this waypoint list represents (the
+        Z-first or the XY-first elbow); `GCodeExecutor.plan()` calls this
+        twice, once per ordering, to conservatively check both.
         """
         waypoints = [start]
         pos = start
         for move in self.moves:
             if move.kind == "LINEAR" and move.target is not None:
+                tx, ty, tz = move.target
+                px, py, pz = pos
+                if _moved(tz, pz) and (_moved(tx, px) or _moved(ty, py)):
+                    elbow = (px, py, tz) if z_first else (tx, ty, pz)
+                    waypoints.append(elbow)
                 waypoints.append(move.target)
                 pos = move.target
             elif move.kind == "HOME":
@@ -224,9 +309,12 @@ class GCodeParser:
         """
         self._absolute = True
         self._position: Point3D = (0.0, 0.0, 0.0)
+        self._theta: float = 0.0
         self._feed_mm_s: Optional[float] = None
 
-    def parse(self, text: str, start: Point3D = (0.0, 0.0, 0.0)) -> GCodeProgram:
+    def parse(
+        self, text: str, start: Point3D = (0.0, 0.0, 0.0), start_theta: float = 0.0
+    ) -> GCodeProgram:
         """Parse a multi-line G-code program into a GCodeProgram of resolved moves.
 
         Resets parser state (absolute mode, feed rate) before parsing, then
@@ -238,6 +326,9 @@ class GCodeParser:
             text: Raw G-code source, one instruction per line.
             start: Starting XYZ position moves are resolved relative/
                 absolute to (default origin).
+            start_theta: Starting Theta (rotary axis) position `A` words
+                are resolved relative/absolute to (default 0). Only
+                matters for programs that use `A` in relative mode (G91).
 
         Returns:
             A GCodeProgram containing one GCodeMove per resolved motion/
@@ -251,6 +342,7 @@ class GCodeParser:
         """
         self._absolute = True
         self._position = start
+        self._theta = start_theta
         self._feed_mm_s = None
         moves: List[GCodeMove] = []
 
@@ -320,6 +412,22 @@ class GCodeParser:
             z = z + words.get("Z", 0.0)
         return (x, y, z)
 
+    def _resolve_theta(self, words: Dict[str, float]) -> Optional[float]:
+        """Resolve a move's Theta target from an `A` word, or None if this
+        line doesn't touch Theta at all.
+
+        Unlike X/Y/Z (which always resolve to a value — an axis not
+        mentioned just stays at its current position), Theta has no
+        Cartesian home in fences.py's model, so a line with no `A` word
+        must produce no Theta motion whatsoever, not an implicit "hold
+        current position" target — see GCodeExecutor's leg classification.
+        """
+        if "A" not in words:
+            return None
+        if self._absolute:
+            return words["A"]
+        return self._theta + words["A"]
+
     def _resolve_feed(self, words: Dict[str, float]) -> Optional[float]:
         """Update and return the parser's carried-over feed rate in mm/s.
 
@@ -344,11 +452,16 @@ class GCodeParser:
         return self._linear_move(words, raw_line)
 
     def _linear_move(self, words: Dict[str, float], raw_line: str) -> List[GCodeMove]:
-        """Shared G0/G1 implementation: resolve target and feed, advance position, emit one move."""
+        """Shared G0/G1 implementation: resolve target/theta/feed, advance position, emit one move."""
         target = self._resolve_target(words)
+        theta = self._resolve_theta(words)
         feed = self._resolve_feed(words)
         self._position = target
-        return [GCodeMove(kind="LINEAR", target=target, feed_mm_s=feed, source_line=raw_line)]
+        if theta is not None:
+            self._theta = theta
+        return [
+            GCodeMove(kind="LINEAR", target=target, theta=theta, feed_mm_s=feed, source_line=raw_line)
+        ]
 
     def _g2(self, words, raw_line):
         """G2 (clockwise arc) — tessellate and emit as a series of LINEAR moves."""
@@ -447,55 +560,27 @@ class GCodeParser:
 # Execution
 # ---------------------------------------------------------------------------
 
-# Tolerance for deciding whether a position actually changed, used only by
-# the debug-patch Z/XY split below (see GCodeExecutor docstring). Needed
-# because mm values round-trip through raw controller units and back —
-# exact float equality is too fragile against that rounding noise.
-_POSITION_EPSILON_MM = 1e-3
 
+def _zt_distance(move: GCodeMove, current_pos: Point3D, current_theta: float) -> float:
+    """"Distance" travelled by a Z/Theta group leg, for duration prediction
+    and speed/ramp scaling (see GCodeExecutor._execute_concurrent_pair).
 
-def _moved(a: float, b: float) -> bool:
-    return abs(a - b) > _POSITION_EPSILON_MM
-
-
-def _split_cross_node_moves(moves: List[GCodeMove], start: Point3D) -> List[GCodeMove]:
-    """Split any LINEAR move that changes both Z and X/Y into a Z-only leg
-    followed by an XY-only leg (Z-first) — see the module docstring's
-    "Z/XY node split" note for why this is necessary on this hardware.
-
-    Run at plan() time, before fence-checking, so the waypoints that get
-    checked are the ones actually executed: an L-shaped Z-then-XY path, not
-    the nominal diagonal. Splitting at execute() time instead would leave
-    the fence check validating a path the gantry never takes.
-
-    Moves that only change Z, or only change X/Y (the overwhelming common
-    case — most G-code, including slicer output, only combines the two on
-    a layer-change-style line), pass through unchanged. HOME/DWELL/PAUSE
-    moves are untouched.
+    Z (mm) and Theta (raw controller units, not a physical length) aren't
+    truly commensurate — there's no verified hardware data on how the
+    C<theta_group_index> group's single shared SPD/ACL/DCL actually governs
+    a combined Z+Theta interpolation (see MMCCommands.group_set_speed's
+    "assumes uniform mm_per_unit across the group" docstring, which is
+    known false for this pairing). Using max() rather than Z alone is a
+    conservative choice: it guarantees neither axis's real travel is
+    silently discounted to near-zero when computing which leg is "longer"
+    and by how much to scale the other — using Z alone let a
+    Theta-dominated move (e.g. a big rotation with a tiny Z step) get
+    scaled down to a crawl, badly undershooting the 30s poll timeout on
+    what should have been an ordinary move.
     """
-    result: List[GCodeMove] = []
-    pos = start
-    for move in moves:
-        if move.kind != "LINEAR" or move.target is None:
-            result.append(move)
-            continue
-        tx, ty, tz = move.target
-        px, py, pz = pos
-        if _moved(tz, pz) and (_moved(tx, px) or _moved(ty, py)):
-            result.append(GCodeMove(
-                kind="LINEAR", target=(px, py, tz),
-                feed_mm_s=move.feed_mm_s, source_line=move.source_line,
-            ))
-            result.append(GCodeMove(
-                kind="LINEAR", target=(tx, ty, tz),
-                feed_mm_s=move.feed_mm_s, source_line=move.source_line,
-            ))
-        else:
-            result.append(move)
-        pos = move.target
-    return result
-
-
+    dz = abs(move.target[2] - current_pos[2])
+    dtheta = abs(move.theta - current_theta) if move.theta is not None else 0.0
+    return max(dz, dtheta)
 
 
 class GCodeExecutor:
@@ -506,15 +591,19 @@ class GCodeExecutor:
     program (checked by identity), so the straight-line segments that were
     fence-checked are the ones actually followed.
 
-    X/Y drive via the coordinated group (fences.py checks XYZ spatially,
-    and this G-code subset has no rotary/Theta motion concept); Z drives
-    via a separate single-axis command, never simultaneously with X/Y —
-    see the module docstring's "Z/XY node split" note for why (Z lives on
-    a different networked PLC node than X/Y, and this firmware's
-    coordinated-group feature can't span that boundary). plan() splits any
-    move that would need both into a Z-only leg followed by an XY-only
-    leg before fence-checking, so what gets checked matches what actually
-    runs.
+    X/Y drive via the commander-node coordinated group (`C<group_index>`).
+    Z and Theta live on the responder node and drive via whichever of
+    three shapes a given move actually needs: a single-axis command (Z
+    alone, or Theta alone), or — when both change together — their own
+    coordinated group (`C<theta_group_index>`, only available if
+    `theta_cmd` is configured). A move that changes both the commander
+    axes and the responder axes cannot be sent as one group command (see
+    the module docstring's node-topology note), so `_execute_concurrent_pair`
+    fires both legs' BMTs non-blocking, back-to-back, and polls both to
+    completion — genuinely concurrent, not the commander-then-responder
+    sequence this used to be. plan() fence-checks both possible elbow
+    orderings of any such move before allowing it (see
+    GCodeProgram.to_waypoints).
     """
 
     def __init__(
@@ -524,28 +613,42 @@ class GCodeExecutor:
         homing: Optional[HomingProcedure] = None,
         axes: Tuple[Axis, Axis] = (X_AXIS, Y_AXIS),
         z_axis: Axis = Z_AXIS,
+        theta_axis: Axis = THETA_AXIS,
         group_index: int = 1,
+        theta_cmd: Optional[MMCCommands] = None,
+        theta_group_index: int = 2,
         confirm_cb: Optional[Callable[[GCodeMove], bool]] = None,
         dry_run: bool = False,
     ):
         """Configure an executor bound to a specific command interface, fence checker, and axis mapping.
 
         Args:
-            cmd: Live MMCCommands wrapper the executor sends group moves
-                and homing/IO commands through.
+            cmd: Live MMCCommands wrapper the executor sends the X/Y group
+                moves, single-axis Z/Theta moves, and homing/IO commands
+                through.
             checker: TrajectoryChecker used by plan() to fence-check the
                 waypoints a parsed program would visit.
             homing: HomingProcedure driving G28. Required only if the
                 program being executed actually contains a G28 — omitting
                 it is fine for programs with no homing move.
-            axes: The two coordinated-group axes, in (X, Y) order — must
-                have exactly 2 elements. Confirmed on hardware that Z
-                cannot be part of this group (see module docstring).
-            z_axis: The axis driven as a separate single-axis leg whenever
-                a move changes Z (see the module docstring's "Z/XY node
-                split" note).
+            axes: The two commander-node coordinated-group axes, in (X, Y)
+                order — must have exactly 2 elements. Confirmed on
+                hardware that Z can't join this group (see module
+                docstring).
+            z_axis: The axis driven whenever a move changes Z and Theta
+                doesn't move with it.
+            theta_axis: The axis driven whenever a move changes Theta (the
+                `A` word) and Z doesn't move with it.
             group_index: Coordinated-group index (the `C<N>` in the ASCII
-                protocol) used for all group moves this executor issues.
+                protocol) used for the X/Y group.
+            theta_cmd: A second MMCCommands instance (sharing the same
+                connection, configured with `group_axes=(z_axis,
+                theta_axis)`) used for the Z/Theta coordinated group, sent
+                only when a move changes both Z and Theta together. A
+                move that needs this group raises GCodeError if `theta_cmd`
+                wasn't given — Z-only and Theta-only moves never need it.
+            theta_group_index: Coordinated-group index used for the
+                Z/Theta group — must differ from `group_index`.
             confirm_cb: Optional callback invoked before each LINEAR/HOME/
                 PAUSE move; returning falsy raises GCodeExecutionAborted
                 and stops execution. If None, all moves proceed
@@ -559,40 +662,55 @@ class GCodeExecutor:
         """
         if len(axes) != 2:
             raise ValueError(
-                "GCodeExecutor's coordinated group covers exactly 2 axes (X, Y) — "
-                "Z moves separately as its own leg, see module docstring"
+                "GCodeExecutor's commander-node group covers exactly 2 axes (X, Y) — "
+                "Z/Theta move separately, see module docstring"
             )
         self._cmd = cmd
         self._checker = checker
         self._homing = homing
         self._axes = axes
         self._z_axis = z_axis
+        self._theta_axis = theta_axis
         self._group_index = group_index
+        self._theta_cmd = theta_cmd
+        self._theta_group_index = theta_group_index
         self._confirm_cb = confirm_cb
         self._dry_run = dry_run
         self._current_pos: Point3D = (0.0, 0.0, 0.0)
+        self._current_theta: float = 0.0
         self._pending_program: Optional[GCodeProgram] = None
         self._pending_trajectory: Optional[CheckedTrajectory] = None
-        # INI is sent once per executor, lazily on the first XY leg —
-        # see _init_group / reset_group_init.
+        # INI is sent once per executor, lazily on the first leg that needs
+        # each group — see _init_group/_init_theta_group and reset_group_init.
         self._group_initialized = False
+        self._theta_group_initialized = False
 
     def plan(self, text: str) -> CheckedTrajectory:
-        """Parse G-code, split any move needing simultaneous Z+XY motion into
-        a Z-only leg followed by an XY-only leg, then fence-check the result.
+        """Parse G-code and fence-check it, covering both elbow orderings a
+        concurrent XY+Z(Theta) leg's swept bounding box could take.
 
-        Splitting before the check is what makes the checked waypoints match
-        what actually executes — see _split_cross_node_moves and the module
-        docstring's "Z/XY node split" note.
+        A move that changes both X/Y and Z runs as two concurrent legs, not
+        a single line or a fixed elbow (see the module docstring's
+        "concurrent responder/commander legs" note) — its true path lies
+        somewhere in the bounding box between start and end. Rather than
+        checking that box directly, this checks both extreme corners
+        (Z-first and XY-first orderings, via GCodeProgram.to_waypoints)
+        through the existing TrajectoryChecker — conservative, and needs no
+        new geometry in fences.py.
 
-        Raises FenceViolation if any segment enters an exclusion zone. The
-        returned CheckedTrajectory must be passed to execute() unmodified —
-        it is the only object execute() will accept.
+        Raises FenceViolation if either ordering enters an exclusion zone.
+        The returned CheckedTrajectory must be passed to execute()
+        unmodified — it is the only object execute() will accept.
         """
-        program = GCodeParser().parse(text, start=self._current_pos)
-        program.moves = _split_cross_node_moves(program.moves, self._current_pos)
-        waypoints = program.to_waypoints(self._current_pos)
-        trajectory = self._checker.check_and_wrap(waypoints)
+        program = GCodeParser().parse(text, start=self._current_pos, start_theta=self._current_theta)
+        xy_first_violations = self._checker.check_trajectory(
+            program.to_waypoints(self._current_pos, z_first=False)
+        )
+        if xy_first_violations:
+            raise xy_first_violations[0]
+        trajectory = self._checker.check_and_wrap(
+            program.to_waypoints(self._current_pos, z_first=True)
+        )
         self._pending_program = program
         self._pending_trajectory = trajectory
         return trajectory
@@ -634,19 +752,14 @@ class GCodeExecutor:
         return bool(self._confirm_cb(move))
 
     def _init_group(self) -> None:
-        """Initialize the coordinated (X, Y) group (`C<group_index> INI <indices>`).
+        """Initialize the commander-node (X, Y) group (`C<group_index> INI <indices>`).
 
-        Sent at most once per executor, lazily on the first XY leg —
-        MMCCommands.init_group's own docstring says "call once after
+        Sent at most once per executor, lazily on the first leg that needs
+        it — MMCCommands.init_group's own docstring says "call once after
         connecting", and re-sending it per move (the original behaviour
         here) contradicted that: a 40-move run re-sent an identical
-        `C1 INI 1 2` 40 times. Programs that only ever move Z never touch
-        the group at all.
-
-        Z is structurally excluded: `self._axes` is the two commander-node
-        axes, with Z held separately as `self._z_axis`, so this cannot
-        construct a cross-node INI even by accident. See the module
-        docstring's "Z/XY node split" note.
+        `C1 INI 1 2` 40 times. Programs that never move X/Y never touch
+        this group at all.
 
         Call reset_group_init() if the controller may have lost its group
         state (power-cycle, reflash) — GantryController does so on
@@ -661,88 +774,403 @@ class GCodeExecutor:
             self._cmd.init_group(*indices)
         self._group_initialized = True
 
+    def _init_theta_group(self) -> None:
+        """Initialize the responder-node (Z, Theta) group
+        (`C<theta_group_index> INI <z_index> <theta_index>`).
+
+        Sent at most once per executor, lazily on the first leg that needs
+        it — mirrors _init_group. Only reached when a move changes both Z
+        and Theta together (see _leg_kinds); Z-only and Theta-only moves
+        never touch this group.
+
+        Raises:
+            GCodeError: If no `theta_cmd` was configured — a move that
+                reaches here has no other way to run.
+        """
+        if self._theta_cmd is None:
+            raise GCodeError(
+                "This move changes both Z and Theta (A) together, which "
+                "requires the Z/Theta coordinated group — configure "
+                "GCodeExecutor with theta_cmd=... (see the class docstring)"
+            )
+        if self._theta_group_initialized:
+            return
+        indices = [self._z_axis.index, self._theta_axis.index]
+        if self._dry_run:
+            logger.info(
+                "[dry-run] C%d INI %s", self._theta_group_index, " ".join(str(i) for i in indices)
+            )
+        else:
+            self._theta_cmd.init_group(*indices)
+        self._theta_group_initialized = True
+
     def reset_group_init(self) -> None:
-        """Forget that the coordinated group was initialized, so the next XY
-        leg re-sends INI.
+        """Forget that either coordinated group was initialized, so the next
+        leg that needs one re-sends its INI.
 
         Call after anything that may have cleared the controller's own
         group state — a power-cycle, a reflash, or a reconnect that might
-        span one. See _init_group.
+        span one. See _init_group/_init_theta_group.
         """
         self._group_initialized = False
+        self._theta_group_initialized = False
+
+    def _leg_kinds(self, move: GCodeMove) -> Tuple[bool, str]:
+        """Classify a LINEAR move, relative to the executor's current
+        position, into (touches_xy, responder_kind).
+
+        responder_kind is one of "none", "z", "theta", "z_theta" — which
+        responder-node command shape (no motion, single-axis Z,
+        single-axis Theta, or the Z/Theta group) this move's Z/Theta
+        portion needs. Combined with touches_xy, this drives every
+        dispatch decision in _execute_linear/_describe_linear.
+        """
+        tx, ty, tz = move.target
+        px, py, pz = self._current_pos
+        touches_xy = _moved(tx, px) or _moved(ty, py)
+        touches_z = _moved(tz, pz)
+        touches_theta = move.theta is not None and _moved(move.theta, self._current_theta)
+        if touches_z and touches_theta:
+            responder = "z_theta"
+        elif touches_z:
+            responder = "z"
+        elif touches_theta:
+            responder = "theta"
+        else:
+            responder = "none"
+        return touches_xy, responder
+
+    def _advance_position(self, move: GCodeMove) -> None:
+        """Update `_current_pos`/`_current_theta` to reflect a completed move."""
+        self._current_pos = move.target
+        if move.theta is not None:
+            self._current_theta = move.theta
 
     def _execute_linear(self, move: GCodeMove) -> None:
-        """Run one LINEAR move as either a Z-only leg or an XY-only leg.
+        """Run one LINEAR move via whichever leg(s) it actually needs.
 
-        After _split_cross_node_moves has run at plan() time, a single
-        LINEAR move never changes both Z and X/Y, so this only has to pick
-        which leg the move is. Updates `_current_pos` regardless of dry-run.
+        A move touching only X/Y, only Z, or only Theta runs as a single
+        leg exactly as before. A move touching X/Y together with Z and/or
+        Theta can't be sent as one group command (node-topology limit —
+        see module docstring), so it runs as two concurrent legs via
+        _execute_concurrent_pair. Updates `_current_pos`/`_current_theta`
+        regardless of dry-run.
 
         Raises:
             GCodeExecutionAborted: If confirm_cb rejects this move.
-            SnapMotionError: If the move doesn't finish within its poll
+            SnapMotionError: If a leg doesn't finish within its poll
                 timeout.
         """
         if not self._confirm(move):
             raise GCodeExecutionAborted(f"aborted by confirm_cb: {move.source_line!r}")
 
-        target_z = move.target[2]
-        _, _, current_z = self._current_pos
-        is_z_leg = _moved(target_z, current_z)
+        touches_xy, responder = self._leg_kinds(move)
 
         if self._dry_run:
-            logger.info("[dry-run] %s", self._describe_linear(move, is_z_leg))
-            self._current_pos = move.target
+            logger.info("[dry-run] %s", self._describe_linear(move, touches_xy, responder))
+            self._advance_position(move)
             return
 
-        if is_z_leg:
-            self._execute_z_leg(move)
-        else:
+        if touches_xy and responder != "none":
+            self._execute_concurrent_pair(move, responder)
+        elif touches_xy:
             self._execute_xy_leg(move)
-        self._current_pos = move.target
+        elif responder == "z":
+            self._execute_z_leg(move)
+        elif responder == "theta":
+            self._execute_theta_leg(move)
+        elif responder == "z_theta":
+            self._execute_zt_leg(move)
+        # responder == "none" and not touches_xy: nothing actually moves.
+
+        self._advance_position(move)
+
+    def _begin_z_leg(
+        self, move: GCodeMove, speed: Optional[float] = None, ramp: Optional[Tuple[float, float]] = None
+    ) -> None:
+        speed = move.feed_mm_s if speed is None else speed
+        if ramp is not None:
+            accel, decel = ramp
+            self._cmd.set_accel(self._z_axis, accel)
+            self._cmd.set_decel(self._z_axis, decel)
+        if speed is not None:
+            self._cmd.set_speed(self._z_axis, speed)
+        self._cmd.begin_move_to(self._z_axis, move.target[2])
+
+    def _poll_z_leg(self, move: GCodeMove, current_pos: Point3D, speed: Optional[float] = None) -> None:
+        distance = abs(move.target[2] - current_pos[2])
+        speed = move.feed_mm_s if speed is None else speed
+        self._poll_axis_move_finished(self._z_axis, predicted_s=predicted_move_s(distance, speed))
 
     def _execute_z_leg(self, move: GCodeMove) -> None:
-        """Move Z alone via a single-axis command. Z can't be part of the
-        coordinated group on this hardware (see module docstring) — this is
-        the only way Z ever moves."""
-        distance = abs(move.target[2] - self._current_pos[2])
-        if move.feed_mm_s is not None:
-            self._cmd.set_speed(self._z_axis, move.feed_mm_s)
-        self._cmd.begin_move_to(self._z_axis, move.target[2])
-        self._poll_axis_move_finished(
-            self._z_axis, predicted_s=predicted_move_s(distance, move.feed_mm_s)
-        )
+        """Move Z alone via a single-axis command."""
+        current_pos = self._current_pos
+        self._begin_z_leg(move)
+        self._poll_z_leg(move, current_pos)
+
+    def _begin_theta_leg(
+        self, move: GCodeMove, speed: Optional[float] = None, ramp: Optional[Tuple[float, float]] = None
+    ) -> None:
+        speed = move.feed_mm_s if speed is None else speed
+        if ramp is not None:
+            accel, decel = ramp
+            self._cmd.set_accel(self._theta_axis, accel)
+            self._cmd.set_decel(self._theta_axis, decel)
+        if speed is not None:
+            self._cmd.set_speed(self._theta_axis, speed)
+        self._cmd.begin_move_to(self._theta_axis, move.theta)
+
+    def _poll_theta_leg(
+        self, move: GCodeMove, current_theta: float, speed: Optional[float] = None
+    ) -> None:
+        distance = abs(move.theta - current_theta)
+        speed = move.feed_mm_s if speed is None else speed
+        self._poll_axis_move_finished(self._theta_axis, predicted_s=predicted_move_s(distance, speed))
+
+    def _execute_theta_leg(self, move: GCodeMove) -> None:
+        """Move Theta alone via a single-axis command."""
+        current_theta = self._current_theta
+        self._begin_theta_leg(move)
+        self._poll_theta_leg(move, current_theta)
+
+    def _begin_zt_leg(
+        self, move: GCodeMove, speed: Optional[float] = None, ramp: Optional[Tuple[float, float]] = None
+    ) -> None:
+        self._init_theta_group()
+        speed = move.feed_mm_s if speed is None else speed
+        if ramp is not None:
+            accel, decel = ramp
+            self._theta_cmd.group_set_accel(accel)
+            self._theta_cmd.group_set_decel(decel)
+        if speed is not None:
+            self._theta_cmd.group_set_speed(speed)
+        self._theta_cmd.group_begin_move_to(move.target[2], move.theta)
+
+    def _poll_zt_leg(
+        self,
+        move: GCodeMove,
+        current_pos: Point3D,
+        current_theta: float,
+        speed: Optional[float] = None,
+    ) -> None:
+        distance = _zt_distance(move, current_pos, current_theta)
+        speed = move.feed_mm_s if speed is None else speed
+        self._poll_theta_group_move_finished(predicted_s=predicted_move_s(distance, speed))
+
+    def _execute_zt_leg(self, move: GCodeMove) -> None:
+        """Move Z and Theta together via their own coordinated group
+        (`C<theta_group_index>`) — both live on the responder node, so
+        this group doesn't cross the node boundary the X/Y group can't
+        cross. See the module docstring.
+        """
+        current_pos = self._current_pos
+        current_theta = self._current_theta
+        self._begin_zt_leg(move)
+        self._poll_zt_leg(move, current_pos, current_theta)
+
+    def _begin_xy_leg(
+        self, move: GCodeMove, speed: Optional[float] = None, ramp: Optional[Tuple[float, float]] = None
+    ) -> None:
+        self._init_group()
+        speed = move.feed_mm_s if speed is None else speed
+        if ramp is not None:
+            accel, decel = ramp
+            self._cmd.group_set_accel(accel)
+            self._cmd.group_set_decel(decel)
+        if speed is not None:
+            self._cmd.group_set_speed(speed)
+        self._cmd.group_begin_move_to(move.target[0], move.target[1])
+
+    def _poll_xy_leg(self, move: GCodeMove, current_pos: Point3D, speed: Optional[float] = None) -> None:
+        distance = math.hypot(move.target[0] - current_pos[0], move.target[1] - current_pos[1])
+        speed = move.feed_mm_s if speed is None else speed
+        self._poll_group_move_finished(predicted_s=predicted_move_s(distance, speed))
 
     def _execute_xy_leg(self, move: GCodeMove) -> None:
-        """Move X/Y via the coordinated group (Z already at its target — see
-        _split_cross_node_moves)."""
-        self._init_group()
-        distance = math.hypot(
-            move.target[0] - self._current_pos[0], move.target[1] - self._current_pos[1]
-        )
-        if move.feed_mm_s is not None:
-            self._cmd.group_set_speed(move.feed_mm_s)
-        self._cmd.group_begin_move_to(move.target[0], move.target[1])
-        self._poll_group_move_finished(
-            predicted_s=predicted_move_s(distance, move.feed_mm_s)
-        )
+        """Move X/Y via the commander-node coordinated group."""
+        current_pos = self._current_pos
+        self._begin_xy_leg(move)
+        self._poll_xy_leg(move, current_pos)
 
-    def _describe_linear(self, move: GCodeMove, is_z_leg: bool) -> str:
-        """Render the ASCII commands _execute_linear would send, for dry-run logging."""
+    def _read_xy_ramp(self) -> Tuple[float, float]:
+        """Return the X/Y group's currently configured (accel, decel), for
+        scaling down the other leg's ramp to match — see
+        _execute_concurrent_pair. Initializes the group first (lazily, like
+        every other XY-group access) since querying ACL/DCL before INI is
+        untested.
+        """
+        self._init_group()
+        return self._cmd.group_get_accel(), self._cmd.group_get_decel()
+
+    def _set_xy_ramp(self, accel: float, decel: float) -> None:
+        self._cmd.group_set_accel(accel)
+        self._cmd.group_set_decel(decel)
+
+    def _read_responder_ramp(self, responder: str) -> Tuple[float, float]:
+        """Return the responder leg's currently configured (accel, decel),
+        for whichever command shape `responder` names — mirrors
+        _read_xy_ramp for the other side of _execute_concurrent_pair.
+        """
+        if responder == "z":
+            return self._cmd.get_accel(self._z_axis), self._cmd.get_decel(self._z_axis)
+        if responder == "theta":
+            return self._cmd.get_accel(self._theta_axis), self._cmd.get_decel(self._theta_axis)
+        self._init_theta_group()
+        return self._theta_cmd.group_get_accel(), self._theta_cmd.group_get_decel()
+
+    def _set_responder_ramp(self, responder: str, accel: float, decel: float) -> None:
+        if responder == "z":
+            self._cmd.set_accel(self._z_axis, accel)
+            self._cmd.set_decel(self._z_axis, decel)
+        elif responder == "theta":
+            self._cmd.set_accel(self._theta_axis, accel)
+            self._cmd.set_decel(self._theta_axis, decel)
+        else:  # "z_theta"
+            self._theta_cmd.group_set_accel(accel)
+            self._theta_cmd.group_set_decel(decel)
+
+    def _execute_concurrent_pair(self, move: GCodeMove, responder: str) -> None:
+        """Fire the responder leg (Z, Theta, or Z+Theta) and the commander
+        XY leg as two independent non-blocking BMTs, back-to-back, then
+        poll both to completion.
+
+        Whichever leg travels *less* distance is scaled down — speed,
+        accel, and decel all multiplied by the same ratio `k` (its
+        distance divided by the longer leg's) — so both legs' trapezoidal
+        velocity profiles take exactly the same time: scaling every rate
+        by the same factor scales every phase's distance by that factor
+        but leaves every phase's *duration* unchanged (t = v/a and
+        v²/(2a) both cancel the common factor identically). The longer leg
+        keeps the nominal commanded feed rate and whatever accel/decel it
+        already had; the shorter leg's ramp is read fresh from the
+        controller and scaled from that reference, so both legs start
+        accelerating together, reach cruise together, and decelerate
+        together — not just start together like a naive same-speed pair
+        would (see the module docstring's "concurrent responder/commander
+        legs" note for why even this still isn't a guaranteed diagonal).
+
+        The shorter leg's *own* pre-scaling ramp is read and restored once
+        both legs finish — this driver otherwise never touches ACL/DCL
+        (every other move leaves it at whatever the controller already
+        has), so a scaled-down value must not outlive this one move. Left
+        stale, it would silently slow every later move on that axis
+        (including how fast pause()/stop() can decelerate it) until some
+        future concurrent-pair move happened to overwrite it again.
+
+        Skipped (both legs get the plain nominal feed rate, ramp
+        untouched) when the move has no F word at all — there's no
+        nominal speed to decompose from.
+        """
+        current_pos = self._current_pos
+        current_theta = self._current_theta
+
+        dist_xy = math.hypot(move.target[0] - current_pos[0], move.target[1] - current_pos[1])
+        if responder == "theta":
+            dist_responder = abs(move.theta - current_theta)
+        elif responder == "z_theta":
+            dist_responder = _zt_distance(move, current_pos, current_theta)
+        else:  # "z"
+            dist_responder = abs(move.target[2] - current_pos[2])
+
+        xy_speed: Optional[float] = move.feed_mm_s
+        responder_speed: Optional[float] = move.feed_mm_s
+        xy_ramp: Optional[Tuple[float, float]] = None
+        responder_ramp: Optional[Tuple[float, float]] = None
+        restore_xy_ramp: Optional[Tuple[float, float]] = None
+        restore_responder_ramp: Optional[Tuple[float, float]] = None
+
+        if move.feed_mm_s is not None and dist_xy > 0 and dist_responder > 0:
+            if dist_xy >= dist_responder:
+                k = dist_responder / dist_xy
+                ref_accel, ref_decel = self._read_xy_ramp()
+                restore_responder_ramp = self._read_responder_ramp(responder)
+                responder_speed = k * move.feed_mm_s
+                responder_ramp = (k * ref_accel, k * ref_decel)
+            else:
+                k = dist_xy / dist_responder
+                ref_accel, ref_decel = self._read_responder_ramp(responder)
+                restore_xy_ramp = self._read_xy_ramp()
+                xy_speed = k * move.feed_mm_s
+                xy_ramp = (k * ref_accel, k * ref_decel)
+
+        # Everything from here on must restore whichever ramp was scaled,
+        # even if a leg never finishes (poll_until_move_finished timeout,
+        # aborted mid-flight) or a begin/poll call raises for any other
+        # reason — see this method's docstring on why a scaled-down ramp
+        # can never be allowed to outlive this one move. abort()/
+        # group_abort() (issued by the poll helpers on timeout) are
+        # immediate, not ramped, so writing ACL/DCL afterward doesn't fight
+        # an in-flight stop.
+        try:
+            if responder == "z":
+                self._begin_z_leg(move, speed=responder_speed, ramp=responder_ramp)
+            elif responder == "theta":
+                self._begin_theta_leg(move, speed=responder_speed, ramp=responder_ramp)
+            else:  # "z_theta"
+                self._begin_zt_leg(move, speed=responder_speed, ramp=responder_ramp)
+            self._begin_xy_leg(move, speed=xy_speed, ramp=xy_ramp)
+
+            if responder == "z":
+                self._poll_z_leg(move, current_pos, speed=responder_speed)
+            elif responder == "theta":
+                self._poll_theta_leg(move, current_theta, speed=responder_speed)
+            else:  # "z_theta"
+                self._poll_zt_leg(move, current_pos, current_theta, speed=responder_speed)
+            self._poll_xy_leg(move, current_pos, speed=xy_speed)
+        finally:
+            # Best-effort: if the try block above already failed (e.g. a
+            # poll timeout), that's the failure the caller needs to see —
+            # don't let a second failure here (e.g. a dropped connection)
+            # replace it in the traceback and hide why the move actually
+            # stopped. Log and move on instead of re-raising.
+            try:
+                if restore_responder_ramp is not None:
+                    self._set_responder_ramp(responder, *restore_responder_ramp)
+                if restore_xy_ramp is not None:
+                    self._set_xy_ramp(*restore_xy_ramp)
+            except Exception:
+                logger.exception(
+                    "Failed to restore ramp after a concurrent-pair move — "
+                    "an axis may be left with a scaled-down ACL/DCL"
+                )
+
+    def _describe_linear(self, move: GCodeMove, touches_xy: bool, responder: str) -> str:
+        """Render the ASCII commands _execute_linear would send, for dry-run logging.
+
+        For a concurrent pair (touches_xy and responder != "none"), the
+        real execute() scales one leg's speed/ramp down using a value read
+        live from the controller (see _execute_concurrent_pair) — dry-run
+        never touches hardware, so it can't reproduce that read, and shows
+        the plain nominal feed rate on both legs with a note that the real
+        run will differ.
+        """
         parts = []
-        if is_z_leg:
+        if responder == "z":
             if move.feed_mm_s is not None:
                 parts.append(f"{self._z_axis.token()} SPD {move.feed_mm_s:.6g}")
             parts.append(f"{self._z_axis.token()} BMT {move.target[2]:.6g}")
-        else:
+        elif responder == "theta":
+            if move.feed_mm_s is not None:
+                parts.append(f"{self._theta_axis.token()} SPD {move.feed_mm_s:.6g}")
+            parts.append(f"{self._theta_axis.token()} BMT {move.theta:.6g}")
+        elif responder == "z_theta":
+            if move.feed_mm_s is not None:
+                parts.append(f"C{self._theta_group_index} SPD {move.feed_mm_s:.6g}")
+            parts.append(f"C{self._theta_group_index} BMT {move.target[2]:.6g} {move.theta:.6g}")
+        if touches_xy:
             if move.feed_mm_s is not None:
                 parts.append(f"C{self._group_index} SPD {move.feed_mm_s:.6g}")
             fmt_pos = " ".join(f"{v:.6g}" for v in move.target[:2])
             parts.append(f"C{self._group_index} BMT {fmt_pos}")
+        if touches_xy and responder != "none" and move.feed_mm_s is not None:
+            parts.append(
+                "(concurrent pair: one leg's speed/ramp will be scaled down "
+                "from a live controller read at execute time — not shown here)"
+            )
         return "; ".join(parts)
 
     def _poll_group_move_finished(self, timeout_s: float = 30.0, predicted_s: float = 0.0) -> None:
-        """Block until the group's move-finished flag is set, aborting the move on timeout.
+        """Block until the X/Y group's move-finished flag is set, aborting the move on timeout.
 
         Polls sparsely via commands.poll_until_move_finished — querying
         C<n> MIF in a tight loop during group interpolation is what
@@ -762,17 +1190,33 @@ class GCodeExecutor:
             self._cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s
         ):
             self._cmd.group_abort()
-            raise SnapMotionError(0, f"Group move did not finish within {timeout_s:.0f}s — aborted")
+            raise SnapMotionError(0, f"X/Y group move did not finish within {timeout_s:.0f}s — aborted")
+
+    def _poll_theta_group_move_finished(self, timeout_s: float = 30.0, predicted_s: float = 0.0) -> None:
+        """Block until the Z/Theta group's move-finished flag is set, aborting the move on timeout.
+
+        Mirrors _poll_group_move_finished, against `theta_cmd` instead of
+        `cmd` — same sparse-polling discipline, same reason.
+
+        Raises:
+            SnapMotionError: If the move hasn't finished within
+                `timeout_s`. The in-progress group move is aborted
+                (`group_abort()`) before raising.
+        """
+        if not poll_until_move_finished(
+            self._theta_cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s
+        ):
+            self._theta_cmd.group_abort()
+            raise SnapMotionError(0, f"Z/Theta group move did not finish within {timeout_s:.0f}s — aborted")
 
     def _poll_axis_move_finished(self, axis: Axis, timeout_s: float = 30.0, predicted_s: float = 0.0) -> None:
         """Block until a single axis's move-finished flag is set, aborting the move on timeout.
 
-        mirrors _poll_group_move_finished, but for the
-        independent Z leg _execute_linear now issues instead of folding Z
-        into the coordinated group. See GCodeExecutor's class docstring.
-        Polls sparsely for the same reason (see commands.py) — single-axis
-        polling was never shown to destabilize the controller the way group
-        polling was, but there's no reason to query harder than needed.
+        Used for the independent Z and Theta legs. Polls sparsely for the
+        same reason as the group pollers (see commands.py) — single-axis
+        polling was never shown to destabilize the controller the way
+        group polling was, but there's no reason to query harder than
+        needed.
 
         Raises:
             SnapMotionError: If the move hasn't finished within

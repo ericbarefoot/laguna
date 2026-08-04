@@ -73,7 +73,8 @@ def _lookup_axis(axes_cfg: List[Dict[str, Any]], name: str) -> Optional[Axis]:
     """Resolve an axis by name: prefer an explicit axes_cfg entry, falling
     back to the known named-axis singletons (X/Y/Z/Theta) so that
     homing.order / gcode axis selection still works even when the config
-    omits the axes: list entirely (using the all-default axis set)."""
+    omits the axes: list entirely (using the all-default axis set).
+    """
     index = _axis_index_by_name(axes_cfg, name)
     if index is not None:
         return _resolve_axis(name, index)
@@ -106,6 +107,8 @@ class GantryController:
         fences: Optional[List[Fence]] = None,
         gcode_axes: Tuple[Axis, Axis] = (X_AXIS, Y_AXIS),
         gcode_z_axis: Axis = Z_AXIS,
+        gcode_theta_axis: Axis = THETA_AXIS,
+        theta_group_index: int = 2,
         safe_mode: bool = True,
         mm_per_unit: float = 1.0,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
@@ -135,6 +138,20 @@ class GantryController:
             mm_per_unit=mm_per_unit,
             coordinate_offset_mm=coordinate_offset_mm,
             group_axes=gcode_axes,
+        )
+        # A second coordinated group, entirely on the responder node
+        # (Z, Theta) — used only when a G-code move changes both together
+        # (see GCodeExecutor._execute_zt_leg/_execute_concurrent_pair).
+        # Sharing `connection` is safe: the transport already serialises
+        # individual request/response pairs, and MotionArbiter.hold()
+        # (held by GantryController.move_to()) serialises whole operations
+        # across both this and self.cmd.
+        self.theta_cmd = MMCCommands(
+            connection,
+            group_index=theta_group_index,
+            mm_per_unit=mm_per_unit,
+            coordinate_offset_mm=coordinate_offset_mm,
+            group_axes=(gcode_z_axis, gcode_theta_axis),
         )
 
         # Per-axis convenience handles — lab.gantry.axis("Y") always works;
@@ -169,7 +186,10 @@ class GantryController:
             homing=self.homing,
             axes=gcode_axes,
             z_axis=gcode_z_axis,
+            theta_axis=gcode_theta_axis,
             group_index=group_index,
+            theta_cmd=self.theta_cmd,
+            theta_group_index=theta_group_index,
         )
 
     @property
@@ -229,12 +249,14 @@ class GantryController:
     def disengage_brake(self, axis: "Axis | AxisHandle | str") -> None:
         """Disengage the electromagnetic brake on the given axis (Y or Z
         only — raises ValueError for axes without a brake). See
-        engage_brake() above for accepted `axis` forms."""
+        engage_brake() above for accepted `axis` forms.
+        """
         self._resolve_axis_handle(axis).disengage_brake()
 
     def brake_is_disengaged(self, axis: "Axis | AxisHandle | str") -> bool:
         """True if the given axis's brake is currently disengaged (released).
-        See engage_brake() above for accepted `axis` forms."""
+        See engage_brake() above for accepted `axis` forms.
+        """
         return self._resolve_axis_handle(axis).brake_is_disengaged()
 
     @classmethod
@@ -254,6 +276,7 @@ class GantryController:
         fences = _build_fences(config.get("fences") or [])
         gcode_axes = _resolve_gcode_axes(axes_cfg)
         gcode_z_axis = _lookup_axis(axes_cfg, "Z") or Z_AXIS
+        gcode_theta_axis = _lookup_axis(axes_cfg, "Theta") or THETA_AXIS
 
         return cls(
             connection=connection,
@@ -264,6 +287,8 @@ class GantryController:
             fences=fences,
             gcode_axes=gcode_axes,
             gcode_z_axis=gcode_z_axis,
+            gcode_theta_axis=gcode_theta_axis,
+            theta_group_index=config.get("theta_group_index", 2),
             safe_mode=config.get("safe_mode", True),
             # Temporary DSM-project workaround — see docs/GANTRY_UNIT_CALIBRATION.md.
             # Flip gantry.mm_per_acp_unit to 1.0 in config once fixed at the source;
@@ -962,11 +987,13 @@ def _build_homing_config(homing_cfg: Dict[str, Any], axes_cfg: List[Dict[str, An
 
 
 def _resolve_gcode_axes(axes_cfg: List[Dict[str, Any]]) -> Tuple[Axis, Axis]:
-    """Pick the X/Y axes by name for the GCodeExecutor's coordinated group.
+    """Pick the X/Y axes by name for the GCodeExecutor's commander-node
+    coordinated group.
 
-    Z is deliberately not included — it cannot join the group on this
-    hardware and is passed separately as the executor's z_axis. See
-    gcode.py's "Z/XY node split" note.
+    Z/Theta are deliberately not included — they cannot join this group on
+    this hardware (different PLC node) and are passed separately as the
+    executor's z_axis/theta_axis/theta_cmd. See gcode.py's module
+    docstring.
     """
     resolved = [axis for axis in (_lookup_axis(axes_cfg, name) for name in ("X", "Y")) if axis]
     if len(resolved) == 2:
