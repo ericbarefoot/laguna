@@ -18,7 +18,7 @@ a failure on real hardware means the assumption is wrong):
 
 import pytest
 
-from laguna import rangefinder as rangefinder_module
+from laguna.rangefinder import subsystem as rangefinder_module
 from laguna.rangefinder import (
     OD2000Rangefinder,
     RangefinderSubsystem,
