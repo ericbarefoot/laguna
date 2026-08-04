@@ -103,6 +103,11 @@ def main() -> None:
     commit_and_tag(new_version)
     print(f"bumped {'.'.join(map(str, current))} -> {new_version}, tagged v{new_version}")
     print("nothing was pushed — push the branch and tag explicitly when ready")
+    print(
+        "laguna.__version__ reads installed package metadata, not pyproject.toml "
+        "live — run `pip install -e .` again if your current environment needs "
+        "to see the bumped version immediately"
+    )
 
 
 if __name__ == "__main__":

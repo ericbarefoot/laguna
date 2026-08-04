@@ -12,7 +12,7 @@ the same shape as `weir`/`gauge`: `subsystem_name = "flow"`,
 `connect()`/`disconnect()`/`get_status()`, registered via `lab.add(flow)`
 → `lab.flow`.
 
-`FlowController` (`src/laguna/flow/__init__.py`) is an ABC; the only
+`FlowController` (`src/laguna/flow/controller.py`) is an ABC; the only
 concrete implementation is `SaflFlowController`. If `safl_ocean_hardware`
 isn't installed, `connect()` logs a warning and returns `False`.
 
@@ -129,4 +129,4 @@ in `src/laguna/experiment/runner.py`:
 - [API reference](../reference/flow.md) — generated from docstrings.
 - [Experiment runner](experiment.md) — how `flow:` config drives scheduling.
 - [Schedule](schedule.md) — the CSV format and interpolation modes.
-- `src/laguna/flow/__init__.py` — the driver itself.
+- `src/laguna/flow/controller.py` — the driver itself.

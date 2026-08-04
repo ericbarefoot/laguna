@@ -45,9 +45,12 @@ mypy src/laguna
 
 ## Releasing / Version Bumps
 
-`pyproject.toml`'s `version` field is the single source of truth —
-`laguna.__version__` reads it dynamically via `importlib.metadata`, it isn't a
-separate hardcoded string. As you make notable changes, add a bullet under the
+`pyproject.toml`'s `version` field is the single source of truth — it isn't
+duplicated as a separate hardcoded string anywhere. `laguna.__version__` reads
+it via `importlib.metadata`, which reflects whatever was true when the package
+was last installed (`pip install -e .`), not a live read of the file — after
+bumping, reinstall if your current environment needs `__version__` to reflect
+it immediately. As you make notable changes, add a bullet under the
 `## [Unreleased]` heading in `CHANGELOG.md`. When it's time to cut a version:
 
 ```bash

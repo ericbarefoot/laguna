@@ -106,7 +106,7 @@ ISDU set (the generic "Technical Information" doc this repo's decode was
 built from explicitly warns not every documented index is implemented on
 every device), or there's a firmware/profile mismatch between this unit and
 the IODD the AL1342 expects. `decode_wtt12l_pdin()` in
-[`src/laguna/rangefinder/__init__.py`](../src/laguna/rangefinder/__init__.py)
+[`src/laguna/rangefinder/decoders.py`](../src/laguna/rangefinder/decoders.py)
 is kept in the code as the documented byte layout, but is unvalidated and
 currently unreachable — don't trust it against real hardware yet.
 
@@ -172,7 +172,7 @@ OD2000 or a hypothetically-working native WTT12L reading** — this is going
 through an extra analog conversion stage the OD2000 doesn't have.
 
 `decode_dp4200_wtt12l_analog_pdin()` in
-[`src/laguna/rangefinder/__init__.py`](../src/laguna/rangefinder/__init__.py)
+[`src/laguna/rangefinder/decoders.py`](../src/laguna/rangefinder/decoders.py)
 implements this, with `near_mm`/`far_mm` as overridable parameters in case
 the sensor ever gets taught a different span than the un-taught default.
 

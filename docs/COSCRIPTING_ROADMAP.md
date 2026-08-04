@@ -52,8 +52,8 @@ Today `stop()` means four different severities:
 | Subsystem | `stop()` does | Severity |
 |---|---|---|
 | `GantryController` (`controller.py:367`) | zero-decel abort, brakes engaged, motors disabled — docstring calls it the emergency-stop path | **hard e-stop** |
-| `SaflWeirController` (`weir/__init__.py:314`) | halt in-progress move | moderate |
-| `SaflFlowController` (`flow/__init__.py:250`) | **stops the pump** | drains the experiment's hydraulic state |
+| `SaflWeirController` (`weir/controller.py:360`) | halt in-progress move | moderate |
+| `SaflFlowController` (`flow/controller.py:309`) | **stops the pump** | drains the experiment's hydraulic state |
 | `GocatorScanner` (`gocator.py:1262`) | stops the SDK data channel | benign |
 | gauge, rangefinders, pi cameras | *no `stop()` at all* | — |
 
@@ -139,7 +139,7 @@ three verbs.
 3. **`DigitalInputTrigger`** (optional, later) — poll a spare gantry PLC digital input
    (see `IOMap` in `robot/macron/commands.py`) or an AL1342 IO-Link port, for a path
    that does not depend on a filesystem write succeeding.
-4. Also poll the VFD's existing **hardware** `e_stop` flag (`flow/__init__.py:333`,
+4. Also poll the VFD's existing **hardware** `e_stop` flag (`flow/controller.py:416`,
    read-only) and propagate it — the pump drive already has a real e-stop circuit.
 
 **A signal-based trigger is deliberately not the primary path.** Python delivers
@@ -162,8 +162,8 @@ everything else here** — without it, two scheduled actions command motion at o
 
 **Zero-arg acquire verbs.** Give the Gocator a scheduler-compatible entry point:
 `GocatorScanner.acquire(gantry=None, **defaults)`, closing over a configured scan
-spec. Mirrors `RangefinderSubsystem.read_mm()` (`rangefinder/__init__.py:286`) and
-`CameraManager.trigger_capture()` (`camera/__init__.py:108`).
+spec. Mirrors `RangefinderSubsystem.read_mm()` (`rangefinder/subsystem.py:167`) and
+`CameraManager.trigger_capture()` (`camera/manager.py:127`).
 
 **`experiment/runner.py`:**
 - Extend the section tuple (`runner.py:149`) and instantiation chain
@@ -207,7 +207,7 @@ follow-up workstream, not a silent gap in this one.
 - Fix second-resolution filename collisions in `save_scan()` (`gocator.py:1626`) and
   `profiler.py:115` — two outputs in the same second overwrite silently.
 
-**Done, narrowly:** `laguna.data.DataProcessor.save_data()` (`data/__init__.py:89`)
+**Done, narrowly:** `laguna.data.DataProcessor.save_data()` (`data/processor.py:89`)
 used to return `True` while writing nothing. It now raises `NotImplementedError`
 instead — reporting success for a silent no-op was an active hazard. Actually
 implementing data streaming/packaging (HDF5/CSV export, compression) is still out
