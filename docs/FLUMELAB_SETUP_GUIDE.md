@@ -350,8 +350,10 @@ else.
 
 ## Further reading
 
-- [Adding a New Subsystem](CONTRIBUTING.md#adding-a-new-subsystem) — the
-  full contract for `from_config()`, the registry, and logging.
+- [Adding a New Subsystem (guide)](ADDING_A_SUBSYSTEM.md) — static vs.
+  gantry-mounted, sensor vs. actuator, and worked examples.
+- [Adding a New Subsystem (checklist)](CONTRIBUTING.md#adding-a-new-subsystem) —
+  the full contract for `from_config()`, the registry, and logging.
 - [Experiment runner](subsystems/experiment.md) — `setup_run()`/
   `run_blocking()` in more depth, and the scheduling keys
   (`interval_s`/`trigger_at`/`use_schedule`).

@@ -91,6 +91,7 @@ nav:
       - Experiment runner: subsystems/experiment.md
       - Data & storage: subsystems/data_storage.md
   - Camera USB setup: CAMERA_USB_SETUP.md
+  - Adding a new subsystem: ADDING_A_SUBSYSTEM.md
   - Contributing: CONTRIBUTING.md
   - API reference:
       - Overview: reference/index.md

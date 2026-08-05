@@ -64,6 +64,11 @@ pushing the branch and tag is a separate, explicit step.
 
 ## Adding a New Subsystem
 
+This is the mechanical checklist. For the design decisions it doesn't
+cover — static vs. gantry-mounted, sensor vs. actuator, and two full
+worked examples — see [Adding a New Subsystem
+(guide)](ADDING_A_SUBSYSTEM.md).
+
 `FlumeLab` is opt-in: subsystems are constructed independently and
 attached with `lab.add(subsystem)` — or built for you from config via
 `lab.add("name")` / `lab.add_all()`, see below — rather than hardcoded
