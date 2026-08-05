@@ -8,11 +8,9 @@ C library via ctypes.
 Usage sketch — see ``docs/subsystems/scanner.md`` for the full guide::
 
     from laguna import FlumeLab
-    from laguna.scanner import GocatorScanner
 
     lab = FlumeLab("config/example_config.yaml")
-    scanner = GocatorScanner.from_config(lab.config.get("gocator"))
-    lab.add(scanner)
+    lab.add("gocator").add("gantry")
     lab.connect_all()
 
     scan = lab.gocator.scan_with_gantry(

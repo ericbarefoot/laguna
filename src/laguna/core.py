@@ -1,7 +1,9 @@
 """Core orchestrator module for FlumeLab.
 
-FlumeLab uses an opt-in model: instantiate subsystems separately and attach them
-with lab.add(subsystem). This avoids hardcoding hardware assumptions in the core.
+FlumeLab uses an opt-in model: subsystems are attached with lab.add(subsystem),
+lab.add("name") (looks up laguna.registry and builds it from config), or
+lab.add_all() (every subsystem whose section is present in the loaded config).
+This avoids hardcoding hardware assumptions in the core.
 """
 from contextlib import contextmanager
 from pathlib import Path
@@ -33,6 +35,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+#: Third-party libraries pinned to WARNING even under debug=True — "debug my
+#: code", not "debug every dependency's own chatter" (matches the existing
+#: paramiko silencing precedent in laguna.experiment.runner.setup_run()).
+_THIRD_PARTY_LOGGERS = ("paramiko", "paramiko.transport")
+
+#: Tags a FileHandler as this class's own operational-log handler, so a
+#: later FlumeLab construction in the same process (a REPL session, a test
+#: suite) can find and remove the previous one instead of piling up
+#: duplicate handlers that each keep writing to an old run's log file.
+_OPERATIONAL_LOG_HANDLER_ATTR = "_laguna_operational_log"
+
 
 class FlumeLab:
     """Main orchestrator for the flume lab robotic system.
@@ -48,7 +61,7 @@ class FlumeLab:
     Example::
 
         lab = FlumeLab("config.yaml")
-        lab.add(CameraManager(configs)).add(GantryController.from_config(lab.config.get("gantry")))
+        lab.add_all()  # builds + registers every subsystem present in config.yaml
         lab.connect_all()
         with lab.experiment() as clock:
             lab.scheduler.run(duration=300)
@@ -68,6 +81,7 @@ class FlumeLab:
         config_file: Optional[str] = None,
         simulate: bool = False,
         speed_factor: Optional[float] = None,
+        debug: bool = False,
     ) -> None:
         logger.info("Initializing FlumeLab system...")
 
@@ -93,6 +107,13 @@ class FlumeLab:
             from .simulation import simulate_config
 
             self.config.config_dict = simulate_config(self.config.config_dict)
+            # simulate_config() drops sections with no simulated backend
+            # (everything but gantry/gocator) from config_dict outright —
+            # explicit_sections must lose them too, or add_all() would try
+            # to build a real weir/flow/gauge/camera controller against
+            # real hardware during what is supposed to be a hardware-free
+            # rehearsal (see laguna.simulation's module docstring).
+            self.config.explicit_sections &= set(self.config.config_dict.keys())
             logger.warning(
                 "SIMULATION MODE — no hardware will be contacted. Structural "
                 "mistakes (schedules, survey extents, missing config) surface; "
@@ -124,6 +145,15 @@ class FlumeLab:
             speed_factor=self.speed_factor,
         )
 
+        #: Global troubleshooting switch. True sets every laguna.* logger
+        #: (including each subsystem's own — overriding its individual
+        #: log_level config, see laguna.subsystem_logging) to DEBUG, which
+        #: is where tessellated motion segments and other low-level detail
+        #: surface; third-party libraries stay pinned to WARNING regardless.
+        #: False leaves each subsystem's own log_level in charge, as today.
+        self.debug = debug
+        self._configure_operational_log()
+
         # Timing subsystem — always present
         self.clock = ExperimentClock(speed_factor=self.speed_factor)
         # Observe every pause/resume, whoever caused it. Scheduler.stop()
@@ -131,9 +161,27 @@ class FlumeLab:
         # silently missed those intervals and left the saved timeline wrong.
         self.clock.on_pause = self.run.paused
         self.clock.on_resume = self.run.resumed
-        self.event_log = EventLog(
-            self.config.get_value("timing.event_log", "./experiment_events.csv")
-        )
+        event_log_path = Path(self.config.get_value("timing.event_log", "./experiment_events.csv"))
+        if self.simulate:
+            # A rehearsal must never be able to land in the same file as a
+            # real experiment's archival record — this file ships as
+            # metadata alongside published data, so a simulated row mixed
+            # in undetected would be a real data-integrity problem.
+            # Suffixed unconditionally, even if timing.event_log was set
+            # explicitly, since the same config file is often reused
+            # for both a real run and a rehearsal of it.
+            event_log_path = event_log_path.with_name(
+                f"{event_log_path.stem}_simulated{event_log_path.suffix}"
+            )
+        self.event_log = EventLog(str(event_log_path))
+        if self.simulate:
+            # Belt-and-suspenders alongside the filename split above: even
+            # if this file's contents end up copied/merged elsewhere, the
+            # row itself still says what it is.
+            self.event_log.log(
+                0.0, "flume_lab", "simulate_mode",
+                notes=f"rehearsal — no hardware contacted; speed_factor={self.speed_factor}",
+            )
         self.scheduler = Scheduler(clock=self.clock, event_log=self.event_log)
 
         # Registry for opt-in hardware subsystems
@@ -143,6 +191,47 @@ class FlumeLab:
         self._start_wall: Optional[float] = None  # wall time of lab.start()
         self.is_running = False
         logger.info("FlumeLab timing backbone ready — add subsystems via lab.add()")
+
+    def _configure_operational_log(self) -> None:
+        """Wire up the operational log tier: connections + broad motion at
+        INFO, low-level/tessellated detail at DEBUG — distinct from the
+        terse, archival event_log CSV (see laguna.subsystem_logging's
+        module docstring for the full split). Reuses standard Python
+        logging rather than a second structured file format; persisted
+        under the run directory (run.root/run.run_id/laguna.log) when one
+        is configured, terminal-only otherwise.
+        """
+        from .subsystem_logging import set_global_debug
+
+        # Always set explicitly (never leave the prior value) — a REPL or
+        # test suite constructing FlumeLab(debug=True) then FlumeLab()
+        # again in the same process must not leave DEBUG stuck from the
+        # first instance. NOTSET defers back to root's basicConfig(INFO).
+        # Third-party loggers are only ever pinned quieter here, never
+        # reset — debug=False must not clobber a level some other code
+        # (e.g. runner.py's verbose_cameras handling) already configured.
+        root_logger = logging.getLogger("laguna")
+        root_logger.setLevel(logging.DEBUG if self.debug else logging.NOTSET)
+        if self.debug:
+            for noisy in _THIRD_PARTY_LOGGERS:
+                logging.getLogger(noisy).setLevel(logging.WARNING)
+        set_global_debug(self.debug)
+
+        for handler in list(root_logger.handlers):
+            if getattr(handler, _OPERATIONAL_LOG_HANDLER_ATTR, False):
+                root_logger.removeHandler(handler)
+                handler.close()
+
+        if self.run.root is not None:
+            log_path = self.run.root / self.run.run_id / "laguna.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(log_path)
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            ))
+            setattr(handler, _OPERATIONAL_LOG_HANDLER_ATTR, True)
+            root_logger.addHandler(handler)
+            logger.info("Operational log: %s", log_path)
 
     # ------------------------------------------------------------------
     # Opt-in subsystem registration
@@ -162,15 +251,32 @@ class FlumeLab:
 
         The subsystem is stored both in ``self._subsystems`` (keyed by name)
         and as a direct attribute (``self.<subsystem_name>``), making
-        ``lab.cameras``, ``lab.gantry``, etc. work naturally.
+        ``lab.cameras``, ``lab.gantry``, etc. work naturally. Subsystems
+        exposing ``attach_event_log()`` (see laguna.subsystem_logging) are
+        wired to this lab's event_log/clock automatically, so they can log
+        their own key actions without the caller doing it by hand.
 
         Args:
-            subsystem: Any object with a ``subsystem_name`` class or instance
-                       attribute (e.g. CameraManager, GantryController).
+            subsystem: Either a built object with a ``subsystem_name`` class
+                       or instance attribute (e.g. CameraManager,
+                       GantryController), or a registry name (e.g.
+                       ``"gantry"``, see laguna.registry.SUBSYSTEM_REGISTRY)
+                       to build via that class's ``from_config(self.config)``.
 
         Returns:
-            self — so calls can be chained: ``lab.add(cam).add(robot)``
+            self — so calls can be chained: ``lab.add(cam).add("gantry")``
         """
+        if isinstance(subsystem, str):
+            from .registry import SUBSYSTEM_REGISTRY
+
+            subsystem_cls = SUBSYSTEM_REGISTRY.get(subsystem)
+            if subsystem_cls is None:
+                raise ValueError(
+                    f"{subsystem!r} is not in laguna.registry.SUBSYSTEM_REGISTRY; "
+                    "pass a built subsystem instance instead, or add it to the registry."
+                )
+            subsystem = subsystem_cls.from_config(self.config)
+
         name = getattr(subsystem, "subsystem_name", None)
         if not name:
             raise ValueError(
@@ -179,7 +285,28 @@ class FlumeLab:
             )
         self._subsystems[name] = subsystem
         setattr(self, name, subsystem)
+        if hasattr(subsystem, "attach_event_log"):
+            subsystem.attach_event_log(self.event_log, self.clock)
         logger.info("Registered subsystem '%s' (%s)", name, type(subsystem).__name__)
+        return self
+
+    def add_all(self) -> "FlumeLab":
+        """Add every subsystem whose config section was explicitly present in the YAML.
+
+        Opt-in follows ``self.config.explicit_sections`` (set by
+        ``Config.load_from_file()``), not ``config_dict`` — ``_get_defaults()``
+        populates every section unconditionally, so config_dict alone can't
+        tell "explicitly configured" from "just the default." Section names
+        with no registry entry (e.g. ``timing``, ``frames``) are skipped.
+
+        Returns:
+            self — so calls can be chained: ``lab.add_all().connect_all()``
+        """
+        from .registry import SUBSYSTEM_REGISTRY
+
+        for name in sorted(self.config.explicit_sections):
+            if name in SUBSYSTEM_REGISTRY:
+                self.add(name)
         return self
 
     # ------------------------------------------------------------------
@@ -705,6 +832,30 @@ class FlumeLab:
             SafetyTier.STOP: lambda: self.end_run(reason=f"trigger:{name}"),
             SafetyTier.ESTOP: lambda: self.estop(reason=f"trigger:{name}"),
         }[tier]()
+
+    def log_note(self, text: str, refers_to: Optional[int] = None) -> int:
+        """Add a free-text note to the event log — for a human to explain
+        what happened, alongside the automatic narrative every other
+        event-log row records.
+
+        The event log ships as metadata alongside published experiment
+        data, so this is the place to record anything an automated
+        subsystem action can't say for itself: why a run was paused, what
+        a sensor glitch looked like, a decision made mid-experiment. Call
+        it any time — pausing/stopping first is not required.
+
+        Args:
+            text: The note itself.
+            refers_to: Optional event_id (returned by this method or any
+                subsystem's log_event()) this note explains — e.g. the
+                event_id of a failed scan you're annotating with the cause.
+
+        Returns:
+            This note's own event_id, so a later note can refer back to it.
+        """
+        return self.event_log.log(
+            self.clock.elapsed(), "operator", "note", notes=text, refers_to=refers_to
+        )
 
     def pause(self, reason: str = "manual") -> None:
         """Pause the experiment — everything quiesces, nothing disconnects.

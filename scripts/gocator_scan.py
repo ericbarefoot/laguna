@@ -38,9 +38,9 @@ LAS/LAZ output needs the optional scanner extra: pip install 'laguna[scanner]'
 Safety: matches the ALLOW_MOTION pattern in example_05/example_07 — motion is
 opt-in, not opt-out. Without --allow-motion this always behaves like
 --dry-run, regardless of what the config file's gantry.safe_mode says; this
-script derives safe_mode from --allow-motion itself rather than trusting a
-possibly-stale config value (see build_gantry_config() below). Pass
---allow-motion only once you've decided to actually move something.
+script derives safe_mode from --allow-motion itself, via set_safe_mode(),
+rather than trusting a possibly-stale config value. Pass --allow-motion only
+once you've decided to actually move something.
 
 The --allow-motion path also uses the per-axis command path (AxisHandle,
 same safe_mode-gated BMT that gantry.move_to() itself uses), which bypasses
@@ -57,8 +57,6 @@ from typing import Optional
 import numpy as np
 
 from laguna import FlumeLab
-from laguna.robot.macron import GantryController
-from laguna.scanner import GocatorScanner
 from laguna.scanner import FILTER_NAMES
 from laguna.scanner.mounting import SENSOR_AXES, SensorMounting
 
@@ -163,19 +161,16 @@ def parse_mounting(spec: Optional[str]) -> Optional[dict]:
     return out
 
 
-def build_gantry_config(lab: FlumeLab, allow_motion: bool) -> dict:
-    """Gantry config section, with safe_mode owned by this script.
+def force_pi_agent_transport(lab: FlumeLab) -> dict:
+    """Force the gantry config's transport to pi_agent before construction.
 
-    Mirrors example_07's pattern: safe_mode is derived from the script's own
-    motion flag (here, --allow-motion) rather than trusted from the config
-    file, so this script's own default (motion off) can't be silently
-    overridden by whatever a shared config happens to have saved. Mutates
-    and returns the same dict lab.config.get("gantry") would — see
-    Config.get()/Config.config_dict.
+    transport has to be set before GantryController is built — there's no
+    post-construction way to change it, unlike safe_mode (see
+    GantryController.set_safe_mode(), called separately after lab.add()).
 
-    transport is forced to pi_agent, same as example_05/example_07: it's the
-    only transport that supports topographic scanning and the only one with
-    a working default. The retired socket_bridge transport depended on
+    Same reasoning as example_05/example_07: pi_agent is the only transport
+    that supports topographic scanning and the only one with a working
+    default. The retired socket_bridge transport depended on
     serial_bridge.py, a hand-started, unversioned script on the Pi that did
     not survive a reboot — see docs/MACRON_GANTRY.md, "Retired:
     serial_bridge.py". Its code path still exists if configured explicitly,
@@ -183,7 +178,6 @@ def build_gantry_config(lab: FlumeLab, allow_motion: bool) -> dict:
     """
     gantry_config = lab.config.get("gantry")
     gantry_config["transport"] = "pi_agent"
-    gantry_config["safe_mode"] = not allow_motion
     return gantry_config
 
 
@@ -382,22 +376,22 @@ def main() -> int:
 
     lab = FlumeLab(args.config)
 
-    gocator_config = lab.config.get_value("gocator")
-    if not gocator_config:
+    if "gocator" not in lab.config.explicit_sections:
         logger.error(
             "No 'gocator:' section in %s — copy the commented block from "
             "config/example_config.yaml",
             args.config,
         )
         return 1
+    gocator_config = lab.config.get("gocator")
 
     # --mounting overrides the config's, so scans come back in gantry
     # coordinates without editing the config file.
     if mounting is not None:
         gocator_config["mounting"] = mounting
 
-    scanner = GocatorScanner.from_config(gocator_config)
-    lab.add(scanner)
+    lab.add("gocator")
+    scanner = lab.gocator
 
     if not scanner.connect():
         logger.error(
@@ -443,10 +437,13 @@ def main() -> int:
             logger.info("Not moving the gantry or scanning.")
             return 0
 
-        gantry_config = build_gantry_config(lab, args.allow_motion)
+        gantry_config = force_pi_agent_transport(lab)
 
-        gantry = GantryController.from_config(gantry_config)
-        lab.add(gantry)
+        lab.add("gantry")
+        gantry = lab.gantry
+        # This script owns the motion decision, not the config file — safe
+        # to call before connect() (see set_safe_mode()'s docstring).
+        gantry.set_safe_mode(not args.allow_motion)
         if not gantry.connect():
             # pi_agent (forced above) SFTPs and launches gantry_agent.py over
             # SSH itself, then owns the serial port for the session — no
@@ -468,8 +465,8 @@ def main() -> int:
             )
             return 1
 
-        # Sanity check, not the primary gate — build_gantry_config() already
-        # set safe_mode=False from --allow-motion above. Fail fast rather than
+        # Sanity check, not the primary gate — set_safe_mode(False) was
+        # already called from --allow-motion above. Fail fast rather than
         # partway through a move if that didn't take for some reason, since
         # safe_mode gates every motion command.
         if gantry.get_status().get("safe_mode", True):

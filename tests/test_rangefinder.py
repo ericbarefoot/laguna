@@ -582,3 +582,72 @@ class TestDecodeDp4200Wtt12lAnalogPdin:
         decoded dict — only current_ma and distance_mm."""
         result = decode_dp4200_wtt12l_analog_pdin("2890FD01")
         assert set(result.keys()) == {"current_ma", "distance_mm"}
+
+
+# ---------------------------------------------------------------------------
+# simulated: True — connect()/reads succeed with no broker or AL1342 needed
+# ---------------------------------------------------------------------------
+
+
+class TestRangefinderSimulated:
+    """simulated: True skips the real MQTT broker and AL1342 HTTP path
+    entirely — connect() succeeds unconditionally, every reading is NaN
+    rather than fabricated. See laguna.simulation."""
+
+    def _rf(self, cls=OD2000Rangefinder, **extra_config):
+        mqtt = FakeMqttSubscriber()
+        config = {"topic": "laguna/od2000", "pdin_port": 2, "simulated": True, **extra_config}
+        return cls(config, mqtt), mqtt
+
+    def test_connect_succeeds_with_no_broker(self):
+        rf, mqtt = self._rf()
+        assert rf.connect() is True
+        assert rf._is_connected is True
+        assert mqtt.connected_called == 0  # real MQTT connect() never touched
+
+    def test_get_distance_mm_is_nan(self):
+        import math
+
+        rf, _ = self._rf()
+        rf.connect()
+        assert math.isnan(rf.get_distance_mm())
+
+    def test_get_latest_sample_is_nan(self):
+        import math
+
+        rf, _ = self._rf()
+        rf.connect()
+        wall_time, distance_mm = rf.get_latest_sample()
+        assert math.isnan(distance_mm)
+
+    def test_get_status_reports_connected_with_nan_reading(self):
+        import math
+
+        rf, _ = self._rf()
+        rf.connect()
+        status = rf.get_status()
+        assert status["is_connected"] is True
+        assert math.isnan(status["latest_distance_mm"])
+
+    def test_read_mm_is_nan_with_no_al1342_host_needed(self):
+        """Real read_mm() requires al1342_host — simulated mode needs
+        neither that config key nor a real HTTP call."""
+        import math
+
+        rf, _ = self._rf()  # no al1342_host in config
+        assert math.isnan(rf.read_mm())
+
+    def test_od2000_activate_deactivate_do_not_touch_the_network(self):
+        """Real activate()/deactivate() call write_acyclic() (a real
+        IO-Link HTTP write) — simulated mode must not reach it, and must
+        not require al1342_host either."""
+        rf, _ = self._rf(cls=OD2000Rangefinder)
+        rf.activate()    # must not raise despite no al1342_host configured
+        rf.deactivate()  # ditto
+
+    def test_wtt12l_simulated_too(self):
+        import math
+
+        rf, _ = self._rf(cls=WTT12LRangefinder)
+        assert rf.connect() is True
+        assert math.isnan(rf.get_distance_mm())

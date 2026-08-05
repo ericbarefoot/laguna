@@ -66,6 +66,7 @@ nav:
   - Home: index.md
   - Architecture: ARCHITECTURE.md
   - Quick reference: QUICKREF.md
+  - FlumeLab setup & logging guide: FLUMELAB_SETUP_GUIDE.md
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
@@ -90,6 +91,7 @@ nav:
       - Experiment runner: subsystems/experiment.md
       - Data & storage: subsystems/data_storage.md
   - Camera USB setup: CAMERA_USB_SETUP.md
+  - Adding a new subsystem: ADDING_A_SUBSYSTEM.md
   - Contributing: CONTRIBUTING.md
   - API reference:
       - Overview: reference/index.md

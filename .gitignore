@@ -101,6 +101,7 @@ experiment_checkpoint.json
 # ...except documentation figures, which are deliberately committed
 !docs/images/*.png
 experiment_events.csv
+experiment_events_simulated.csv
 .claude/
 
 # MkDocs build output (generated via `mkdocs build`, see mkdocs.yml)

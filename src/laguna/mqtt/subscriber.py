@@ -12,7 +12,10 @@ import logging
 import queue
 import uuid
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,11 @@ class MqttSubscriber:
         for topic in self._initial_topics:
             self._queues[topic] = queue.Queue()
             self._topics.append(topic)
+
+    @classmethod
+    def from_config(cls, config: "Config") -> "MqttSubscriber":
+        """Build from the lab's Config (its 'mqtt:' section)."""
+        return cls(config.get("mqtt"))
 
     # ------------------------------------------------------------------
     # Subsystem lifecycle

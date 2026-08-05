@@ -20,9 +20,14 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import paramiko
+
+from ..subsystem_logging import SubsystemLogging
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +73,7 @@ class CaptureResult:
     error: Optional[str] = None
 
 
-class CameraArray:
+class CameraArray(SubsystemLogging):
     """Manages a set of networked Raspberry Pi cameras for synchronised capture."""
 
     subsystem_name = "pi_cameras"
@@ -79,11 +84,38 @@ class CameraArray:
         ssh_user: str = DEFAULT_SSH_USER,
         ssh_key: Optional[str] = None,
         ssh_passphrase: Optional[str] = None,
+        log_level: str = "INFO",
+        event_log_verbosity: str = "INFO",
+        simulated: bool = False,
     ):
         self.hosts = hosts
         self.ssh_user = ssh_user
         self.ssh_key = ssh_key
         self.ssh_passphrase = ssh_passphrase
+        self.log_level = log_level
+        self.event_log_verbosity = event_log_verbosity
+        self._simulated = simulated
+
+    @classmethod
+    def from_config(cls, config: "Config") -> "CameraArray":
+        """Build from the lab's Config (its 'pi_cameras:' section).
+
+        hosts defaults to [] here, not this class's own DEFAULT_CAMERAS
+        (real named lab cameras) — a pi_cameras: section with some other
+        key set but no explicit hosts: must not silently target real
+        hardware. ssh_user defaults to "ucrs" here, not this class's own
+        "pi" default — both match laguna.experiment.runner's historical
+        setup_run() defaults, which this classmethod replaces.
+        """
+        pi_cfg = config.get("pi_cameras")
+        return cls(
+            hosts=pi_cfg.get("hosts", []),
+            ssh_user=pi_cfg.get("ssh_user", "ucrs"),
+            ssh_key=pi_cfg.get("ssh_key"),
+            log_level=pi_cfg.get("log_level", "INFO"),
+            event_log_verbosity=pi_cfg.get("event_log_verbosity", "INFO"),
+            simulated=pi_cfg.get("simulated", False),
+        )
 
     def _connect(self, hostname: str) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
@@ -280,6 +312,22 @@ class CameraArray:
         Measures per-host clock offsets then adjusts each camera's target
         timestamp so they all fire at the same wall-clock moment.
         """
+        if self._simulated:
+            # No real SSH/timing work — proves the schedule fires the
+            # trigger, not that the cameras would actually agree on timing.
+            # Timing fields are NaN, not a fabricated spread, per
+            # laguna.simulation's module docstring.
+            pc_target = time.time() + lead_time
+            return [
+                CaptureResult(
+                    hostname=host, success=True, filename="<simulated>",
+                    target_time=pc_target, capture_time_mid=float("nan"),
+                    capture_time_mid_pc=float("nan"), capture_duration_ms=float("nan"),
+                    latency_ms=float("nan"), clock_offset_s=float("nan"),
+                )
+                for host in self.hosts
+            ]
+
         logger.debug("Measuring clock offsets before trigger...")
         offsets = self._measure_offsets()
 
@@ -319,6 +367,19 @@ class CameraArray:
         output_dir.mkdir(parents=True, exist_ok=True)
         local_paths: Dict[str, Path] = {}
 
+        if self._simulated:
+            # No real SFTP, no real file written — a placeholder path,
+            # clearly not a real filename, so the archival log_event()
+            # call below still fires and still proves the trigger->fetch
+            # pipeline ran, without pretending there's an actual image.
+            for result in results:
+                if not result.success:
+                    continue
+                local = output_dir / f"{result.hostname}_simulated.jpg"
+                local_paths[result.hostname] = local
+                self.log_event("capture", host=result.hostname, file=str(local))
+            return local_paths
+
         for result in results:
             if not result.success or not result.filename:
                 continue
@@ -331,8 +392,13 @@ class CameraArray:
                 sftp.close()
                 client.close()
                 local_paths[result.hostname] = local
+                self.log_event("capture", host=result.hostname, file=str(local))
             except Exception as exc:
                 print(f"  [warn] Could not fetch image from {result.hostname}: {exc}")
+
+        failed = [r.hostname for r in results if not r.success]
+        if failed:
+            self.log_event("capture_partial_failure", level="WARNING", failed=failed)
 
         return local_paths
 

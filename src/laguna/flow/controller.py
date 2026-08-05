@@ -1,8 +1,13 @@
 """Pump flow control subsystem."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 import logging
+
+from ..subsystem_logging import SubsystemLogging
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +139,7 @@ class FlowController(ABC):
         ...
 
 
-class SaflFlowController(FlowController):
+class SaflFlowController(FlowController, SubsystemLogging):
     """Flow controller backed by a Fuji VFD pump and Teknic motor for solenoid IO.
 
     NOTE: In production, the TeknicMotor instance should be shared with
@@ -168,6 +173,11 @@ class SaflFlowController(FlowController):
                   Config._get_defaults(); override per-installation as
                   needed. The resulting frequency is clamped to [0, 60] Hz
                   by the underlying VFD driver.
+                - log_level / event_log_verbosity: see laguna.subsystem_logging
+                  (both default 'INFO').
+                - simulated: build a SimulatedVFD + SimulatedTeknicMotor
+                  instead of the real drivers — see laguna.simulation
+                  (default False).
         """
         self._vfd_port = config.get("vfd_port", "/dev/ttyUSB1")
         self._vfd_slave_id = config.get("vfd_slave_id", 1)
@@ -176,6 +186,9 @@ class SaflFlowController(FlowController):
         self.C0 = config.get("C0", 4.902)
         self.C1 = config.get("C1", 58.49)
         self.C2 = config.get("C2", 0.08956)
+        self.log_level = config.get("log_level", "INFO")
+        self.event_log_verbosity = config.get("event_log_verbosity", "INFO")
+        self._simulated = config.get("simulated", False)
 
         self._vfd = None
         self._motor = None
@@ -183,6 +196,11 @@ class SaflFlowController(FlowController):
         self._current_flowrate = 0.0
         self._qin_state = False
         self._qaux_state = False
+
+    @classmethod
+    def from_config(cls, config: "Config") -> "SaflFlowController":
+        """Build from the lab's Config (its 'flow:' section)."""
+        return cls(config.get("flow"))
 
     def connect(self) -> bool:
         """Open connections to both the VFD (Modbus) and the ClearCore (serial).
@@ -194,6 +212,13 @@ class SaflFlowController(FlowController):
         Returns:
             True only if both the VFD and motor connections succeeded.
         """
+        if self._simulated:
+            from ..simulation import SimulatedTeknicMotor, SimulatedVFD
+
+            self._vfd = SimulatedVFD()
+            self._motor = SimulatedTeknicMotor()
+            self._is_connected = self._vfd.connect() and self._motor.connect()
+            return self._is_connected
         if _VFD is None or _TeknicMotor is None:
             logger.warning(
                 "safl_ocean_hardware is not installed; SaflFlowController cannot connect"
@@ -247,6 +272,7 @@ class SaflFlowController(FlowController):
         self._require_connected()
         self._vfd.set_freq_from_flowrate(lpm, self.C0, self.C1, self.C2)
         self._current_flowrate = lpm
+        self.log_event("set_flowrate", flowrate_lpm=f"{lpm:.2f}")
         return True
 
     def get_flowrate(self) -> float:
@@ -265,7 +291,9 @@ class SaflFlowController(FlowController):
             RuntimeError: If not connected.
         """
         self._require_connected()
-        return self._vfd.start()
+        started = self._vfd.start()
+        self.log_event("start")
+        return started
 
     def _vfd_stop(self) -> bool:
         """Stop the pump drive itself. See stop() for the safety verb."""
@@ -314,6 +342,7 @@ class SaflFlowController(FlowController):
         """
         try:
             self._vfd_stop()
+            self.log_event("stop")
         except Exception as exc:
             logger.error("Could not stop the pump: %s", exc)
             return f"pump may still be running: {exc}"
@@ -369,6 +398,7 @@ class SaflFlowController(FlowController):
         self._require_connected()
         self._motor.set_io(0, state)
         self._qin_state = state
+        self.log_event("qin", state=state)
 
     @property
     def qaux(self) -> bool:
@@ -391,6 +421,7 @@ class SaflFlowController(FlowController):
         self._require_connected()
         self._motor.set_io(1, state)
         self._qaux_state = state
+        self.log_event("qaux", state=state)
 
     def get_status(self) -> Dict[str, Any]:
         """Return connection state, flow setpoint, valve states, and raw VFD status.

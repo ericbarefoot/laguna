@@ -1,8 +1,13 @@
 """Weir (tailgate) elevation control subsystem."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 import logging
+
+from ..subsystem_logging import SubsystemLogging
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +148,7 @@ class WeirController(ABC):
         ...
 
 
-class SaflWeirController(WeirController):
+class SaflWeirController(WeirController, SubsystemLogging):
     """Weir controller backed by a Teknic ClearCore stepper motor.
 
     The ClearCore firmware handles all unit conversion internally (configured
@@ -164,12 +169,24 @@ class SaflWeirController(WeirController):
                 - home_offset_mm: Position value written to the controller's
                   position register once home() finds the limit switch
                   (default 0.0).
+                - log_level / event_log_verbosity: see laguna.subsystem_logging
+                  (both default 'INFO').
+                - simulated: build a SimulatedTeknicMotor instead of the
+                  real driver — see laguna.simulation (default False).
         """
         self._port = config.get("port", "/dev/ttyUSB0")
         self._baudrate = config.get("baudrate", 9600)
         self._home_offset_mm = config.get("home_offset_mm", 0.0)
+        self.log_level = config.get("log_level", "INFO")
+        self.event_log_verbosity = config.get("event_log_verbosity", "INFO")
+        self._simulated = config.get("simulated", False)
         self._motor = None
         self._is_connected = False
+
+    @classmethod
+    def from_config(cls, config: "Config") -> "SaflWeirController":
+        """Build from the lab's Config (its 'weir:' section)."""
+        return cls(config.get("weir"))
 
     def connect(self) -> bool:
         """Open the serial connection to the ClearCore controller.
@@ -179,6 +196,12 @@ class SaflWeirController(WeirController):
             or if the connection attempt raised an exception (the exception
             is logged, not propagated).
         """
+        if self._simulated:
+            from ..simulation import SimulatedTeknicMotor
+
+            self._motor = SimulatedTeknicMotor()
+            self._is_connected = self._motor.connect()
+            return self._is_connected
         if _TeknicMotor is None:
             logger.warning(
                 "safl_ocean_hardware is not installed; SaflWeirController cannot connect"
@@ -232,7 +255,9 @@ class SaflWeirController(WeirController):
             RuntimeError: If not connected.
         """
         self._require_connected()
-        return self._motor.move_to_position(mm)
+        accepted = self._motor.move_to_position(mm)
+        self.log_event("go_to_elevation", target_mm=f"{mm:.2f}")
+        return accepted
 
     def get_elevation(self) -> float:
         """Query and return the ClearCore's current position in mm.

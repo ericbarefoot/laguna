@@ -48,8 +48,6 @@ The pass is: start a non-blocking move, wait out the acceleration ramp
 """
 
 from laguna import FlumeLab
-from laguna.robot.macron import GantryController
-from laguna.scanner import GocatorScanner
 
 # --- Scan geometry — adjust for your setup ---
 SCAN_AXIS = "X"          # gantry axis to travel along
@@ -64,18 +62,17 @@ ALLOW_MOTION = False
 def main():
     lab = FlumeLab("config/example_config.yaml")
 
-    gocator_config = lab.config.get_value("gocator")
-    if not gocator_config:
+    if "gocator" not in lab.config.explicit_sections:
         print("No 'gocator:' section in the config — nothing to do.")
         return
 
-    scanner = GocatorScanner.from_config(gocator_config)
-    lab.add(scanner)
+    lab.add("gocator")
+    scanner = lab.gocator
 
     if not scanner.connect():
         print("Could not connect to the Gocator. Check that the SDK libraries")
         print("are built (scripts/build_gosdk.sh) and the sensor answers at")
-        print(f"{gocator_config.get('ip')} — try pinging it.")
+        print(f"{lab.config.get('gocator').get('ip')} — try pinging it.")
         return
 
     # Read-only: what the sensor currently thinks it's doing.
@@ -94,10 +91,10 @@ def main():
     # The scan
     # ------------------------------------------------------------------
 
-    gantry_config = lab.config.get("gantry")
-    gantry_config["safe_mode"] = False      # this script owns the decision
-    gantry = GantryController.from_config(gantry_config)
-    lab.add(gantry)
+    lab.add("gantry")
+    gantry = lab.gantry
+    gantry.set_safe_mode(False)  # this script owns the decision — see set_safe_mode()'s
+                                  # docstring; safe to call before connect()
 
     if not gantry.connect():
         print("Could not connect to the gantry — see the errors above.")

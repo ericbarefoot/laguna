@@ -5,6 +5,8 @@ frames and safety machinery — so these check the seams where "simulated"
 could quietly stop meaning anything.
 """
 
+import csv
+
 import pytest
 
 from laguna import FlumeLab
@@ -80,27 +82,32 @@ class TestSimulateConfig:
         cfg = {"gantry": {}, "gocator": {}}
         assert set(simulate_config(cfg)) == {"gantry", "gocator"}
 
-    def test_subsystems_with_no_simulated_backend_are_dropped(self):
-        """weir/flow/gauge/cameras/rangefinders have no simulated transport —
-        a Modbus VFD, a serial stepper, an ultrasonic sensor, SSH to a Pi.
-        Constructing the real controller classes for these under
-        simulate=True would silently contact real hardware during what is
-        supposed to be a hardware-free rehearsal, so they must be dropped
-        rather than passed through untouched."""
+    def test_every_registry_subsystem_is_marked_simulated_not_dropped(self):
+        """Every laguna.registry.SUBSYSTEM_REGISTRY entry has a simulated
+        backend now (SimulatedTeknicMotor/VFD/MassaSensor, and a
+        `simulated` flag pi_cameras/dslr_cameras/od2000/wtt12l check
+        directly) — a rehearsal must exercise all of them, or it proves
+        nothing about their schedules."""
         cfg = {
             "gantry": {}, "gocator": {}, "weir": {}, "flow": {}, "gauge": {},
             "pi_cameras": {}, "dslr_cameras": {}, "od2000": {}, "wtt12l": {},
         }
         out = simulate_config(cfg)
-        assert set(out) == {"gantry", "gocator"}
+        assert set(out) == set(cfg)
+        for section in ("weir", "flow", "gauge", "pi_cameras", "dslr_cameras",
+                        "od2000", "wtt12l"):
+            assert out[section]["simulated"] is True
 
-    def test_no_hardware_sections_left_untouched(self):
-        """The specific defect: simulate_config() used to leave weir/flow (and
-        everything else without a simulated backend) byte-for-byte identical
-        to the input, so setup_run() built the real SaflWeirController/
-        SaflFlowController against real hardware during simulate=True."""
-        cfg = {"weir": {"port": "/dev/ttyUSB0"}}
-        assert "weir" not in simulate_config(cfg)
+    def test_unknown_sections_with_no_simulated_backend_are_dropped(self, monkeypatch):
+        """_NO_SIMULATED_BACKEND is empty today (every registered subsystem
+        has a simulated path), but the drop mechanism itself must still
+        work for whatever gets added to the registry next without one —
+        exercised here with a synthetic section name."""
+        import laguna.simulation as simulation
+
+        monkeypatch.setattr(simulation, "_NO_SIMULATED_BACKEND", ("not_yet_simulated",))
+        cfg = {"gantry": {}, "not_yet_simulated": {"port": "/dev/ttyUSB9"}}
+        assert set(simulate_config(cfg)) == {"gantry"}
 
     def test_the_original_config_is_not_mutated(self):
         cfg = {"gantry": {"transport": "pi_agent"}}
@@ -109,11 +116,11 @@ class TestSimulateConfig:
 
 
 class TestSetupRunSimulation:
-    """setup_run() reads its own local raw-YAML dict to decide which
-    subsystems to build — a separate object from FlumeLab's own
-    lab.config.config_dict. simulate=True has to reach both, or the section
-    check here (`if "weir" in cfg`) still finds it and builds the real
-    controller against real hardware."""
+    """setup_run() builds subsystems via lab.add_all(), which keys off
+    lab.config.explicit_sections — simulate=True has to reach that (see
+    FlumeLab.__init__'s explicit_sections intersection with the
+    simulate_config()-rewritten config_dict), or a section dropped there
+    would still get built here for real."""
 
     def _config_path(self, tmp_path):
         import yaml
@@ -128,26 +135,65 @@ class TestSetupRunSimulation:
         }))
         return str(path)
 
-    def test_simulate_flows_through_to_setup_runs_own_subsystem_construction(
-        self, tmp_path, monkeypatch
+    def test_weir_and_flow_are_now_constructed_and_connect_under_simulate(
+        self, tmp_path
     ):
+        """weir/flow have simulated backends now (SimulatedTeknicMotor/VFD) —
+        constructed and successfully connected under simulate=True even
+        though safl_ocean_hardware isn't installed in this environment,
+        which is exactly the point: no real driver is needed to rehearse."""
         from laguna.experiment.runner import setup_run
-
-        constructed = []
-        monkeypatch.setattr(
-            "laguna.weir.SaflWeirController.__init__",
-            lambda self, config: constructed.append("weir"),
-        )
-        monkeypatch.setattr(
-            "laguna.flow.SaflFlowController.__init__",
-            lambda self, config: constructed.append("flow"),
-        )
 
         lab = setup_run(self._config_path(tmp_path), simulate=True)
 
-        assert constructed == [], "weir/flow must not be constructed under simulate=True"
-        assert "weir" not in lab._subsystems
-        assert "flow" not in lab._subsystems
+        assert "weir" in lab._subsystems
+        assert "flow" in lab._subsystems
+        assert lab.weir._is_connected is True
+        assert lab.flow._is_connected is True
+
+    def test_every_registry_subsystem_connects_end_to_end(self, tmp_path):
+        """The full point of extending simulate=True past gantry/gocator:
+        a rehearsal should exercise weir/flow/gauge/camera/rangefinder
+        schedules too, not just motion — every subsystem in
+        laguna.registry.SUBSYSTEM_REGISTRY connects successfully with no
+        real hardware anywhere."""
+        import math
+
+        import yaml
+
+        from laguna.experiment.runner import setup_run
+        from laguna.registry import SUBSYSTEM_REGISTRY
+
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.safe_dump({
+            "gantry": {"transport": "pi_agent", "safe_mode": True,
+                       "axes": [{"name": "X", "index": 1}]},
+            "gocator": {"ip": "192.168.1.10"},
+            "weir": {"port": "/dev/ttyUSB0"},
+            "flow": {"vfd_port": "/dev/ttyUSB1"},
+            "gauge": {"port": "/dev/ttyUSB2"},
+            "pi_cameras": {"hosts": ["pi1.local"]},
+            "dslr_cameras": {"cameras": {"Camera1": {}}},
+            "od2000": {"topic": "laguna/od2000", "pdin_port": 2},
+            "wtt12l": {"topic": "laguna/wtt12l", "pdin_port": 7},
+        }))
+
+        lab = setup_run(str(path), simulate=True)
+
+        assert set(lab._subsystems) == set(SUBSYSTEM_REGISTRY)
+        # connect_all() already ran inside setup_run(); every subsystem
+        # must have actually connected, not just been constructed.
+        for name, subsystem in lab._subsystems.items():
+            status = subsystem.get_status()
+            assert status.get("is_connected", True) is True, f"{name} did not connect"
+
+        # Readings are NaN, not fabricated — commands (already exercised by
+        # the other per-subsystem simulated tests) are what a rehearsal is
+        # actually checking here.
+        assert math.isnan(lab.gauge.read_mm())
+        assert math.isnan(lab.weir.get_elevation())
+        assert math.isnan(lab.od2000.get_distance_mm())
+        assert math.isnan(lab.wtt12l.get_distance_mm())
 
     def test_gantry_still_gets_simulated_config_through_setup_run(self, tmp_path):
         from laguna.experiment.runner import setup_run
@@ -190,11 +236,51 @@ class TestFlumeLabSimulation:
             },
         }))
         lab = FlumeLab(str(path), simulate=True)
-        lab.add(GantryController.from_config(lab.config.get("gantry")))
+        lab.add(GantryController.from_config(lab.config))
         assert lab.connect_all() is True
 
         lab.gantry.move_to(X=150.0)
         assert lab.gantry.get_status()["positions"]["X"] == pytest.approx(150.0)
+
+    def test_event_log_gets_a_simulated_suffix_by_default(self, tmp_path):
+        path = tmp_path / "cfg.yaml"
+        path.write_text(f"timing:\n  event_log: {tmp_path / 'experiment_events.csv'}\n")
+        lab = FlumeLab(str(path), simulate=True)
+        assert lab.event_log._path == tmp_path / "experiment_events_simulated.csv"
+        assert not (tmp_path / "experiment_events.csv").exists()
+
+    def test_explicit_event_log_path_is_still_suffixed(self, tmp_path):
+        """A rehearsal must never be able to land in the same file as a real
+        run's — even if timing.event_log was set explicitly, since the same
+        config is often reused for both a real run and its rehearsal."""
+        path = tmp_path / "cfg.yaml"
+        path.write_text(f"timing:\n  event_log: {tmp_path / 'my_events.csv'}\n")
+        lab = FlumeLab(str(path), simulate=True)
+        assert lab.event_log._path == tmp_path / "my_events_simulated.csv"
+
+    def test_real_run_does_not_get_the_suffix(self, tmp_path):
+        path = tmp_path / "cfg.yaml"
+        path.write_text(f"timing:\n  event_log: {tmp_path / 'experiment_events.csv'}\n")
+        lab = FlumeLab(str(path))
+        assert lab.event_log._path == tmp_path / "experiment_events.csv"
+
+    def test_simulate_mode_row_written_at_construction(self, tmp_path):
+        path = tmp_path / "cfg.yaml"
+        path.write_text(f"timing:\n  event_log: {tmp_path / 'events.csv'}\n")
+        FlumeLab(str(path), simulate=True)
+        with open(tmp_path / "events_simulated.csv", newline="") as f:
+            rows = list(csv.DictReader(f))
+        marker_rows = [r for r in rows if r["event_type"] == "simulate_mode"]
+        assert len(marker_rows) == 1
+        assert marker_rows[0]["subsystem"] == "flume_lab"
+
+    def test_real_run_has_no_simulate_mode_row(self, tmp_path):
+        path = tmp_path / "cfg.yaml"
+        path.write_text(f"timing:\n  event_log: {tmp_path / 'events.csv'}\n")
+        FlumeLab(str(path))
+        with open(tmp_path / "events.csv", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert [r for r in rows if r["event_type"] == "simulate_mode"] == []
 
 
 class TestSimulatedScanner:
@@ -227,6 +313,28 @@ class TestSimulatedScanner:
         scan = scanner.receive_surface(timeout_s=1.0)
         assert np.isnan(scan.z_mm).any()
         assert scan.valid_count < scan.z_mm.size
+
+    def test_surface_size_is_fixed_and_small_regardless_of_scan_config(self):
+        """A rehearsal must not accumulate large files even if the real
+        config asks for a big fixed_length_mm/high frame rate — the
+        simulated surface is always the same small fixed grid (see
+        laguna.scanner.simulation's SIM_ROWS/SIM_COLS), not scaled to
+        whatever a real scan would have produced."""
+        from laguna.scanner import GocatorScanner
+        from laguna.scanner.simulation import SIM_COLS, SIM_ROWS
+
+        big_scanner = GocatorScanner({
+            "ip": "1.2.3.4", "simulated": True,
+            "travel_speed_mm_s": 20.0, "fixed_length_mm": 5000.0,  # a large real pass
+        })
+        big_scanner.connect()
+        big_scanner.start()
+        scan = big_scanner.receive_surface(timeout_s=1.0)
+
+        assert scan.shape == (SIM_ROWS, SIM_COLS)
+        # float64 x/y/z per point, well under a megabyte either way —
+        # nowhere near the GB range a long real scan can reach.
+        assert scan.z_mm.nbytes < 1_000_000
 
     def test_export_paths_work_end_to_end(self, tmp_path):
         scanner = self._scanner()

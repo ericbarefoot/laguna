@@ -1,8 +1,13 @@
 """Water level measurement subsystem."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import TYPE_CHECKING, Dict, Any, Optional
 import logging
+
+from ..subsystem_logging import SubsystemLogging
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +57,7 @@ class WaterLevelSensor(ABC):
         ...
 
 
-class SaflWaterLevelSensor(WaterLevelSensor):
+class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
     """Water level sensor backed by a Massa ultrasonic distance sensor.
 
     The Massa sensor measures a downward-looking distance to the water
@@ -80,14 +85,26 @@ class SaflWaterLevelSensor(WaterLevelSensor):
                   reading of zero distance; used as `offset_mm -
                   distance_mm` for every reading in this class
                   (default 0.0).
+                - log_level / event_log_verbosity: see laguna.subsystem_logging
+                  (both default 'INFO').
+                - simulated: build a SimulatedMassaSensor instead of the
+                  real driver — see laguna.simulation (default False).
         """
         self._port = config.get("port", "/dev/ttyUSB2")
         self._sensor_ids = config.get("sensor_ids", [0])
         self._offsets = config.get("offsets", None)
         self._offset_mm = config.get("offset_mm", 0.0)
+        self.log_level = config.get("log_level", "INFO")
+        self.event_log_verbosity = config.get("event_log_verbosity", "INFO")
+        self._simulated = config.get("simulated", False)
         self._sensor = None
         self._is_connected = False
         self._last_read: Optional[dict] = None
+
+    @classmethod
+    def from_config(cls, config: "Config") -> "SaflWaterLevelSensor":
+        """Build from the lab's Config (its 'gauge:' section)."""
+        return cls(config.get("gauge"))
 
     def connect(self) -> bool:
         """Open the serial connection to the Massa sensor(s).
@@ -97,6 +114,12 @@ class SaflWaterLevelSensor(WaterLevelSensor):
             or if the connection attempt raised an exception (the exception
             is logged, not propagated).
         """
+        if self._simulated:
+            from ..simulation import SimulatedMassaSensor
+
+            self._sensor = SimulatedMassaSensor()
+            self._is_connected = self._sensor.connect()
+            return self._is_connected
         if _MassaSensor is None:
             logger.warning(
                 "safl_ocean_hardware is not installed; SaflWaterLevelSensor cannot connect"
@@ -127,7 +150,15 @@ class SaflWaterLevelSensor(WaterLevelSensor):
         result = self._sensor.read()
         self._last_read = result
         # Distance decreases as water rises: elevation = offset - distance_cm * 10
-        return self._offset_mm - result["distance_cm"] * 10.0
+        elevation_mm = self._offset_mm - result["distance_cm"] * 10.0
+        # Operational log only, not the archival event log — a reading
+        # measures the experiment's state without changing it, so it's
+        # data, not a "step taken." A caller polling this on a schedule
+        # that wants specific readings archived as milestones can do so
+        # explicitly via lab.log_note() or runner.py's log_as_event opt-in
+        # — see laguna.subsystem_logging's module docstring.
+        logger.info("read_mm: elevation_mm=%.2f", elevation_mm)
+        return elevation_mm
 
     def read_mm_smoothed(self) -> float:
         """Read and return elevation using the sensor's built-in FIFO moving average.

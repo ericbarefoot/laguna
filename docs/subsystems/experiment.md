@@ -8,11 +8,15 @@ script) calls into rather than hand-wiring subsystems itself.
 ## What `setup_run()` actually does
 
 1. Loads `lab_config` YAML and instantiates a `FlumeLab`.
-2. For each of `gauge`, `weir`, `flow`, `pi_cameras`, `dslr_cameras`: if that
-   top-level key is present in the YAML, instantiate the matching subsystem
-   and `lab.add()` it. **Absent key → subsystem is simply not created** —
-   this is how the framework stays opt-in; a config with only a `weir:`
-   section runs weir-only with no camera/gauge code touched at all.
+2. Calls `lab.add_all()` — builds and registers every subsystem whose
+   section was explicitly present in the YAML, via
+   `laguna.registry.SUBSYSTEM_REGISTRY` (gantry, weir, gauge, flow,
+   gocator, od2000, wtt12l, pi_cameras, dslr_cameras). **Absent key →
+   subsystem is simply not created** — this is how the framework stays
+   opt-in; a config with only a `weir:` section runs weir-only with no
+   camera/gauge code touched at all. See the
+   [FlumeLab setup guide](../FLUMELAB_SETUP_GUIDE.md) for the full
+   `add()`/`add_all()`/registry picture.
 3. Connects every registered subsystem, logging which succeeded/failed
    (failures are non-fatal — the run continues without that subsystem).
 4. Registers one scheduled action per subsystem, in one of three mutually
@@ -27,7 +31,10 @@ script) calls into rather than hand-wiring subsystems itself.
 
    `_validate_trigger_config()` raises `ValueError` at setup time if a
    section specifies more than one of these — fail fast rather than
-   silently picking one.
+   silently picking one. `gauge`/`weir`'s periodic status-polling actions
+   also respect an opt-in `log_as_event: true` key — see the
+   [setup guide's logging section](../FLUMELAB_SETUP_GUIDE.md#two-tier-logging)
+   for why a poll doesn't reach the archival event log by default.
 
 5. Returns the configured (but not yet running) `FlumeLab`. Call
    `lab.start(duration)` yourself, or use `run_blocking()` (below) for the
@@ -97,6 +104,9 @@ the [event log](timing.md) while a run is in progress.
 
 ## Further reading
 
+- [FlumeLab setup & logging guide](../FLUMELAB_SETUP_GUIDE.md) — `add()`/
+  `add_all()`/the registry, the two-tier event/operational log model, and
+  `simulate=True` rehearsal mode, all with worked examples.
 - [API reference](../reference/experiment.md) — generated from docstrings.
 - [Timing](timing.md) — the `Scheduler`/`EventLog` this module drives.
 - [Schedule](schedule.md) — the CSV format behind `use_schedule: true`.
