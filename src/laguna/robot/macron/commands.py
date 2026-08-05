@@ -377,24 +377,23 @@ class MMCCommands:
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
         group_axes: tuple[Axis, ...] = (X_AXIS, Y_AXIS, Z_AXIS),
     ):
-        """
-        Args:
-            connection: Transport to send formatted ASCII commands over.
-            group_index: Coordinated-group index (the `C<N>` prefix).
-            mm_per_unit: Real mm per raw controller (ACP) unit, applied to
-                every linear-axis (X/Y/Z) position/velocity value. Defaults
-                to 1.0 (no conversion) — pass the value from
-                config's `gantry.mm_per_acp_unit` to apply the
-                docs/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
-                Theta.
-            coordinate_offset_mm: Optional {axis_name: offset_mm} real-mm
-                translation from the gantry's raw zero to a real-world
-                origin, applied to position (not velocity/delta) values for
-                linear axes. Axes not present in the dict get 0.0.
-            group_axes: The axes coordinated-group commands' positional
-                arguments map to, in order — must match how the group was
-                configured (e.g. via GCodeExecutor/GantryController). Used
-                only to look up per-axis mm_per_unit/offset for group moves.
+        """Args:
+        connection: Transport to send formatted ASCII commands over.
+        group_index: Coordinated-group index (the `C<N>` prefix).
+        mm_per_unit: Real mm per raw controller (ACP) unit, applied to
+            every linear-axis (X/Y/Z) position/velocity value. Defaults
+            to 1.0 (no conversion) — pass the value from
+            config's `gantry.mm_per_acp_unit` to apply the
+            docs/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
+            Theta.
+        coordinate_offset_mm: Optional {axis_name: offset_mm} real-mm
+            translation from the gantry's raw zero to a real-world
+            origin, applied to position (not velocity/delta) values for
+            linear axes. Axes not present in the dict get 0.0.
+        group_axes: The axes coordinated-group commands' positional
+            arguments map to, in order — must match how the group was
+            configured (e.g. via GCodeExecutor/GantryController). Used
+            only to look up per-axis mm_per_unit/offset for group moves.
         """
         self._conn = connection
         self._group = group_index
@@ -722,9 +721,17 @@ class MMCCommands:
         result = self._send(f"{self._gx()} ACL {raw:.6g}")
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
+    def group_get_accel(self) -> float:
+        result = self._send(f"{self._gx()} ACL")
+        return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
+
     def group_set_decel(self, value: float) -> float:
         raw = self._delta_to_raw(self._group_axes[0], value) if self._group_axes else value
         result = self._send(f"{self._gx()} DCL {raw:.6g}")
+        return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
+
+    def group_get_decel(self) -> float:
+        result = self._send(f"{self._gx()} DCL")
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_set_actual_position(self, *positions: float) -> None:
@@ -1081,7 +1088,8 @@ class AxisHandle:
 
     def move_by(self, delta: float, timeout: float = 30.0) -> None:
         """Relative move (real mm), blocking until it finishes. See move_to()
-        for why this polls internally rather than using the blocking MVB."""
+        for why this polls internally rather than using the blocking MVB.
+        """
         self._check_motion_allowed("move_by")
         self._cmd.begin_move_by(self._axis, delta)
         self._poll_move_finished(timeout, predicted_s=predicted_move_s(delta, self._last_speed()))
@@ -1158,14 +1166,16 @@ class AxisHandle:
     def disengage_brake(self) -> None:
         """Disengage this axis's electromagnetic brake. Raises ValueError if
         this axis has no brake (X/Theta), or if the underlying IOMap channel
-        hasn't been configured yet — see MMCCommands.disengage_brake."""
+        hasn't been configured yet — see MMCCommands.disengage_brake.
+        """
         self._require_brake()
         self._cmd.disengage_brake(self._axis, self._io_map)
 
     def engage_brake(self) -> None:
         """Engage this axis's electromagnetic brake. Raises ValueError if
         this axis has no brake (X/Theta), or if the underlying IOMap channel
-        hasn't been configured yet — see MMCCommands.engage_brake."""
+        hasn't been configured yet — see MMCCommands.engage_brake.
+        """
         self._require_brake()
         self._cmd.engage_brake(self._axis, self._io_map)
 
@@ -1174,6 +1184,7 @@ class AxisHandle:
         Raises ValueError if this axis has no brake (X/Theta), or if the
         underlying IOMap channel hasn't been configured/probed yet — see
         MMCCommands.brake_is_disengaged (also: Z's status feedback is not
-        reachable via ASCII at all on this hardware, see that method)."""
+        reachable via ASCII at all on this hardware, see that method).
+        """
         self._require_brake()
         return self._cmd.brake_is_disengaged(self._axis, self._io_map)
