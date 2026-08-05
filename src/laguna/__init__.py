@@ -2,7 +2,9 @@
 Laguna: Robotic flume control system for experimental data acquisition and processing.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import version as _version
+
+__version__ = _version("laguna")
 __author__ = "Lab Team"
 
 from .core import FlumeLab

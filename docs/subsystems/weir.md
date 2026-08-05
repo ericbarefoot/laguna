@@ -13,7 +13,7 @@ the same shape as every other subsystem here: a `subsystem_name` class
 attribute (`"weir"`), `connect()`/`disconnect()`/`get_status()`, and
 registration via `lab.add(weir)` → `lab.weir`.
 
-`WeirController` (`src/laguna/weir/__init__.py`) is an ABC; the only
+`WeirController` (`src/laguna/weir/controller.py`) is an ABC; the only
 concrete implementation today is `SaflWeirController`, which requires the
 `safl_ocean_hardware` package to be installed. If it isn't, `connect()`
 logs a warning and returns `False` rather than raising — the subsystem is
@@ -120,4 +120,4 @@ still good.
 - [API reference](../reference/weir.md) — generated from docstrings.
 - [Experiment runner](experiment.md) — how `weir:` config drives scheduling.
 - [Schedule](schedule.md) — the CSV format and `weir_elevation_mm` spline interpolation.
-- `src/laguna/weir/__init__.py` — the driver itself.
+- `src/laguna/weir/controller.py` — the driver itself.

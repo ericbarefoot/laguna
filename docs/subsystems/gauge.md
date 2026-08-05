@@ -13,7 +13,7 @@ subsystem contract — `subsystem_name = "gauge"`, `connect()`/
 `disconnect()`/`get_status()` — and registers via `lab.add(gauge)` →
 `lab.gauge`.
 
-`WaterLevelSensor` (`src/laguna/gauge/__init__.py`) is an ABC; the only
+`WaterLevelSensor` (`src/laguna/gauge/sensor.py`) is an ABC; the only
 concrete implementation is `SaflWaterLevelSensor`, backed by
 `safl_ocean_hardware.massa.MassaSensor`. If that package isn't installed,
 `connect()` logs a warning and returns `False` rather than raising.
@@ -101,4 +101,4 @@ observed to drop its serial connection between polls.
 
 - [API reference](../reference/gauge.md) — generated from docstrings.
 - [Experiment runner](experiment.md) — how `gauge:` config drives polling.
-- `src/laguna/gauge/__init__.py` — the driver itself.
+- `src/laguna/gauge/sensor.py` — the driver itself.

@@ -1,8 +1,8 @@
 # Data & storage
 
 **Status: early scaffolding, not wired into anything.** `DataProcessor`
-(`src/laguna/data/__init__.py`) and `RemoteStorage`
-(`src/laguna/storage/__init__.py`) are not imported by `core.py`,
+(`src/laguna/data/processor.py`) and `RemoteStorage`
+(`src/laguna/storage/remote.py`) are not imported by `core.py`,
 `experiment/runner.py`, any example, or any test — a repo-wide search finds
 zero references to either class outside their own module. Neither has a
 `subsystem_name`, so neither can be `lab.add()`-ed like `weir`/`gauge`/
@@ -54,5 +54,5 @@ code doesn't commit to either.
 
 ## Further reading
 
-- `src/laguna/data/__init__.py`, `src/laguna/storage/__init__.py` — the modules themselves; short enough to read directly rather than relying on this page.
+- `src/laguna/data/processor.py`, `src/laguna/storage/remote.py` (+ `storage/backends.py`) — the modules themselves; short enough to read directly rather than relying on this page.
 - [Experiment runner](experiment.md) — the actual subsystem-wiring pattern these would need to follow to become opt-in `FlumeLab` subsystems.
