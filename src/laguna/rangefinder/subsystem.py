@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from laguna.mqtt import MqttSubscriber
+
+if TYPE_CHECKING:
+    from laguna.config import Config
 
 from .al1342 import read_pdin_hex, write_acyclic
 from .calibration import LinearCalibration
@@ -62,6 +65,19 @@ class RangefinderSubsystem:
         self._sample_count = 0
         self._t_first_sample: Optional[float] = None
         self._is_connected = False
+
+    @classmethod
+    def from_config(cls, config: "Config") -> "RangefinderSubsystem":
+        """Build from the lab's Config: this subsystem's own section (by
+        cls.subsystem_name) plus a fresh MqttSubscriber built from the
+        shared 'mqtt:' section — each rangefinder gets its own client ID
+        (see MqttSubscriber's docstring on why two instances can't share
+        one), so a private MqttSubscriber per instance is the correct
+        default even when several rangefinders read the same broker.
+        """
+        section = config.get(cls.subsystem_name)
+        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
+        return cls(section, mqtt_subscriber)
 
     # ------------------------------------------------------------------
     # Subsystem lifecycle

@@ -264,8 +264,9 @@ from laguna.config import Config
 from laguna.robot.macron import GantryController
 
 config = Config(config_file="config/example_config.yaml")
-gantry = GantryController.from_config(config.get("gantry"))
+gantry = GantryController.from_config(config)
 lab.add(gantry)  # subsystem_name = "gantry" -> lab.gantry
+# or, if lab already owns this Config: lab.add("gantry")
 ```
 
 ## Current status / resuming work
@@ -299,7 +300,7 @@ Nothing needs starting by hand any more. `PiGantryConnection.connect()` SFTPs
 
 ```python
 from laguna.robot.macron import GantryController
-gantry = GantryController.from_config(config.get("gantry"))  # transport: pi_agent
+gantry = GantryController.from_config(config)  # transport: pi_agent
 gantry.connect()
 gantry.connection.send("WHT")  # should return "0"
 ```

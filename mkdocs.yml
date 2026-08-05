@@ -66,6 +66,7 @@ nav:
   - Home: index.md
   - Architecture: ARCHITECTURE.md
   - Quick reference: QUICKREF.md
+  - FlumeLab setup & logging guide: FLUMELAB_SETUP_GUIDE.md
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md

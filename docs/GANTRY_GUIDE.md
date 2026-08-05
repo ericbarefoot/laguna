@@ -56,7 +56,7 @@ from laguna.config import Config
 from laguna.robot.macron import GantryController
 
 config = Config(config_file="config/example_config.yaml")
-gantry = GantryController.from_config(config.get("gantry"))
+gantry = GantryController.from_config(config)
 
 gantry.connect()
 print(gantry.get_status())
@@ -71,7 +71,7 @@ Register it with `FlumeLab` exactly like any other subsystem:
 from laguna.core import FlumeLab
 
 lab = FlumeLab("config/example_config.yaml")
-lab.add(gantry)          # -> lab.gantry
+lab.add("gantry")        # -> lab.gantry
 lab.connect_all()
 lab.get_system_status()  # {'timing': {...}, 'gantry': {...}}
 ```
@@ -256,55 +256,45 @@ elif "trigger_at" in cfg:
         lab.scheduler.at(float(t), action, subsystem=subsystem, name=name)
 ```
 
-**Current gap**: `config/example_config.yaml` and `Config._get_defaults()`
-already have a full `gantry:` section, and `GantryController.from_config()`
-is ready to use — but `setup_run()` does not yet instantiate or register
-the gantry the way it does `gauge`/`weir`/`flow`/cameras. Right now you
-cannot add the gantry to a scheduled experiment through config alone; it
-needs a small addition to `setup_run()`, following the exact pattern
-already used for `gauge`:
+`setup_run()` builds and registers every subsystem whose section is
+present in the YAML — including `gantry:` — via `lab.add_all()`
+(`laguna.core.FlumeLab.add_all`), which looks each section name up in
+`laguna.registry.SUBSYSTEM_REGISTRY` and calls its `from_config()` for
+you. No manual `lab.add(gantry)` needed; `lab.gantry` is populated by the
+time `setup_run()` returns.
+
+The gantry still has no scheduled action of its own the way `gauge`/`weir`
+do — it only ever moves as part of a scan (see `laguna.scanner.gocator`'s
+`_scan_gocator` closure in `setup_run()`), so there's no built-in periodic
+status-logging equivalent to `_log_gauge`/`_log_weir_status`. Add one the
+same way if you want it:
 
 ```python
-# in setup_run(), alongside the existing "if 'gauge' in cfg:" block
-gantry = None
-if "gantry" in cfg:
-    from laguna.robot.macron import GantryController
-    gantry = GantryController.from_config(cfg["gantry"])
-    lab.add(gantry)
-
-# ...after the generic connect loop, alongside _log_gauge/_log_weir_status...
+# alongside _log_gauge/_log_weir_status in setup_run()
 def _log_gantry_status():
     try:
-        status = gantry.get_status()
+        status = lab.gantry.get_status()
         logger.info("Gantry positions: %s", status.get("positions"))
         lab.event_log.log(lab.clock.elapsed(), "gantry", "get_status", str(status))
     except Exception as e:
         logger.error("Gantry status query failed: %s", e)
         raise
 
-if gantry is not None and "gantry" in cfg:
-    _register_action(lab, cfg["gantry"], "gantry", "log_status", action=_log_gantry_status)
+if "gantry" in lab._subsystems:
+    _register_action(lab, lab.config.get("gantry"), "gantry", "log_status",
+                     action=_log_gantry_status)
 ```
-
-Until that's added, you can still drive the gantry manually inside your own
-script — `setup_run()` returns a plain `FlumeLab`, and `lab.add(gantry)`
-works before or after calling it, same as any other subsystem.
 
 ### Full example sketch
 
 ```python
 from laguna.experiment import setup_run, run_blocking
-from laguna.robot.macron import GantryController
 
 lab = setup_run("config/example_config.yaml", schedule="my_schedule.csv")
-
-# until setup_run() wires the gantry in itself (see gap above), add it by hand:
-gantry = GantryController.from_config(lab.config.get("gantry"))
-lab.add(gantry)
-gantry.connect()
+# lab.gantry is already connected and registered — nothing more to add.
 
 lab.scheduler.repeat(every=10, action=lambda: lab.event_log.log(
-    lab.clock.elapsed(), "gantry", "get_status", str(gantry.get_status())
+    lab.clock.elapsed(), "gantry", "get_status", str(lab.gantry.get_status())
 ), subsystem="gantry", name="log_status")
 
 run_blocking(lab, duration=300)  # runs weir/gauge/gantry/cameras together
@@ -317,10 +307,10 @@ shape:
 
 | | weir / gauge | gantry |
 |---|---|---|
-| Factory | `SaflWeirController(cfg)` — constructor *is* the factory | `GantryController.from_config(cfg)` — explicit classmethod |
-| Registration | `lab.add(weir)` → `lab.weir` | `lab.add(gantry)` → `lab.gantry` |
+| Factory | `SaflWeirController(cfg)` — constructor *is* the factory | `GantryController.from_config(config)` — explicit classmethod, takes the whole `Config` |
+| Registration | `lab.add("weir")` → `lab.weir` | `lab.add("gantry")` → `lab.gantry` |
 | Status | `get_status()` → `{"is_connected": ..., "elevation_mm": ..., ...}` | `get_status()` → `{"subsystem": "gantry", "is_connected": ..., "safe_mode": ..., "positions": {...}}` |
-| Scheduling | `interval_s` (status polling) or `use_schedule` (CSV-driven motion, e.g. `weir.go_to_elevation()`) | not yet wired into `setup_run()` — see gap above; same `_register_action()` mechanism would apply once it is |
+| Scheduling | `interval_s` (status polling) or `use_schedule` (CSV-driven motion, e.g. `weir.go_to_elevation()`) | no built-in scheduled action — it only moves as part of a scan; add a `_log_gantry_status`-style closure yourself if you want periodic polling, same `_register_action()` mechanism |
 
 ## Further reading
 

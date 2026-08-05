@@ -11,12 +11,17 @@ and passed to DslrCameraSubsystem at initialization.
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+from ..subsystem_logging import SubsystemLogging
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
 
-class DslrCameraSubsystem:
+class DslrCameraSubsystem(SubsystemLogging):
     """DSLR camera subsystem using dualcam-timelapse.
 
     Wraps dualcam.CameraManager (Canon DSLR capture via gphoto2) to integrate with
@@ -42,38 +47,58 @@ class DslrCameraSubsystem:
         self,
         config_path: Optional[str] = None,
         dualcam_path: Optional[str] = None,
+        log_level: str = "INFO",
+        event_log_verbosity: str = "INFO",
+        simulated: bool = False,
     ) -> None:
         """Initialize DSLR subsystem.
 
         Args:
             config_path: Path to dualcam YAML config (cameras.yaml).
-                         Not required when constructed via from_dict().
+                         Not required when constructed via from_config().
             dualcam_path: Optional path to dualcam-timelapse repo root.
                          If provided, added to sys.path before import.
+            log_level / event_log_verbosity: see laguna.subsystem_logging
+                (both default 'INFO').
+            simulated: Skip gphoto2/USB entirely — connect()/capture_all()
+                succeed without touching real cameras, returning placeholder
+                filenames instead of real images (default False; see
+                laguna.simulation's module docstring).
         """
         self.config_path = Path(config_path) if config_path else None
         self.dualcam_path = Path(dualcam_path) if dualcam_path else None
+        self.log_level = log_level
+        self.event_log_verbosity = event_log_verbosity
+        self._simulated = simulated
         self._camera_manager = None
         self._is_connected = False
         self._main_yaml_path: Optional[str] = None
         self._config: Optional[dict] = None
 
     @classmethod
-    def from_dict(cls, config: dict, main_yaml_path: str) -> "DslrCameraSubsystem":
-        """Construct from the dslr_cameras: section of the main experiment YAML.
+    def from_config(cls, config: "Config") -> "DslrCameraSubsystem":
+        """Build from the lab's Config: its 'dslr_cameras:' section, plus
+        config.config_file to resolve output_dir paths and persist detected
+        port assignments back to the same experiment YAML they came from.
 
-        Resolves relative output_dir paths and stores the config in memory.
-        Port assignments detected at runtime are persisted back to the main YAML.
-
-        Args:
-            config: The dslr_cameras: dict from experiment_config.yaml.
-            main_yaml_path: Absolute or relative path to experiment_config.yaml.
+        Raises:
+            ValueError: If config.config_file is None (a Config built from
+                defaults/a dict only, not FlumeLab(config_file)) — there is
+                no YAML location to resolve relative paths against.
         """
-        main_path = Path(main_yaml_path).resolve()
+        dslr_cfg = config.get("dslr_cameras")
+        if config.config_file is None:
+            raise ValueError(
+                "DslrCameraSubsystem.from_config() needs config.config_file "
+                "to resolve output_dir paths and persist port assignments — "
+                "build the Config from a YAML file (FlumeLab(config_file=...) "
+                "or Config(config_file=...)), not from defaults/a dict alone."
+            )
+        main_path = Path(config.config_file).resolve()
         main_dir = main_path.parent
 
         # Resolve relative output_dir values relative to the main YAML location
-        cameras_raw = config.get("cameras", {})
+        cameras_raw = dslr_cfg.get("cameras", {})
         cameras_resolved: Dict[str, Any] = {}
         for cam_name, cam_cfg in cameras_raw.items():
             resolved = dict(cam_cfg)
@@ -84,7 +109,12 @@ class DslrCameraSubsystem:
                 resolved["output_dir"] = str(out)
             cameras_resolved[cam_name] = resolved
 
-        instance = cls(dualcam_path=config.get("dualcam_path"))
+        instance = cls(
+            dualcam_path=dslr_cfg.get("dualcam_path"),
+            log_level=dslr_cfg.get("log_level", "INFO"),
+            event_log_verbosity=dslr_cfg.get("event_log_verbosity", "INFO"),
+            simulated=dslr_cfg.get("simulated", False),
+        )
         instance._config = {"cameras": cameras_resolved}
         instance._main_yaml_path = str(main_path)
         return instance
@@ -109,6 +139,12 @@ class DslrCameraSubsystem:
         Returns:
             True if at least one camera connected, False otherwise.
         """
+        if self._simulated:
+            # No gphoto2, no USB — self._camera_manager stays None;
+            # capture_all() checks self._simulated before it would ever
+            # need one.
+            self._is_connected = True
+            return True
         try:
             from .gvfs import release_gphoto_usb, detect_camera_ports
 
@@ -271,6 +307,23 @@ class DslrCameraSubsystem:
             Dict mapping camera name to output Path, or None if capture failed.
             Example: {"Hangang": Path(...), "Nakdong": Path(...)}
         """
+        if self._simulated:
+            # No real capture — a placeholder path per configured camera,
+            # clearly not a real filename, so log_event("capture", ...)
+            # still fires and still proves the trigger reached every
+            # camera, without pretending there's an actual image.
+            if not self._is_connected:
+                logger.warning("DSLR cameras not connected — skipping capture")
+                return {}
+            camera_names = list((self._config or {}).get("cameras", {}))
+            results: Dict[str, Optional[Path]] = {}
+            for cam_name in camera_names:
+                path = Path(f"<simulated>/{cam_name}.jpg")
+                results[cam_name] = path
+                self.log_event("capture", camera=cam_name, file=str(path))
+            logger.info("DSLR capture complete (simulated): %s", camera_names)
+            return results
+
         if not self._is_connected or not self._camera_manager:
             logger.warning("DSLR cameras not connected — skipping capture")
             return {}
@@ -278,6 +331,11 @@ class DslrCameraSubsystem:
         try:
             results = self._camera_manager.capture_all_parallel()
             logger.info("DSLR capture complete: %s", list(results.keys()))
+            for cam_name, path in results.items():
+                if path:
+                    self.log_event("capture", camera=cam_name, file=str(path))
+                else:
+                    self.log_event("capture_failed", level="WARNING", camera=cam_name)
             return results
         except Exception as e:
             logger.error("DSLR capture failed: %s", e)

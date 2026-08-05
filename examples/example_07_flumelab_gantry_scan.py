@@ -55,9 +55,6 @@ gantry connection, handled automatically below from the same flag).
 import time
 
 from laguna import FlumeLab
-from laguna.mqtt import MqttSubscriber
-from laguna.rangefinder import OD2000Rangefinder, WTT12LRangefinder
-from laguna.robot.macron.controller import GantryController
 from laguna.robot.macron.fences import FenceViolation
 
 # --- Connection settings — adjust for your setup ---
@@ -92,7 +89,6 @@ def build_lab() -> FlumeLab:
     gantry_config["ssh_user"] = PI_USER
     gantry_config["ssh_key"] = PI_KEY
     gantry_config["remote_serial_device"] = REMOTE_SERIAL_DEVICE
-    gantry_config["safe_mode"] = not ALLOW_MOTION
 
     # Example keepout zone — e.g. a fixed obstacle (equipment stand, camera
     # tripod leg) sitting in the gantry's travel envelope. This one is
@@ -118,19 +114,23 @@ def build_lab() -> FlumeLab:
         "al1342_host": AL1342_HOST,
     }
 
-    lab.add(GantryController.from_config(lab.config.get("gantry")))
+    # lab.add("name") looks up the registry (laguna.registry), pulls that
+    # section's config, and calls from_config() for you — each rangefinder's
+    # from_config() builds its own MqttSubscriber from the shared 'mqtt:'
+    # section automatically (see RangefinderSubsystem.from_config()), which
+    # is genuinely useful on its own, not just plumbing get_distance_mm()/
+    # get_latest_sample() need: get_status() (see the status printout below)
+    # surfaces the live topic, sample count, and achieved rate — a quick,
+    # human-readable way to confirm the AL1342 is actually publishing and
+    # which port/sensor a given reading came from.
+    lab.add("gantry").add("od2000").add("wtt12l")
 
-    # Each rangefinder gets its own MqttSubscriber, connected to the AL1342's
-    # continuous MQTT stream — this is genuinely useful on its own, not just
-    # plumbing get_distance_mm()/get_latest_sample() need: get_status() (see
-    # the status printout below) surfaces the live topic, sample count, and
-    # achieved rate, which is a quick, human-readable way to confirm the
-    # AL1342 is actually publishing and which port/sensor a given reading
-    # came from — independent of the on-demand HTTP path (activate()/
-    # read_mm()) and scanning (which polls the AL1342 directly from
-    # gantry_agent.py on the Pi, not via MQTT at all).
-    lab.add(OD2000Rangefinder(lab.config.get("od2000"), MqttSubscriber(lab.config.get("mqtt"))))
-    lab.add(WTT12LRangefinder(lab.config.get("wtt12l"), MqttSubscriber(lab.config.get("mqtt"))))
+    # This script owns the motion decision, not the config file — set_safe_mode()
+    # is the real API for it (rather than mutating gantry_config["safe_mode"]
+    # before construction): it's an explicit, auditable verb call, and it
+    # correctly no-ops until connect() if called before connecting (see its
+    # docstring), same as here.
+    lab.gantry.set_safe_mode(not ALLOW_MOTION)
 
     return lab
 

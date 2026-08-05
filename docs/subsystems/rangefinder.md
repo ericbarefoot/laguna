@@ -129,12 +129,11 @@ scanning; that bridge is now retired. See `docs/MACRON_GANTRY.md`,
 
 ```python
 from laguna import FlumeLab
-from laguna.robot.macron import GantryController
 from laguna.robot.macron.profiler import TopographicProfiler
 
 lab = FlumeLab("config/example_config.yaml")
-gantry = GantryController.from_config(lab.config.get("gantry"))  # transport: pi_agent
-lab.add(gantry)
+lab.add("gantry")  # transport: pi_agent
+gantry = lab.gantry
 lab.connect_all()
 
 profiler = TopographicProfiler(

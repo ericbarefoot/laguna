@@ -4,6 +4,7 @@ FlumeLab subsystem interface (connect/disconnect/get_status/stop).
 
 import pytest
 
+from laguna.config import Config
 from laguna.robot.macron.commands import THETA_AXIS, X_AXIS, Y_AXIS, Z_AXIS
 from laguna.robot.macron.connection import EthernetConnection, RS232Connection
 from laguna.robot.macron.controller import GantryController
@@ -11,6 +12,11 @@ from laguna.robot.macron.fences import BoxFence
 from laguna.robot.macron.pi_bridge import PiGantryConnection
 from laguna.robot.macron.position_store import GantryPositionStore
 from tests.macron_fixtures import FakeSnapConnection
+
+
+def _cfg(gantry_dict: dict) -> Config:
+    """Wrap a bare 'gantry:' section dict as the Config object from_config() expects."""
+    return Config(defaults={"gantry": gantry_dict})
 
 # Deliberately still socket_bridge: that transport is retired as the *default*
 # (pi_agent is now, see src/laguna/config.py) but the code path remains
@@ -35,7 +41,7 @@ BASE_CONFIG = {
 
 class TestFromConfigTransport:
     def test_socket_bridge_transport(self):
-        controller = GantryController.from_config(BASE_CONFIG)
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert isinstance(controller._connection, RS232Connection)
         assert controller._connection.port == "socket://red.dyn.ucr.edu:9700"
 
@@ -47,20 +53,20 @@ class TestFromConfigTransport:
             ssh_key="~/.ssh/id_ed25519",
             remote_serial_device="/dev/ttyUSB0",
         )
-        controller = GantryController.from_config(cfg)
+        controller = GantryController.from_config(_cfg(cfg))
         assert isinstance(controller._connection, PiGantryConnection)
         assert controller._connection.ssh_user == "oak"
         assert controller._connection.safe_mode is True
 
     def test_ethernet_transport(self):
         cfg = dict(BASE_CONFIG, transport="ethernet", ethernet={"host": "10.0.0.5", "port": 23})
-        controller = GantryController.from_config(cfg)
+        controller = GantryController.from_config(_cfg(cfg))
         assert isinstance(controller._connection, EthernetConnection)
         assert controller._connection.host == "10.0.0.5"
 
     def test_rs232_direct_transport(self):
         cfg = dict(BASE_CONFIG, transport="rs232", rs232={"port": "/dev/ttyUSB0", "baud": 19200})
-        controller = GantryController.from_config(cfg)
+        controller = GantryController.from_config(_cfg(cfg))
         assert isinstance(controller._connection, RS232Connection)
         assert controller._connection.port == "/dev/ttyUSB0"
         assert controller._connection.baudrate == 19200
@@ -68,16 +74,16 @@ class TestFromConfigTransport:
     def test_unknown_transport_raises(self):
         cfg = dict(BASE_CONFIG, transport="carrier_pigeon")
         with pytest.raises(ValueError):
-            GantryController.from_config(cfg)
+            GantryController.from_config(_cfg(cfg))
 
 
 class TestFromConfigAxesAndIOMap:
     def test_axes_resolved_in_config_order(self):
-        controller = GantryController.from_config(BASE_CONFIG)
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert controller._axes == (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
 
     def test_io_map_picks_up_confirmed_and_configured_channels(self):
-        controller = GantryController.from_config(BASE_CONFIG)
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
         io_map = controller._io_map
         assert io_map.y_brake_output == 4
         assert io_map.y_brake_status_input == 8
@@ -90,14 +96,14 @@ class TestFromConfigAxesAndIOMap:
     def test_missing_axes_falls_back_to_default_four(self):
         cfg = dict(BASE_CONFIG)
         cfg.pop("axes")
-        controller = GantryController.from_config(cfg)
+        controller = GantryController.from_config(_cfg(cfg))
         assert controller._axes == (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
 
     def test_gcode_group_is_xy_only_with_z_held_separately(self):
         """Z cannot join the commander-node coordinated group on this
         hardware, so the executor takes the two commander axes as its
         group and Z as its own axis — see gcode.py's module docstring."""
-        controller = GantryController.from_config(BASE_CONFIG)
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert controller.gcode._axes == (X_AXIS, Y_AXIS)
         assert controller.gcode._z_axis == Z_AXIS
 
@@ -105,7 +111,7 @@ class TestFromConfigAxesAndIOMap:
         """Z and Theta share the responder node, so they get their own
         coordinated group (default index 2) via a second MMCCommands
         sharing the gantry's connection — see issue #24."""
-        controller = GantryController.from_config(BASE_CONFIG)
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert controller.theta_cmd is not controller.cmd
         assert controller.theta_cmd._group == 2
         assert controller.theta_cmd._group_axes == (Z_AXIS, THETA_AXIS)
@@ -114,23 +120,23 @@ class TestFromConfigAxesAndIOMap:
 
     def test_theta_group_index_is_configurable(self):
         config = dict(BASE_CONFIG, theta_group_index=7)
-        controller = GantryController.from_config(config)
+        controller = GantryController.from_config(_cfg(config))
         assert controller.theta_cmd._group == 7
         assert controller.gcode._theta_group_index == 7
 
 
 class TestFromConfigHomingAndFences:
     def test_homing_order_resolved_from_names(self):
-        controller = GantryController.from_config(BASE_CONFIG)
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert controller.homing._config.home_order == (Z_AXIS, X_AXIS, Y_AXIS)
 
     def test_homing_order_unknown_axis_raises(self):
         cfg = dict(BASE_CONFIG, homing={"order": ["NotAnAxis"]})
         with pytest.raises(KeyError):
-            GantryController.from_config(cfg)
+            GantryController.from_config(_cfg(cfg))
 
     def test_fences_built_from_config(self):
-        controller = GantryController.from_config(BASE_CONFIG)
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert len(controller.fence_registry) == 1
         fence = controller.fence_registry.get("bed")
         assert isinstance(fence, BoxFence)
@@ -138,12 +144,12 @@ class TestFromConfigHomingAndFences:
     def test_unknown_fence_type_raises(self):
         cfg = dict(BASE_CONFIG, fences=[{"type": "sphere", "name": "x"}])
         with pytest.raises(ValueError):
-            GantryController.from_config(cfg)
+            GantryController.from_config(_cfg(cfg))
 
     def test_no_fences_gives_empty_registry(self):
         cfg = dict(BASE_CONFIG)
         cfg.pop("fences")
-        controller = GantryController.from_config(cfg)
+        controller = GantryController.from_config(_cfg(cfg))
         assert len(controller.fence_registry) == 0
 
 
@@ -268,7 +274,7 @@ class TestMoveTo:
 
     def test_vector_move_is_fence_checked(self):
         cfg = dict(BASE_CONFIG, fences=[{"type": "box", "name": "bed", "x": [0, 10], "y": [0, 10], "z": [0, 10]}])
-        controller = GantryController.from_config(cfg)
+        controller = GantryController.from_config(_cfg(cfg))
         from laguna.robot.macron.fences import FenceViolation
 
         with pytest.raises(FenceViolation):

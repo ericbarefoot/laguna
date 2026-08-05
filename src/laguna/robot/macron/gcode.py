@@ -771,6 +771,7 @@ class GCodeExecutor:
         if self._dry_run:
             logger.info("[dry-run] C%d INI %s", self._group_index, " ".join(str(i) for i in indices))
         else:
+            logger.debug("C%d INI %s", self._group_index, " ".join(str(i) for i in indices))
             self._cmd.init_group(*indices)
         self._group_initialized = True
 
@@ -801,6 +802,9 @@ class GCodeExecutor:
                 "[dry-run] C%d INI %s", self._theta_group_index, " ".join(str(i) for i in indices)
             )
         else:
+            logger.debug(
+                "C%d INI %s", self._theta_group_index, " ".join(str(i) for i in indices)
+            )
             self._theta_cmd.init_group(*indices)
         self._theta_group_initialized = True
 
@@ -870,6 +874,13 @@ class GCodeExecutor:
             logger.info("[dry-run] %s", self._describe_linear(move, touches_xy, responder))
             self._advance_position(move)
             return
+
+        # One line per tessellated segment — deliberately DEBUG, not INFO.
+        # An arc can expand into dozens of these (see _tessellate_arc); the
+        # broad "move_to() started/completed" pair a caller sees is logged
+        # once, at the GantryController layer — see laguna.subsystem_logging's
+        # module docstring for the tier split.
+        logger.debug("%s", self._describe_linear(move, touches_xy, responder))
 
         if touches_xy and responder != "none":
             self._execute_concurrent_pair(move, responder)
@@ -1246,6 +1257,7 @@ class GCodeExecutor:
         if self._dry_run:
             logger.info("[dry-run] home_all()")
         else:
+            logger.debug("home_all() (G28)")
             if self._homing is None:
                 raise GCodeError("G28 requires a HomingProcedure but none was configured")
             result = self._homing.home_all()
@@ -1262,6 +1274,7 @@ class GCodeExecutor:
         if self._dry_run:
             logger.info("[dry-run] dwell %.3fs", move.dwell_s or 0.0)
             return
+        logger.debug("dwell %.3fs", move.dwell_s or 0.0)
         time.sleep(move.dwell_s or 0.0)
 
     def _execute_pause(self, move: GCodeMove) -> None:

@@ -30,9 +30,12 @@ import logging
 import time
 from ctypes import byref
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 from . import gosdk as _g
 from .gosdk import GoSdkError, GoSdkLib, GoSdkTimeout
@@ -988,6 +991,6 @@ class GocatorScanner(GocatorSettingsMixin):
         return written
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GocatorScanner":
-        """Build from a config dict — mirrors GantryController.from_config()."""
-        return cls(config)
+    def from_config(cls, config: "Config") -> "GocatorScanner":
+        """Build from the lab's Config (its 'gocator:' section)."""
+        return cls(config.get("gocator"))

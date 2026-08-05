@@ -18,13 +18,27 @@ class Config:
     
     def __init__(self, config_file: Optional[str] = None, defaults: Optional[Dict[str, Any]] = None):
         """Initialize configuration.
-        
+
         Args:
             config_file: Path to YAML configuration file
             defaults: Default configuration dictionary
         """
         self.config_dict = defaults or self._get_defaults()
-        
+
+        #: Resolved path of the loaded config file, or None if this Config
+        #: was built from defaults/a dict only. Subsystems that need to
+        #: locate files relative to the experiment config (e.g.
+        #: DslrCameraSubsystem) read this via from_config(config).
+        self.config_file: Optional[str] = None
+
+        #: Top-level section names that were literally present in the
+        #: loaded YAML — as opposed to _get_defaults()'s unconditional
+        #: defaults, which populate every section whether or not the user
+        #: asked for it. FlumeLab.add_all() opt-in keys off this set, not
+        #: config_dict, since config_dict can never distinguish "explicitly
+        #: configured" from "just the default."
+        self.explicit_sections: set = set()
+
         if config_file:
             self.load_from_file(config_file)
     
@@ -154,10 +168,13 @@ class Config:
         path = Path(config_file)
         if not path.exists():
             raise FileNotFoundError(f"Configuration file not found: {config_file}")
-        
+
         with open(path, "r") as f:
             file_config = yaml.safe_load(f) or {}
-        
+
+        self.config_file = str(path.resolve())
+        self.explicit_sections = set(file_config.keys())
+
         # Recursively merge loaded config with defaults
         self._merge_config(self.config_dict, file_config)
     

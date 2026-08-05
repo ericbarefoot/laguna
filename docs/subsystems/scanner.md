@@ -66,14 +66,10 @@ gantry **X** — see "Sensor axes are not gantry axes".) So:
 
 ```python
 from laguna import FlumeLab
-from laguna.robot.macron import GantryController
-from laguna.scanner import GocatorScanner
 
 lab = FlumeLab("config/example_config.yaml")
 
-scanner = GocatorScanner.from_config(lab.config.get("gocator"))
-gantry = GantryController.from_config(lab.config.get("gantry"))
-lab.add(scanner).add(gantry)
+lab.add("gocator").add("gantry")
 lab.connect_all()
 
 # Coordinated pass: configures travel speed from feed_rate_mm_s, derives
@@ -82,7 +78,7 @@ lab.connect_all()
 # a non-blocking move, waits out the accel ramp, triggers, receives the
 # surface.
 scan = lab.gocator.scan_with_gantry(
-    gantry, axis="X", end_mm=400.0, feed_rate_mm_s=20.0, settle_s=0.5
+    lab.gantry, axis="X", end_mm=400.0, feed_rate_mm_s=20.0, settle_s=0.5
 )
 
 print(scan.shape)                 # (rows, cols) = (Y samples, X samples)

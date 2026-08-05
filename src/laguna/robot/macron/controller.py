@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ...config import Config
 
 from .commands import (
     Axis,
@@ -84,10 +87,11 @@ def _lookup_axis(axes_cfg: List[Dict[str, Any]], name: str) -> Optional[Axis]:
 class GantryController:
     """FlumeLab subsystem facade for the macron gantry.
 
-    Build via GantryController.from_config(cfg) (cfg is the 'gantry:'
-    section of a laguna config — see config/example_config.yaml) rather
-    than constructing directly, unless custom fences/axes are needed
-    programmatically.
+    Build via GantryController.from_config(config) (config is the lab's
+    whole Config, not just its 'gantry:' section — see
+    config/example_config.yaml, or lab.add("gantry") which does this for
+    you) rather than constructing directly, unless custom fences/axes are
+    needed programmatically.
     """
 
     subsystem_name = "gantry"
@@ -260,8 +264,9 @@ class GantryController:
         return self._resolve_axis_handle(axis).brake_is_disengaged()
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GantryController":
-        """Build a GantryController from a laguna 'gantry:' config section."""
+    def from_config(cls, config: "Config") -> "GantryController":
+        """Build a GantryController from the lab's Config (its 'gantry:' section)."""
+        config = config.get("gantry")
         connection = _build_transport(config)
 
         axes_cfg: List[Dict[str, Any]] = config.get("axes") or []
@@ -578,13 +583,30 @@ class GantryController:
                 gantry, or neither vector nor any keyword was given.
             FenceViolation: If the X/Y/Z path would enter an exclusion zone.
         """
+        target = vector if vector is not None else {
+            axis: value for axis, value in (("X", X), ("Y", Y), ("Z", Z), ("Theta", Theta))
+            if value is not None
+        }
+        # One operational-log line per call, not per tessellated G-code
+        # segment underneath — _move_to()/GCodeExecutor.execute() may issue
+        # many coordinated-group commands for a single arc, but that detail
+        # belongs at DEBUG (see gcode.py), not here. See
+        # laguna.subsystem_logging's module docstring for the tier split.
+        logger.info("move_to(%s) — started", target)
+
         # Serialise whole operations, not just individual commands. The
         # transport already locks per request/response pair, but a move is
         # many commands with a physical traverse in between — nothing else
         # stops a scheduled scan landing in the middle of one. Re-entrant,
         # so nesting inside scan_with_gantry() is fine. See motion_arbiter.
         with self.arbiter.hold(f"{type(self).__name__}.move_to"):
-            return self._move_to(vector, X=X, Y=Y, Z=Z, Theta=Theta, speed=speed)
+            try:
+                result = self._move_to(vector, X=X, Y=Y, Z=Z, Theta=Theta, speed=speed)
+            except Exception:
+                logger.exception("move_to(%s) — failed", target)
+                raise
+        logger.info("move_to(%s) — completed", target)
+        return result
 
     def _move_to(
         self,
@@ -838,7 +860,13 @@ class GantryController:
         Returns:
             True if homing completed successfully on every axis.
         """
-        result = self.homing.home_all()
+        logger.info("home() — started")
+        try:
+            result = self.homing.home_all()
+        except Exception:
+            logger.exception("home() — failed")
+            raise
+        logger.info("home() — %s", "completed" if result.success else "did not find home")
         return result.success
 
     def enable(self) -> None:

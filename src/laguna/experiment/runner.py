@@ -7,8 +7,6 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-import yaml
-
 from laguna import FlumeLab
 from laguna.schedule import ExperimentSchedule
 
@@ -18,17 +16,6 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------ #
 # Internal helpers                                                     #
 # ------------------------------------------------------------------ #
-
-def _load_yaml(config_path: str) -> dict:
-    try:
-        with open(config_path) as f:
-            return yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        logger.warning("Config file %s not found", config_path)
-        return {}
-    except Exception as e:
-        logger.warning("Could not load config %s: %s", config_path, e)
-        return {}
 
 
 def _validate_trigger_config(section_name: str, cfg: dict) -> None:
@@ -138,19 +125,7 @@ def setup_run(
     Returns:
         Configured FlumeLab. Call lab.start(duration) to begin.
     """
-    cfg = _load_yaml(lab_config)
     lab = FlumeLab(lab_config, simulate=simulate, speed_factor=speed_factor)
-    if simulate:
-        # setup_run() reads its own local `cfg` (raw YAML, not merged with
-        # Config's defaults) to decide which subsystems to construct — see
-        # the `if "weir" in cfg` pattern below. FlumeLab.__init__ already
-        # simulated lab.config.config_dict for lab.config.get(...) callers
-        # (acquire_scan(), survey passes), but that is a different dict; this
-        # `cfg` needs the same rewrite or the sections dropped there would
-        # still get built here, real hardware and all.
-        from laguna.simulation import simulate_config
-
-        cfg = simulate_config(cfg)
 
     if not verbose_cameras:
         logging.getLogger("paramiko").setLevel(logging.WARNING)
@@ -164,90 +139,48 @@ def setup_run(
         logger.info("Loaded schedule from %s (%d time points)", schedule,
                     len(exp_schedule._df))
 
-    # Validate scheduling config for all present sections. "gantry" has no
-    # scheduled action of its own — it only ever moves as part of a scan —
-    # but interval_s/trigger_at/use_schedule under a gantry: block would be
-    # silently ignored without this, so it's validated here too rather than
-    # left to fail confusingly later.
+    # lab.config.explicit_sections is already simulate-filtered by
+    # FlumeLab.__init__ (dropped down to gantry/gocator under simulate=True)
+    # — this is the same set add_all() below uses to decide what to build,
+    # so validation here sees exactly what will actually get constructed.
+    active = lab.config.explicit_sections
+
+    # Validate scheduling config for all present sections. Catches
+    # mutually-exclusive combinations (e.g. interval_s AND trigger_at both
+    # set) early with a clear error — including for gantry/od2000/wtt12l,
+    # none of which have a scheduled action registered below (gantry only
+    # ever moves as part of a scan; the rangefinders are read via their own
+    # continuous MQTT stream, not polled on a schedule), so a config
+    # mistake there would otherwise go unnoticed rather than just unused.
     for section in ("gauge", "weir", "flow", "pi_cameras", "dslr_cameras",
-                    "gantry", "gocator"):
-        if section in cfg:
-            _validate_trigger_config(section, cfg[section])
+                    "gantry", "gocator", "od2000", "wtt12l"):
+        if section in active:
+            _validate_trigger_config(section, lab.config.get(section))
 
     # Warn if use_schedule sections lack a schedule CSV
     for section in ("weir", "flow"):
-        if cfg.get(section, {}).get("use_schedule") and exp_schedule is None:
+        if section in active and lab.config.get(section).get("use_schedule") and exp_schedule is None:
             logger.warning(
                 "[%s] use_schedule=true but no schedule CSV provided — "
                 "will be connected in read-only mode", section,
             )
 
     # ------------------------------------------------------------------ #
-    # Instantiate subsystems (only those present in YAML)                 #
+    # Instantiate subsystems (only those explicitly present in the YAML)  #
     # ------------------------------------------------------------------ #
 
-    gauge = None
-    weir = None
-    flow = None
-    pi_array = None
-    pi_output_dir = None
-    dslr = None
+    lab.add_all()
 
-    if "gauge" in cfg:
-        from laguna.gauge import SaflWaterLevelSensor
-        gauge = SaflWaterLevelSensor(cfg["gauge"])
-        lab.add(gauge)
+    if "gocator" in lab._subsystems and lab.run.root is not None:
+        # Route scans under the run directory rather than the bare
+        # configured output_dir, so a run's whole output tree is one
+        # self-contained artifact — see laguna.run_context.
+        lab.gocator._output_dir = lab.run.path_for("gocator", str(lab.gocator._output_dir))
 
-    if "weir" in cfg:
-        from laguna.weir import SaflWeirController
-        weir = SaflWeirController(cfg["weir"])
-        lab.add(weir)
-
-    if "flow" in cfg:
-        from laguna.flow import SaflFlowController
-        flow = SaflFlowController(cfg["flow"])
-        lab.add(flow)
-
-    if "pi_cameras" in cfg:
-        pi_cfg = cfg["pi_cameras"]
-        from laguna.camera.network import CameraArray
-        pi_array = CameraArray(
-            hosts=pi_cfg.get("hosts", []),
-            ssh_user=pi_cfg.get("ssh_user", "ucrs"),
-            ssh_key=pi_cfg.get("ssh_key"),
-        )
-        pi_output_dir = Path(pi_cfg.get("output_dir", "./captures/pi"))
+    pi_output_dir: Optional[Path] = None
+    if "pi_cameras" in lab._subsystems:
+        pi_output_dir = Path(lab.config.get("pi_cameras").get("output_dir", "./captures/pi"))
         pi_output_dir.mkdir(parents=True, exist_ok=True)
-        lab.add(pi_array)
-
-    if "dslr_cameras" in cfg:
-        from laguna.camera import DslrCameraSubsystem
-        dslr = DslrCameraSubsystem.from_dict(
-            config=cfg["dslr_cameras"],
-            main_yaml_path=lab_config,
-        )
-        lab.add(dslr)
-
-    # The survey half of the rig. Until now gantry/gocator were hand-scripted
-    # in examples only — they were absent from this function entirely, so a
-    # scan could not be part of a scheduled experiment. See
-    # docs/COSCRIPTING_ROADMAP.md.
-    gantry = None
-    if "gantry" in cfg:
-        from laguna.robot.macron.controller import GantryController
-        gantry = GantryController.from_config(cfg["gantry"])
-        lab.add(gantry)
-
-    gocator = None
-    if "gocator" in cfg:
-        from laguna.scanner import GocatorScanner
-        gocator = GocatorScanner.from_config(cfg["gocator"])
-        if lab.run.root is not None:
-            # Route scans under the run directory rather than the bare
-            # configured output_dir, so a run's whole output tree is one
-            # self-contained artifact — see laguna.run_context.
-            gocator._output_dir = lab.run.path_for("gocator", str(gocator._output_dir))
-        lab.add(gocator)
 
     # ------------------------------------------------------------------ #
     # Connect                                                              #
@@ -261,9 +194,9 @@ def setup_run(
         else:
             logger.warning("  %-14s FAILED — continuing without it", sub_name)
 
-    if gauge is not None and gauge._is_connected:
+    if "gauge" in lab._subsystems and lab.gauge._is_connected:
         try:
-            gauge.read_mm()
+            lab.gauge.read_mm()
         except Exception:
             pass
 
@@ -272,82 +205,97 @@ def setup_run(
     # ------------------------------------------------------------------ #
 
     def _log_gauge():
+        # A sensor reading, not a state change — goes to the operational
+        # log only (SaflWaterLevelSensor.read_mm()'s own logger.info() call)
+        # unless this section opts into archiving it, e.g. an hourly
+        # summary reading that IS a milestone worth the published record.
         try:
-            gauge.connect()
-            elev_mm = gauge.read_mm()
-            logger.info("Water level: %.2f mm", elev_mm)
-            lab.event_log.log(lab.clock.elapsed(), "gauge", "read_mm",
-                              f"elevation_mm={elev_mm:.2f}")
+            lab.gauge.connect()
+            elev_mm = lab.gauge.read_mm()
+            if lab.config.get("gauge").get("log_as_event", False):
+                lab.event_log.log(lab.clock.elapsed(), "gauge", "read_mm",
+                                  notes=f"elevation_mm={elev_mm:.2f}")
         except Exception as e:
             logger.error("Gauge read failed: %s", e)
             raise
 
     def _log_weir_status():
+        # A periodic status snapshot, not a state-changing action — this
+        # stays a runner-level scheduling decision rather than something
+        # SaflWeirController logs on its own (get_status() is also called
+        # from print_summary()/get_system_status(), which must not spam the
+        # event log every time someone checks status). Archived only if
+        # this section opts in via log_as_event — see _log_gauge above.
         try:
-            weir.connect()
-            status = weir.get_status()
+            lab.weir.connect()
+            status = lab.weir.get_status()
             motor = status.get("motor", {})
             elev = status.get("elevation_mm")
             logger.info("Weir: elevation=%.2f mm  enabled=%s  fault=%s  steps=%s",
                         elev if elev is not None else float("nan"),
                         motor.get("Enabled"), motor.get("MotorInFault"), motor.get("StepsActive"))
-            lab.event_log.log(lab.clock.elapsed(), "weir", "get_status",
-                              f"elevation_mm={elev} enabled={motor.get('Enabled')} "
-                              f"fault={motor.get('MotorInFault')}")
+            if weir_cfg.get("log_as_event", False):
+                lab.event_log.log(lab.clock.elapsed(), "weir", "get_status",
+                                  f"elevation_mm={elev} enabled={motor.get('Enabled')} "
+                                  f"fault={motor.get('MotorInFault')}")
         except Exception as e:
             logger.error("Weir status query failed: %s", e)
             raise
 
     def _make_update_weir(t_s: float) -> Callable:
         def _update_weir():
+            # weir.go_to_elevation() logs its own target_mm now — see
+            # SaflWeirController.go_to_elevation().
             try:
-                weir.connect()
+                lab.weir.connect()
                 target_mm = exp_schedule.weir_elevation(t_s)
                 logger.info("Weir -> %.2f mm  (t=%.0f s)", target_mm, t_s)
-                weir.go_to_elevation(target_mm)
-                lab.event_log.log(lab.clock.elapsed(), "weir", "update_elevation",
-                                  f"target_mm={target_mm:.2f}")
+                lab.weir.go_to_elevation(target_mm)
             except Exception as e:
                 logger.error("Weir update failed: %s", e)
                 raise
         return _update_weir
 
     def _log_flow_status():
+        # Periodic status snapshot — same reasoning as _log_weir_status.
         try:
-            status = flow.get_status()
+            status = lab.flow.get_status()
             logger.info("Flow: %.2f lpm  qin=%s qaux=%s",
                         status.get("flowrate_lpm", 0),
                         status.get("qin_open"), status.get("qaux_open"))
-            lab.event_log.log(lab.clock.elapsed(), "flow", "get_status",
-                              f"flowrate_lpm={status.get('flowrate_lpm', 0):.2f}")
+            if flow_cfg.get("log_as_event", False):
+                lab.event_log.log(lab.clock.elapsed(), "flow", "get_status",
+                                  f"flowrate_lpm={status.get('flowrate_lpm', 0):.2f}")
         except Exception as e:
             logger.error("Flow status query failed: %s", e)
             raise
 
     def _make_update_flow(t_s: float) -> Callable:
         def _update_flow():
+            # set_flowrate()/start()/stop()/qin/qaux each log their own key
+            # action now — see SaflFlowController.
             try:
                 df = exp_schedule._df
                 lpm = float(exp_schedule.pump_flow(t_s)) if "pump_flow_lpm" in df.columns else 0.0
                 qin = bool(exp_schedule.qin_open(t_s)) if "qin_open" in df.columns else False
                 qaux = bool(exp_schedule.qaux_open(t_s)) if "qaux_open" in df.columns else False
-                flow.set_flowrate(lpm)
-                flow.start() if lpm > 0 else flow.stop()
-                flow.qin = qin
-                flow.qaux = qaux
+                lab.flow.set_flowrate(lpm)
+                lab.flow.start() if lpm > 0 else lab.flow.stop()
+                lab.flow.qin = qin
+                lab.flow.qaux = qaux
                 logger.info("Flow: %.2f lpm  qin=%s qaux=%s  (t=%.0f s)", lpm, qin, qaux, t_s)
-                lab.event_log.log(lab.clock.elapsed(), "flow", "update",
-                                  f"flowrate_lpm={lpm:.2f} qin={qin} qaux={qaux}")
             except Exception as e:
                 logger.error("Flow update failed: %s", e)
                 raise
         return _update_flow
 
     def _capture_pi():
+        # fetch_images() logs its own per-host capture/partial-failure
+        # events now — see CameraArray.fetch_images().
         try:
             from laguna.camera.network import assess_spread
             logger.info("Pi cameras: triggering capture...")
-            results = pi_array.trigger_capture()
+            results = lab.pi_cameras.trigger_capture()
             n_ok = sum(1 for r in results if r.success)
             times_mid = [r.capture_time_mid_pc for r in results
                          if r.success and r.capture_time_mid_pc is not None]
@@ -360,32 +308,24 @@ def setup_run(
             for r in results:
                 if not r.success:
                     logger.warning("  %s FAILED: %s", r.hostname, r.error)
-            fetched = pi_array.fetch_images(results, pi_output_dir)
+            fetched = lab.pi_cameras.fetch_images(results, pi_output_dir)
             for host, path in fetched.items():
                 logger.info("  %s -> %s", host, Path(path).name)
-                lab.event_log.log(lab.clock.elapsed(), "pi_cameras", "capture",
-                                  f"host={host} file={path}")
-            if n_ok < len(results):
-                failed = [r.hostname for r in results if not r.success]
-                lab.event_log.log(lab.clock.elapsed(), "pi_cameras", "capture_partial_failure",
-                                  f"failed={failed}")
         except Exception as e:
             logger.error("Pi camera capture failed: %s", e)
             raise
 
     def _capture_dslr():
+        # capture_all() logs its own per-camera capture/capture_failed
+        # events now — see DslrCameraSubsystem.capture_all().
         try:
             logger.info("DSLR cameras: triggering capture...")
-            results = dslr.capture_all()
+            results = lab.dslr_cameras.capture_all()
             for cam_name, path in results.items():
                 if path:
                     logger.info("  %s -> %s", cam_name, Path(path).name)
-                    lab.event_log.log(lab.clock.elapsed(), "dslr_cameras", "capture",
-                                      f"camera={cam_name} file={path}")
                 else:
                     logger.warning("  %s FAILED", cam_name)
-                    lab.event_log.log(lab.clock.elapsed(), "dslr_cameras", "capture_failed",
-                                      f"camera={cam_name}")
         except Exception as e:
             logger.error("DSLR capture failed: %s", e)
             raise
@@ -394,11 +334,11 @@ def setup_run(
     # Register scheduled actions                                           #
     # ------------------------------------------------------------------ #
 
-    if gauge is not None:
-        _register_action(lab, cfg.get("gauge", {}), "gauge", "read_mm", action=_log_gauge)
+    if "gauge" in lab._subsystems:
+        _register_action(lab, lab.config.get("gauge"), "gauge", "read_mm", action=_log_gauge)
 
-    if weir is not None:
-        weir_cfg = cfg.get("weir", {})
+    if "weir" in lab._subsystems:
+        weir_cfg = lab.config.get("weir")
         schedule_has_weir = (exp_schedule is not None
                              and "weir_elevation_mm" in exp_schedule._df.columns)
         if weir_cfg.get("use_schedule"):
@@ -411,8 +351,8 @@ def setup_run(
         else:
             _register_action(lab, weir_cfg, "weir", "get_status", action=_log_weir_status)
 
-    if flow is not None:
-        flow_cfg = cfg.get("flow", {})
+    if "flow" in lab._subsystems:
+        flow_cfg = lab.config.get("flow")
         schedule_has_flow = (exp_schedule is not None and any(
             c in exp_schedule._df.columns for c in ("pump_flow_lpm", "qin_open", "qaux_open")
         ))
@@ -426,12 +366,12 @@ def setup_run(
         else:
             _register_action(lab, flow_cfg, "flow", "get_status", action=_log_flow_status)
 
-    if pi_array is not None:
-        _register_action(lab, cfg.get("pi_cameras", {}), "pi_cameras", "capture",
+    if "pi_cameras" in lab._subsystems:
+        _register_action(lab, lab.config.get("pi_cameras"), "pi_cameras", "capture",
                          action=_capture_pi, exp_schedule=exp_schedule, schedule_col="pi_cameras")
 
-    if dslr is not None:
-        _register_action(lab, cfg.get("dslr_cameras", {}), "dslr_cameras", "capture",
+    if "dslr_cameras" in lab._subsystems:
+        _register_action(lab, lab.config.get("dslr_cameras"), "dslr_cameras", "capture",
                          action=_capture_dslr, exp_schedule=exp_schedule, schedule_col="dslr_cameras")
 
     def _scan_gocator():
@@ -454,9 +394,9 @@ def setup_run(
         # build the filename and embed it in the surface's own metadata —
         # it cannot be computed after the fact.
         runtime_s = lab.clock.elapsed()
-        gocator._run_stamp = lab.run.stamp(runtime_s)
+        lab.gocator._run_stamp = lab.run.stamp(runtime_s)
         try:
-            scan = gocator.acquire(gantry=gantry)
+            scan = lab.gocator.acquire(gantry=lab._subsystems.get("gantry"))
         except (ScanNotPossibleError, MotionBusyError) as exc:
             # Not a skippable hiccup. Either the scanner cannot collect at
             # all, or something moved the gantry outside the scripted plan —
@@ -471,7 +411,7 @@ def setup_run(
             return
         if scan is None:
             return
-        path = getattr(gocator, "_last_saved_path", None)
+        path = getattr(lab.gocator, "_last_saved_path", None)
         if path:
             lab.run.record_output("gocator", path, runtime_s, points=scan.valid_count)
         lab.event_log.log(
@@ -480,8 +420,8 @@ def setup_run(
             notes=f"file={path}" if path else "",
         )
 
-    if gocator is not None:
-        _register_action(lab, cfg.get("gocator", {}), "gocator", "scan",
+    if "gocator" in lab._subsystems:
+        _register_action(lab, lab.config.get("gocator"), "gocator", "scan",
                          action=_scan_gocator, exp_schedule=exp_schedule,
                          schedule_col="gocator")
 
