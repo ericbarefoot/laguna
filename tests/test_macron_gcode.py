@@ -8,7 +8,8 @@ import math
 
 import pytest
 
-from laguna.robot.macron.commands import MMCCommands, X_AXIS, Y_AXIS, Z_AXIS
+from laguna.robot.macron.commands import MMCCommands, THETA_AXIS, X_AXIS, Y_AXIS, Z_AXIS
+from laguna.robot.macron.connection import SnapMotionError
 from laguna.robot.macron.fences import BoxFence, FenceRegistry, FenceViolation, TrajectoryChecker
 from laguna.robot.macron.gcode import (
     GCodeError,
@@ -56,6 +57,29 @@ class TestParserModalState:
     def test_partial_axis_words_keep_other_axes_unchanged(self):
         program = GCodeParser().parse("G1 X10 Y10 Z10\nG1 X20")
         assert program.moves[1].target == (20.0, 10.0, 10.0)
+
+    def test_a_word_resolves_theta_absolute(self):
+        program = GCodeParser().parse("G1 X10 A90")
+        assert program.moves[0].target == (10.0, 0.0, 0.0)
+        assert program.moves[0].theta == 90.0
+
+    def test_a_word_resolves_theta_relative(self):
+        program = GCodeParser().parse("G91\nG1 A10\nG1 A10")
+        assert program.moves[0].theta == 10.0
+        assert program.moves[1].theta == 20.0
+
+    def test_no_a_word_means_theta_is_none_not_unchanged(self):
+        """Unlike X/Y/Z (which always resolve, backfilling the current
+        value), a line with no A word must produce theta=None — "don't
+        move Theta at all", not "hold Theta's last-seen position".
+        """
+        program = GCodeParser().parse("G1 A90\nG1 X10")
+        assert program.moves[0].theta == 90.0
+        assert program.moves[1].theta is None
+
+    def test_start_theta_seeds_relative_moves(self):
+        program = GCodeParser().parse("G91\nG1 A10", start_theta=45.0)
+        assert program.moves[0].theta == 55.0
 
     def test_g21_is_a_no_op(self):
         program = GCodeParser().parse("G21\nG1 X1")
@@ -152,9 +176,15 @@ class TestParserArcs:
 # Executor
 # ---------------------------------------------------------------------------
 
-def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None):
+def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None, with_theta_group=True):
     conn = FakeSnapConnection(responses)
     cmd = MMCCommands(conn)
+    # A second MMCCommands for the Z/Theta responder-node group (C2),
+    # sharing the same wire — mirrors GantryController.__init__. Building
+    # it costs nothing (INI is lazy), so most tests get it for free; pass
+    # with_theta_group=False for the few that specifically want to exercise
+    # the "no theta_cmd configured" error path.
+    theta_cmd = MMCCommands(conn, group_index=2, group_axes=(Z_AXIS, THETA_AXIS)) if with_theta_group else None
     registry = FenceRegistry()
     for fence in fences or []:
         registry.add(fence)
@@ -169,8 +199,8 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None):
     )
     homing = HomingProcedure(cmd, homing_config, io_map=io_map)
     executor = GCodeExecutor(
-        cmd, checker, homing=homing, axes=(X_AXIS, Y_AXIS), z_axis=Z_AXIS,
-        dry_run=dry_run, confirm_cb=confirm_cb,
+        cmd, checker, homing=homing, axes=(X_AXIS, Y_AXIS), z_axis=Z_AXIS, theta_axis=THETA_AXIS,
+        theta_cmd=theta_cmd, dry_run=dry_run, confirm_cb=confirm_cb,
     )
     return executor, conn
 
@@ -216,7 +246,8 @@ class TestExecutorLinearMoves:
 
     def test_group_init_is_sent_once_not_per_execute(self):
         """INI is remembered across execute() calls — a 40-move
-        run was re-sending an identical `C1 INI 1 2` 40 times."""
+        run was re-sending an identical `C1 INI 1 2` 40 times.
+        """
         responses = {
             "C1 INI 1 2": "0",
             "C1 SPD 20": "20",
@@ -233,7 +264,8 @@ class TestExecutorLinearMoves:
 
     def test_reset_group_init_forces_ini_to_be_resent(self):
         """A power-cycle/reflash can clear the controller's group state —
-        GantryController.connect() calls this so the next move re-inits."""
+        GantryController.connect() calls this so the next move re-inits.
+        """
         responses = {"C1 INI 1 2": "0", "C1 SPD 20": "20", "C1 BMT 10 0": "0", "C1 MIF": "1"}
         executor, conn = _make_executor(responses)
         executor.execute(executor.plan("G1 X10 F1200"))
@@ -259,38 +291,290 @@ class TestExecutorLinearMoves:
         executor.execute(trajectory)
         assert conn.sent.count("C1 MIF") == 3
 
-    def test_moves_z_independently_of_the_xy_group(self):
-        """A move touching both Z and X/Y is split at plan() time into a
-        Z-only leg then an XY-only leg, so it never sends a 3-axis group
-        command (`C1 INI 1 2 5`, confirmed on the bench to return error
-        1010). Group init is lazy — it lands on the XY leg, after the Z
-        leg has already run."""
+    def test_moves_z_concurrently_with_the_xy_group_scaled_to_match_duration(self):
+        """A move touching both Z and X/Y fires the Z leg and the XY group
+        leg as two independent non-blocking BMTs, back-to-back — both BMTs
+        land on the wire before either MIF poll starts. Z travels less than
+        X/Y here (3mm vs 10mm), so it's the "short" leg: before firing
+        either BMT, the executor reads X/Y's currently-configured ramp
+        (C1 ACL/DCL, the scaling reference) *and* Z's own currently-
+        configured ramp (A5 ACL/DCL, so it can be restored afterward), and
+        scales Z's speed *and* accel/decel down by k=3/10=0.3, so both
+        legs' trapezoids take the same time — not just the same nominal F.
+        X/Y (the "long" leg) is left at the plain nominal feed rate and
+        whatever ramp it already had. Once both legs finish, Z's ramp is
+        restored to its own original (unscaled) values — this driver
+        otherwise never touches ACL/DCL, so a scaled-down value must not
+        outlive this one move (see _execute_concurrent_pair's docstring).
+        It still never sends a 3-axis group command (`C1 INI 1 2 5`,
+        confirmed on the bench to return error 1010): Z stays on its own
+        single-axis command since Theta isn't moving with it.
+        """
         responses = {
-            "A5 SPD 10": "10",
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "A5 ACL": "25",  # Z's own ramp before this move — restored after
+            "A5 DCL": "20",
+            "A5 ACL 15": "15",
+            "A5 DCL 12": "12",
+            "A5 SPD 3": "3",
             "A5 BMT 3": "0",
             "A5 MIF": "1",
-            "C1 INI 1 2": "0",
             "C1 SPD 10": "10",
             "C1 BMT 10 0": "0",
             "C1 MIF": "1",
+            "A5 ACL 25": "25",  # restore
+            "A5 DCL 20": "20",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 Z3 F600")
         executor.execute(trajectory)
         assert conn.sent == [
-            "A5 SPD 10", "A5 BMT 3", "A5 MIF",
-            "C1 INI 1 2", "C1 SPD 10", "C1 BMT 10 0", "C1 MIF",
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
+            "A5 ACL", "A5 DCL",  # read Z's own ramp (to restore later)
+            "A5 ACL 15", "A5 DCL 12", "A5 SPD 3", "A5 BMT 3",  # Z, scaled by k=0.3
+            "C1 SPD 10", "C1 BMT 10 0",  # X/Y, unscaled
+            "A5 MIF", "C1 MIF",
+            "A5 ACL 25", "A5 DCL 20",  # Z's ramp restored
         ]
         assert "C1 INI 1 2 5" not in conn.sent
 
-    def test_split_happens_before_fence_checking(self):
-        """The split runs in plan(), so the waypoints that get fence-checked
-        are the L-shaped path actually executed — not the nominal diagonal.
-        A fence the diagonal would miss but the L-path enters must still be
-        caught."""
+    def test_moves_z_and_theta_concurrently_with_the_xy_group_scaled_to_match_duration(self):
+        """A move touching X/Y, Z, and Theta (A) together fires the Z/Theta
+        group's BMT (C2) and the XY group's BMT (C1) back-to-back,
+        non-blocking, then polls both — the full emulated 4-axis case from
+        issue #24. Z/Theta is the "short" leg here: its "distance" is
+        max(|delta Z|, |delta Theta|) = max(3, 2) = 3 (Z dominates), still
+        less than X/Y's 10mm, so its speed and ramp are scaled by k=0.3
+        from X/Y's ramp, same as the Z-only case above — and its own prior
+        ramp is restored afterward the same way.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "C2 INI 5 6": "0",
+            "C2 ACL": "25",  # Z/Theta's own ramp before this move — restored after
+            "C2 DCL": "20",
+            "C2 ACL 15": "15",
+            "C2 DCL 12": "12",
+            "C2 SPD 3": "3",
+            "C2 BMT 3 2": "0",
+            "C2 MIF": "1",
+            "C1 SPD 10": "10",
+            "C1 BMT 10 0": "0",
+            "C1 MIF": "1",
+            "C2 ACL 25": "25",  # restore
+            "C2 DCL 20": "20",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 A2 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
+            "C2 INI 5 6", "C2 ACL", "C2 DCL",  # read Z/Theta's own ramp (to restore later)
+            "C2 ACL 15", "C2 DCL 12", "C2 SPD 3", "C2 BMT 3 2",  # Z/Theta, scaled
+            "C1 SPD 10", "C1 BMT 10 0",  # X/Y, unscaled
+            "C2 MIF", "C1 MIF",
+            "C2 ACL 25", "C2 DCL 20",  # Z/Theta's ramp restored
+        ]
+
+    def test_moves_z_concurrently_with_z_as_the_long_leg(self):
+        """Opposite branch from the two tests above: Z travels further than
+        X/Y (20 vs 5), so Z is the "long" leg (nominal feed rate, ramp
+        untouched) and X/Y is scaled down by k=5/20=0.25 from Z's
+        currently-configured ramp, read via single-axis A5 ACL/DCL
+        queries (no group involved for a plain Z leg). X/Y's own prior
+        ramp is read too (C1 ACL/DCL) and restored once both legs finish.
+        """
+        responses = {
+            "A5 ACL": "20",
+            "A5 DCL": "16",
+            "C1 INI 1 2": "0",
+            "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
+            "C1 DCL": "10",
+            "A5 SPD 10": "10",
+            "A5 BMT 20": "0",
+            "A5 MIF": "1",
+            "C1 ACL 5": "5",
+            "C1 DCL 4": "4",
+            "C1 SPD 2.5": "2.5",
+            "C1 BMT 5 0": "0",
+            "C1 MIF": "1",
+            "C1 ACL 12": "12",  # restore
+            "C1 DCL 10": "10",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X5 Z20 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "A5 ACL", "A5 DCL",  # read Z's ramp (scaling reference)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "A5 SPD 10", "A5 BMT 20",  # Z, unscaled
+            "C1 ACL 5", "C1 DCL 4", "C1 SPD 2.5", "C1 BMT 5 0",  # X/Y, scaled by k=0.25
+            "A5 MIF", "C1 MIF",
+            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+        ]
+
+    def test_moves_z_and_theta_concurrently_with_z_theta_as_the_long_leg(self):
+        """Same opposite-branch coverage as above, but for the Z/Theta
+        group (C2) rather than a plain Z leg. Its "distance" is
+        max(|delta Z|, |delta Theta|) = max(20, 15) = 20 (Z dominates),
+        still further than X/Y's 5mm, so Z/Theta stays "long" and X/Y is
+        scaled down by k=5/20=0.25 from the group's currently-configured
+        ramp (C2 ACL/DCL); X/Y's own prior ramp is restored afterward.
+        """
+        responses = {
+            "C2 INI 5 6": "0",
+            "C2 ACL": "20",
+            "C2 DCL": "16",
+            "C1 INI 1 2": "0",
+            "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
+            "C1 DCL": "10",
+            "C2 SPD 10": "10",
+            "C2 BMT 20 15": "0",
+            "C2 MIF": "1",
+            "C1 ACL 5": "5",
+            "C1 DCL 4": "4",
+            "C1 SPD 2.5": "2.5",
+            "C1 BMT 5 0": "0",
+            "C1 MIF": "1",
+            "C1 ACL 12": "12",  # restore
+            "C1 DCL 10": "10",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X5 Z20 A15 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "C2 INI 5 6", "C2 ACL", "C2 DCL",  # read Z/Theta's ramp (scaling reference)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "C2 SPD 10", "C2 BMT 20 15",  # Z/Theta, unscaled
+            "C1 ACL 5", "C1 DCL 4", "C1 SPD 2.5", "C1 BMT 5 0",  # X/Y, scaled by k=0.25
+            "C2 MIF", "C1 MIF",
+            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+        ]
+
+    def test_zt_distance_is_dominated_by_theta_not_just_z(self):
+        """Z alone moves only 2mm (less than X/Y's 5mm), which would make
+        Z/Theta look like the "short" leg if distance were Z-only — but
+        Theta rotates 50 units, so max(|delta Z|, |delta Theta|)=50 makes
+        Z/Theta the "long" leg instead (unscaled) and X/Y the "short" one
+        (k=5/50=0.1). This is exactly the case _zt_distance exists for:
+        a Theta-dominated move must not get scaled down as if it were
+        short just because Z's own contribution is small.
+        """
+        responses = {
+            "C2 INI 5 6": "0",
+            "C2 ACL": "20",
+            "C2 DCL": "16",
+            "C1 INI 1 2": "0",
+            "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
+            "C1 DCL": "10",
+            "C2 SPD 10": "10",
+            "C2 BMT 2 50": "0",
+            "C2 MIF": "1",
+            "C1 ACL 2": "2",
+            "C1 DCL 1.6": "1.6",
+            "C1 SPD 1": "1",
+            "C1 BMT 5 0": "0",
+            "C1 MIF": "1",
+            "C1 ACL 12": "12",  # restore
+            "C1 DCL 10": "10",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X5 Z2 A50 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "C2 INI 5 6", "C2 ACL", "C2 DCL",  # read Z/Theta's ramp (scaling reference)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "C2 SPD 10", "C2 BMT 2 50",  # Z/Theta, unscaled — Theta dominates, so it's the "long" leg
+            "C1 ACL 2", "C1 DCL 1.6", "C1 SPD 1", "C1 BMT 5 0",  # X/Y, scaled by k=0.1
+            "C2 MIF", "C1 MIF",
+            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+        ]
+
+    def test_ramp_is_restored_even_if_a_leg_times_out(self, monkeypatch):
+        """If either leg's poll times out (poll_until_move_finished
+        returns False, the move is aborted, SnapMotionError raised), the
+        scaled leg's ramp must still be restored — the whole point of
+        wrapping the fire+poll sequence in try/finally. Forces the
+        "not finished" outcome directly rather than waiting out a real
+        30s timeout.
+        """
+        monkeypatch.setattr(
+            "laguna.robot.macron.gcode.poll_until_move_finished", lambda *a, **kw: False
+        )
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "A5 ACL": "25",  # Z's own ramp before this move
+            "A5 DCL": "20",
+            "A5 ACL 15": "15",
+            "A5 DCL 12": "12",
+            "A5 SPD 3": "3",
+            "A5 BMT 3": "0",
+            "A5 ABT": "0",  # abort(), issued by _poll_axis_move_finished on timeout
+            "C1 SPD 10": "10",
+            "C1 BMT 10 0": "0",
+            "A5 ACL 25": "25",  # restore, even though the move timed out
+            "A5 DCL 20": "20",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        with pytest.raises(SnapMotionError):
+            executor.execute(trajectory)
+        assert "A5 ABT" in conn.sent
+        assert conn.sent[-2:] == ["A5 ACL 25", "A5 DCL 20"]
+
+    def test_z_and_theta_without_xy_uses_the_theta_group_alone(self):
+        """A move touching only Z and Theta (no X/Y) needs no concurrency —
+        it's a single leg via the Z/Theta group, same shape as an XY-only
+        move today.
+        """
+        responses = {
+            "C2 INI 5 6": "0",
+            "C2 SPD 10": "10",
+            "C2 BMT 3 90": "0",
+            "C2 MIF": "1",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 Z3 A90 F600")
+        executor.execute(trajectory)
+        assert conn.sent == ["C2 INI 5 6", "C2 SPD 10", "C2 BMT 3 90", "C2 MIF"]
+
+    def test_theta_only_move_uses_a_single_axis_command(self):
+        """A move touching only Theta (no X/Y/Z) never touches either
+        coordinated group.
+        """
+        responses = {"A6 SPD 10": "10", "A6 BMT 90": "0", "A6 MIF": "1"}
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 A90 F600")
+        executor.execute(trajectory)
+        assert conn.sent == ["A6 SPD 10", "A6 BMT 90", "A6 MIF"]
+
+    def test_z_theta_group_requires_theta_cmd(self):
+        """A move needing the Z/Theta group without a configured theta_cmd
+        raises clearly instead of silently doing the wrong thing.
+        """
+        executor, conn = _make_executor({}, with_theta_group=False)
+        trajectory = executor.plan("G1 Z3 A90")
+        with pytest.raises(GCodeError, match="theta_cmd"):
+            executor.execute(trajectory)
+
+    def test_dual_elbow_fence_check_catches_either_ordering(self):
+        """Since the XY leg and the Z leg now run concurrently rather than
+        as a fixed sequence, the true swept path is the bounding box
+        between start and end, not one line. plan() checks both possible
+        elbow orderings (Z-first and XY-first) — a fence only the
+        Z-first elbow enters must still be caught.
+        """
         from laguna.robot.macron.fences import BoxFence
-        # Straight diagonal (0,0,0)->(10,10,5) misses this box; the split
-        # path goes (0,0,0)->(0,0,5)->(10,10,5), whose second leg crosses it.
+        # Straight diagonal (0,0,0)->(10,10,5) misses this box. The
+        # Z-first elbow (0,0,0)->(0,0,5)->(10,10,5) crosses it on its
+        # second leg; the XY-first elbow (0,0,0)->(10,10,0)->(10,10,5)
+        # does not.
         executor, conn = _make_executor(
             {}, fences=[BoxFence("post", 4, 6, 4, 6, 4, 6)]
         )
@@ -298,11 +582,129 @@ class TestExecutorLinearMoves:
             executor.plan("G1 X10 Y10 Z5 F600")
         assert conn.sent == []
 
+    def test_dual_elbow_fence_check_catches_the_other_ordering_too(self):
+        """Symmetric to the above: a fence only the XY-first elbow enters
+        (and the Z-first elbow and the diagonal both miss) must also be
+        caught — proving both orderings are actually checked, not just one.
+        """
+        from laguna.robot.macron.fences import BoxFence
+        # XY-first elbow (0,0,0)->(10,10,0)->(10,10,5) crosses this box on
+        # its first leg (z=0, within [0,2]); Z-first elbow
+        # (0,0,0)->(0,0,5)->(10,10,5) never enters x=[8,10]/y=[8,10] at
+        # z=[0,2] (its first leg stays at x=y=0, its second leg is at z=5).
+        executor, conn = _make_executor(
+            {}, fences=[BoxFence("post", 8, 10, 8, 10, 0, 2)]
+        )
+        with pytest.raises(FenceViolation):
+            executor.plan("G1 X10 Y10 Z5 F600")
+        assert conn.sent == []
+
+    def test_moves_x_and_theta_concurrently_without_z(self):
+        """X/Y paired with Theta alone (no Z change) is also a concurrent
+        pair — the "caller picks" case where Theta joins an XY move without
+        needing the Z/Theta group at all. Theta travels further than X/Y
+        here (20 vs 5), so this covers the opposite branch from the Z
+        tests above: Theta is the "long" leg (left at the nominal feed
+        rate, ramp untouched) and X/Y is the "short" one — scaled by
+        k=5/20=0.25 from Theta's currently-configured ramp (read via
+        single-axis A6 ACL/DCL queries, not a group — Theta alone never
+        touches C2). X/Y's own prior ramp is read too and restored once
+        both legs finish.
+        """
+        responses = {
+            "A6 ACL": "20",
+            "A6 DCL": "16",
+            "C1 INI 1 2": "0",
+            "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
+            "C1 DCL": "10",
+            "A6 SPD 10": "10",
+            "A6 BMT 20": "0",
+            "A6 MIF": "1",
+            "C1 ACL 5": "5",
+            "C1 DCL 4": "4",
+            "C1 SPD 2.5": "2.5",
+            "C1 BMT 5 0": "0",
+            "C1 MIF": "1",
+            "C1 ACL 12": "12",  # restore
+            "C1 DCL 10": "10",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X5 A20 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "A6 ACL", "A6 DCL",  # read Theta's ramp (scaling reference)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "A6 SPD 10", "A6 BMT 20",  # Theta, unscaled
+            "C1 ACL 5", "C1 DCL 4", "C1 SPD 2.5", "C1 BMT 5 0",  # X/Y, scaled by k=0.25
+            "A6 MIF", "C1 MIF",
+            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+        ]
+
+    def test_moves_x_and_theta_concurrently_with_theta_as_the_short_leg(self):
+        """Opposite branch from the test above: X/Y travels further than
+        Theta (20 vs 5), so X/Y is "long" (nominal feed rate, ramp
+        untouched, X/Y's ramp read via C1 ACL/DCL) and Theta is scaled
+        down by k=5/20=0.25 — the single-axis-responder mirror of the Z
+        "short leg" case. Theta's own prior ramp is restored once both
+        legs finish.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "20",
+            "C1 DCL": "16",
+            "A6 ACL": "25",  # Theta's own ramp before this move — restored after
+            "A6 DCL": "20",
+            "A6 ACL 5": "5",
+            "A6 DCL 4": "4",
+            "A6 SPD 2.5": "2.5",
+            "A6 BMT 5": "0",
+            "A6 MIF": "1",
+            "C1 SPD 10": "10",
+            "C1 BMT 20 0": "0",
+            "C1 MIF": "1",
+            "A6 ACL 25": "25",  # restore
+            "A6 DCL 20": "20",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X20 A5 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
+            "A6 ACL", "A6 DCL",  # read Theta's own ramp (to restore later)
+            "A6 ACL 5", "A6 DCL 4", "A6 SPD 2.5", "A6 BMT 5",  # Theta, scaled by k=0.25
+            "C1 SPD 10", "C1 BMT 20 0",  # X/Y, unscaled
+            "A6 MIF", "C1 MIF",
+            "A6 ACL 25", "A6 DCL 20",  # Theta's ramp restored
+        ]
+
+    def test_z_only_move_uses_a_single_axis_command_no_ramp_scaling(self):
+        """A move touching only Z (no X/Y, no Theta) is a single leg, same
+        as an XY-only or Theta-only move — no concurrency, no ramp
+        decomposition, ACL/DCL never touched.
+        """
+        responses = {"A5 SPD 10": "10", "A5 BMT 3": "0", "A5 MIF": "1"}
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 Z3 F600")
+        executor.execute(trajectory)
+        assert conn.sent == ["A5 SPD 10", "A5 BMT 3", "A5 MIF"]
+
     def test_dry_run_sends_nothing(self):
         executor, conn = _make_executor({}, dry_run=True)
         trajectory = executor.plan("G1 X10 Y10 F600")
         executor.execute(trajectory)
         assert conn.sent == []
+
+    def test_dry_run_describes_every_leg_kind(self, caplog):
+        """Dry-run logging covers each responder kind (z, theta, z_theta)
+        combined with an XY leg, without sending anything. Each line uses
+        a fresh executor so every case starts from (0,0,0)/theta=0 and
+        genuinely touches the axes it claims to.
+        """
+        for line in ("G1 X10 Z3 F600", "G1 X10 A90 F600", "G1 X10 Z3 A90 F600"):
+            executor, conn = _make_executor({}, dry_run=True)
+            trajectory = executor.plan(line)
+            executor.execute(trajectory)
+            assert conn.sent == []
 
     def test_confirm_cb_can_abort_before_sending(self):
         executor, conn = _make_executor({"C1 INI 1 2": "0"}, confirm_cb=lambda move: False)
@@ -329,7 +731,8 @@ class TestExecutorHomeDwellPause:
         obstructions block several of the limit switches it depends on
         (plan step 2, from 5c170d3). G28 therefore cannot run, and must
         fail before touching the wire rather than jogging into a blocked
-        switch."""
+        switch.
+        """
         executor, conn = _make_executor({})
         trajectory = executor.plan("G28")
         with pytest.raises(NotImplementedError, match="Homing is temporarily disabled"):

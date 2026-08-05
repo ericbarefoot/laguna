@@ -94,12 +94,29 @@ class TestFromConfigAxesAndIOMap:
         assert controller._axes == (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
 
     def test_gcode_group_is_xy_only_with_z_held_separately(self):
-        """Z cannot join the coordinated group on this hardware, so the
-        executor takes the two commander axes as its group and Z as a
-        separate single-axis leg — see gcode.py's "Z/XY node split"."""
+        """Z cannot join the commander-node coordinated group on this
+        hardware, so the executor takes the two commander axes as its
+        group and Z as its own axis — see gcode.py's module docstring."""
         controller = GantryController.from_config(BASE_CONFIG)
         assert controller.gcode._axes == (X_AXIS, Y_AXIS)
         assert controller.gcode._z_axis == Z_AXIS
+
+    def test_theta_group_is_wired_to_a_second_mmc_commands_on_group_2(self):
+        """Z and Theta share the responder node, so they get their own
+        coordinated group (default index 2) via a second MMCCommands
+        sharing the gantry's connection — see issue #24."""
+        controller = GantryController.from_config(BASE_CONFIG)
+        assert controller.theta_cmd is not controller.cmd
+        assert controller.theta_cmd._group == 2
+        assert controller.theta_cmd._group_axes == (Z_AXIS, THETA_AXIS)
+        assert controller.gcode._theta_cmd is controller.theta_cmd
+        assert controller.gcode._theta_axis == THETA_AXIS
+
+    def test_theta_group_index_is_configurable(self):
+        config = dict(BASE_CONFIG, theta_group_index=7)
+        controller = GantryController.from_config(config)
+        assert controller.theta_cmd._group == 7
+        assert controller.gcode._theta_group_index == 7
 
 
 class TestFromConfigHomingAndFences:
