@@ -44,6 +44,10 @@ class RangefinderSubsystem:
                 laguna.rangefinder.calibration and
                 scripts/calibrate_rangefinder.py). If given, read_mm()
                 applies it instead of returning the raw decoded distance.
+            simulated: Skip the real MQTT/AL1342-HTTP paths entirely —
+                connect() succeeds with no broker needed, every reading is
+                NaN rather than fabricated (default False; see
+                laguna.simulation's module docstring).
         mqtt_subscriber: A connected or unconnected MqttSubscriber instance.
     """
 
@@ -54,6 +58,7 @@ class RangefinderSubsystem:
         self._pdin_port = int(config.get("pdin_port", 1))
         self._offset_mm = float(config.get("offset_mm", 0.0))
         self._al1342_host = config.get("al1342_host")
+        self._simulated = config.get("simulated", False)
         self._mqtt = mqtt_subscriber
 
         calibration_file = config.get("calibration_file")
@@ -89,6 +94,9 @@ class RangefinderSubsystem:
         Returns:
             True if connected successfully.
         """
+        if self._simulated:
+            self._is_connected = True
+            return True
         if not self._mqtt._is_connected:
             ok = self._mqtt.connect()
             if not ok:
@@ -99,11 +107,24 @@ class RangefinderSubsystem:
 
     def disconnect(self) -> None:
         """Disconnect the underlying MQTT subscriber."""
+        if self._simulated:
+            self._is_connected = False
+            return
         self._mqtt.disconnect()
         self._is_connected = False
 
     def get_status(self) -> Dict[str, Any]:
         """Return connection state and the most recent reading (no I/O)."""
+        if self._simulated:
+            return {
+                "is_connected": self._is_connected,
+                "topic": self._topic,
+                "pdin_port": self._pdin_port,
+                "latest_distance_mm": float("nan"),
+                "latest_wall_time": time.time(),
+                "sample_count": 0,
+                "achieved_rate_hz": float("nan"),
+            }
         distance_mm = None
         wall_time = None
         if self._latest_sample is not None:
@@ -149,6 +170,8 @@ class RangefinderSubsystem:
 
     def get_distance_mm(self) -> Optional[float]:
         """Return the most recent distance reading in mm, or None if no data yet."""
+        if self._simulated:
+            return float("nan")
         self._poll()
         if self._latest_sample is None:
             return None
@@ -156,6 +179,8 @@ class RangefinderSubsystem:
 
     def get_latest_sample(self) -> Optional[Tuple[float, float]]:
         """Return (wall_time_unix, distance_mm) for the most recent reading."""
+        if self._simulated:
+            return (time.time(), float("nan"))
         self._poll()
         return self._latest_sample
 
@@ -188,6 +213,8 @@ class RangefinderSubsystem:
             RuntimeError: If 'al1342_host' wasn't given in config, or the
                 AL1342 returns a non-200 code (e.g. wrong pdin_port).
         """
+        if self._simulated:
+            return float("nan")
         self._require_al1342_host()
         hex_str = read_pdin_hex(self._al1342_host, self._pdin_port, timeout=timeout)
         decoded = self._decode(hex_str)
@@ -231,10 +258,14 @@ class OD2000Rangefinder(RangefinderSubsystem):
         return decode_od2000_pdin(hex_str)
 
     def activate(self) -> None:
+        if self._simulated:
+            return
         self._require_al1342_host()
         write_acyclic(self._al1342_host, self._pdin_port, index=97, subindex=0, value="00")
 
     def deactivate(self) -> None:
+        if self._simulated:
+            return
         self._require_al1342_host()
         write_acyclic(self._al1342_host, self._pdin_port, index=97, subindex=0, value="01")
 

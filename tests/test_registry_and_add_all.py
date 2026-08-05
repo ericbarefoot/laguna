@@ -35,33 +35,39 @@ class TestConfigExplicitSections:
 
 
 class TestSimulateFiltersExplicitSections:
-    def test_non_simulated_sections_are_dropped(self, tmp_path):
+    def test_non_simulated_sections_are_dropped(self, tmp_path, monkeypatch):
         """The specific bug this guards: simulate_config() drops sections
-        with no simulated backend (rangefinders) from config_dict, but
-        explicit_sections is a separate attribute — if FlumeLab.__init__
-        didn't also filter it, add_all() would still try to build a real
-        OD2000Rangefinder against real hardware under simulate=True (see
-        laguna.simulation's module docstring). weir/flow/gauge/pi_cameras/
-        dslr_cameras do have simulated backends now, so they're deliberately
-        not the example here — see TestSimulateConfig in test_simulation.py
-        for that coverage."""
+        with no simulated backend from config_dict, but explicit_sections
+        is a separate attribute — if FlumeLab.__init__ didn't also filter
+        it, add_all() would still try to build a real controller against
+        real hardware under simulate=True (see laguna.simulation's module
+        docstring). Every real laguna.registry.SUBSYSTEM_REGISTRY entry has
+        a simulated backend now, so this exercises the mechanism with a
+        synthetic section name rather than a real one — see
+        TestSimulateConfig in test_simulation.py for the real coverage."""
+        import laguna.simulation as simulation
+
+        monkeypatch.setattr(simulation, "_NO_SIMULATED_BACKEND", ("not_yet_simulated",))
         path = tmp_path / "cfg.yaml"
         path.write_text(
             "gantry:\n  axes: [{name: X, index: 1}]\n"
-            "od2000:\n  topic: laguna/od2000\n"
+            "not_yet_simulated:\n  port: /dev/ttyUSB9\n"
         )
         lab = FlumeLab(str(path), simulate=True)
         assert lab.config.explicit_sections == {"gantry"}
 
-    def test_add_all_under_simulate_never_touches_dropped_sections(self, tmp_path):
+    def test_add_all_under_simulate_never_touches_dropped_sections(self, tmp_path, monkeypatch):
+        import laguna.simulation as simulation
+
+        monkeypatch.setattr(simulation, "_NO_SIMULATED_BACKEND", ("not_yet_simulated",))
         path = tmp_path / "cfg.yaml"
         path.write_text(
             "gantry:\n  axes: [{name: X, index: 1}]\n"
-            "od2000:\n  topic: laguna/od2000\n"
+            "not_yet_simulated:\n  port: /dev/ttyUSB9\n"
         )
         lab = FlumeLab(str(path), simulate=True)
         lab.add_all()
-        assert "od2000" not in lab._subsystems
+        assert "not_yet_simulated" not in lab._subsystems
         assert "gantry" in lab._subsystems
 
 

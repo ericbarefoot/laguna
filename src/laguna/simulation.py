@@ -25,32 +25,35 @@ Fence checking is real too — a rehearsed move that would violate a fence
 still raises, since that's a structural mistake in the script, not a
 physical unknown.
 
-**Simulated (gantry, gocator, weir, flow, gauge, pi_cameras,
-dslr_cameras):** commands succeed and log exactly as they would against
-real hardware — this is what actually exercises a schedule end to end,
-proving the right commands fire in the right order. Readings come back as
-NaN (or an equivalent "unknown" placeholder for non-numeric fields), never
-a fabricated physically-plausible number — a rehearsal checks that the
+**Simulated — every subsystem in laguna.registry.SUBSYSTEM_REGISTRY**
+(gantry, gocator, weir, flow, gauge, pi_cameras, dslr_cameras, od2000,
+wtt12l): commands succeed and log exactly as they would against real
+hardware — this is what actually exercises a schedule end to end, proving
+the right commands fire in the right order. Readings come back as NaN (or
+an equivalent "unknown" placeholder for non-numeric fields), never a
+fabricated physically-plausible number — a rehearsal checks that the
 script and plan are well-formed and execute as scheduled, not physical
 feasibility. Physical-limit checking is fences.py's job (real, see above),
-not this module's. Gantry moves complete instantly and camera captures
+not this module's. Gantry moves complete instantly, a simulated Gocator
+scan is a small fixed-size synthetic surface (~80,000 cells, not scaled to
+whatever a real scan's config asks for — see
+laguna.scanner.simulation.SIM_ROWS/SIM_COLS — so a rehearsal with scans on
+a tight interval does not accumulate large files), and camera captures
 "return" placeholder filenames with no file behind them.
 
-**Not present at all (od2000, wtt12l):** there is no simulated IO-Link/AL1342
-model yet. ``simulate_config()`` drops these sections from the config
-rather than constructing the real controllers for them — a fail-closed
-guard against a "rehearsal" silently commanding real hardware, not a
-simulation of what they would do. A schedule that depends on one of these
-firing is not exercised by simulate=True today.
+``_NO_SIMULATED_BACKEND`` is empty today — every registered subsystem has
+a simulated path. It's kept as the fail-closed guard (drop the section
+rather than construct the real controller) for whatever gets added to the
+registry next without one yet, not deleted outright.
 
-So this catches structural mistakes across almost the whole rig — a
+So this catches structural mistakes across the whole opt-in rig — a
 schedule that never fires, a survey that overruns, a scan spec missing a
 key, a subsystem that fails to quiesce, a camera trigger wired to the
 wrong schedule column — and cannot catch physical ones (a mounting sign, a
 feed rate the gantry cannot actually hold, a target outside the work
-envelope, whether a valve would actually open) or anything involving the
-still-dropped rangefinder subsystems. It is a rehearsal of the script and
-plan, not a simulator of the physical apparatus, and the distinction is
+envelope, whether a valve would actually open). It is a rehearsal of the
+script and plan, not a simulator of the physical apparatus, and the
+distinction is
 worth keeping in mind when a rehearsed script meets real hardware.
 """
 
@@ -58,7 +61,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -303,18 +306,20 @@ def simulated_gocator_lib() -> Any:
 
 #: Config sections with a simulated backend (see SimulatedSnapConnection,
 #: SimulatedGoSdkLib, SimulatedTeknicMotor/SimulatedVFD/SimulatedMassaSensor,
-#: and the pi_cameras/dslr_cameras "simulated" flag each subsystem's own
-#: connect()/action methods check directly). Anything else has no simulated
-#: backend at all.
+#: and the pi_cameras/dslr_cameras/od2000/wtt12l "simulated" flag each
+#: subsystem's own connect()/action methods check directly). This is now
+#: every entry in laguna.registry.SUBSYSTEM_REGISTRY — simulate=True
+#: rehearses the whole opt-in rig, not a subset of it.
 _SIMULATED_SECTIONS = ("gantry", "gocator", "weir", "flow", "gauge",
-                        "pi_cameras", "dslr_cameras")
+                        "pi_cameras", "dslr_cameras", "od2000", "wtt12l")
 
-#: Sections that would otherwise construct a real hardware controller with no
-#: simulated backend to fall back to — an IO-Link/AL1342 rangefinder. Dropped
-#: under simulate=True rather than silently connecting to real hardware
-#: during what is supposed to be a rehearsal — a fail-closed guard, not a
-#: simulation of what they would do.
-_NO_SIMULATED_BACKEND = ("od2000", "wtt12l", "wtt12l_powerprox")
+#: Sections that would otherwise construct a real hardware controller with
+#: no simulated backend to fall back to. Empty today — kept as the
+#: fail-closed guard for whatever gets added to the registry next without a
+#: simulated path yet, rather than deleting the mechanism. Dropped under
+#: simulate=True rather than silently connecting to real hardware during
+#: what is supposed to be a rehearsal.
+_NO_SIMULATED_BACKEND: Tuple[str, ...] = ()
 
 
 def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -324,10 +329,10 @@ def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     `"simulated": True` flag added (gantry/gocator use their own existing
     `transport`/`simulated` conventions instead) — a rehearsal must
     exercise the same set the real run would, or it proves nothing about
-    the schedule. The rangefinder sections in _NO_SIMULATED_BACKEND have no
-    simulated backend yet, so they're dropped entirely rather than
-    constructing the real controller classes under simulate=True. This is
-    a fail-closed guard, not equivalent coverage — see module docstring.
+    the schedule. Anything in _NO_SIMULATED_BACKEND has no simulated
+    backend yet, so it's dropped entirely rather than constructing the
+    real controller class under simulate=True — a fail-closed guard, not
+    equivalent coverage. See module docstring.
     """
     out = dict(config)
     if "gantry" in out:
@@ -341,7 +346,8 @@ def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         gocator = dict(out["gocator"])
         gocator["simulated"] = True
         out["gocator"] = gocator
-    for section in ("weir", "flow", "gauge", "pi_cameras", "dslr_cameras"):
+    for section in ("weir", "flow", "gauge", "pi_cameras", "dslr_cameras",
+                     "od2000", "wtt12l"):
         if section in out:
             sub = dict(out[section])
             sub["simulated"] = True

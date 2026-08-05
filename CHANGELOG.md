@@ -11,18 +11,26 @@ them into a dated release section when you cut a version.
 ## [Unreleased]
 
 ### Added
-- **`simulate=True` now rehearses weir, flow, gauge, and both camera
-  subsystems, not just gantry/gocator.** Each builds a simulated driver
+- **`simulate=True` now rehearses every subsystem in
+  `laguna.registry.SUBSYSTEM_REGISTRY`** — weir, flow, gauge, both camera
+  subsystems, and both AL1342 rangefinders (`od2000`/`wtt12l`), not just
+  gantry/gocator. Each builds a simulated driver
   (`SimulatedTeknicMotor`, `SimulatedVFD`, `SimulatedMassaSensor` in
-  `laguna.simulation`; `pi_cameras`/`dslr_cameras` check a `simulated` flag
-  directly) — commands succeed and log exactly as they would against real
+  `laguna.simulation`; `pi_cameras`/`dslr_cameras`/`od2000`/`wtt12l` check a
+  `simulated` flag directly, skipping the real MQTT broker/AL1342 HTTP
+  path) — commands succeed and log exactly as they would against real
   hardware, so a rehearsal actually proves a schedule's weir moves, flow
-  changes, and camera triggers fire in the right order. Readings come back
-  `NaN` (or `None` for non-numeric status fields) rather than a fabricated
-  physically-plausible value — a rehearsal checks that the script and plan
-  are well-formed and execute as scheduled, not physical feasibility (fence
-  checking still is, and still runs for real). Only the rangefinder
-  sections (`od2000`/`wtt12l`) remain dropped — no simulated backend yet.
+  changes, camera triggers, and rangefinder activate/read calls all fire in
+  the right order. Readings come back `NaN` (or `None` for non-numeric
+  status fields) rather than a fabricated physically-plausible value — a
+  rehearsal checks that the script and plan are well-formed and execute as
+  scheduled, not physical feasibility (fence checking still is, and still
+  runs for real). `_NO_SIMULATED_BACKEND` is empty today; kept as the
+  fail-closed guard for whatever gets added to the registry next without a
+  simulated path yet. A simulated Gocator scan is a small fixed-size
+  synthetic surface (~80,000 cells, well under a megabyte) regardless of
+  what the real scan config asks for, so a rehearsal with frequent scans
+  does not accumulate large files.
 - A rehearsal's event log can no longer land in the same file as a real
   run's: `simulate=True` suffixes the event-log filename with `_simulated`
   (even if `timing.event_log` was set explicitly, since the same config is

@@ -82,29 +82,32 @@ class TestSimulateConfig:
         cfg = {"gantry": {}, "gocator": {}}
         assert set(simulate_config(cfg)) == {"gantry", "gocator"}
 
-    def test_weir_flow_gauge_and_cameras_are_marked_simulated_not_dropped(self):
-        """These now have simulated backends (SimulatedTeknicMotor/VFD/
-        MassaSensor, and a `simulated` flag pi_cameras/dslr_cameras check
-        directly) — a rehearsal must exercise them, or it proves nothing
-        about their schedules. Only the still-backend-less rangefinder
-        sections get dropped."""
+    def test_every_registry_subsystem_is_marked_simulated_not_dropped(self):
+        """Every laguna.registry.SUBSYSTEM_REGISTRY entry has a simulated
+        backend now (SimulatedTeknicMotor/VFD/MassaSensor, and a
+        `simulated` flag pi_cameras/dslr_cameras/od2000/wtt12l check
+        directly) — a rehearsal must exercise all of them, or it proves
+        nothing about their schedules."""
         cfg = {
             "gantry": {}, "gocator": {}, "weir": {}, "flow": {}, "gauge": {},
             "pi_cameras": {}, "dslr_cameras": {}, "od2000": {}, "wtt12l": {},
         }
         out = simulate_config(cfg)
-        assert set(out) == {"gantry", "gocator", "weir", "flow", "gauge",
-                             "pi_cameras", "dslr_cameras"}
-        for section in ("weir", "flow", "gauge", "pi_cameras", "dslr_cameras"):
+        assert set(out) == set(cfg)
+        for section in ("weir", "flow", "gauge", "pi_cameras", "dslr_cameras",
+                        "od2000", "wtt12l"):
             assert out[section]["simulated"] is True
 
-    def test_rangefinder_sections_are_still_dropped(self):
-        """od2000/wtt12l have no simulated backend yet — constructing the
-        real controller classes for these under simulate=True would
-        silently contact real hardware during what is supposed to be a
-        hardware-free rehearsal, so they must still be dropped."""
-        cfg = {"od2000": {}, "wtt12l": {}}
-        assert set(simulate_config(cfg)) == set()
+    def test_unknown_sections_with_no_simulated_backend_are_dropped(self, monkeypatch):
+        """_NO_SIMULATED_BACKEND is empty today (every registered subsystem
+        has a simulated path), but the drop mechanism itself must still
+        work for whatever gets added to the registry next without one —
+        exercised here with a synthetic section name."""
+        import laguna.simulation as simulation
+
+        monkeypatch.setattr(simulation, "_NO_SIMULATED_BACKEND", ("not_yet_simulated",))
+        cfg = {"gantry": {}, "not_yet_simulated": {"port": "/dev/ttyUSB9"}}
+        assert set(simulate_config(cfg)) == {"gantry"}
 
     def test_the_original_config_is_not_mutated(self):
         cfg = {"gantry": {"transport": "pi_agent"}}
@@ -148,16 +151,18 @@ class TestSetupRunSimulation:
         assert lab.weir._is_connected is True
         assert lab.flow._is_connected is True
 
-    def test_all_seven_simulated_subsystems_connect_end_to_end(self, tmp_path):
+    def test_every_registry_subsystem_connects_end_to_end(self, tmp_path):
         """The full point of extending simulate=True past gantry/gocator:
-        a rehearsal should exercise weir/flow/gauge/camera schedules too,
-        not just motion — every subsystem with a simulated backend
-        connects successfully with no real hardware anywhere."""
+        a rehearsal should exercise weir/flow/gauge/camera/rangefinder
+        schedules too, not just motion — every subsystem in
+        laguna.registry.SUBSYSTEM_REGISTRY connects successfully with no
+        real hardware anywhere."""
         import math
 
         import yaml
 
         from laguna.experiment.runner import setup_run
+        from laguna.registry import SUBSYSTEM_REGISTRY
 
         path = tmp_path / "cfg.yaml"
         path.write_text(yaml.safe_dump({
@@ -169,13 +174,13 @@ class TestSetupRunSimulation:
             "gauge": {"port": "/dev/ttyUSB2"},
             "pi_cameras": {"hosts": ["pi1.local"]},
             "dslr_cameras": {"cameras": {"Camera1": {}}},
+            "od2000": {"topic": "laguna/od2000", "pdin_port": 2},
+            "wtt12l": {"topic": "laguna/wtt12l", "pdin_port": 7},
         }))
 
         lab = setup_run(str(path), simulate=True)
 
-        assert set(lab._subsystems) == {
-            "gantry", "gocator", "weir", "flow", "gauge", "pi_cameras", "dslr_cameras",
-        }
+        assert set(lab._subsystems) == set(SUBSYSTEM_REGISTRY)
         # connect_all() already ran inside setup_run(); every subsystem
         # must have actually connected, not just been constructed.
         for name, subsystem in lab._subsystems.items():
@@ -187,6 +192,8 @@ class TestSetupRunSimulation:
         # actually checking here.
         assert math.isnan(lab.gauge.read_mm())
         assert math.isnan(lab.weir.get_elevation())
+        assert math.isnan(lab.od2000.get_distance_mm())
+        assert math.isnan(lab.wtt12l.get_distance_mm())
 
     def test_gantry_still_gets_simulated_config_through_setup_run(self, tmp_path):
         from laguna.experiment.runner import setup_run
@@ -306,6 +313,28 @@ class TestSimulatedScanner:
         scan = scanner.receive_surface(timeout_s=1.0)
         assert np.isnan(scan.z_mm).any()
         assert scan.valid_count < scan.z_mm.size
+
+    def test_surface_size_is_fixed_and_small_regardless_of_scan_config(self):
+        """A rehearsal must not accumulate large files even if the real
+        config asks for a big fixed_length_mm/high frame rate — the
+        simulated surface is always the same small fixed grid (see
+        laguna.scanner.simulation's SIM_ROWS/SIM_COLS), not scaled to
+        whatever a real scan would have produced."""
+        from laguna.scanner import GocatorScanner
+        from laguna.scanner.simulation import SIM_COLS, SIM_ROWS
+
+        big_scanner = GocatorScanner({
+            "ip": "1.2.3.4", "simulated": True,
+            "travel_speed_mm_s": 20.0, "fixed_length_mm": 5000.0,  # a large real pass
+        })
+        big_scanner.connect()
+        big_scanner.start()
+        scan = big_scanner.receive_surface(timeout_s=1.0)
+
+        assert scan.shape == (SIM_ROWS, SIM_COLS)
+        # float64 x/y/z per point, well under a megabyte either way —
+        # nowhere near the GB range a long real scan can reach.
+        assert scan.z_mm.nbytes < 1_000_000
 
     def test_export_paths_work_end_to_end(self, tmp_path):
         scanner = self._scanner()

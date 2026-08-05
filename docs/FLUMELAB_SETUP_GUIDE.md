@@ -230,8 +230,9 @@ lab.connect_all()   # succeeds — nothing on the network
 ```
 
 `simulate=True` rehearses the **script and plan**, not physical
-feasibility. Seven subsystems have a simulated backend today — gantry,
-gocator, weir, flow, gauge, `pi_cameras`, `dslr_cameras`:
+feasibility. Every subsystem in `laguna.registry.SUBSYSTEM_REGISTRY` has a
+simulated backend today — gantry, gocator, weir, flow, gauge,
+`pi_cameras`, `dslr_cameras`, `od2000`, `wtt12l`:
 
 - **Commands succeed and log exactly as they would for real** — this is
   what actually proves a schedule fires the right thing at the right
@@ -259,10 +260,17 @@ gocator, weir, flow, gauge, `pi_cameras`, `dslr_cameras`:
   violate a fence still raises `FenceViolation` — physical-limit checking
   is `fences.py`'s job, real in every mode, and a rehearsal that let
   fence-violating scripts through would be worse than no rehearsal.
-- **Only `od2000`/`wtt12l`** (the AL1342 rangefinders) have no simulated
-  backend yet — their sections are dropped from the config under
-  `simulate=True` rather than connecting to real hardware, with a
-  `logger.warning(...)` naming what was dropped.
+- **The rangefinders (`od2000`/`wtt12l`) rehearse too** — `connect()`
+  succeeds with no MQTT broker or AL1342 needed, `activate()`/
+  `deactivate()` skip the real IO-Link HTTP write, and every reading
+  (`get_distance_mm()`, `read_mm()`, `get_status()`'s numeric fields) comes
+  back `NaN`. Every entry in `laguna.registry.SUBSYSTEM_REGISTRY` has a
+  simulated path today — `_NO_SIMULATED_BACKEND` is empty, kept only as
+  the fail-closed guard for whatever gets added next without one.
+- **A simulated Gocator scan is a small, fixed-size synthetic surface**
+  (~80,000 cells, well under a megabyte) — it does not scale up with
+  `fixed_length_mm`/frame rate the way a real scan would, so a rehearsal
+  with scans on a tight schedule does not accumulate large files on disk.
 
 ### Rehearsal-specific event log safeguards
 
