@@ -15,7 +15,10 @@ exhaustive *what* — every public class, method, and parameter.
 | [Camera](camera.md) | `CameraManager`, DSLR, networked Pi array, local capture |
 | [Weir](weir.md) | Tailgate elevation control |
 | [Gauge](gauge.md) | Ultrasonic water-level sensing |
+| [Rangefinder](rangefinder.md) | OD2000 / WTT12L distance sensors via AL1342 |
+| [Scanner](scanner.md) | Gocator 2690 3D laser scanner |
 | [Flow](flow.md) | Pump / solenoid flow control |
 | [Schedule](schedule.md) | Time-elevation schedule loading and interpolation |
 | [Timing](timing.md) | Experiment clock, scheduler, checkpointing, event log |
 | [Experiment runner](experiment.md) | YAML-driven experiment setup and blocking run |
+| [Data & storage](data_storage.md) | Post-processing and remote storage backends |
