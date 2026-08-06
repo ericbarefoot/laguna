@@ -162,9 +162,12 @@ class GocatorSettingsMixin:
         ceiling, can shift as other settings change).
 
         Args:
-            x, y, z: Active-area origin, mm.
-            width, length, height: Extents from that origin, mm — X, Y and Z
-                respectively.
+            x: Active-area origin X, mm.
+            y: Active-area origin Y, mm.
+            z: Active-area origin Z, mm.
+            width: Active-area extent in X (across laser), mm.
+            length: Active-area extent in Y (along travel), mm.
+            height: Active-area extent in Z (range/standoff), mm.
             flush: Push to the sensor with ``GoSensor_Flush``. Pass False to
                 batch this with other changes and flush once yourself.
 
@@ -290,9 +293,10 @@ class GocatorSettingsMixin:
         at x=2, 0.496 mm at x=4.
 
         Args:
-            x, z: Dividers. Validated against the sensor's own option list
-                rather than an assumed {1, 2, 4}, since it is model- and
-                mode-dependent.
+            x: X-axis resolution divider. Validated against the sensor's own
+                option list rather than an assumed {1, 2, 4}, since it is
+                model- and mode-dependent.
+            z: Z-axis resolution divider (for standoff resolution).
             flush: Push to the sensor. False to batch with other changes.
 
         Raises:
@@ -721,6 +725,13 @@ class GocatorSettingsMixin:
                 then validated against. None falls back to the config's
                 ``active_area``, and to leaving the sensor's own if neither
                 is set.
+            subsampling: X/Z resolution divider dict, e.g. ``{x: 2, z: 1}``.
+                Works in both uniform-spacing and point-cloud modes.
+            spacing_interval: X resampling bin size config dict
+                (``type`` and/or ``value_mm``). Requires uniform spacing.
+            filters: Post-processing filter dict, with filter names as keys
+                and bool or window size (mm) as values. Requires uniform
+                spacing.
 
         Returns:
             Dict of the values actually applied (read back from the sensor).

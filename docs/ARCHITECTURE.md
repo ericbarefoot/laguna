@@ -119,7 +119,7 @@ Failures in a scheduled action are caught and logged (`result="error:
 
 FlumeLab has a three-tier safety vocabulary — `pause()`/`stop()` (aliased as
 `FlumeLab.stop()`, kept for existing scripts) / `estop()` — identical across
-every subsystem. See `laguna.safety` and `docs/COSCRIPTING_ROADMAP.md` for
+every subsystem. See `laguna.safety` and `docs/archive/COSCRIPTING_ROADMAP.md` for
 the full design; the short version:
 
 `FlumeLab.stop()` (really a pause) sets the scheduler's stop event (the

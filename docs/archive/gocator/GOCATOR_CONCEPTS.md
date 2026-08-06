@@ -1,5 +1,7 @@
 # Gocator 2690 concepts (encoderless surface scanning)
 
+> **Archived 2026-08-05.** Kept for historical context; no longer maintained.
+
 Research notes on the LMI Gocator 2690 laser line-profile sensor, focused on
 running it **without an encoder** — an external gantry axis moves the sensor
 at constant velocity, and we issue software start/stop triggers around the

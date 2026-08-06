@@ -1,6 +1,4 @@
-"""
-Laguna: Robotic flume control system for experimental data acquisition and processing.
-"""
+"""Robotic flume control system for experimental data acquisition and processing."""
 
 from importlib.metadata import version as _version
 

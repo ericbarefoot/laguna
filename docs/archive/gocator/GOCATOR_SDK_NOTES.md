@@ -1,7 +1,9 @@
 # LMI Gocator 2690 / GoSDK Notes
 
+> **Archived 2026-08-05.** Kept for historical context; no longer maintained.
+
 Research notes from the vendor GO_SDK (`14400-6.5.2.5_SOFTWARE_GO_SDK`,
-unzipped locally at `/home/eric/Downloads/14400-6.5.2.5_SOFTWARE_GO_SDK/GO_SDK/`,
+unzipped locally at `<local path, not checked into this repo>`,
 **not** checked into this repo) for planning the Gocator 2690 laser
 line-profile sensor integration (IP `192.168.1.10`, branch
 `feat-gocator-integration`). No encoder — motion comes from an existing

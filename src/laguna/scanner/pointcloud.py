@@ -23,13 +23,17 @@ x/y/z raw triple, which is what an un-resampled surface needs.
 from __future__ import annotations
 
 import csv
+from ctypes import c_void_p
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 
 from .mounting import SensorMounting
+
+if TYPE_CHECKING:
+    from .gosdk import GoSdkLib
 
 NM_TO_MM = 1e-6
 UM_TO_MM = 1e-3
@@ -363,7 +367,7 @@ class SurfaceScan:
         """Return a copy with Y rescaled for a corrected travel speed.
 
         Encoderless Y spacing is only as good as the travel speed the sensor
-        was told (see docs/reference/gocator/GOCATOR_CONCEPTS.md §2c). If the
+        was told (see docs/archive/gocator/GOCATOR_CONCEPTS.md §2c). If the
         gantry's true velocity is later measured to differ, this rescales the
         travel axis without a re-scan.
 
@@ -413,8 +417,8 @@ def _scale(raw: np.ndarray, resolution_nm: int, offset_um: int) -> np.ndarray:
 
 
 def uniform_surface_to_scan(
-    lib,
-    msg,
+    lib: "GoSdkLib",
+    msg: c_void_p,
     metadata: Optional[Dict[str, Any]] = None,
     mounting: Optional[SensorMounting] = None,
 ) -> SurfaceScan:
@@ -424,6 +428,7 @@ def uniform_surface_to_scan(
         lib: A :class:`laguna.scanner.gosdk.GoSdkLib`.
         msg: The message handle from ``GoDataSet_At``.
         metadata: Extra context to merge into the result's metadata.
+        mounting: Sensor-to-gantry axis transform. Defaults to identity.
     """
     import ctypes
 
@@ -479,8 +484,8 @@ def uniform_surface_to_scan(
 
 
 def surface_point_cloud_to_scan(
-    lib,
-    msg,
+    lib: "GoSdkLib",
+    msg: c_void_p,
     metadata: Optional[Dict[str, Any]] = None,
     mounting: Optional[SensorMounting] = None,
 ) -> SurfaceScan:
@@ -488,6 +493,12 @@ def surface_point_cloud_to_scan(
 
     Unlike the uniform surface, each cell carries its own x/y/z raw triple
     (an un-resampled surface), so X and Y come back as full 2-D arrays.
+
+    Args:
+        lib: A :class:`laguna.scanner.gosdk.GoSdkLib`.
+        msg: The message handle from ``GoDataSet_At``.
+        metadata: Extra context to merge into the result's metadata.
+        mounting: Sensor-to-gantry axis transform. Defaults to identity.
     """
     import ctypes
 

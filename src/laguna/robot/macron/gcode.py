@@ -413,8 +413,9 @@ class GCodeParser:
         return (x, y, z)
 
     def _resolve_theta(self, words: Dict[str, float]) -> Optional[float]:
-        """Resolve a move's Theta target from an `A` word, or None if this
-        line doesn't touch Theta at all.
+        """Resolve a move's Theta target from an `A` word or None.
+
+        None if this line doesn't touch Theta at all.
 
         Unlike X/Y/Z (which always resolve to a value — an axis not
         mentioned just stays at its current position), Theta has no
@@ -562,8 +563,10 @@ class GCodeParser:
 
 
 def _zt_distance(move: GCodeMove, current_pos: Point3D, current_theta: float) -> float:
-    """"Distance" travelled by a Z/Theta group leg, for duration prediction
-    and speed/ramp scaling (see GCodeExecutor._execute_concurrent_pair).
+    """"Distance" travelled by a Z/Theta group leg.
+
+    For duration prediction and speed/ramp scaling (see
+    GCodeExecutor._execute_concurrent_pair).
 
     Z (mm) and Theta (raw controller units, not a physical length) aren't
     truly commensurate — there's no verified hardware data on how the
@@ -686,8 +689,10 @@ class GCodeExecutor:
         self._theta_group_initialized = False
 
     def plan(self, text: str) -> CheckedTrajectory:
-        """Parse G-code and fence-check it, covering both elbow orderings a
-        concurrent XY+Z(Theta) leg's swept bounding box could take.
+        """Parse G-code and fence-check both elbow orderings.
+
+        Covers both elbow orderings a concurrent XY+Z(Theta) leg's swept
+        bounding box could take.
 
         A move that changes both X/Y and Z runs as two concurrent legs, not
         a single line or a fixed elbow (see the module docstring's
@@ -776,8 +781,9 @@ class GCodeExecutor:
         self._group_initialized = True
 
     def _init_theta_group(self) -> None:
-        """Initialize the responder-node (Z, Theta) group
-        (`C<theta_group_index> INI <z_index> <theta_index>`).
+        """Initialize the responder-node (Z, Theta) coordinated group.
+
+        Sends `C<theta_group_index> INI <z_index> <theta_index>`.
 
         Sent at most once per executor, lazily on the first leg that needs
         it — mirrors _init_group. Only reached when a move changes both Z
@@ -809,8 +815,9 @@ class GCodeExecutor:
         self._theta_group_initialized = True
 
     def reset_group_init(self) -> None:
-        """Forget that either coordinated group was initialized, so the next
-        leg that needs one re-sends its INI.
+        """Forget that coordinated groups were initialized.
+
+        So the next leg that needs one re-sends its INI.
 
         Call after anything that may have cleared the controller's own
         group state — a power-cycle, a reflash, or a reconnect that might
@@ -820,8 +827,9 @@ class GCodeExecutor:
         self._theta_group_initialized = False
 
     def _leg_kinds(self, move: GCodeMove) -> Tuple[bool, str]:
-        """Classify a LINEAR move, relative to the executor's current
-        position, into (touches_xy, responder_kind).
+        """Classify a LINEAR move into (touches_xy, responder_kind).
+
+        Relative to the executor's current position.
 
         responder_kind is one of "none", "z", "theta", "z_theta" — which
         responder-node command shape (no motion, single-axis Z,
@@ -969,10 +977,11 @@ class GCodeExecutor:
         self._poll_theta_group_move_finished(predicted_s=predicted_move_s(distance, speed))
 
     def _execute_zt_leg(self, move: GCodeMove) -> None:
-        """Move Z and Theta together via their own coordinated group
-        (`C<theta_group_index>`) — both live on the responder node, so
-        this group doesn't cross the node boundary the X/Y group can't
-        cross. See the module docstring.
+        """Move Z and Theta together via coordinated group.
+
+        Via their own coordinated group (`C<theta_group_index>`) — both live
+        on the responder node, so this group doesn't cross the node boundary
+        the X/Y group can't cross. See the module docstring.
         """
         current_pos = self._current_pos
         current_theta = self._current_theta
@@ -1004,8 +1013,9 @@ class GCodeExecutor:
         self._poll_xy_leg(move, current_pos)
 
     def _read_xy_ramp(self) -> Tuple[float, float]:
-        """Return the X/Y group's currently configured (accel, decel), for
-        scaling down the other leg's ramp to match — see
+        """Return the X/Y group's currently configured (accel, decel).
+
+        For scaling down the other leg's ramp to match — see
         _execute_concurrent_pair. Initializes the group first (lazily, like
         every other XY-group access) since querying ACL/DCL before INI is
         untested.
@@ -1018,8 +1028,9 @@ class GCodeExecutor:
         self._cmd.group_set_decel(decel)
 
     def _read_responder_ramp(self, responder: str) -> Tuple[float, float]:
-        """Return the responder leg's currently configured (accel, decel),
-        for whichever command shape `responder` names — mirrors
+        """Return the responder leg's currently configured (accel, decel).
+
+        For whichever command shape `responder` names — mirrors
         _read_xy_ramp for the other side of _execute_concurrent_pair.
         """
         if responder == "z":
@@ -1041,9 +1052,10 @@ class GCodeExecutor:
             self._theta_cmd.group_set_decel(decel)
 
     def _execute_concurrent_pair(self, move: GCodeMove, responder: str) -> None:
-        """Fire the responder leg (Z, Theta, or Z+Theta) and the commander
-        XY leg as two independent non-blocking BMTs, back-to-back, then
-        poll both to completion.
+        """Fire the responder and commander legs as independent non-blocking BMTs.
+
+        Fire the responder leg (Z, Theta, or Z+Theta) and the commander
+        XY leg back-to-back, then poll both to completion.
 
         Whichever leg travels *less* distance is scaled down — speed,
         accel, and decel all multiplied by the same ratio `k` (its

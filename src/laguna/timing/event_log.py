@@ -15,11 +15,17 @@ _HEADER = [
 
 
 def _last_event_id(path: Path) -> int:
-    """Read the last well-formed row's event_id from an existing event log.
+    """Read the last well-formed event_id from an existing event log.
 
-    Scans from the end so a resumed experiment's IDs continue past what's
-    already in the file (never restart at 1 and collide with earlier rows)
-    even if the very last row was left malformed by a crash mid-write.
+    Scans from the end to find the most recent valid row, so resumed
+    experiments continue ID numbering past existing rows (never restart at 1
+    and collide) even if the final row was left malformed by a crash.
+
+    Args:
+        path: Path to the event log file.
+
+    Returns:
+        The highest event_id in the file, or 0 if none found or no valid rows.
     """
     with open(path, newline="") as f:
         rows = list(csv.reader(f))
@@ -64,6 +70,15 @@ class EventLog:
     """
 
     def __init__(self, path: str) -> None:
+        """Initialize the event log.
+
+        Creates the file with a header row on first open; if the file already
+        exists, appends to it without re-writing the header so resumed
+        experiments accumulate in the same log.
+
+        Args:
+            path: File path for the CSV event log.
+        """
         self._path = Path(path)
         self._lock = threading.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,11 +99,20 @@ class EventLog:
         notes: str = "",
         refers_to: Optional[int] = None,
     ) -> int:
-        """Append one event row and flush to disk.
+        """Append one event row to the log and flush to disk.
+
+        Args:
+            runtime_s: Experiment runtime in seconds when the event occurred.
+            subsystem: Name of the subsystem generating this event.
+            event_type: Type/name of the event.
+            result: Status string, typically "ok" or "failed" or an error.
+            notes: Optional freeform context about the event.
+            refers_to: Optional event_id of a prior row this event explains
+                or annotates (e.g., an operator note added after a pause).
 
         Returns:
-            This row's event_id — capture it to let a later note refer
-            back to this specific event via log()'s refers_to.
+            This row's event_id; capture it to let later notes refer back
+            to this specific event via the refers_to parameter.
         """
         now = time.time()
         iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
@@ -103,7 +127,7 @@ class EventLog:
         return event_id
 
     def close(self) -> None:
-        """Flush and close the underlying file."""
+        """Flush and close the event log file."""
         with self._lock:
             self._fh.flush()
             self._fh.close()

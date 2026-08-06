@@ -1,5 +1,7 @@
 # Roadmap: co-scripting the survey instruments with the rest of FlumeLab
 
+> **Archived 2026-08-05.** Kept for historical context; no longer maintained.
+
 > Status: **all five workstreams implemented**, each as its own PR in a
 > stack off `develop`. Written 2026-08-03 alongside the Gocator integration
 > work. None has been validated against hardware yet.

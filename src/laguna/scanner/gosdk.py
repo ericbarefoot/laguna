@@ -9,7 +9,7 @@ The vendor SDK ships no Python bindings (C/C#/VB.NET samples only), and no
 prebuilt x86_64 shared library — see ``scripts/build_gosdk.sh``. Function
 signatures below are transcribed from the SDK headers; each group cites the
 header it came from so they can be re-checked against a future SDK version.
-SDK reference notes: ``docs/reference/gocator/GOCATOR_SDK_NOTES.md``.
+SDK reference notes: ``docs/archive/gocator/GOCATOR_SDK_NOTES.md``.
 
 Polling (``GoSystem_ReceiveData``) is used rather than GoSdk's async
 data-handler callback: the callback fires on a thread the SDK spawns itself,
@@ -112,6 +112,7 @@ class GoSdkError(RuntimeError):
     """A GoSdk call returned a non-kOK status."""
 
     def __init__(self, function: str, status: int):
+        """Initialize an SDK error with function name and status code."""
         self.function = function
         self.status = status
         super().__init__(f"{function} failed with kStatus={status}")
@@ -239,6 +240,7 @@ class GoSdkLib:
     """
 
     def __init__(self, lib_dir: Optional[str] = None):
+        """Load the GoSdk libraries and apply function prototypes."""
         self.lib_dir = find_lib_dir(lib_dir)
         # kApi must be RTLD_GLOBAL: libGoSdk.so resolves kApi symbols at load.
         self.kapi = ctypes.CDLL(

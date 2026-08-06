@@ -24,9 +24,8 @@ make docs-serve      # http://127.0.0.1:8000, live-reloads as you edit docs/*.md
 ```bash
 git clone <repo-url>
 cd laguna
-python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -e ".[dev]"
+mamba env create -f environment.yml   # or: conda env create -f environment.yml
+mamba activate flumelab               # or: conda activate flumelab
 ```
 
 ## Run Your First Experiment

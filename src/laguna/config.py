@@ -20,8 +20,8 @@ class Config:
         """Initialize configuration.
 
         Args:
-            config_file: Path to YAML configuration file
-            defaults: Default configuration dictionary
+            config_file: Path to YAML configuration file.
+            defaults: Default configuration dictionary.
         """
         self.config_dict = defaults or self._get_defaults()
 
@@ -45,9 +45,9 @@ class Config:
     @staticmethod
     def _get_defaults() -> Dict[str, Any]:
         """Get default configuration values.
-        
+
         Returns:
-            Dictionary with default configuration
+            Dictionary with default subsystem configuration.
         """
         return {
             "robot": {
@@ -128,7 +128,7 @@ class Config:
                 "fences": [],
                 # TEMPORARY: 1 raw controller (ACP) unit measures as this many real
                 # mm on X/Y/Z — confirmed 15.0 on hardware 2026-07-28, see
-                # docs/GANTRY_UNIT_CALIBRATION.md. This is the single toggle: once
+                # docs/archive/GANTRY_UNIT_CALIBRATION.md. This is the single toggle: once
                 # the Snap2Motion/DSM project's axis scale is fixed at the source,
                 # change this to 1.0 (and gantry_agent.py's matching
                 # MM_PER_ACP_UNIT constant) — nothing else needs to change.
@@ -158,12 +158,12 @@ class Config:
     
     def load_from_file(self, config_file: str) -> None:
         """Load configuration from a YAML file.
-        
+
         Args:
-            config_file: Path to the YAML configuration file
-            
+            config_file: Path to the YAML configuration file.
+
         Raises:
-            FileNotFoundError: If configuration file does not exist
+            FileNotFoundError: If configuration file does not exist.
         """
         path = Path(config_file)
         if not path.exists():
@@ -181,10 +181,10 @@ class Config:
     @staticmethod
     def _merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> None:
         """Merge override configuration into base configuration.
-        
+
         Args:
-            base: Base configuration dictionary (modified in place)
-            override: Override configuration dictionary
+            base: Base configuration dictionary (modified in place).
+            override: Override configuration dictionary.
         """
         for key, value in override.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
@@ -194,15 +194,15 @@ class Config:
     
     def get(self, subsystem: str) -> Dict[str, Any]:
         """Get configuration for a specific subsystem.
-        
+
         Args:
-            subsystem: Name of the subsystem (e.g., 'robot', 'camera')
-            
+            subsystem: Name of the subsystem (e.g., 'robot', 'camera').
+
         Returns:
-            Configuration dictionary for the subsystem
-            
+            Configuration dictionary for the subsystem.
+
         Raises:
-            KeyError: If subsystem configuration not found
+            KeyError: If subsystem configuration not found.
         """
         if subsystem not in self.config_dict:
             raise KeyError(f"Configuration for subsystem '{subsystem}' not found")
@@ -210,13 +210,13 @@ class Config:
     
     def get_value(self, path: str, default: Any = None) -> Any:
         """Get a specific configuration value using dot notation.
-        
+
         Args:
-            path: Dot-separated path (e.g., 'robot.port')
-            default: Default value if path not found
-            
+            path: Dot-separated path (e.g., 'robot.port').
+            default: Default value if path not found.
+
         Returns:
-            Configuration value or default if not found
+            Configuration value or default if not found.
         """
         keys = path.split(".")
         value = self.config_dict

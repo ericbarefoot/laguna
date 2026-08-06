@@ -68,16 +68,34 @@ class Pass:
 
     @property
     def length_mm(self) -> float:
+        """Get the traverse distance in mm.
+
+        Returns:
+            Distance from start to end.
+        """
         return math.dist(self.start, self.end)
 
     def duration_s(self, feed_rate_mm_s: Optional[float] = None) -> Optional[float]:
-        """How long this pass takes to traverse, if a feed rate is known."""
+        """Get the traverse duration at a given feed rate.
+
+        Args:
+            feed_rate_mm_s: Feed rate in mm/s. If not provided, uses the pass's
+                configured feed_rate_mm_s.
+
+        Returns:
+            Duration in seconds, or None if no feed rate is available.
+        """
         rate = feed_rate_mm_s or self.feed_rate_mm_s
         if not rate:
             return None
         return self.length_mm / rate
 
     def to_dict(self) -> Dict[str, Any]:
+        """Export pass to a dictionary.
+
+        Returns:
+            Dict with pass index, start/end, instrument, axis, feed rate, and label.
+        """
         return {
             "index": self.index,
             "start": list(self.start),
@@ -90,24 +108,40 @@ class Pass:
 
 
 class Survey:
-    """Base for anything that plans a list of passes."""
+    """Base class for survey planners that produce a list of passes."""
 
     def passes(self) -> List[Pass]:  # pragma: no cover - interface
+        """Get the planned passes.
+
+        Returns:
+            List of Pass objects.
+        """
         raise NotImplementedError
 
     def __iter__(self) -> Iterator[Pass]:
+        """Iterate over the passes."""
         return iter(self.passes())
 
     def __len__(self) -> int:
+        """Get the number of passes.
+
+        Returns:
+            Number of passes in this survey.
+        """
         return len(self.passes())
 
     def duration_s(self, feed_rate_mm_s: Optional[float] = None) -> Optional[float]:
-        """Total traverse time, ignoring repositioning between passes.
+        """Get total traverse time, ignoring repositioning between passes.
 
-        A lower bound rather than an estimate — the gantry still has to get
-        from the end of one pass to the start of the next, and the sensor
-        needs its settle time. Useful for "will this fit in the gap between
-        scheduled events", which is the question that usually matters.
+        A lower bound, as the gantry repositioning and sensor settle time are
+        not included.
+
+        Args:
+            feed_rate_mm_s: Feed rate in mm/s. If not provided, uses each pass's
+                configured feed rate.
+
+        Returns:
+            Total duration in seconds, or None if any pass lacks a feed rate.
         """
         totals = [p.duration_s(feed_rate_mm_s) for p in self.passes()]
         if any(t is None for t in totals):
@@ -115,7 +149,11 @@ class Survey:
         return sum(totals)
 
     def describe(self) -> str:
-        """Multi-line summary, for printing a plan before running it."""
+        """Get a multi-line human-readable summary.
+
+        Returns:
+            Formatted string describing all passes in the survey.
+        """
         rows = [f"{len(self)} passes"]
         for p in self.passes():
             rows.append(
@@ -168,6 +206,7 @@ class RasterSurvey(Survey):
     feed_rate_mm_s: Optional[float] = None
 
     def __post_init__(self) -> None:
+        """Validate raster survey parameters."""
         if len(self.origin) != 3:
             raise ValueError(f"origin must have 3 components [x, y, z], got {self.origin!r}")
         if self.swath_mm <= 0:
@@ -189,10 +228,19 @@ class RasterSurvey(Survey):
 
     @property
     def pitch_mm(self) -> float:
-        """Distance between adjacent pass centres."""
+        """Get the distance between adjacent pass centres.
+
+        Returns:
+            Pitch distance in mm.
+        """
         return self.swath_mm * (1.0 - self.overlap)
 
     def passes(self) -> List[Pass]:
+        """Generate the planned passes for this raster survey.
+
+        Returns:
+            List of Pass objects tiling the region.
+        """
         travel_i = _AXIS_INDEX[self.axis]
         step_i = _AXIS_INDEX[self.step_axis]
 
@@ -235,7 +283,11 @@ class RasterSurvey(Survey):
         return out
 
     def coverage_mm(self) -> float:
-        """Total width actually imaged, which may exceed `width_mm`."""
+        """Get the total width actually imaged.
+
+        Returns:
+            Total width coverage, which may exceed requested width_mm due to overlap.
+        """
         passes = self.passes()
         step_i = _AXIS_INDEX[self.step_axis]
         first = passes[0].start[step_i]
@@ -271,6 +323,7 @@ class RepeatTransect(Survey):
     feed_rate_mm_s: Optional[float] = None
 
     def __post_init__(self) -> None:
+        """Validate repeat transect parameters."""
         if len(self.start) != 3:
             raise ValueError(f"start must have 3 components [x, y, z], got {self.start!r}")
         if len(self.end) != 3:
@@ -281,6 +334,11 @@ class RepeatTransect(Survey):
             raise ValueError("at least one instrument is required")
 
     def passes(self) -> List[Pass]:
+        """Generate the planned passes for this repeat transect survey.
+
+        Returns:
+            List of Pass objects repeating the transect with each instrument.
+        """
         out: List[Pass] = []
         for r in range(self.repeats):
             for instrument in self.instruments:
@@ -322,25 +380,36 @@ class SurveyRunner:
     """
 
     def __init__(self, lab: Any, survey: Survey, checkpoint: Optional[Any] = None) -> None:
+        """Initialize a survey runner.
+
+        Args:
+            lab: Connected FlumeLab instance.
+            survey: The survey plan to execute.
+            checkpoint: Optional CheckpointStore for resumable execution.
+        """
         self.lab = lab
         self.survey = survey
         self.checkpoint = checkpoint
         self.completed: List[int] = []
 
     def pending(self) -> List[Pass]:
-        """Passes not yet done, according to the checkpoint."""
+        """Get the list of passes not yet completed.
+
+        Returns:
+            Passes not yet done, according to the checkpoint (if present).
+        """
         if self.checkpoint is None:
             return list(self.survey.passes())
         return [p for p in self.survey.passes() if not self.checkpoint.is_complete(p.index)]
 
     def run(self, dry_run: bool = False) -> List[Pass]:
-        """Execute the pending passes in order.
+        """Execute all pending passes in order.
 
         Args:
-            dry_run: Log the plan without moving or measuring.
+            dry_run: If True, log the plan without moving or measuring.
 
         Returns:
-            The passes actually executed.
+            The passes that were executed.
         """
         done: List[Pass] = []
         for p in self.pending():
@@ -361,15 +430,17 @@ class SurveyRunner:
         return done
 
     def _run_pass(self, p: Pass) -> None:
-        """Position for one pass and measure it.
+        """Position and measure one pass.
 
-        Logs one event-log row per pass — success or failure — so a survey's
-        activity is traceable the same way every other scheduled action's is
-        (see laguna.core._for_each_subsystem's rationale: silently missing
-        data can invalidate an experiment as thoroughly as bad data can).
-        Re-raises after logging, since a failed pass mid-survey is exactly
-        the "run is no longer doing what it was told" case the rest of the
-        codebase escalates rather than silently continuing past.
+        Logs success or failure to the event log, then re-raises on error so
+        a failed pass escalates (not silently continues).
+
+        Args:
+            p: Pass to execute.
+
+        Raises:
+            ValueError: If the pass is missing required parameters.
+            Any exception from scanner.acquire() or the profiler path.
         """
         # place() puts the INSTRUMENT's measuring point on the target, which
         # is what makes one plan valid for several instruments.

@@ -31,7 +31,12 @@ import numpy as np
 
 @dataclass
 class CalibrationPoint:
-    """One (known real-world height, raw sensor reading) pair."""
+    """A single (known real-world height, raw sensor reading) calibration pair.
+
+    Attributes:
+        known_height_mm: Reference height in millimeters.
+        raw_value: Corresponding uncalibrated sensor reading.
+    """
 
     known_height_mm: float
     raw_value: float
@@ -39,21 +44,18 @@ class CalibrationPoint:
 
 @dataclass
 class LinearCalibration:
-    """A fitted real_height_mm = slope * raw_value + intercept transform.
+    """A fitted linear transform mapping raw sensor readings to real heights.
 
-    Args:
-        device: Free-form device identifier, e.g. "od2000" or
-            "wtt12l_powerprox" — stored for reference, not interpreted by
-            this module.
-        slope: Fitted slope.
-        intercept: Fitted intercept.
-        r_squared: Coefficient of determination of the fit against
-            `points`. 1.0 for an exact fit (also the trivial case with
-            exactly 2 points); lower values mean the raw/height
-            relationship isn't very linear, or the readings were noisy.
-        points: The calibration points the fit was computed from.
-        created_at: ISO-ish local timestamp string, set automatically by
-            fit().
+    Represents real_height_mm = slope * raw_value + intercept for a specific
+    rangefinder device, fitted against calibration points.
+
+    Attributes:
+        device: Device identifier (e.g. "od2000", "wtt12l_powerprox").
+        slope: Fitted slope coefficient.
+        intercept: Fitted intercept coefficient.
+        r_squared: Coefficient of determination (1.0 = perfect fit).
+        points: Calibration points used to fit the line.
+        created_at: ISO-format timestamp when the calibration was created.
     """
 
     device: str
@@ -64,22 +66,38 @@ class LinearCalibration:
     created_at: str = ""
 
     def apply(self, raw_value: float) -> float:
-        """Transform a raw sensor reading to real-world z height (mm)."""
+        """Transform a raw sensor reading to real-world z height (mm).
+
+        Args:
+            raw_value: Uncalibrated sensor reading.
+
+        Returns:
+            Calibrated height in millimeters.
+        """
         return self.slope * raw_value + self.intercept
 
     def residuals_mm(self) -> List[float]:
-        """Per-point (predicted - known) error in mm, for sanity-checking
-        fit quality beyond the single r_squared number."""
+        """Compute per-point fit residuals (predicted - known) in mm.
+
+        Returns:
+            List of residuals for each calibration point, useful for
+            assessing fit quality beyond the r_squared value alone.
+        """
         return [self.apply(p.raw_value) - p.known_height_mm for p in self.points]
 
     @classmethod
     def fit(cls, device: str, points: Sequence[CalibrationPoint]) -> "LinearCalibration":
         """Least-squares fit a line through the given calibration points.
 
+        Args:
+            device: Device identifier for the resulting calibration.
+            points: At least 2 (raw_value, known_height_mm) pairs.
+
+        Returns:
+            Fitted LinearCalibration with slope, intercept, and r_squared.
+
         Raises:
-            ValueError: If fewer than 2 points are given (a line needs at
-                least 2 points; r_squared is trivially 1.0 with exactly 2
-                and isn't a meaningful quality signal until you have 3+).
+            ValueError: If fewer than 2 points are given.
         """
         if len(points) < 2:
             raise ValueError(
@@ -102,11 +120,10 @@ class LinearCalibration:
         )
 
     def to_csv(self, path: Union[str, Path]) -> None:
-        """Save this calibration (fit parameters + source points) to CSV.
+        """Save calibration (parameters and points) to CSV file.
 
-        The file has a small metadata block, a blank line, then the
-        calibration points — see from_csv() for the exact format this
-        round-trips through.
+        Args:
+            path: File path to write (metadata, blank line, then points).
         """
         path = Path(path)
         with path.open("w", newline="") as f:
@@ -124,11 +141,16 @@ class LinearCalibration:
 
     @classmethod
     def from_csv(cls, path: Union[str, Path]) -> "LinearCalibration":
-        """Load a calibration previously saved with to_csv().
+        """Load a calibration from a CSV file written by to_csv().
+
+        Args:
+            path: File path to read.
+
+        Returns:
+            LinearCalibration instance with metadata and points.
 
         Raises:
-            ValueError: If required metadata (slope, intercept) is missing
-                — i.e. the file isn't one to_csv() wrote.
+            ValueError: If required metadata (slope, intercept) is missing.
         """
         path = Path(path)
         with path.open("r", newline="") as f:

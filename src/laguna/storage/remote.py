@@ -59,7 +59,10 @@ class RemoteStorage:
             return False
 
     def disconnect(self) -> None:
-        """Disconnect from remote storage."""
+        """Disconnect from remote storage.
+
+        Sets is_connected to False after backend disconnect.
+        """
         if self.backend and self.is_connected:
             self.backend.disconnect()
             self.is_connected = False
@@ -69,11 +72,11 @@ class RemoteStorage:
         """Upload file to remote storage.
 
         Args:
-            local_path: Local file path
-            remote_path: Remote storage path
+            local_path: Local file path.
+            remote_path: Remote destination path.
 
         Returns:
-            True if upload successful
+            True if upload successful, False if disabled or connection unavailable.
         """
         if not self.enabled or not self.is_connected:
             logger.warning("Remote storage not available")
@@ -92,11 +95,11 @@ class RemoteStorage:
         """Download file from remote storage.
 
         Args:
-            remote_path: Remote storage path
-            local_path: Local file path for download
+            remote_path: Path on remote storage.
+            local_path: Local destination path.
 
         Returns:
-            True if download successful
+            True if download successful, False if disabled or connection unavailable.
         """
         if not self.enabled or not self.is_connected:
             logger.warning("Remote storage not available")
@@ -115,10 +118,10 @@ class RemoteStorage:
         """List files in remote storage.
 
         Args:
-            remote_path: Remote storage path to list
+            remote_path: Path on remote storage to list.
 
         Returns:
-            List of filenames or None if failed
+            List of filenames, empty list if path empty, or None on error.
         """
         if not self.enabled or not self.is_connected:
             return None
@@ -132,10 +135,10 @@ class RemoteStorage:
             return None
 
     def _get_backend(self) -> Optional["StorageBackend"]:
-        """Factory method to get storage backend.
+        """Factory method to instantiate storage backend by type.
 
         Returns:
-            StorageBackend instance or None
+            StorageBackend instance (S3, SFTP, or Local) or None if unsupported.
         """
         storage_type = self.storage_type.lower()
 

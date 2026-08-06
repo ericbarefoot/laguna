@@ -1,5 +1,7 @@
 # Finding: Gantry ACP Units Are Not Millimeters
 
+> **Archived 2026-08-05.** Kept for historical context; no longer maintained.
+
 **Status as of 2026-07-29: confirmed on hardware, still not fixed at the
 source — but the software workaround described below has now landed as a
 single toggle in two places, replacing the scattered per-script stopgaps.

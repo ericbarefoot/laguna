@@ -36,6 +36,15 @@ class CameraManager:
     subsystem_name = "cameras"
 
     def __init__(self, configs: List[Dict[str, Any]]) -> None:
+        """Initialize camera manager from a list of camera configuration dicts.
+
+        Each config dict should have a 'type' key ('network' or 'local')
+        and type-specific settings (hosts, ssh_user, etc. for network;
+        device_id, fps, etc. for local).
+
+        Args:
+            configs: List of camera configuration dicts.
+        """
         self._network: List[CameraArray] = []
         self._local: List[LocalCamera] = []
         self._lead_times: Dict[int, float] = {}
@@ -195,9 +204,11 @@ class CameraManager:
 
     @property
     def is_recording(self) -> bool:
+        """True if any local camera is currently recording."""
         return any(c.is_recording for c in self._local)
 
     def get_frame_count(self) -> int:
+        """Return total frame count across all local cameras."""
         return sum(c.get_frame_count() for c in self._local)
 
     def get_status(self) -> dict:

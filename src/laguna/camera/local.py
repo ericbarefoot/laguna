@@ -14,6 +14,12 @@ class LocalCamera:
     """
 
     def __init__(self, config: Dict[str, Any]) -> None:
+        """Initialize local camera from configuration dict.
+
+        Args:
+            config: Dict with optional keys: name, device_id, fps, resolution,
+                capture_format.
+        """
         self.name = config.get("name", "local")
         self.device_id = config.get("device_id", 0)
         self.fps = config.get("fps", 30)
@@ -76,6 +82,7 @@ class LocalCamera:
         logger.info("LocalCamera '%s': recording stopped", self.name)
 
     def get_frame_count(self) -> int:
+        """Return the total number of frames captured so far."""
         return self.frame_count
 
 

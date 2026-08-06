@@ -73,6 +73,18 @@ class TopographicProfiler:
         output_dir: str = "/tmp",
         sensor: str = "od2000",
     ):
+        """Initialize the topographic profiler.
+
+        Args:
+            gantry: GantryController whose connection is a PiGantryConnection.
+            pi_host: Hostname of the Pi (e.g., 'red.lab').
+            pi_user: SSH username on the Pi.
+            pi_key: Path to SSH private key (optional).
+            pdin_port: IO-Link port number (1–8).
+            al1342_host: AL1342 IP address.
+            output_dir: Local directory where retrieved CSVs are saved.
+            sensor: "od2000" (default) or "wtt12l_powerprox".
+        """
         if not al1342_host:
             raise ValueError("al1342_host must be specified")
         self._gantry = gantry
@@ -175,9 +187,12 @@ class TopographicProfiler:
         return ProfileResult(path=local_csv, metadata=metadata, df=df)
 
     def stop(self) -> None:
-        """Cancel the currently running scan. Safe to call from another
-        thread while scan() is blocked in wait_for_scan_result() — the
-        agent's BST-on-cancel path still ends with a normal scan_done."""
+        """Cancel the currently running scan.
+
+        Safe to call from another thread while scan() is blocked in
+        wait_for_scan_result() — the agent's BST-on-cancel path still ends
+        with a normal scan_done message.
+        """
         self._gantry.connection.stop_scan()
 
     # ------------------------------------------------------------------
@@ -185,10 +200,23 @@ class TopographicProfiler:
     # ------------------------------------------------------------------
 
     def _sftp_retrieve(self, remote_csv: str, local_csv: Path, remote_meta: str, local_meta: Path) -> None:
-        """Retrieve the CSV (and best-effort the metadata sidecar) from the
-        Pi's disk via a small, dedicated SFTP session — separate from the
-        gantry's own persistent agent connection, which is reserved for the
-        JSON command/scan protocol."""
+        """Retrieve the CSV and metadata files from the Pi via SFTP.
+
+        Retrieves CSV from remote Pi disk to local path. Attempts best-effort
+        retrieval of metadata sidecar; its absence is not fatal. Uses a small,
+        dedicated SFTP session separate from the gantry's own persistent agent
+        connection, which is reserved for the JSON command/scan protocol.
+
+        Args:
+            remote_csv: Remote path to CSV file on Pi.
+            local_csv: Local path to save CSV file.
+            remote_meta: Remote path to metadata file on Pi.
+            local_meta: Local path to save metadata file.
+
+        Raises:
+            ImportError: If paramiko is not installed.
+            OSError: If SFTP retrieval fails.
+        """
         try:
             import paramiko  # type: ignore[import]
         except ImportError as e:

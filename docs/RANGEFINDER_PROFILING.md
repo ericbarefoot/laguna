@@ -1,50 +1,45 @@
 # Topographic Profiling with the SICK OD2000 Rangefinder
 
-**Status as of 2026-07-28: implemented and unified into the gantry agent.**
-Scanning no longer uses a separate deployed script — `gantry_agent.py`
+Scanning is implemented and unified into the gantry agent. `gantry_agent.py`
 (`src/laguna/robot/macron/gantry_agent.py`, the same persistent Pi-side
 process that already handles interactive axis commands via
 `PiGantryConnection`) is the sole owner of the BLC serial port and runs
 scans on a background thread, with a live STOP path
 (`TopographicProfiler.stop()` → agent-side `BST`). `TopographicProfiler`
-(`src/laguna/robot/macron/profiler.py`) is now a thin coordinator over
+(`src/laguna/robot/macron/profiler.py`) is a thin coordinator over
 `gantry.connection.start_scan()`/`wait_for_scan_result()`. See
 `docs/subsystems/rangefinder.md` for usage and `docs/MQTT_AL1342_SETUP.md`
 for the one-time AL1342 hardware bring-up steps.
 
-**Open items resolved:**
-- Serial safety: a single `threading.Lock` inside `SerialBridge.send()`
-  serializes interactive commands and the scan worker thread on one shared
-  connection — no more disconnect/reconnect handoff between two processes.
-- Clock correction not needed — BLC serial and OD2000 polling both run on
-  the Pi's single local clock.
-- AL1342 achieved rate: MQTT push tops out at 2 Hz (`timer[n]` floor,
-  confirmed by measurement); scans instead poll `pdin/getdata` directly
-  over a persistent HTTP connection, measured at **380.7 Hz, zero errors**
-  on hardware 2026-07-28 — see `docs/MQTT_AL1342_SETUP.md`.
-- PDIN byte layout confirmed: big-endian int32 nm, validated against a
-  physical 808.4 mm ± 0.1 mm reference (decoded 808.2778 mm).
-- `serial_bridge.py` confirmed (from source) to hold the serial port
-  permanently for its process lifetime — it and `gantry_agent.py` must
-  never run concurrently; no longer something `TopographicProfiler` needs
-  to work around, since it doesn't touch the serial port itself at all.
+Serial safety is managed through a single `threading.Lock` inside `SerialBridge.send()`
+that serializes interactive commands and the scan worker thread on one shared
+connection — no disconnect/reconnect handoff between two processes is needed.
+Clock correction is not required because BLC serial and OD2000 polling both run on
+the Pi's single local clock.
 
-**Open items remaining:** run a commanded-vs-actual validation pass on real
-hardware (compare predicted end position to ACP after a real move); confirm
-STOP latency on hardware (expected ~one MIF poll tick, ~0.1s).
+The AL1342 MQTT push rate tops out at 2 Hz (`timer[n]` floor); scans instead poll
+`pdin/getdata` directly over a persistent HTTP connection, achieving **380.7 Hz, zero errors**.
+The PDIN byte layout is big-endian int32 nm, validated against a physical 808.4 mm ± 0.1 mm
+reference (decoded 808.2778 mm). See `docs/MQTT_AL1342_SETUP.md` for details.
+
+Note that `serial_bridge.py` holds the serial port permanently for its process lifetime — it and
+`gantry_agent.py` must never run concurrently. `TopographicProfiler` no longer needs to work
+around this constraint since it does not touch the serial port itself.
+
+**Not yet implemented:** commanded-vs-actual validation on real hardware (comparing predicted end
+position to ACP after a real move); STOP latency measurement (expected ~one MIF poll tick, ~0.1s).
 
 ---
 
-*Original brainstorm (retained for context):* written after a serial-polling
-speed benchmark found the controller capped at ~3.48 Hz for safe position
-polling, and that pipelining reads caused a hang requiring physical power-cycle.
-This document asked: can we build a topographic elevation profile without
-depending on high-rate position feedback from that controller at all?
+## Design constraints and rationale
 
-**Confirmed so far:** the scan is 1D, on an **X or Y** axis (a separate tool
-handles 2D scans, out of scope here); the profiling/fusion logic should run
-**on the Pi** (`red.dyn.ucr.edu`), not centrally from the laguna PC — see
-"Infrastructure" below for why that matters.
+The controller is capped at approximately 3.48 Hz for safe position polling, and
+pipelining reads causes a hang requiring physical power-cycle. This design avoids
+depending on high-rate position feedback from the controller at all.
+
+The scan operates on a single axis — **X or Y** (a separate tool handles 2D scans,
+out of scope here). The profiling and fusion logic runs **on the Pi** (`red.dyn.ucr.edu`),
+not centrally from the laguna PC — see "Infrastructure" below for why that matters.
 
 ## The sensor and its data path
 
@@ -277,15 +272,15 @@ validation of using the capture-latch for an external trigger rather than a
 limit switch. **C** remains the highest-fidelity, highest-effort fallback
 if neither A nor B proves accurate enough.
 
-## Open items
+## Outstanding technical work
 
-- **Measure the actual MQTT publish rate empirically** once observable live
-  — the AL1342's exact IoT/MQTT cycle-time spec couldn't be confirmed from
-  public documentation, and this rate (not the sensor's internal 7.5kHz, and
-  not the OEM-2T) is the real ceiling on spatial resolution for Approach A.
-- Confirm the AL1342's IoT/MQTT feature is actually enabled/configured (vs.
-  needing setup) before building against it.
-- Once Approach A is prototyped, run the commanded-vs-actual validation
-  pass (compare predicted end position to `ACP`/`ENP` after a real move) —
-  this hasn't been done for this hardware at all yet, per `ARCHITECTURE.md`'s
+- **Measure the actual MQTT publish rate empirically** — the AL1342's exact IoT/MQTT
+  cycle-time spec is not confirmed from public documentation, and this rate
+  (not the sensor's internal 7.5kHz, and not the OEM-2T) is the real ceiling on
+  spatial resolution for Approach A.
+- Confirm the AL1342's IoT/MQTT feature is enabled and configured before
+  depending on it.
+- Conduct a commanded-vs-actual validation pass (comparing predicted end
+  position to `ACP`/`ENP` after a real move once Approach A is prototyped) —
+  this has not been done for this hardware yet, per `ARCHITECTURE.md`'s
   own "Next Steps" list.

@@ -5,9 +5,8 @@
 ```bash
 git clone <repo-url>
 cd laguna
-python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -e ".[dev]"
+mamba env create -f environment.yml   # or: conda env create -f environment.yml
+mamba activate flumelab               # or: conda activate flumelab
 ```
 
 Verify it worked:
@@ -181,8 +180,9 @@ laguna/
 ## Common Errors
 
 **`ModuleNotFoundError: No module named 'laguna'`**
-Confirm you ran `pip install -e "."` inside an activated venv
-(`which python` should point into the venv).
+Confirm you activated the `flumelab` conda env (`mamba activate flumelab`)
+and that `environment.yml` was applied (`which python` should point into
+`.../envs/flumelab`).
 
 **Serial port permission denied (Linux/macOS)**
 ```bash

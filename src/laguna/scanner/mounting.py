@@ -76,9 +76,8 @@ def _parse_target(spec: Any, key: str) -> Tuple[int, float]:
 class SensorMounting:
     """How the sensor's X/Y/Z sit in the gantry's X/Y/Z.
 
-    Args:
-        scan_x, scan_y, scan_z: Where each sensor axis points in gantry
-            terms, e.g. ``"-Y"``. Defaults form the identity map.
+    Each axis maps to a signed gantry axis, e.g. ``"-Y"``. Defaults form the
+    identity map. See ``__init__`` for the per-axis parameters.
 
     Raises:
         ValueError: If two sensor axes map onto the same gantry axis, or if
@@ -92,6 +91,13 @@ class SensorMounting:
         scan_y: str = "+Y",
         scan_z: str = "+Z",
     ) -> None:
+        """Initialize sensor-to-gantry axis mapping.
+
+        Args:
+            scan_x: Sensor X axis (across laser) target in gantry coords.
+            scan_y: Sensor Y axis (along travel) target in gantry coords.
+            scan_z: Sensor Z axis (range/standoff) target in gantry coords.
+        """
         self.spec: Dict[str, str] = {
             "scan_x": scan_x,
             "scan_y": scan_y,

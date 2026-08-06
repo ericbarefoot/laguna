@@ -16,44 +16,32 @@ from .decoders import decode_dp4200_wtt12l_analog_pdin, decode_od2000_pdin
 
 
 class RangefinderSubsystem:
-    """Base rangefinder subsystem backed by an AL1342 MQTT data stream, with
-    on-demand HTTP access (activate/deactivate/read_mm) for interactive use.
+    """Base rangefinder subsystem backed by an AL1342 MQTT data stream.
 
-    Delegates connection lifecycle to the provided MqttSubscriber, then
-    decodes incoming PDIN payloads and caches the latest reading — this
-    MQTT path is for continuous/background monitoring and is what scans
-    use internally. activate()/read_mm() are a separate, synchronous HTTP
-    path (mirrors laguna.weir.SaflWeirController's get_elevation() shape)
-    for one-off interactive reads, e.g. ``lab.od2000.connect();
-    lab.od2000.activate(); lab.od2000.read_mm()``.
+    Provides both a continuous MQTT-based stream for background monitoring
+    (get_distance_mm, get_latest_sample) and synchronous HTTP on-demand access
+    for interactive use (activate, deactivate, read_mm).
 
-    Prefer the OD2000Rangefinder / WTT12LRangefinder subclasses below,
-    which set subsystem_name and the correct decode/calibration wiring for
-    each device — this base class is still constructible directly (as
-    existing tests/scripts do) with the OD2000 decode as the default.
+    Prefer OD2000Rangefinder or WTT12LRangefinder subclasses in practice,
+    which set subsystem_name and configure the correct decode/calibration.
 
     Args:
-        config: Dict with keys:
-            topic: MQTT topic the AL1342 publishes PDIN events on.
-            pdin_port: IO-Link port the sensor is connected to (1-8).
-            offset_mm: Physical mounting offset, added to every reading
-                (both the MQTT and read_mm() paths).
-            al1342_host: AL1342 IP address (raw IP — it has no DNS of its
-                own), required only for activate()/deactivate()/read_mm().
-            calibration_file: Optional path to a LinearCalibration CSV (see
-                laguna.rangefinder.calibration and
-                scripts/calibrate_rangefinder.py). If given, read_mm()
-                applies it instead of returning the raw decoded distance.
-            simulated: Skip the real MQTT/AL1342-HTTP paths entirely —
-                connect() succeeds with no broker needed, every reading is
-                NaN rather than fabricated (default False; see
-                laguna.simulation's module docstring).
-        mqtt_subscriber: A connected or unconnected MqttSubscriber instance.
+        config: Dict with keys: topic (MQTT topic), pdin_port (1-8),
+            offset_mm (mounting offset), al1342_host (IP for HTTP access),
+            calibration_file (optional LinearCalibration CSV), simulated
+            (bool, disables real I/O when True).
+        mqtt_subscriber: MqttSubscriber instance for MQTT operations.
     """
 
     subsystem_name = "rangefinder"
 
     def __init__(self, config: Dict[str, Any], mqtt_subscriber: MqttSubscriber):
+        """Initialize a rangefinder subsystem.
+
+        Args:
+            config: Configuration dict (see class docstring for keys).
+            mqtt_subscriber: MqttSubscriber for MQTT operations.
+        """
         self._topic = config.get("topic", "laguna/od2000")
         self._pdin_port = int(config.get("pdin_port", 1))
         self._offset_mm = float(config.get("offset_mm", 0.0))
@@ -73,12 +61,14 @@ class RangefinderSubsystem:
 
     @classmethod
     def from_config(cls, config: "Config") -> "RangefinderSubsystem":
-        """Build from the lab's Config: this subsystem's own section (by
-        cls.subsystem_name) plus a fresh MqttSubscriber built from the
-        shared 'mqtt:' section — each rangefinder gets its own client ID
-        (see MqttSubscriber's docstring on why two instances can't share
-        one), so a private MqttSubscriber per instance is the correct
-        default even when several rangefinders read the same broker.
+        """Build a rangefinder subsystem from lab configuration.
+
+        Args:
+            config: Lab Config with subsystem section (by subsystem_name)
+                and shared 'mqtt:' section.
+
+        Returns:
+            Rangefinder subsystem instance with a private MqttSubscriber.
         """
         section = config.get(cls.subsystem_name)
         mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
@@ -154,7 +144,7 @@ class RangefinderSubsystem:
     # ------------------------------------------------------------------
 
     def _poll(self) -> None:
-        """Drain the MQTT queue and update cached latest reading."""
+        """Drain MQTT queue and update internal latest reading cache."""
         messages = self._mqtt.drain(self._topic)
         for msg in messages:
             try:
@@ -196,8 +186,9 @@ class RangefinderSubsystem:
             )
 
     def activate(self) -> None:
-        """Turn on whatever the sensor needs to produce valid readings (e.g.
-        a laser emitter). Default is a no-op — override per device.
+        """Turn on whatever the sensor needs to produce valid readings.
+
+        Default is a no-op; override per device (e.g. for laser emitter control).
         """
         pass
 
@@ -206,12 +197,17 @@ class RangefinderSubsystem:
         pass
 
     def read_mm(self, timeout: float = 5.0) -> float:
-        """Take a single on-demand HTTP reading (not the MQTT-cached
-        stream), applying offset_mm and, if configured, a LinearCalibration.
+        """Take a single on-demand HTTP reading with offset and calibration.
+
+        Args:
+            timeout: HTTP request timeout in seconds (default 5.0).
+
+        Returns:
+            Calibrated and offset distance in millimeters.
 
         Raises:
-            RuntimeError: If 'al1342_host' wasn't given in config, or the
-                AL1342 returns a non-200 code (e.g. wrong pdin_port).
+            RuntimeError: If 'al1342_host' not in config, or AL1342
+                returns non-200 code.
         """
         if self._simulated:
             return float("nan")
@@ -225,9 +221,16 @@ class RangefinderSubsystem:
         return value + self._offset_mm
 
     def _calibration_raw_value(self, decoded: Dict[str, Any]) -> float:
-        """Which decoded field a configured calibration was fitted against.
-        Override for devices calibrated against something other than
-        distance_mm (see WTT12LRangefinder, calibrated against current_ma)."""
+        """Extract the field from decoded values used for calibration.
+
+        Override for devices calibrated against fields other than distance_mm.
+
+        Args:
+            decoded: Decoded PDIN values dict.
+
+        Returns:
+            Calibration input value (default: distance_mm).
+        """
         return decoded["distance_mm"]
 
     # ------------------------------------------------------------------
@@ -235,35 +238,51 @@ class RangefinderSubsystem:
     # ------------------------------------------------------------------
 
     def _extract_pdin_hex(self, msg: Dict[str, Any]) -> str:
-        """Extract pdin hex string from AL1342 MQTT event envelope."""
+        """Extract PDIN hex string from AL1342 MQTT message envelope.
+
+        Args:
+            msg: MQTT message dict from AL1342.
+
+        Returns:
+            Hex-encoded PDIN payload string.
+        """
         key = f"/iolinkmaster/port[{self._pdin_port}]/iolinkdevice/pdin"
         return msg["data"]["payload"][key]["data"]
 
     def _decode(self, hex_str: str) -> Dict[str, Any]:
-        """Decode raw PDIN hex to engineering values. Override to update layout."""
+        """Decode raw PDIN hex string to engineering values.
+
+        Args:
+            hex_str: Hex-encoded PDIN payload.
+
+        Returns:
+            Dict of decoded values (layout depends on device subclass).
+        """
         return decode_od2000_pdin(hex_str)
 
 
 class OD2000Rangefinder(RangefinderSubsystem):
-    """OD2000 rangefinder subsystem: ``lab.od2000.connect(); lab.od2000.activate();
-    lab.od2000.read_mm()``. Laser activate/deactivate via IO-Link acyclic
-    write (IODD index 97/0, inverted convention — "00" = laser on, "01" =
-    off, confirmed on hardware 2026-07-28, see
-    examples/example_06_od2000_acyclic_read.py).
+    """OD2000 7002T15 rangefinder subsystem with laser control.
+
+    Activates and deactivates the laser emitter via IO-Link acyclic write
+    (IODD index 97/0: value "00" enables laser, "01" disables).
     """
 
     subsystem_name = "od2000"
 
     def _decode(self, hex_str: str) -> Dict[str, Any]:
+        """Decode OD2000 PDIN hex string."""
         return decode_od2000_pdin(hex_str)
 
     def activate(self) -> None:
+        """Enable the OD2000 laser emitter."""
         if self._simulated:
             return
         self._require_al1342_host()
         write_acyclic(self._al1342_host, self._pdin_port, index=97, subindex=0, value="00")
 
     def deactivate(self) -> None:
+        """Disable the OD2000 laser emitter."""
         if self._simulated:
             return
         self._require_al1342_host()
@@ -271,23 +290,25 @@ class OD2000Rangefinder(RangefinderSubsystem):
 
 
 class WTT12LRangefinder(RangefinderSubsystem):
-    """WTT12L PowerProx rangefinder subsystem, read via its analog output
-    through an ifm DP4200 IO-Link analog-input bridge (the sensor's own
-    native IO-Link process data never validated on this AL1342 — see
-    docs/WTT12L_POWERPROX_SETUP.md).
+    """WTT12L PowerProx rangefinder subsystem via DP4200 analog input bridge.
 
-    activate()/deactivate() are intentionally left as the base class's
-    no-ops: the DP4200 bridge has no laser/emitter control path ("no
-    programmatic laser control on this path", same doc).
+    The sensor's analog output is digitized through an ifm DP4200 IO-Link
+    analog-input bridge. Laser control not available on this path.
     """
 
     subsystem_name = "wtt12l"
 
     def _decode(self, hex_str: str) -> Dict[str, Any]:
+        """Decode DP4200 PDIN hex string (WTT12L via analog path)."""
         return decode_dp4200_wtt12l_analog_pdin(hex_str)
 
     def _calibration_raw_value(self, decoded: Dict[str, Any]) -> float:
-        # Calibrated directly against current_ma, not this decoder's own
-        # distance_mm (which already bakes in an unconfirmed current->mm
-        # span) — see scripts/calibrate_rangefinder.py's module docstring.
+        """Return current_ma (not distance_mm) for calibration.
+
+        Args:
+            decoded: Decoded PDIN values dict.
+
+        Returns:
+            Current in mA from channel 1 (used as calibration input).
+        """
         return decoded["current_ma"]

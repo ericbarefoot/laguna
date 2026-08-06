@@ -1,5 +1,7 @@
 # Rangefinder Sensor Noise Characterization (2026-07-28)
 
+> **Archived 2026-08-05.** Kept for historical context; no longer maintained.
+
 **Status: investigation complete for this pass.** Started from "the scan
 output looks noisy, is OD2000 averaging worth tuning?" and ended up finding
 that sensor read noise is *not* the dominant source of noise in scan data —
@@ -44,7 +46,7 @@ raw HTTP poll rate (~375-380 Hz in both cases) — a meaningful fraction of
 every poll re-reads a stale value that hasn't updated yet at the sensor's
 own internal rate.
 
-![Stationary and scan histograms](images/sensor_noise_stationary_and_scan_histograms.png)
+![Stationary and scan histograms](../images/sensor_noise_stationary_and_scan_histograms.png)
 
 **Takeaway: lightening the filter from the default barely moves raw noise,
 and buys only ~16% more true update rate** (261→302 Hz) — nowhere near the
@@ -67,7 +69,7 @@ Four X-axis line scans (`server-setup/plans/scan_output/profile_*.csv`,
 2026-07-28 evening) showed strongly **bimodal** distance histograms — two
 clusters ~10-15 mm apart, not a single noisy peak:
 
-![Scan profiles vs position](images/sensor_noise_scan_profiles_vs_position.png)
+![Scan profiles vs position](../images/sensor_noise_scan_profiles_vs_position.png)
 
 This turned out to be real: **a ~10mm-thick smartphone was intentionally
 placed in the scan path** during several of these scans, at an inconsistent
@@ -100,14 +102,14 @@ feed rate 50 mm/s over ~985mm of travel) still showed:
   residual std was still **~1.8mm** — two orders of magnitude larger than
   the ~91 µm stationary sensor-noise floor.
 
-![Y-axis reference scan](images/sensor_noise_yaxis_reference_scan.png)
+![Y-axis reference scan](../images/sensor_noise_yaxis_reference_scan.png)
 
 ### FFT of the detrended residual
 
 Interpolated the (slightly irregularly-sampled, ~309 Hz nominal) residual
 onto a uniform time grid and took a windowed FFT:
 
-![Vibration power spectrum](images/sensor_noise_vibration_fft.png)
+![Vibration power spectrum](../images/sensor_noise_vibration_fft.png)
 
 **Finding: broadband power concentrated in ~1-40 Hz, with a sharp knee down
 to the noise floor above ~45-50 Hz.** No single dominant tone — the top
@@ -145,7 +147,7 @@ Stationary noise capture via the DP4200 analog bridge (see
 `docs/WTT12L_POWERPROX_SETUP.md` for why it's not native IO-Link), same
 method as section 1, no gantry motion:
 
-![WTT12L histogram](images/sensor_noise_wtt12l_histogram.png)
+![WTT12L histogram](../images/sensor_noise_wtt12l_histogram.png)
 
 | Sensor / config | std | range |
 |---|---|---|

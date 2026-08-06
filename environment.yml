@@ -1,0 +1,8 @@
+name: flumelab
+channels:
+  - conda-forge
+dependencies:
+  - python=3.14
+  - pip
+  - pip:
+      - -e .[dev,scanner,docs,storage]

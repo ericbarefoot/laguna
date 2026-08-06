@@ -21,16 +21,9 @@ class ExperimentSchedule:
 
     Each recognized column in the source table (weir elevation, pump flow,
     valve states) becomes an independent function of experiment time,
-    interpolated according to `INTERP_DEFAULTS` (overridable per column via
-    the `interpolation` argument). These functions are what the scheduler
-    calls to determine setpoints at arbitrary times between the table's
-    explicit rows — see the `weir_elevation`/`pump_flow`/`qin_open`/
-    `qaux_open` properties.
-
-    Example::
-
-        schedule = ExperimentSchedule.from_csv("run1.csv")
-        target_mm = schedule.weir_elevation(t=42.5)
+    interpolated according to INTERP_DEFAULTS (overridable per column via
+    the interpolation argument). Access interpolators via properties:
+    weir_elevation, pump_flow, qin_open, qaux_open.
     """
 
     INTERP_DEFAULTS = {
@@ -133,44 +126,64 @@ class ExperimentSchedule:
 
     @property
     def weir_elevation(self) -> Callable[[float], float]:
-        """Callable mapping experiment time (s) to target weir elevation (mm).
+        """Interpolator function for weir elevation (mm) by experiment time (s).
+
+        Returns:
+            Callable that takes time in seconds and returns elevation in mm.
 
         Raises:
-            AttributeError: If the schedule table had no
-                'weir_elevation_mm' column.
+            AttributeError: If weir_elevation_mm column not in source table.
         """
         return self._get_interpolator("weir_elevation_mm")
 
     @property
     def pump_flow(self) -> Callable[[float], float]:
-        """Callable mapping experiment time (s) to target pump flow rate (L/min).
+        """Interpolator function for pump flow rate (L/min) by experiment time (s).
+
+        Returns:
+            Callable that takes time in seconds and returns flow in L/min.
 
         Raises:
-            AttributeError: If the schedule table had no 'pump_flow_lpm'
-                column.
+            AttributeError: If pump_flow_lpm column not in source table.
         """
         return self._get_interpolator("pump_flow_lpm")
 
     @property
     def qin_open(self) -> Callable[[float], bool]:
-        """Callable mapping experiment time (s) to target inlet valve state.
+        """Interpolator function for inlet valve state by experiment time (s).
+
+        Returns:
+            Callable that takes time in seconds and returns valve state.
 
         Raises:
-            AttributeError: If the schedule table had no 'qin_open' column.
+            AttributeError: If qin_open column not in source table.
         """
         return self._get_interpolator("qin_open")
 
     @property
     def qaux_open(self) -> Callable[[float], bool]:
-        """Callable mapping experiment time (s) to target auxiliary valve state.
+        """Interpolator function for auxiliary valve state by experiment time (s).
+
+        Returns:
+            Callable that takes time in seconds and returns valve state.
 
         Raises:
-            AttributeError: If the schedule table had no 'qaux_open' column.
+            AttributeError: If qaux_open column not in source table.
         """
         return self._get_interpolator("qaux_open")
 
     def _get_interpolator(self, col: str) -> Callable:
-        """Look up the interpolator built for `col`, or raise if it wasn't present in the source table."""
+        """Retrieve interpolator for given column name.
+
+        Args:
+            col: Column name to look up.
+
+        Returns:
+            Callable interpolator for the column.
+
+        Raises:
+            AttributeError: If column was not present in source table.
+        """
         if col not in self._interpolators:
             raise AttributeError(
                 f"No interpolator for column '{col}'. "
@@ -180,32 +193,42 @@ class ExperimentSchedule:
 
     @staticmethod
     def _build_spline(times: np.ndarray, values: np.ndarray) -> Callable[[float], float]:
-        """Build a natural cubic spline interpolator through (times, values).
+        """Build cubic spline interpolator through (times, values).
 
-        Used for weir elevation by default — motion should be smooth
-        (continuous velocity/acceleration) rather than piecewise-linear.
+        Args:
+            times: Time array (seconds).
+            values: Value array at corresponding times.
+
+        Returns:
+            Callable that evaluates spline at arbitrary time points.
         """
         cs = CubicSpline(times, values)
         return lambda t: float(cs(t))
 
     @staticmethod
     def _build_linear(times: np.ndarray, values: np.ndarray) -> Callable[[float], float]:
-        """Build a piecewise-linear interpolator through (times, values).
+        """Build piecewise-linear interpolator through (times, values).
 
-        Used for pump flow by default. Values before the first or after the
-        last timestamp are clamped to the nearest endpoint (numpy.interp
-        semantics), not extrapolated.
+        Args:
+            times: Time array (seconds).
+            values: Value array at corresponding times.
+
+        Returns:
+            Callable that linearly interpolates at arbitrary time points.
+                Values before/after endpoints are clamped (not extrapolated).
         """
         return lambda t: float(np.interp(t, times, values))
 
     @staticmethod
     def _build_step(times: np.ndarray, values: np.ndarray) -> Callable:
-        """Build a zero-order-hold (step) interpolator through (times, values).
+        """Build zero-order-hold (step) interpolator through (times, values).
 
-        Used by default for the boolean valve columns (qin_open,
-        qaux_open), where "50% open" is meaningless — the value at time
-        `t` is whatever it was most recently set to at or before `t`.
-        Times before the first row hold the first row's value.
+        Args:
+            times: Time array (seconds).
+            values: Value array at corresponding times.
+
+        Returns:
+            Callable that returns value most recently set at or before time t.
         """
         def step_interp(t):
             idx = np.searchsorted(times, t, side="right") - 1

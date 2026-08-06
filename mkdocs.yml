@@ -64,19 +64,22 @@ plugins:
 
 nav:
   - Home: index.md
-  - Architecture: ARCHITECTURE.md
-  - Quick reference: QUICKREF.md
-  - FlumeLab setup & logging guide: FLUMELAB_SETUP_GUIDE.md
+  - Getting Started:
+      - Architecture: ARCHITECTURE.md
+      - Quick reference: QUICKREF.md
+      - FlumeLab setup & logging guide: FLUMELAB_SETUP_GUIDE.md
+  - Workflow Guides:
+      - Overview: guides/index.md
+      - Getting started: guides/getting-started.md
+      - Rehearsing with simulate=True: guides/simulate.md
+      - Scheduling a multi-subsystem experiment: guides/scheduled-experiment.md
+      - Driving the gantry safely: guides/gantry-motion.md
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
       - Rangefinder profiling: RANGEFINDER_PROFILING.md
       - MQTT & AL1342 setup: MQTT_AL1342_SETUP.md
       - WTT12L PowerProx setup: WTT12L_POWERPROX_SETUP.md
-      - Unit calibration finding: GANTRY_UNIT_CALIBRATION.md
-      - Sensor noise characterization: SENSOR_NOISE_CHARACTERIZATION.md
-      - Gocator SDK notes: reference/gocator/GOCATOR_SDK_NOTES.md
-      - Gocator concepts: reference/gocator/GOCATOR_CONCEPTS.md
   - Subsystems:
       - Camera: subsystems/camera.md
       - Weir: subsystems/weir.md
@@ -100,7 +103,19 @@ nav:
       - Camera: reference/camera.md
       - Weir: reference/weir.md
       - Gauge: reference/gauge.md
+      - Rangefinder: reference/rangefinder.md
+      - Scanner: reference/scanner.md
       - Flow: reference/flow.md
       - Schedule: reference/schedule.md
       - Timing: reference/timing.md
       - Experiment runner: reference/experiment.md
+      - Data & storage: reference/data_storage.md
+  - Changelog: CHANGELOG.md
+  - Archive:
+      - Overview: archive/index.md
+      - Docs history: archive/DOCS_OVERHAUL_HISTORY.md
+      - Co-scripting roadmap: archive/COSCRIPTING_ROADMAP.md
+      - Gantry unit calibration finding: archive/GANTRY_UNIT_CALIBRATION.md
+      - Sensor noise characterization: archive/SENSOR_NOISE_CHARACTERIZATION.md
+      - Gocator SDK notes: archive/gocator/GOCATOR_SDK_NOTES.md
+      - Gocator concepts: archive/gocator/GOCATOR_CONCEPTS.md

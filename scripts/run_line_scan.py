@@ -18,7 +18,7 @@ on this AL1342), so it has no programmatic laser control — see that doc's
 
 1. Horizontal (position along the scan axis): gantry_agent.py now applies
    the 15 mm/unit conversion itself (see its MM_PER_ACP_UNIT constant and
-   docs/GANTRY_UNIT_CALIBRATION.md), so TopographicProfiler's CSV `pos_mm`
+   docs/archive/GANTRY_UNIT_CALIBRATION.md), so TopographicProfiler's CSV `pos_mm`
    column and `actual_start_mm`/`actual_end_mm` metadata are already real
    mm — this script no longer needs to convert them itself. `--distance-mm`
    below is passed straight through as real mm.
@@ -91,7 +91,7 @@ SENSOR_DEFAULTS = {
 }
 
 # --- Horizontal unit conversion — see module docstring point 1 and
-# docs/GANTRY_UNIT_CALIBRATION.md. Used only to interpret this script's own
+# docs/archive/GANTRY_UNIT_CALIBRATION.md. Used only to interpret this script's own
 # direct `ACP` query below (a raw passthrough command, not routed through
 # gantry_agent.py's scan protocol, which now converts internally) — keep in
 # sync by hand with gantry_agent.py's MM_PER_ACP_UNIT. ---
@@ -110,7 +110,7 @@ def add_real_world_columns(
     the input.
 
     `pos_mm` is already real mm as of gantry_agent.py's own
-    MM_PER_ACP_UNIT conversion (docs/GANTRY_UNIT_CALIBRATION.md) — this
+    MM_PER_ACP_UNIT conversion (docs/archive/GANTRY_UNIT_CALIBRATION.md) — this
     just copies it to `real_pos_mm` for a consistent column name across
     calibrated and uncalibrated output.
 

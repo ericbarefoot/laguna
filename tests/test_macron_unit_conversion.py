@@ -1,6 +1,6 @@
 """Tests for MMCCommands' mm_per_unit / coordinate_offset_mm conversion —
 the software workaround for the 15 mm/unit gantry finding (see
-docs/GANTRY_UNIT_CALIBRATION.md). Offline, driven against FakeSnapConnection.
+docs/archive/GANTRY_UNIT_CALIBRATION.md). Offline, driven against FakeSnapConnection.
 """
 
 import pytest
