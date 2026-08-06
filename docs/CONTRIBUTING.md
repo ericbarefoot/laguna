@@ -7,14 +7,16 @@ Thanks for your interest in contributing to Laguna.
 ```bash
 git clone <repo-url>
 cd laguna
-python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -e ".[dev]"
+mamba env create -f environment.yml   # or: conda env create -f environment.yml
+mamba activate flumelab               # or: conda activate flumelab
 ```
 
-`.[docs]` additionally installs MkDocs/Material/mkdocstrings if you're
-working on this documentation site — see `make docs-serve` /
-`make docs-build` and [the index page](index.md#viewing-these-docs-as-a-site).
+`environment.yml` installs the package editable with every extra
+(`dev`, `scanner`, `docs`, `storage`) via pip inside the conda env — the
+package's actual dependency versions stay pinned in `pyproject.toml`, not
+duplicated here, so there's one source of truth. See `make docs-serve` /
+`make docs-build` and [the index page](index.md#viewing-these-docs-as-a-site)
+for working on this documentation site.
 
 ## Running Tests
 

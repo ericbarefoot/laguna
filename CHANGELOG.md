@@ -76,6 +76,11 @@ them into a dated release section when you cut a version.
   archiving. Defaults to `false`.
 
 ### Changed
+- **Breaking:** Minimum supported Python bumped from 3.9 to **3.14**
+  (`requires-python`, `ruff`/`black`/`mypy` target versions all updated to
+  match). The repo's `.venv` is currently on 3.13.13 and will need
+  recreating against a 3.14 interpreter; the `flumelab` conda env is
+  already on 3.14.6.
 - **Breaking:** `GantryController.from_config()` and
   `GocatorScanner.from_config()` now take the lab's whole `Config` object
   instead of just their own section dict, matching every other
