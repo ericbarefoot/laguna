@@ -322,7 +322,7 @@ class GantryController:
             gcode_theta_axis=gcode_theta_axis,
             theta_group_index=config.get("theta_group_index", 2),
             safe_mode=config.get("safe_mode", True),
-            # Temporary DSM-project workaround — see docs/GANTRY_UNIT_CALIBRATION.md.
+            # Temporary DSM-project workaround — see docs/archive/GANTRY_UNIT_CALIBRATION.md.
             # Flip gantry.mm_per_acp_unit to 1.0 in config once fixed at the source;
             # nothing else needs to change.
             mm_per_unit=config.get("mm_per_acp_unit", 1.0),

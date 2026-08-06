@@ -361,7 +361,7 @@ class MMCCommands:
 
     All position/velocity values are in real mm / mm/s — this class converts
     to/from the controller's raw ACP user units internally via mm_per_unit
-    and coordinate_offset_mm (see docs/GANTRY_UNIT_CALIBRATION.md: on this
+    and coordinate_offset_mm (see docs/archive/GANTRY_UNIT_CALIBRATION.md: on this
     hardware 1 raw unit = 15mm on X/Y/Z, not 1mm, until that's fixed at the
     Snap2Motion/DSM source). This is deliberately the single choke point for
     that conversion — every position/velocity-reading or -writing method
@@ -387,7 +387,7 @@ class MMCCommands:
                 every linear-axis (X/Y/Z) position/velocity value. Defaults
                 to 1.0 (no conversion) — pass the value from
                 config's `gantry.mm_per_acp_unit` to apply the
-                docs/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
+                docs/archive/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
                 Theta.
             coordinate_offset_mm: Optional {axis_name: offset_mm} real-mm
                 translation from the gantry's raw zero to a real-world
@@ -872,7 +872,7 @@ class MMCCommands:
         single scalar shared by all group axes, so this assumes uniform
         mm_per_unit across the group (true for this hardware: X/Y/Z all
         measured at the same 15 mm/unit ratio, see
-        docs/GANTRY_UNIT_CALIBRATION.md).
+        docs/archive/GANTRY_UNIT_CALIBRATION.md).
         """
         raw = self._delta_to_raw(self._group_axes[0], value) if self._group_axes else value
         result = self._send(f"{self._gx()} SPD {raw:.6g}")

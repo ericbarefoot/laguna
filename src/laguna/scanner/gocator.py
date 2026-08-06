@@ -20,7 +20,7 @@ Pi-side AL1342 IO-Link master), the Gocator is a plain Ethernet device on the
 laguna PC's own network — no SSH, no deployed scripts, no MQTT.
 
 See ``docs/subsystems/scanner.md`` for usage and
-``docs/reference/gocator/`` for SDK/manual reference notes.
+``docs/archive/gocator/`` for SDK/manual reference notes.
 """
 
 from __future__ import annotations

@@ -247,7 +247,7 @@ implemented and both land in the same `SurfaceScan`, distinguished by
 per-cell arrays rather than 1-D axis vectors.
 
 Source: [Uniform Data and Point Cloud Data](https://am.lmi3d.com/manuals/gopxl/gopxl-1.1/LMILaserLineProfiler/Content/TheoryOfOperation/Profile_RangeOutput/ResampledAndUniformSpacingProfile.htm),
-plus `docs/reference/gocator/GOCATOR_CONCEPTS.md` §4.
+plus `docs/archive/gocator/GOCATOR_CONCEPTS.md` §4.
 
 Scaling, applied by `pointcloud.py`:
 
@@ -311,9 +311,9 @@ python -m pytest tests/test_gocator_scanner.py -q
 
 ## Reference
 
-- `docs/reference/gocator/GOCATOR_SDK_NOTES.md` — GoSdk C API: ports, enums,
+- `docs/archive/gocator/GOCATOR_SDK_NOTES.md` — GoSdk C API: ports, enums,
   message structs, control flow, threading/buffer gotchas
-- `docs/reference/gocator/GOCATOR_CONCEPTS.md` — manual-derived concepts:
+- `docs/archive/gocator/GOCATOR_CONCEPTS.md` — manual-derived concepts:
   Profile vs Surface, encoderless triggering, alignment, 2690 specs
 - `scripts/gocator_scan.py` — full-control CLI: every sensor knob plus the
   coordinated gantry pass. Read-only by default; needs `--allow-motion` to move.

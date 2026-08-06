@@ -56,7 +56,7 @@ ASCII. Useful for quick manual testing, calibration, and one-off moves.
    ACP units on X = 300mm, 20 ACP units on Y = 300mm — all three give the
    identical ratio, 15 mm per ACP unit. This is now handled by
    GantryController/MMCCommands themselves (via the mm_per_unit param
-   below), not by this example — see docs/GANTRY_UNIT_CALIBRATION.md for
+   below), not by this example — see docs/archive/GANTRY_UNIT_CALIBRATION.md for
    the finding writeup. If the Snap2Motion/DSM project's axis scale is
    fixed at the source, change MM_PER_ACP_UNIT below to 1.0 (and
    gantry.mm_per_acp_unit in config/example_config.yaml) — nothing else
@@ -81,7 +81,7 @@ REMOTE_SERIAL_DEVICE = "/dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00
 REMOTE_BAUD = 9600
 
 # --- Unit conversion — confirmed on hardware 2026-07-28, see point 5 above
-# and docs/GANTRY_UNIT_CALIBRATION.md. The single toggle: flip to 1.0 once
+# and docs/archive/GANTRY_UNIT_CALIBRATION.md. The single toggle: flip to 1.0 once
 # the DSM project's axis scale is fixed at the source. ---
 MM_PER_ACP_UNIT = 15.0
 

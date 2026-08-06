@@ -4,7 +4,7 @@ Example 7: FlumeLab with gantry + OD2000 + WTT12L PowerProx together
 Demonstrates the "simple verb" API added on top of FlumeLab: one lab
 instance owns the gantry and both rangefinders, then does a few
 move_to()s and acquire_scan()s through it — the same shapes described in
-the API-consistency refactor (see docs/GANTRY_UNIT_CALIBRATION.md and
+the API-consistency refactor (see docs/archive/GANTRY_UNIT_CALIBRATION.md and
 docs/subsystems/rangefinder.md), rather than reaching into
 GantryController/TopographicProfiler/MMCCommands directly (still
 available via lab.gantry.cmd / lab.gantry.gcode for anything this
@@ -36,7 +36,7 @@ gantry connection, handled automatically below from the same flag).
    re-confirm on yours.
 3. mm_per_acp_unit (config/example_config.yaml's gantry section, default
    15.0) is a stopgap for this specific machine's uncorrected axis scale,
-   not a universal constant — see docs/GANTRY_UNIT_CALIBRATION.md. It's
+   not a universal constant — see docs/archive/GANTRY_UNIT_CALIBRATION.md. It's
    what makes the move_to()/acquire_scan() calls below speak real mm.
 4. move_to()'s vector form is [X, Y, Z, Theta], matching the axis order
    in config/example_config.yaml's gantry.axes list — reorder the values

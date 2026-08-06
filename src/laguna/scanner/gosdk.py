@@ -9,7 +9,7 @@ The vendor SDK ships no Python bindings (C/C#/VB.NET samples only), and no
 prebuilt x86_64 shared library — see ``scripts/build_gosdk.sh``. Function
 signatures below are transcribed from the SDK headers; each group cites the
 header it came from so they can be re-checked against a future SDK version.
-SDK reference notes: ``docs/reference/gocator/GOCATOR_SDK_NOTES.md``.
+SDK reference notes: ``docs/archive/gocator/GOCATOR_SDK_NOTES.md``.
 
 Polling (``GoSystem_ReceiveData``) is used rather than GoSdk's async
 data-handler callback: the callback fires on a thread the SDK spawns itself,

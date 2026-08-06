@@ -128,7 +128,7 @@ class Config:
                 "fences": [],
                 # TEMPORARY: 1 raw controller (ACP) unit measures as this many real
                 # mm on X/Y/Z — confirmed 15.0 on hardware 2026-07-28, see
-                # docs/GANTRY_UNIT_CALIBRATION.md. This is the single toggle: once
+                # docs/archive/GANTRY_UNIT_CALIBRATION.md. This is the single toggle: once
                 # the Snap2Motion/DSM project's axis scale is fixed at the source,
                 # change this to 1.0 (and gantry_agent.py's matching
                 # MM_PER_ACP_UNIT constant) — nothing else needs to change.

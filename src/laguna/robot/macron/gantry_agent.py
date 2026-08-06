@@ -97,7 +97,7 @@ except ImportError:
 
 
 # Real mm per raw controller (ACP) unit on the linear (X/Y/Z) axes —
-# confirmed on hardware 2026-07-28, see docs/GANTRY_UNIT_CALIBRATION.md.
+# confirmed on hardware 2026-07-28, see docs/archive/GANTRY_UNIT_CALIBRATION.md.
 # This is the ONE place scan math converts between the two: incoming
 # end_mm/feed_rate_mm_s (real mm, from the scan_start request) are divided
 # by this to get the raw ACP values the BMT/SPD hardware commands need;

@@ -99,7 +99,7 @@ class DataProcessor:
         raise NotImplementedError(
             "DataProcessor.save_data() does not write anything yet — "
             "HDF5/CSV export and compression are unimplemented. See "
-            "docs/COSCRIPTING_ROADMAP.md."
+            "docs/archive/COSCRIPTING_ROADMAP.md."
         )
 
     def export_data(self, format: str = "csv") -> Optional[str]:

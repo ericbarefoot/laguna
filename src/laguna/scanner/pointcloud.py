@@ -367,7 +367,7 @@ class SurfaceScan:
         """Return a copy with Y rescaled for a corrected travel speed.
 
         Encoderless Y spacing is only as good as the travel speed the sensor
-        was told (see docs/reference/gocator/GOCATOR_CONCEPTS.md §2c). If the
+        was told (see docs/archive/gocator/GOCATOR_CONCEPTS.md §2c). If the
         gantry's true velocity is later measured to differ, this rescales the
         travel axis without a re-scan.
 

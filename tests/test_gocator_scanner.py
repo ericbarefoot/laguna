@@ -11,7 +11,7 @@ assumption is wrong, not the test):
 
   - Surface Y spacing comes from GoTransform travel speed (mm/s), not from any
     GoSetup accessor. Confirmed on hardware 2026-07-30; see
-    docs/reference/gocator/GOCATOR_CONCEPTS.md §2c.
+    docs/archive/gocator/GOCATOR_CONCEPTS.md §2c.
   - The encoderless recipe is TIME trigger + FIXED_LENGTH surface generation +
     SOFTWARE start trigger, with the trigger fired mid-move.
   - Surface resolutions are nanometres, offsets micrometres, grid values

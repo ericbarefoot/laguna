@@ -218,6 +218,12 @@ garbage-value failure mode if it recurs.
 4. **`confirm_cb`** on `GCodeExecutor` — per-motion-segment human
    confirmation hook for real-motion testing.
 
+**No motion has ever been sent to the hardware.** Every verification so
+far has been read-only queries, or, where even those failed, connectivity
+checks. Real motion (Stage 3 testing) is still gated on explicit
+authorization in a future session — nothing in this repo commands it by
+default (`safe_mode=True` everywhere).
+
 ## Files
 
 | File | Purpose |
