@@ -277,16 +277,20 @@ class SimulatedGoSdkLib:
     """Stands in for :class:`laguna.scanner.gosdk.GoSdkLib`."""
 
     def __init__(self, lib_dir: Optional[str] = None) -> None:
+        """Initialize the simulated GoSdk library (lib_dir is ignored)."""
         self.lib_dir = "<simulated>"
         self.go = _SimGo()
 
     def call(self, name: str, *args) -> None:
+        """Invoke a named method on the simulated GoSdk."""
         getattr(self.go, name)(*args)
 
     def handle(self, name: str, *args) -> int:
+        """Invoke a named handle-accessor method on the simulated GoSdk."""
         return getattr(self.go, name)(*args)
 
     def parse_ip(self, ip: str) -> Any:
+        """Parse a dotted-quad IP string into a simulated kIpAddress."""
         return _g.kIpAddress() if hasattr(_g, "kIpAddress") else ctypes.c_int(0)
 
 

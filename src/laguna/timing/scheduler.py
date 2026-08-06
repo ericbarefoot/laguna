@@ -33,6 +33,12 @@ class Scheduler:
         clock: ExperimentClock,
         event_log: Optional[EventLog] = None,
     ) -> None:
+        """Initialize the scheduler.
+
+        Args:
+            clock: The ExperimentClock that drives scheduling.
+            event_log: Optional EventLog to record scheduler events (e.g., failures).
+        """
         self._clock = clock
         self._event_log = event_log
         self._recurring: List[dict] = []
@@ -52,7 +58,14 @@ class Scheduler:
     ) -> None:
         """Register action to fire every `every` runtime seconds.
 
-        The first firing happens at runtime = every (not at 0).
+        Args:
+            every: Interval in experiment runtime seconds between firings.
+            action: Callable to invoke at each interval.
+            subsystem: Name of the subsystem (for logging and identification).
+            name: Optional human-readable name for this action; defaults to action.__name__.
+
+        Note:
+            The first firing happens at runtime = every (not at 0).
         """
         self._recurring.append(
             {"every": every, "action": action, "subsystem": subsystem,
@@ -66,7 +79,14 @@ class Scheduler:
         subsystem: str = "scheduler",
         name: str = "",
     ) -> None:
-        """Register action to fire once at `runtime_s`."""
+        """Register action to fire once at a specific runtime.
+
+        Args:
+            runtime_s: Experiment runtime in seconds when the action should fire.
+            action: Callable to invoke at the specified time.
+            subsystem: Name of the subsystem (for logging and identification).
+            name: Optional human-readable name for this action; defaults to action.__name__.
+        """
         self._oneshot.append(
             {"runtime_s": runtime_s, "action": action, "subsystem": subsystem,
              "name": name or action.__name__, "_fired": False}
@@ -79,12 +99,12 @@ class Scheduler:
     def run(self, duration: float, on_complete: Optional[Callable[[], Any]] = None) -> None:
         """Block for `duration` runtime seconds, firing registered actions as due.
 
-        Resumes the clock if it was paused (e.g. after a previous stop() call).
-        Returns when duration expires or stop() is called.
+        Resumes the clock if paused (e.g. after a previous stop() call).
 
         Args:
+            duration: Duration in experiment runtime seconds to run.
             on_complete: Optional callback invoked only when the duration expires
-                         naturally (not when stop() is called externally).
+                naturally (not when stop() is called externally).
         """
         self._stop_event.clear()
         if self._clock.is_running and self._clock.is_paused:
@@ -145,8 +165,8 @@ class Scheduler:
     def stop(self) -> None:
         """Interrupt run() and pause the experiment clock.
 
-        Pauses rather than stops the clock so elapsed runtime is preserved
-        and the experiment can be resumed with run() later.
+        Pauses (does not stop) the clock to preserve elapsed runtime and allow
+        resumption with a later run() call.
         """
         self._stop_event.set()
         if self._clock.is_running and not self._clock.is_paused:
@@ -157,8 +177,12 @@ class Scheduler:
     def run_async(self, duration: float) -> threading.Thread:
         """Run the scheduler in a background daemon thread.
 
-        Returns the thread so the caller can join() it if needed.
-        Call stop() from another thread to interrupt the run.
+        Args:
+            duration: Duration in experiment runtime seconds to run.
+
+        Returns:
+            The daemon thread so the caller can join() it if needed.
+            Call stop() from another thread to interrupt the run.
         """
         t = threading.Thread(
             target=self.run, args=(duration,), daemon=True, name="scheduler-main"
@@ -171,7 +195,14 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _fire(self, action: Callable, subsystem: str, name: str, runtime_s: float) -> None:
-        """Dispatch action in a daemon thread; log only on failure."""
+        """Dispatch action in a daemon thread; log exceptions only.
+
+        Args:
+            action: Callable to invoke in a background thread.
+            subsystem: Subsystem name for logging context.
+            name: Action name for logging context.
+            runtime_s: Runtime when this action fires (for event logging).
+        """
         def _run():
             try:
                 action()

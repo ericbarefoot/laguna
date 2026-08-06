@@ -61,6 +61,21 @@ DEFAULT_LEAD_TIME = 5.0
 
 @dataclass
 class CaptureResult:
+    """Result of a single camera capture from the networked array.
+
+    Attributes:
+        hostname: Hostname of the Raspberry Pi camera.
+        success: True if capture succeeded, False otherwise.
+        filename: Path to captured image file on the Pi (None if capture failed).
+        target_time: Target Unix timestamp for capture (PC clock).
+        capture_time_mid: Actual mid-capture Unix timestamp (Pi clock frame).
+        capture_time_mid_pc: Actual mid-capture Unix timestamp (converted to PC clock).
+        capture_duration_ms: Duration of capture exposure in milliseconds.
+        latency_ms: Time from target to actual capture start in milliseconds.
+        clock_offset_s: Measured clock offset (Pi time − PC time) in seconds.
+        error: Error message if capture failed.
+    """
+
     hostname: str
     success: bool
     filename: Optional[str] = None
@@ -88,6 +103,18 @@ class CameraArray(SubsystemLogging):
         event_log_verbosity: str = "INFO",
         simulated: bool = False,
     ):
+        """Initialize a networked Pi camera array.
+
+        Args:
+            hosts: List of Pi hostnames (default: DEFAULT_CAMERAS).
+            ssh_user: SSH user for Pi connections (default: DEFAULT_SSH_USER).
+            ssh_key: Path to SSH private key file (optional).
+            ssh_passphrase: Passphrase for encrypted SSH key (optional).
+            log_level: Logging level (default 'INFO').
+            event_log_verbosity: Event log verbosity (default 'INFO').
+            simulated: If True, skip real SSH and hardware I/O, return placeholder
+                results (default False; see laguna.simulation module docstring).
+        """
         self.hosts = hosts
         self.ssh_user = ssh_user
         self.ssh_key = ssh_key
@@ -459,11 +486,19 @@ class CameraArray(SubsystemLogging):
 
 
 def _resolve_passphrase(cli_value: Optional[str]) -> Optional[str]:
-    """Return SSH passphrase from the first available source:
-    1. --ssh-passphrase CLI arg
+    """Resolve SSH passphrase from multiple sources in priority order.
+
+    Checks sources in this order:
+    1. cli_value argument (if provided)
     2. LAGUNA_SSH_PASSPHRASE environment variable
     3. ~/.config/laguna/ssh_passphrase file
     4. Interactive getpass prompt
+
+    Args:
+        cli_value: SSH passphrase from CLI (takes priority if provided).
+
+    Returns:
+        The resolved passphrase string, or None if no passphrase found or provided.
     """
     import getpass
     import os

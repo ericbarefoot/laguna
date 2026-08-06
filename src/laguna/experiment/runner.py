@@ -19,7 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_trigger_config(section_name: str, cfg: dict) -> None:
-    """Raise ValueError if conflicting scheduling options are specified."""
+    """Validate that scheduling options are not mutually exclusive.
+
+    Args:
+        section_name: Config section name for error messages.
+        cfg: Config dictionary to validate.
+
+    Raises:
+        ValueError: If conflicting scheduling options are present.
+    """
     use = cfg.get("use_schedule", False)
     has_interval = "interval_s" in cfg
     has_at = "trigger_at" in cfg
@@ -43,21 +51,18 @@ def _register_action(
 ) -> None:
     """Register a scheduled action via interval_s, trigger_at, or use_schedule.
 
-    Works for any subsystem — cameras, sensors, actuators, or future additions.
+    Args:
+        lab: FlumeLab instance to register actions with.
+        cfg: Config dict with scheduling options (mutually exclusive).
+        subsystem: Subsystem name for the scheduler.
+        name: Action name for the scheduler.
+        action: Optional fixed action callable. Ignored if action_factory is set.
+        action_factory: Optional factory(t_s) -> Callable for schedule-dependent actions.
+        exp_schedule: ExperimentSchedule for use_schedule mode.
+        schedule_col: Optional schedule column to filter by (for fixed actions).
 
-    Scheduling modes (cfg keys, mutually exclusive):
-      interval_s: N    — action fires every N runtime seconds
-      trigger_at: [t]  — action fires once at each listed runtime second
-      use_schedule: true — action fires at schedule CSV time points
-
-    For use_schedule with a fixed action (cameras, sensors):
-      - If schedule_col is present in the CSV: fire only at truthy rows.
-      - If schedule_col is absent: fire at every time_s row.
-
-    For use_schedule with an action that depends on the scheduled value (actuators):
-      - Pass action_factory(t_s: float) -> Callable instead of action.
-      - Fires at every time_s row; each call uses action_factory to build a
-        closure capturing the target value at that time.
+    Raises:
+        ValueError: If scheduling config is invalid (caught by _validate_trigger_config).
     """
     use_sched = cfg.get("use_schedule", False)
 
@@ -95,35 +100,23 @@ def setup_run(
     simulate: bool = False,
     speed_factor: Optional[float] = None,
 ) -> FlumeLab:
-    """Set up a FlumeLab from experiment_config.yaml.
+    """Set up and configure a FlumeLab from a YAML config file.
 
-    Instantiates only the subsystems whose sections are present in the YAML.
-    Registers scheduled actions with intervals or trigger times from the YAML.
-
-    Scheduling options per section (mutually exclusive):
-      interval_s: N         — fire every N seconds
-      trigger_at: [t1, t2]  — fire at these runtime seconds
-      use_schedule: true    — fire at schedule CSV time points; actuator sections
-                              read their setpoint from the matching interpolated
-                              column; camera sections filter by an optional column
-                              named after the YAML key (e.g. pi_cameras: 1/0)
+    Instantiates all subsystems whose sections are present in the YAML and
+    registers scheduled actions from interval_s, trigger_at, or use_schedule
+    keys.
 
     Args:
         lab_config: Path to experiment_config.yaml.
-        schedule: Optional path to schedule CSV. Required if any section has
-                  use_schedule: true. Only time_s is required; actuator columns
-                  (weir_elevation_mm, pump_flow_lpm, qin_open, qaux_open) and
-                  camera trigger columns (pi_cameras, dslr_cameras) are optional.
-        verbose_cameras: Show full paramiko / SSH progress during Pi captures.
-        simulate: Rehearse with no hardware attached — see laguna.simulation.
-                  Only gantry/gocator have a simulated backend; every other
-                  section (weir, flow, gauge, cameras, rangefinders) is
-                  dropped rather than connecting to real hardware.
+        schedule: Optional path to schedule CSV (required if any section uses
+            use_schedule: true).
+        verbose_cameras: If True, show full paramiko/SSH progress during captures.
+        simulate: If True, rehearse with no hardware attached (see laguna.simulation).
         speed_factor: Experiment seconds per real second. Only valid with
-                      simulate=True (see FlumeLab.__init__).
+            simulate=True.
 
     Returns:
-        Configured FlumeLab. Call lab.start(duration) to begin.
+        Configured FlumeLab ready for experiment setup or start.
     """
     lab = FlumeLab(lab_config, simulate=simulate, speed_factor=speed_factor)
 
@@ -429,19 +422,15 @@ def setup_run(
 
 
 def run_blocking(lab: FlumeLab, duration: float) -> None:
-    """Run lab.start(duration) with signal-based pause/resume control.
+    """Run the experiment with signal-based pause/resume control.
 
-    Intended for non-interactive CLI use. Prints PID at startup so the user
-    can send signals from another terminal. Writes .experiment.pid to the
-    current directory (removed on exit).
+    Runs lab.start(duration) and responds to Ctrl+C and Unix signals for
+    pausing/resuming. Writes .experiment.pid for signal-based control from
+    another terminal. Intended for non-interactive CLI use.
 
-    Control:
-      First Ctrl+C          — pause (hardware stays connected)
-      Second Ctrl+C         — stop and disconnect
-      kill -USR1 <pid>      — pause from another terminal
-      kill -USR2 <pid>      — resume from another terminal
-      kill <pid> (SIGTERM)  — stop and disconnect
-      tail -f experiment_events.csv — live status from another terminal
+    Args:
+        lab: Configured FlumeLab ready to start.
+        duration: Experiment duration in seconds.
     """
     pid = os.getpid()
     pid_file = Path(".experiment.pid")

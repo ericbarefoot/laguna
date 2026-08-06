@@ -84,6 +84,7 @@ class SimulatedSnapConnection:
     _COMMAND = re.compile(r"^(?P<prefix>[AC]\d+|SOB|INB)\s*(?P<verb>[A-Z]{3})?\s*(?P<args>.*)$")
 
     def __init__(self) -> None:
+        """Initialize the simulated Snap connection."""
         self._connected = False
         self.sent: list = []
         #: axis token -> {"acp": mm, "spd": mm/s, "mtr": bool}
@@ -96,26 +97,43 @@ class SimulatedSnapConnection:
     # -- SnapConnection interface --------------------------------------
 
     def connect(self) -> None:
+        """Connect the simulated gantry."""
         self._connected = True
         logger.info("Simulated gantry connected (no hardware)")
 
     def disconnect(self) -> None:
+        """Disconnect the simulated gantry."""
         self._connected = False
 
     @property
     def is_connected(self) -> bool:
+        """Check if connected.
+
+        Returns:
+            Connection status.
+        """
         return self._connected
 
     def send(self, command: str) -> str:
+        """Send a command and get the response.
+
+        Args:
+            command: ASCII command string.
+
+        Returns:
+            Response string.
+        """
         self.sent.append(command)
         return self._answer(command.strip())
 
     # -- the model ------------------------------------------------------
 
     def _axis(self, token: str) -> Dict[str, Any]:
+        """Get or create an axis state dictionary."""
         return self.axes.setdefault(token, {"acp": 0.0, "spd": 10.0, "mtr": False})
 
     def _answer(self, command: str) -> str:
+        """Process a command and return the response."""
         match = self._COMMAND.match(command)
         if not match:
             return "0"
@@ -179,114 +197,184 @@ class SimulatedSnapConnection:
 
 
 class SimulatedTeknicMotor:
-    """Stand-in for safl_ocean_hardware's TeknicMotor — shared by
-    SaflWeirController (position) and SaflFlowController (digital IO).
+    """Stand-in for safl_ocean_hardware's TeknicMotor.
 
-    Every command succeeds instantly; every reading comes back NaN (or None
-    for non-numeric status fields) rather than a fabricated position or
-    fault state — see module docstring on why this deliberately does not
-    track a fake position the way SimulatedSnapConnection tracks a real
-    one. Commanding a move here proves the schedule sends the right
-    command at the right time; it says nothing about where the axis
-    "ended up," because there is no physical model to ask.
+    Every command succeeds instantly; every reading returns NaN (or None for
+    non-numeric fields) rather than a fabricated state. Commanding proves the
+    schedule sends the right command at the right time, not physical position.
     """
 
     def connect(self) -> bool:
+        """Connect the simulated motor.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def disconnect(self) -> None:
+        """Disconnect the simulated motor."""
         pass
 
     def set_absolute_position(self, mm: float) -> None:
+        """Set absolute position (no-op in simulation)."""
         pass
 
     def move_to_position(self, mm: float) -> bool:
+        """Move to position.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def get_position(self) -> float:
+        """Get current position.
+
+        Returns:
+            NaN (no physical model).
+        """
         return float("nan")
 
     def set_velocity(self, mm_per_sec: float) -> None:
+        """Set velocity (no-op in simulation)."""
         pass
 
     def poll_status(self) -> Dict[str, Any]:
+        """Poll motor status.
+
+        Returns:
+            Dict with NaN positions and None status fields.
+        """
         return {
             "position": float("nan"), "VelSetPoint": float("nan"),
             "Enabled": None, "MotorInFault": None, "StepsActive": None,
         }
 
     def enable(self) -> None:
+        """Enable the motor (no-op in simulation)."""
         pass
 
     def disable(self) -> None:
+        """Disable the motor (no-op in simulation)."""
         pass
 
     def wait_for_HLFB(self, timeout: float) -> None:
+        """Wait for high-level feedback (no-op in simulation)."""
         pass
 
     def clear_faults(self) -> None:
+        """Clear faults (no-op in simulation)."""
         pass
 
     def find_home(self, home_position_mm: float = 0.0) -> bool:
+        """Find home position.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def stop(self) -> None:
+        """Stop the motor (no-op in simulation)."""
         pass
 
     def set_io(self, channel: int, state: bool) -> None:
+        """Set digital IO (no-op in simulation)."""
         pass
 
 
 class SimulatedVFD:
-    """Stand-in for safl_ocean_hardware's VFD (Fuji pump drive) — see
-    SimulatedTeknicMotor's docstring for the same "commands succeed,
-    readings are NaN" reasoning.
+    """Stand-in for safl_ocean_hardware's VFD (Fuji pump drive).
+
+    Commands succeed instantly; readings are NaN or None. See
+    SimulatedTeknicMotor's docstring for the reasoning.
     """
 
     def __init__(self) -> None:
+        """Initialize the simulated VFD."""
         self.setpoint = float("nan")
 
     def connect(self) -> bool:
+        """Connect the simulated VFD.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def disconnect(self) -> None:
+        """Disconnect the simulated VFD."""
         pass
 
     def set_freq_from_flowrate(self, lpm: float, c0: float, c1: float, c2: float) -> None:
+        """Set frequency from flowrate (no-op in simulation)."""
         pass
 
     def start(self) -> bool:
+        """Start the VFD.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def stop(self) -> bool:
+        """Stop the VFD.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def clear_faults(self) -> bool:
+        """Clear VFD faults.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def poll_state(self) -> Dict[str, Any]:
+        """Poll VFD state.
+
+        Returns:
+            Dict with None status fields.
+        """
         return {"state_message": None, "e_stop": None}
 
     def poll_setpoint(self) -> None:
+        """Poll setpoint (no-op in simulation)."""
         pass
 
 
 class SimulatedMassaSensor:
-    """Stand-in for safl_ocean_hardware's MassaSensor (ultrasonic water
-    level) — readings are NaN rather than a fabricated water level; see
-    SimulatedTeknicMotor's docstring for the same reasoning. Deliberately
-    has no dist_cm_array_moving_avg attribute — SaflWaterLevelSensor's
-    read_mm_smoothed() already treats that as "no moving average yet" and
-    returns NaN, so this needs no special-casing there either.
+    """Stand-in for safl_ocean_hardware's MassaSensor.
+
+    Readings are NaN rather than fabricated water levels. See
+    SimulatedTeknicMotor's docstring for the reasoning. Deliberately omits
+    dist_cm_array_moving_avg; SaflWaterLevelSensor.read_mm_smoothed()
+    treats its absence as "no moving average yet" and returns NaN anyway.
     """
 
     def connect(self) -> bool:
+        """Connect the simulated sensor.
+
+        Returns:
+            True (always succeeds).
+        """
         return True
 
     def disconnect(self) -> None:
+        """Disconnect the simulated sensor."""
         pass
 
     def read(self) -> Dict[str, Any]:
+        """Read sensor data.
+
+        Returns:
+            Dict with NaN distance, temperature, and signal strength.
+        """
         return {
             "distance_cm": float("nan"), "temperature": float("nan"),
             "signal_strength": float("nan"),
@@ -323,16 +411,18 @@ _NO_SIMULATED_BACKEND: Tuple[str, ...] = ()
 
 
 def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Rewrite a config so every subsystem with a simulated backend uses it.
+    """Rewrite a config to use simulated backends for all subsystems.
 
-    Every _SIMULATED_SECTIONS entry keeps its section and gets a
-    `"simulated": True` flag added (gantry/gocator use their own existing
-    `transport`/`simulated` conventions instead) — a rehearsal must
-    exercise the same set the real run would, or it proves nothing about
-    the schedule. Anything in _NO_SIMULATED_BACKEND has no simulated
-    backend yet, so it's dropped entirely rather than constructing the
-    real controller class under simulate=True — a fail-closed guard, not
-    equivalent coverage. See module docstring.
+    Every _SIMULATED_SECTIONS entry adds `"simulated": True` (gantry/gocator
+    use their own transport/simulated conventions). A rehearsal must exercise
+    the same set the real run would. Sections in _NO_SIMULATED_BACKEND are
+    dropped entirely rather than connecting to real hardware.
+
+    Args:
+        config: Original config dictionary.
+
+    Returns:
+        Modified config with simulated backends enabled.
     """
     out = dict(config)
     if "gantry" in out:

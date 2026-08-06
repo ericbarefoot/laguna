@@ -36,6 +36,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from ..config import Config
+    from ..robot.macron.controller import GantryController
 
 from . import gosdk as _g
 from .gosdk import GoSdkError, GoSdkLib, GoSdkTimeout
@@ -136,6 +137,7 @@ class GocatorScanner(GocatorSettingsMixin):
     subsystem_name = "gocator"
 
     def __init__(self, config: Dict[str, Any]):
+        """Initialize the Gocator scanner from a config dict."""
         self._ip = config.get("ip", "192.168.1.10")
         self._travel_speed_mm_s = config.get("travel_speed_mm_s")
         self._frame_rate_hz = config.get("frame_rate_hz")
@@ -640,7 +642,7 @@ class GocatorScanner(GocatorSettingsMixin):
 
     def scan_with_gantry(
         self,
-        gantry,
+        gantry: "GantryController",
         axis: Optional[str] = None,
         end_mm: Optional[float] = None,
         feed_rate_mm_s: Optional[float] = None,
@@ -689,10 +691,13 @@ class GocatorScanner(GocatorSettingsMixin):
                 part of a longer traverse; a mismatch against the derived
                 distance is logged as a warning, not rejected, since that
                 may be exactly what's wanted.
+            metadata: Extra context merged into the result's metadata.
+            timeout_s: Receive budget in seconds. Defaults to computed value
+                based on configured fixed length and travel speed.
 
         Returns:
             The captured :class:`SurfaceScan`, with gantry context in
-            ``metadata``.
+            metadata.
 
         Raises:
             RuntimeError: If not connected.
@@ -815,7 +820,9 @@ class GocatorScanner(GocatorSettingsMixin):
                 except GoSdkError as e:
                     logger.warning("Error stopping after gantry scan: %s", e)
 
-    def acquire(self, gantry=None, **overrides: Any) -> Optional[SurfaceScan]:
+    def acquire(
+        self, gantry: Optional["GantryController"] = None, **overrides: Any
+    ) -> Optional[SurfaceScan]:
         """Run one configured scan — a zero-argument entry point for schedulers.
 
         ``scan_with_gantry()`` needs four arguments including a gantry handle,

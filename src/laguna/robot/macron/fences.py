@@ -36,9 +36,13 @@ DEFAULT_RESOLUTION_MM = 0.5
 # ---------------------------------------------------------------------------
 
 class Fence(ABC):
+    """A 3D exclusion-zone geometry that trajectories are checked against."""
+
     @property
     @abstractmethod
-    def name(self) -> str: ...
+    def name(self) -> str:
+        """Unique identifier, used in the registry and violation messages."""
+        ...
 
     @abstractmethod
     def contains(self, x: float, y: float, z: float) -> bool:
@@ -69,9 +73,11 @@ class BoxFence(Fence):
 
     @property
     def name(self) -> str:
+        """Unique identifier for this fence."""
         return self._name
 
     def contains(self, x: float, y: float, z: float) -> bool:
+        """True if (x, y, z) is inside the box, inclusive of its bounds."""
         return (
             self.x_min <= x <= self.x_max
             and self.y_min <= y <= self.y_max
@@ -79,6 +85,7 @@ class BoxFence(Fence):
         )
 
     def describe(self) -> str:
+        """Human-readable description for violation messages."""
         return (
             f"BoxFence({self._name!r} "
             f"x=[{self.x_min},{self.x_max}] "
@@ -107,15 +114,18 @@ class CylinderFence(Fence):
 
     @property
     def name(self) -> str:
+        """Unique identifier for this fence."""
         return self._name
 
     def contains(self, x: float, y: float, z: float) -> bool:
+        """True if (x, y, z) is inside the cylinder, inclusive of its bounds."""
         return (
             math.hypot(x - self.center_x, y - self.center_y) <= self.radius
             and self.z_min <= z <= self.z_max
         )
 
     def describe(self) -> str:
+        """Human-readable description for violation messages."""
         return (
             f"CylinderFence({self._name!r} "
             f"center=({self.center_x},{self.center_y}) "
@@ -132,28 +142,50 @@ class FenceRegistry:
     """Mutable collection of active fences."""
 
     def __init__(self) -> None:
+        """Create an empty registry."""
         self._fences: dict[str, Fence] = {}
 
     def add(self, fence: Fence) -> None:
+        """Register a fence.
+
+        Args:
+            fence: The fence to add.
+
+        Raises:
+            ValueError: A fence with this name is already registered.
+        """
         if fence.name in self._fences:
             raise ValueError(f"A fence named {fence.name!r} already exists. Remove it first.")
         self._fences[fence.name] = fence
 
     def remove(self, name: str) -> None:
+        """Unregister a fence by name.
+
+        Raises:
+            KeyError: No fence with this name is registered.
+        """
         if name not in self._fences:
             raise KeyError(f"No fence named {name!r}")
         del self._fences[name]
 
     def get(self, name: str) -> Fence:
+        """Look up a registered fence by name.
+
+        Raises:
+            KeyError: No fence with this name is registered.
+        """
         return self._fences[name]
 
     def list(self) -> list[Fence]:
+        """All registered fences, in no particular order."""
         return list(self._fences.values())
 
     def __len__(self) -> int:
+        """Count of registered fences."""
         return len(self._fences)
 
     def __contains__(self, name: str) -> bool:
+        """True if a fence with this name is registered."""
         return name in self._fences
 
 
@@ -174,6 +206,15 @@ class FenceViolation(Exception):
         point: Point3D,
         segment: tuple[Point3D, Point3D] | None = None,
     ):
+        """Build the violation and its message.
+
+        Args:
+            fence: The exclusion zone that was entered.
+            point: The specific (x, y, z) found inside the fence.
+            segment: The trajectory segment (start, end) being checked when
+                the violation was found, if this came from a segment check
+                rather than a single-point check.
+        """
         self.fence = fence
         self.point = point
         self.segment = segment
@@ -207,6 +248,10 @@ class CheckedTrajectory:
 
     @property
     def is_safe(self) -> bool:
+        """True if no violations were recorded.
+
+        Always true in normal usage — see class docstring.
+        """
         return len(self.violations) == 0
 
 
@@ -226,13 +271,31 @@ class TrajectoryChecker:
         registry: FenceRegistry,
         resolution_mm: float = DEFAULT_RESOLUTION_MM,
     ):
+        """Bind a checker to a fence registry.
+
+        Args:
+            registry: Fences to check trajectories against.
+            resolution_mm: Sampling interval along each segment.
+
+        Raises:
+            ValueError: ``resolution_mm`` is not positive.
+        """
         if resolution_mm <= 0:
             raise ValueError(f"resolution_mm must be positive, got {resolution_mm}")
         self._registry = registry
         self.resolution_mm = resolution_mm
 
     def check_point(self, x: float, y: float, z: float) -> list[FenceViolation]:
-        """Return violations for a single point (may hit more than one fence)."""
+        """Return violations for a single point (may hit more than one fence).
+
+        Args:
+            x: X coordinate.
+            y: Y coordinate.
+            z: Z coordinate.
+
+        Returns:
+            List of FenceViolation objects for any fences containing this point.
+        """
         return [
             FenceViolation(f, (x, y, z))
             for f in self._registry.list()
@@ -242,7 +305,15 @@ class TrajectoryChecker:
     def check_segment(
         self, p1: Point3D, p2: Point3D
     ) -> list[FenceViolation]:
-        """Sample p1→p2 at resolution_mm steps; return all fence violations found."""
+        """Sample p1→p2 at resolution_mm steps; return all fence violations found.
+
+        Args:
+            p1: Segment start point (x, y, z).
+            p2: Segment end point (x, y, z).
+
+        Returns:
+            List of FenceViolation objects for any fence intersections found.
+        """
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         dz = p2[2] - p1[2]

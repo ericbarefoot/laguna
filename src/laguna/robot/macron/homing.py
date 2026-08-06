@@ -59,11 +59,21 @@ class HomingConfig:
     axis_configs: dict[Axis, AxisHomingConfig] = field(default_factory=dict)
 
     def axis_config(self, axis: Axis) -> Optional[AxisHomingConfig]:
+        """Get the homing config for a specific axis.
+
+        Args:
+            axis: The axis to look up.
+
+        Returns:
+            The AxisHomingConfig for this axis, or None if not configured.
+        """
         return self.axis_configs.get(axis)
 
 
 @dataclass
 class HomingResult:
+    """Result of a homing sequence execution."""
+
     success: bool
     axis_results: dict[str, float]  # axis name → final standoff position
     error: Optional[str] = None
@@ -84,6 +94,13 @@ class HomingProcedure:
         config: HomingConfig,
         io_map: Optional[IOMap] = None,
     ):
+        """Initialize the homing procedure.
+
+        Args:
+            cmd: Active MMCCommands instance (connection must already be open).
+            config: HomingConfig with capture sources and motion parameters.
+            io_map: IOMap for brake control. Defaults to standard pin mapping.
+        """
         self._cmd = cmd
         self._config = config
         self._io_map = io_map or IOMap()
@@ -190,6 +207,14 @@ class HomingProcedure:
     # ------------------------------------------------------------------
 
     def _disengage_brake_if_needed(self, axis: Axis) -> None:
+        """Disengage brake for Y/Z axes before homing motion.
+
+        Waits up to 0.5s for brake feedback to confirm disengagement.
+        Logs warning if feedback does not confirm but continues anyway.
+
+        Args:
+            axis: Target axis (no-op for axes without brakes).
+        """
         if axis not in (Y_AXIS, Z_AXIS):
             return
         self._cmd.disengage_brake(axis, self._io_map)
@@ -205,7 +230,13 @@ class HomingProcedure:
         )
 
     def _backoff_if_already_tripped(self, axis: Axis) -> None:
-        """If the limit switch is already active, jog away before starting homing."""
+        """If the limit switch is already active, jog away before starting homing.
+
+        Backs off 2× standoff distance to ensure switch is fully cleared.
+
+        Args:
+            axis: Target axis.
+        """
         self._cmd.arm_capture(axis)
         if not self._cmd.get_capture_bit(axis):
             return
@@ -223,6 +254,16 @@ class HomingProcedure:
         )
 
     def _wait_for_capture(self, axis: Axis) -> None:
+        """Wait for the capture latch to trip (limit switch detected).
+
+        Aborts axis motion if timeout elapses before capture.
+
+        Args:
+            axis: Target axis.
+
+        Raises:
+            SnapMotionError: If capture does not trip within configured timeout.
+        """
         cfg = self._config
         deadline = time.monotonic() + cfg.timeout_s
         while not self._cmd.capture_has_tripped(axis):

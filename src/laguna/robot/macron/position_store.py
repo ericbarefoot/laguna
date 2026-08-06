@@ -28,10 +28,22 @@ class GantryPositionStore:
     """Reads/writes {axis_name: position_mm} to a JSON file."""
 
     def __init__(self, path: str) -> None:
+        """Initialize position store at the given file path.
+
+        Args:
+            path: Filesystem path to the JSON checkpoint file.
+        """
         self._path = Path(path)
 
     def save(self, positions: Dict[str, float]) -> None:
-        """Atomically persist `positions`, tagged with the current wall time."""
+        """Atomically persist `positions`, tagged with the current wall time.
+
+        Args:
+            positions: Dictionary mapping axis names to position values in mm.
+
+        Raises:
+            OSError: If file write fails.
+        """
         tmp = self._path.with_suffix(".tmp")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps({"positions": positions, "wall_time": time.time()}, indent=2))

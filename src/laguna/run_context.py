@@ -77,6 +77,14 @@ class RunContext:
         run_id: Optional[str] = None,
         speed_factor: float = 1.0,
     ) -> None:
+        """Initialize a run context.
+
+        Args:
+            root: Directory to create the run directory beneath. None disables
+                the run directory.
+            run_id: Override the generated run ID.
+            speed_factor: Experiment seconds per real second for rehearsals.
+        """
         self.run_id = run_id or new_run_id()
         #: Experiment seconds per real second, so runtime_at()/wall_at() stay
         #: correct for an accelerated rehearsal. Recorded in the manifest
@@ -94,7 +102,11 @@ class RunContext:
 
     @property
     def directory(self) -> Optional[Path]:
-        """This run's directory, created on first use. None if not enabled."""
+        """Get this run's directory, creating it if needed.
+
+        Returns:
+            Path to run directory, or None if run directory is not enabled.
+        """
         if self.root is None:
             return None
         path = self.root / self.run_id
@@ -120,10 +132,12 @@ class RunContext:
     # ------------------------------------------------------------------
 
     def started(self) -> None:
+        """Record the run start time."""
         self.started_wall = time.time()
         self.write()
 
     def paused(self) -> None:
+        """Record the start of a pause interval."""
         # Guard against a double pause leaving two open intervals, which
         # would make the mapping ambiguous rather than merely wrong.
         if self.pauses and self.pauses[-1][1] is None:
@@ -132,18 +146,27 @@ class RunContext:
         self.write()
 
     def resumed(self) -> None:
+        """Record the end of a pause interval."""
         if self.pauses and self.pauses[-1][1] is None:
             self.pauses[-1][1] = time.time()
             self.write()
 
     def ended(self) -> None:
+        """Record the run end time."""
         self.ended_wall = time.time()
         if self.pauses and self.pauses[-1][1] is None:
             self.pauses[-1][1] = self.ended_wall
         self.write()
 
     def paused_before(self, wall: float) -> float:
-        """Total seconds spent paused before a wall-clock instant."""
+        """Get total seconds spent paused before a wall-clock instant.
+
+        Args:
+            wall: Wall-clock timestamp.
+
+        Returns:
+            Total pause duration before the given time.
+        """
         total = 0.0
         for start, end in self.pauses:
             if start >= wall:
@@ -152,26 +175,36 @@ class RunContext:
         return total
 
     def runtime_at(self, wall: float) -> float:
-        """Experiment runtime corresponding to a wall-clock instant.
+        """Convert wall-clock time to experiment runtime.
 
-        The conversion the manifest exists for: given a scan file's UTC
-        timestamp, what was the experiment runtime? Piecewise, because every
-        pause shifts the two timelines apart.
+        Args:
+            wall: Wall-clock timestamp.
+
+        Returns:
+            Experiment runtime at that wall time, adjusted for pauses and
+            speed_factor.
 
         Raises:
-            RuntimeError: If the run never recorded a start.
+            RuntimeError: If the run never recorded a start time.
         """
         if self.started_wall is None:
             raise RuntimeError("this run has no recorded start time")
         return (wall - self.started_wall - self.paused_before(wall)) * self.speed_factor
 
     def wall_at(self, runtime_s: float) -> float:
-        """Wall-clock instant corresponding to an experiment runtime.
+        """Convert experiment runtime to wall-clock time.
 
-        The inverse of :meth:`runtime_at`. Walks the pause intervals forward
-        rather than inverting analytically, since the mapping is a step
-        function and a closed form would have to special-case landing inside
-        a pause.
+        Inverse of runtime_at(). Walks pause intervals forward rather than
+        inverting analytically, since the mapping is a step function.
+
+        Args:
+            runtime_s: Experiment runtime in seconds.
+
+        Returns:
+            Wall-clock timestamp at that runtime.
+
+        Raises:
+            RuntimeError: If the run never recorded a start time.
         """
         if self.started_wall is None:
             raise RuntimeError("this run has no recorded start time")
@@ -191,7 +224,14 @@ class RunContext:
         runtime_s: Optional[float] = None,
         **extra: Any,
     ) -> None:
-        """Note a file this run produced, for the manifest."""
+        """Record a file produced by this run.
+
+        Args:
+            subsystem: Subsystem that produced the file.
+            path: File path.
+            runtime_s: Experiment runtime when file was produced.
+            **extra: Additional metadata fields.
+        """
         self.outputs.append(
             {
                 "subsystem": subsystem,
@@ -204,10 +244,13 @@ class RunContext:
         self.write()
 
     def stamp(self, runtime_s: Optional[float] = None) -> Dict[str, Any]:
-        """Fields to embed in a subsystem's own metadata.
+        """Get fields to embed in a subsystem's metadata.
 
-        Both timelines, so a file is self-describing even if the manifest is
-        ever separated from it.
+        Args:
+            runtime_s: Optional runtime to include.
+
+        Returns:
+            Dict with run_id, runtime_s, and wall_time for self-describing files.
         """
         return {
             "run_id": self.run_id,
@@ -216,6 +259,12 @@ class RunContext:
         }
 
     def to_dict(self) -> Dict[str, Any]:
+        """Export run state as a dictionary.
+
+        Returns:
+            Dict with run_id, speed_factor, start/end times, pause intervals,
+            and outputs.
+        """
         return {
             "run_id": self.run_id,
             "speed_factor": self.speed_factor,
@@ -226,11 +275,13 @@ class RunContext:
         }
 
     def write(self) -> Optional[Path]:
-        """Persist the manifest. Atomic, and never raises.
+        """Persist the manifest atomically.
 
-        Written on every change rather than at the end, so a run killed
-        mid-flight still leaves a usable timeline — which is exactly the case
-        where reconstructing one by hand is hardest.
+        Written on every change so an interrupted run still leaves a usable
+        timeline.
+
+        Returns:
+            Path to the written manifest, or None if write failed.
         """
         try:
             directory = self.directory
@@ -250,9 +301,16 @@ class RunContext:
 
     @classmethod
     def load(cls, path: str) -> "RunContext":
-        """Read a manifest back, for after-the-fact analysis.
+        """Load a manifest from disk.
 
-        Accepts either the ``run.json`` itself or the directory holding it.
+        Args:
+            path: Path to run.json or the directory containing it.
+
+        Returns:
+            RunContext with the loaded run state.
+
+        Raises:
+            FileNotFoundError: If manifest does not exist.
         """
         p = Path(path)
         if p.is_dir():
@@ -267,6 +325,11 @@ class RunContext:
         return ctx
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        """Return a string representation of the run context.
+
+        Returns:
+            Debugging representation showing run_id and output count.
+        """
         return f"RunContext({self.run_id!r}, outputs={len(self.outputs)})"
 
 

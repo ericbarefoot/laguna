@@ -120,6 +120,15 @@ def parse_command(cmd: str) -> Tuple[str, int]:
 
     Handles the optional leading axis/group prefix (A<n>/C<n>) — e.g.
     "A1 SPD 5000" -> ("SPD", 1); "INB 3" -> ("INB", 1); "WHT" -> ("WHT", 0).
+
+    Args:
+        cmd: Formatted ASCII command string.
+
+    Returns:
+        Tuple of (mnemonic, argument_count).
+
+    Raises:
+        ValueError: If command is empty or has no mnemonic.
     """
     tokens = cmd.split()
     if not tokens:
@@ -160,20 +169,40 @@ class SafeModeConnection(SnapConnection):
     """
 
     def __init__(self, inner: SnapConnection, safe_mode: bool = True):
+        """Wrap a connection with safe-mode gating.
+
+        Args:
+            inner: Inner SnapConnection to wrap.
+            safe_mode: Whether safe-mode restrictions are active (default True).
+        """
         self._inner = inner
         self.safe_mode = safe_mode
 
     def connect(self) -> None:
+        """Open inner connection."""
         self._inner.connect()
 
     def disconnect(self) -> None:
+        """Close inner connection."""
         self._inner.disconnect()
 
     @property
     def is_connected(self) -> bool:
+        """True if inner connection is open."""
         return self._inner.is_connected
 
     def send(self, command: str) -> str:
+        """Send command with safe-mode and ENA checks.
+
+        Args:
+            command: ASCII command string.
+
+        Returns:
+            Response value token.
+
+        Raises:
+            SnapMotionError: If command violates safe-mode or ENA restrictions.
+        """
         check_ena_banned(command)     # unconditional — see check_ena_banned
         if self.safe_mode:
             check_safe_mode(command)  # raises before touching the inner connection
@@ -201,6 +230,25 @@ class PiGantryConnection(SnapConnection):
         max_reconnect_attempts: int = 3,
         legacy_modem_lines: bool = False,
     ):
+        """Initialize SSH bridge to remote gantry_agent.py.
+
+        Args:
+            host: Hostname or IP of the Pi running gantry_agent.
+            ssh_user: SSH username.
+            ssh_key: Path to SSH private key (optional).
+            ssh_passphrase: Passphrase for encrypted key (optional).
+            remote_serial_device: Device path on Pi (e.g. /dev/ttyUSB0).
+            remote_baud: Baud rate for serial device.
+            ssh_port: SSH port (default 22).
+            timeout: Command timeout in seconds.
+            safe_mode: Whether motion-blocking restrictions are active.
+            reconnect_on_failure: Whether to auto-reconnect on failure.
+            max_reconnect_attempts: Maximum reconnection attempts.
+            legacy_modem_lines: Whether to use legacy modem line settings.
+
+        Raises:
+            ValueError: If required parameters are missing or invalid.
+        """
         if not host:
             raise ValueError("host must be a non-empty string")
         if not ssh_user:
@@ -249,6 +297,16 @@ class PiGantryConnection(SnapConnection):
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
+        """Establish SSH connection and launch gantry_agent.py.
+
+        Deploys gantry_agent.py to the Pi, launches it as a persistent
+        process, waits for ready signal, and starts the reader thread.
+
+        Raises:
+            ImportError: If paramiko is not installed.
+            SnapMotionError: If connection fails or agent launch times out.
+            OSError: If SSH connection fails.
+        """
         try:
             import paramiko  # type: ignore[import]
         except ImportError as exc:
@@ -367,6 +425,7 @@ class PiGantryConnection(SnapConnection):
             logger.debug("[agent] %s", msg)
 
     def disconnect(self) -> None:
+        """Close the connection to the gantry agent gracefully."""
         self._reader_stop.set()
         channel = self._channel
         client = self._client
@@ -407,6 +466,7 @@ class PiGantryConnection(SnapConnection):
 
     @property
     def is_connected(self) -> bool:
+        """True if the connection to the agent is currently open and active."""
         return (
             self._channel is not None
             and not self._channel.closed
@@ -415,6 +475,7 @@ class PiGantryConnection(SnapConnection):
 
     @property
     def is_scan_running(self) -> bool:
+        """True if a topographic scan is currently running on the agent."""
         return self._scan_running
 
     # ------------------------------------------------------------------
@@ -459,6 +520,17 @@ class PiGantryConnection(SnapConnection):
     # ------------------------------------------------------------------
 
     def send(self, command: str) -> str:
+        """Send a command to the agent and return the response.
+
+        Args:
+            command: ASCII command string to send.
+
+        Returns:
+            Response value token as a string.
+
+        Raises:
+            SnapMotionError: If response is an error, timeout occurs, or safe_mode blocks the command.
+        """
         check_ena_banned(command)     # unconditional — see check_ena_banned
         if self.safe_mode:
             check_safe_mode(command)  # raises before anything is written
@@ -508,21 +580,29 @@ class PiGantryConnection(SnapConnection):
         al1342_host: str, pdin_port: int, output: str,
         sensor: str = "od2000",
     ) -> dict:
-        """Start a topographic scan on the agent. Returns the ack dict
-        ({"scan_started": True, "start_pos_mm": ..., "accel_mm_s2": ...,
-        "decel_mm_s2": ...}). Raises SnapMotionError if the agent rejects it
-        (blocked by its own safe_mode, a scan is already running, or
-        `sensor` isn't one gantry_agent.py recognizes) or on timeout waiting
-        for the ack. The scan itself then runs on the agent's background
-        thread — use wait_for_scan_result() to block for completion, and
-        stop_scan() to cancel it early.
+        """Start a topographic scan on the agent.
 
-        sensor: "od2000" (default) or "wtt12l_powerprox" — see
-        gantry_agent.py's SENSOR_DECODERS and
-        docs/WTT12L_POWERPROX_SETUP.md. Selects both the pdin decode and
-        whether the agent attempts laser on/off (skipped for
-        wtt12l_powerprox — see that doc's "no programmatic laser control
-        on this path").
+        Returns the ack dict ({"scan_started": True, "start_pos_mm": ...,
+        "accel_mm_s2": ..., "decel_mm_s2": ...}). Raises SnapMotionError if
+        the agent rejects it (blocked by its own safe_mode, a scan is already
+        running, or `sensor` isn't one gantry_agent.py recognizes) or on
+        timeout waiting for the ack. The scan itself then runs on the agent's
+        background thread — use wait_for_scan_result() to block for
+        completion, and stop_scan() to cancel it early.
+
+        Args:
+            axis: Scanning axis name ("X", "Y", or "Z").
+            end_mm: End position for scan in mm.
+            feed_rate_mm_s: Scanning feed rate in mm/s.
+            al1342_host: AL1342 scanner IP address.
+            pdin_port: IO-Link port number for rangefinder.
+            output: Output CSV file path.
+            sensor: "od2000" (default) or "wtt12l_powerprox" — see
+                gantry_agent.py's SENSOR_DECODERS and
+                docs/WTT12L_POWERPROX_SETUP.md. Selects both the pdin
+                decode and whether the agent attempts laser on/off
+                (skipped for wtt12l_powerprox — see that doc's "no
+                programmatic laser control on this path").
         """
         if self._scan_running:
             raise SnapMotionError(0, "Scan already in progress")
@@ -565,18 +645,22 @@ class PiGantryConnection(SnapConnection):
         return msg
 
     def stop_scan(self) -> None:
-        """Request the agent cancel the currently running scan (sends BST
-        on the scanning axis). Fire-and-forget — call wait_for_scan_result()
-        to observe the scan's actual completion afterward; a stopped scan
-        still finishes normally through the same scan_done path (see
-        gantry_agent.py), just with fewer samples than a full pass.
+        """Request the agent cancel the currently running scan.
+
+        Sends BST on the scanning axis. Fire-and-forget — call
+        wait_for_scan_result() to observe the scan's actual completion
+        afterward; a stopped scan still finishes normally through the same
+        scan_done path (see gantry_agent.py), just with fewer samples than
+        a full pass.
         """
         self._write_line(json.dumps({"op": "scan_stop"}))
 
     def wait_for_scan_result(self, timeout: float) -> dict:
-        """Block for the async scan_done/scan_error message. Raises
-        SnapMotionError on timeout. Returns the raw dict either way — check
-        for "error" in the result to distinguish success from failure."""
+        """Block for the async scan completion message.
+
+        Raises SnapMotionError on timeout. Returns the raw dict either way —
+        check for "error" in the result to distinguish success from failure.
+        """
         try:
             result = self._scan_result_queue.get(timeout=timeout)
         except queue.Empty:

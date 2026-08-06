@@ -146,8 +146,11 @@ def _log(msg: str) -> None:
 
 
 def _emit(obj: dict) -> None:
-    """Write one JSON line to stdout, guarded so the main thread and the scan
-    worker thread never interleave partial writes."""
+    """Write one JSON line to stdout.
+
+    Guarded so the main thread and the scan worker thread never interleave
+    partial writes.
+    """
     with _stdout_lock:
         print(json.dumps(obj), flush=True)
 
@@ -189,6 +192,14 @@ def check_ena_banned(cmd: str) -> None:
 
 
 def check_safe_mode(cmd: str) -> None:
+    """Check if a command is allowed by safe_mode restrictions.
+
+    Args:
+        cmd: Command string to check.
+
+    Raises:
+        PermissionError: If the command is blocked by safe_mode.
+    """
     mnemonic, arg_count = parse_command(cmd)
     max_args = SAFE_COMMANDS.get(mnemonic)
     if max_args is None or arg_count > max_args:
@@ -255,8 +266,9 @@ def _decode_pdin(hex_str: str, pdin_port: int) -> dict:
 
 
 def _decode_dp4200_wtt12l_pdin(hex_str: str, pdin_port: int) -> dict:
-    """Decode a WTT12L-A2523 PowerProx reading taken via its analog output,
-    digitized by an ifm DP4200 IO-Link analog-input bridge plugged into
+    """Decode a WTT12L-A2523 PowerProx reading from an analog output.
+
+    Digitized by an ifm DP4200 IO-Link analog-input bridge plugged into
     pdin_port in place of the WTT12L's own IO-Link connection (the WTT12L's
     native process data never validated on this AL1342 — see
     docs/WTT12L_POWERPROX_SETUP.md).
@@ -437,6 +449,14 @@ class SerialBridge:
 
     def __init__(self, port: str, baud: int, timeout: float = 5.0,
                  assert_modem_lines: bool = False):
+        """Initialize the serial bridge.
+
+        Args:
+            port: Serial port device path.
+            baud: Baud rate for the connection.
+            timeout: Read timeout in seconds.
+            assert_modem_lines: Whether to assert modem control lines.
+        """
         # --- exclusive access -------------------------------------------
         # exclusive=True is load-bearing, not hygiene. Linux does not lock tty
         # devices by default, so without it a second agent opens the same port
@@ -498,6 +518,7 @@ class SerialBridge:
         self._lock = threading.Lock()
 
     def close(self) -> None:
+        """Close the serial port connection."""
         if self._ser.is_open:
             self._ser.close()
 
@@ -528,11 +549,17 @@ class ScanState:
     """Tracks the currently running scan thread, if any."""
 
     def __init__(self):
+        """Initialize the scan state tracker."""
         self._lock = threading.Lock()
         self._thread: "threading.Thread | None" = None
         self._stop_event: "threading.Event | None" = None
 
     def is_running(self) -> bool:
+        """Check if a scan thread is currently running.
+
+        Returns:
+            True if a scan thread is running.
+        """
         with self._lock:
             return self._thread is not None and self._thread.is_alive()
 
@@ -556,6 +583,7 @@ class ScanState:
             return True
 
     def request_stop(self) -> None:
+        """Signal the running scan thread to stop."""
         with self._lock:
             if self._stop_event is not None:
                 self._stop_event.set()
@@ -665,7 +693,11 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
         t = rec["wall_time"]
         in_ramp = not (t_slew_start <= t <= t_slew_end)
         pos_mm = start_pos_mm + feed_rate_mm_s * (t - t_slew_start)
-        wall_iso = datetime.datetime.utcfromtimestamp(t).isoformat() + "Z"
+        wall_iso = (
+            datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         csv_rows.append({
             "wall_time_unix": t,
             "wall_time_iso": wall_iso,
@@ -738,6 +770,11 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
 
 
 def main() -> None:
+    """Run the gantry_agent as a standalone service.
+
+    Manages serial communication with the Snap2Motion controller and handles
+    topographic scan requests via a JSON-based protocol on stdin/stdout.
+    """
     parser = argparse.ArgumentParser(description="Persistent Snap2Motion serial bridge agent")
     parser.add_argument("--port", required=True, help="Serial device path")
     parser.add_argument("--baud", type=int, default=9600)

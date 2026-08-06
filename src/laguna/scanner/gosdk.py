@@ -112,6 +112,7 @@ class GoSdkError(RuntimeError):
     """A GoSdk call returned a non-kOK status."""
 
     def __init__(self, function: str, status: int):
+        """Initialize an SDK error with function name and status code."""
         self.function = function
         self.status = status
         super().__init__(f"{function} failed with kStatus={status}")
@@ -239,6 +240,7 @@ class GoSdkLib:
     """
 
     def __init__(self, lib_dir: Optional[str] = None):
+        """Load the GoSdk libraries and apply function prototypes."""
         self.lib_dir = find_lib_dir(lib_dir)
         # kApi must be RTLD_GLOBAL: libGoSdk.so resolves kApi symbols at load.
         self.kapi = ctypes.CDLL(

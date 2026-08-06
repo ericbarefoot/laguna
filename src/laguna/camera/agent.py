@@ -25,6 +25,21 @@ def _log(msg: str) -> None:
 
 
 def capture_at_time(target_time: float, output_dir: str = "/tmp/laguna_captures") -> dict:
+    """Capture one image at a specific Unix timestamp on a remote Raspberry Pi.
+
+    Waits until target_time, then captures a single frame via picamzero and returns
+    a dict with timing metadata (target_time, capture start/end, latency, filename).
+
+    Args:
+        target_time: Unix timestamp (seconds since epoch) when capture should occur.
+        output_dir: Directory to write captured image files (default /tmp/laguna_captures).
+
+    Returns:
+        Dict with either:
+        - On success: filename, target_time, capture_time_start, capture_time_end,
+          capture_time_mid, capture_duration_ms, latency_ms.
+        - On error: error key with a string description.
+    """
     _log("Starting — importing picamzero...")
     try:
         picamzero = importlib.import_module("picamzero")

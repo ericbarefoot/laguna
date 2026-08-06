@@ -1,3 +1,5 @@
+"""Timestamp utilities for camera logging."""
+
 import time
 
 

@@ -1,5 +1,4 @@
-"""Two-tier logging for subsystems: a terse archival event log vs. a
-detailed operational log, plus this mixin's own two knobs for the former.
+"""Two-tier logging for subsystems: event log vs. operational log.
 
 **The event log** (laguna.timing.EventLog, written via this mixin's
 log_event()) is the terse, archival narrative — it ships alongside
@@ -47,10 +46,13 @@ _GLOBAL_DEBUG = False
 
 
 def set_global_debug(enabled: bool) -> None:
-    """Force every subsystem's terminal logger to inherit DEBUG from the
-    "laguna" root logger, overriding each subsystem's own configured
-    log_level — called by FlumeLab(debug=True), not meant to be called
-    directly.
+    """Set global DEBUG mode for all laguna loggers.
+
+    Called by FlumeLab(debug=True) to override all subsystem log_level configs.
+
+    Args:
+        enabled: If True, set all laguna loggers to DEBUG; if False, leave
+            subsystem log_level configs in control.
     """
     global _GLOBAL_DEBUG
     _GLOBAL_DEBUG = enabled
@@ -71,11 +73,13 @@ class SubsystemLogging:
     _clock: Optional[Any] = None
 
     def attach_event_log(self, event_log: Any, clock: Any) -> None:
-        """Wire this instance's log_event() calls to the run's event log/clock.
+        """Wire this subsystem's log_event() calls to the run's event log.
 
-        Called automatically by FlumeLab.add() for any subsystem exposing
-        this method (see its hasattr(subsystem, "attach_event_log") check)
-        — no need to call this directly.
+        Called automatically by FlumeLab.add() for subsystems with this method.
+
+        Args:
+            event_log: EventLog instance to write to.
+            clock: ExperimentClock for elapsed time.
         """
         self._event_log = event_log
         self._clock = clock
@@ -85,12 +89,16 @@ class SubsystemLogging:
             )
 
     def log_event(self, action: str, level: str = "INFO", result: str = "ok", **fields: Any) -> None:
-        """Record one of this subsystem's key actions to the event log.
+        """Record a key action to the event log.
 
-        No-ops before attach_event_log() has run (e.g. a subsystem built
-        and used directly, outside FlumeLab), or when `level` is below this
-        subsystem's configured event_log_verbosity — the event log stays a
-        record of key actions, not a rehash of every internal detail.
+        No-op before attach_event_log() is called, or if `level` is below
+        the subsystem's event_log_verbosity threshold.
+
+        Args:
+            action: Action type string.
+            level: Log level (DEBUG, INFO, WARNING, etc.).
+            result: Result string (e.g., 'ok', 'error: ...')
+            **fields: Additional key=value pairs for the log record.
         """
         if self._event_log is None or self._clock is None:
             return

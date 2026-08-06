@@ -307,12 +307,8 @@ class SaflFlowController(FlowController, SubsystemLogging):
     def pause(self) -> Optional[str]:
         """Stop the pump, remembering the setpoint so resume() can restore it.
 
-        Pausing a flume stops the water: the hydraulic condition is part of
-        the experiment, so leaving the pump running would mean the experiment
-        continues while everything else is held. The cost is that resuming
-        needs a re-stabilisation period — that is inherent, not a defect.
-
-        Never raises; a pause that throws leaves the rest of the rig running.
+        Returns:
+            Note about any issues encountered, or None if successful.
         """
         self._paused_flowrate = self._current_flowrate
         try:
@@ -335,10 +331,10 @@ class SaflFlowController(FlowController, SubsystemLogging):
         return None
 
     def stop(self) -> Optional[str]:
-        """End cleanly: stop the pump, leave the valves as they are.
+        """Stop the pump, leaving the valves at their current state.
 
-        The valve positions are part of the experiment's configuration, not a
-        hazard on their own — only estop() forces them shut.
+        Returns:
+            Note about any issues encountered, or None if successful.
         """
         try:
             self._vfd_stop()

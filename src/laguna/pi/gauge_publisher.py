@@ -31,6 +31,12 @@ _running = True
 
 
 def _sigterm(signum, frame):
+    """Signal handler to gracefully stop the publisher.
+
+    Args:
+        signum: Signal number.
+        frame: Stack frame.
+    """
     global _running
     _running = False
 
@@ -38,9 +44,14 @@ def _sigterm(signum, frame):
 def _read_massa(ser) -> dict:
     """Send a poll to the Massa sensor and parse the response.
 
-    The Massa M300 series uses a simple ASCII request/response protocol:
-    send '!000R\\r\\n' (for sensor ID 0) and get back a CSV line with
-    distance_cm and optional temperature.
+    Args:
+        ser: Serial port connected to the Massa sensor.
+
+    Returns:
+        Dict with distance_cm, temperature_c, and signal_strength.
+
+    Raises:
+        ValueError: If the response format is unexpected.
     """
     ser.reset_input_buffer()
     ser.write(b"!000R\r\n")
@@ -60,6 +71,11 @@ def _read_massa(ser) -> dict:
 
 
 def main():
+    """Main entry point for the gauge publisher.
+
+    Connects to a Massa ultrasonic sensor over serial and publishes
+    readings to an MQTT broker.
+    """
     parser = argparse.ArgumentParser(description="Massa gauge → MQTT publisher")
     parser.add_argument("--port", required=True, help="Serial device for Massa sensor")
     parser.add_argument("--baud", type=int, default=9600)

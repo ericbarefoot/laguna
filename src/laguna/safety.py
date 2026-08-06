@@ -76,6 +76,7 @@ class SafetyTier(enum.Enum):
 
     @property
     def severity(self) -> int:
+        """Ordinal severity, PAUSE < STOP < ESTOP, for escalation comparisons."""
         return {"pause": 0, "stop": 1, "estop": 2}[self.value]
 
 
@@ -136,6 +137,14 @@ class SentinelFileTrigger:
         tier: SafetyTier = SafetyTier.ESTOP,
         name: Optional[str] = None,
     ) -> None:
+        """Watch ``path`` for existence as the trip condition.
+
+        Args:
+            path: Sentinel file path. Existence means tripped.
+            tier: Severity to demand while the file exists.
+            name: Identifier used in logs/refusal messages. Defaults to
+                ``"{tier}_file:{filename}"``.
+        """
         self.path = Path(path)
         self.tier = tier
         self.name = name or f"{tier.value}_file:{self.path.name}"
@@ -146,6 +155,7 @@ class SentinelFileTrigger:
         return f"remove {self.path}"
 
     def is_tripped(self) -> bool:
+        """True while the sentinel file exists."""
         return self.path.exists()
 
     def clear(self) -> bool:
@@ -157,6 +167,7 @@ class SentinelFileTrigger:
             return False
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        """Debug repr showing path and tier."""
         return f"SentinelFileTrigger({str(self.path)!r}, {self.tier.name})"
 
 
@@ -182,6 +193,16 @@ class CallableTrigger:
         name: str = "callable",
         hint: Optional[str] = None,
     ) -> None:
+        """Wrap a zero-arg predicate as a trigger.
+
+        Args:
+            predicate: Called with no arguments; truthy means tripped. An
+                exception is treated as not-tripped (see class docstring).
+            tier: Severity to demand while the predicate is true.
+            name: Identifier used in logs/refusal messages.
+            hint: Remediation text for refusal messages. Defaults to a
+                generic message referencing ``name`` if not given.
+        """
         self._predicate = predicate
         self.tier = tier
         self.name = name
@@ -189,12 +210,16 @@ class CallableTrigger:
 
     @property
     def hint(self) -> str:
-        """How to clear this trigger. Generic unless the caller supplied one —
-        a health-check predicate's remediation is caller-specific (e.g. a
-        VFD e-stop needs the physical button released, not a file removed)."""
+        """How to clear this trigger.
+
+        Generic unless the caller supplied one — a health-check predicate's
+        remediation is caller-specific (e.g. a VFD e-stop needs the physical
+        button released, not a file removed).
+        """
         return self._hint or f"resolve whatever '{self.name}' is checking"
 
     def is_tripped(self) -> bool:
+        """Evaluate the predicate. False (not an exception) if it raises."""
         try:
             return bool(self._predicate())
         except Exception as exc:
@@ -225,6 +250,14 @@ class SafetyMonitor:
         on_trip: Optional[Callable[[SafetyTier, str], None]] = None,
         poll_s: float = TRIGGER_POLL_S,
     ) -> None:
+        """Create a monitor, optionally pre-loaded with triggers.
+
+        Args:
+            triggers: Sources to poll. More can be added via ``add()``.
+            on_trip: Called with ``(tier, trigger_name)`` when a tier first
+                fires (see class docstring for escalation semantics).
+            poll_s: Seconds between polls.
+        """
         self.triggers: List = list(triggers or [])
         self._on_trip = on_trip
         self._poll_s = poll_s
@@ -233,6 +266,7 @@ class SafetyMonitor:
         self._fired_at: Optional[int] = None    # highest severity already fired
 
     def add(self, trigger) -> "SafetyMonitor":
+        """Register another trigger and return self, for chaining."""
         self.triggers.append(trigger)
         return self
 

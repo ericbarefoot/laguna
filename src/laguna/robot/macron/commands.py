@@ -146,6 +146,7 @@ class Axis:
     index: int
 
     def token(self) -> str:
+        """Return the ASCII axis prefix token (e.g. 'A1')."""
         return AXIS_TOKEN_FMT.format(n=self.index)
 
 
@@ -202,7 +203,7 @@ class AxisState:
 
 @dataclass
 class GroupState:
-    """Snapshot of a coordinated group's status."""
+    """Snapshot of a coordinated group's motion status."""
     speed: float = 0.0
     accel: float = 0.0
     decel: float = 0.0
@@ -377,23 +378,25 @@ class MMCCommands:
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
         group_axes: tuple[Axis, ...] = (X_AXIS, Y_AXIS, Z_AXIS),
     ):
-        """Args:
-        connection: Transport to send formatted ASCII commands over.
-        group_index: Coordinated-group index (the `C<N>` prefix).
-        mm_per_unit: Real mm per raw controller (ACP) unit, applied to
-            every linear-axis (X/Y/Z) position/velocity value. Defaults
-            to 1.0 (no conversion) — pass the value from
-            config's `gantry.mm_per_acp_unit` to apply the
-            docs/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
-            Theta.
-        coordinate_offset_mm: Optional {axis_name: offset_mm} real-mm
-            translation from the gantry's raw zero to a real-world
-            origin, applied to position (not velocity/delta) values for
-            linear axes. Axes not present in the dict get 0.0.
-        group_axes: The axes coordinated-group commands' positional
-            arguments map to, in order — must match how the group was
-            configured (e.g. via GCodeExecutor/GantryController). Used
-            only to look up per-axis mm_per_unit/offset for group moves.
+        """Initialize ASCII command formatter for a controller connection.
+
+        Args:
+            connection: Transport to send formatted ASCII commands over.
+            group_index: Coordinated-group index (the `C<N>` prefix).
+            mm_per_unit: Real mm per raw controller (ACP) unit, applied to
+                every linear-axis (X/Y/Z) position/velocity value. Defaults
+                to 1.0 (no conversion) — pass the value from
+                config's `gantry.mm_per_acp_unit` to apply the
+                docs/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
+                Theta.
+            coordinate_offset_mm: Optional {axis_name: offset_mm} real-mm
+                translation from the gantry's raw zero to a real-world
+                origin, applied to position (not velocity/delta) values for
+                linear axes. Axes not present in the dict get 0.0.
+            group_axes: The axes coordinated-group commands' positional
+                arguments map to, in order — must match how the group was
+                configured (e.g. via GCodeExecutor/GantryController). Used
+                only to look up per-axis mm_per_unit/offset for group moves.
         """
         self._conn = connection
         self._group = group_index
@@ -464,15 +467,38 @@ class MMCCommands:
     # ------------------------------------------------------------------
 
     def set_motor(self, axis: Axis, on: bool) -> bool:
-        """Enable or disable a single-axis motor drive. Returns current state."""
+        """Enable or disable a single-axis motor drive.
+
+        Args:
+            axis: Target axis.
+            on: True to enable, False to disable.
+
+        Returns:
+            Current motor state (True = on).
+        """
         val = 1 if on else 0
         return bool(self._send(f"{self._ax(axis)} MTR {val}"))
 
     def get_motor(self, axis: Axis) -> bool:
+        """Read single-axis motor drive state.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            True if motor is on, False if off.
+        """
         return bool(self._send(f"{self._ax(axis)} MTR"))
 
     def set_motor_group(self, on: bool) -> bool:
-        """Enable or disable all motors in the coordinated group."""
+        """Enable or disable all motors in the coordinated group.
+
+        Args:
+            on: True to enable, False to disable.
+
+        Returns:
+            Current group motor state (True = on).
+        """
         val = 1 if on else 0
         return bool(self._send(f"{self._gx()} MTR {val}"))
 
@@ -489,65 +515,197 @@ class MMCCommands:
     # ------------------------------------------------------------------
 
     def get_actual_position(self, axis: Axis) -> float:
-        """Read the axis stepper position tracker (ACP), in real mm."""
+        """Read the axis stepper position tracker (ACP), in real mm.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Current position in real mm.
+        """
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ACP"))
 
     def set_actual_position(self, axis: Axis, value: float) -> float:
-        """Set/zero the actual position register (ACP), given real mm. Returns new value in mm."""
+        """Set/zero the actual position register (ACP), given real mm.
+
+        Args:
+            axis: Target axis.
+            value: Position value in real mm.
+
+        Returns:
+            New position value in real mm.
+        """
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ACP {raw:.6g}"))
 
     def get_encoder_position(self, axis: Axis) -> float:
-        """Read raw encoder position (ENP) in real mm. Distinct from ACP — use to detect lost steps."""
+        """Read raw encoder position (ENP) in real mm.
+
+        Distinct from ACP (stepper position) — use to detect lost steps.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Current encoder position in real mm.
+        """
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ENP"))
 
     def set_encoder_position(self, axis: Axis, value: float) -> float:
-        """Zero or offset the encoder position register, given real mm."""
+        """Zero or offset the encoder position register, given real mm.
+
+        Args:
+            axis: Target axis.
+            value: Position value in real mm.
+
+        Returns:
+            New encoder position in real mm.
+        """
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ENP {raw:.6g}"))
 
     def get_commanded_position(self, axis: Axis) -> float:
+        """Read the last commanded position (COP), in real mm.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Last commanded position in real mm.
+        """
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} COP"))
 
     def get_destination_position(self, axis: Axis) -> float:
-        """Read the target position of the current or most recent move (DEP), in real mm."""
+        """Read the target position of the current or most recent move (DEP), in real mm.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Move destination in real mm.
+        """
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} DEP"))
 
     def set_speed(self, axis: Axis, value: float) -> float:
+        """Set axis motion speed (SPD), given real mm/s.
+
+        Args:
+            axis: Target axis.
+            value: Speed in real mm/s.
+
+        Returns:
+            Speed after command in real mm/s.
+        """
         raw = self._delta_to_raw(axis, value)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} SPD {raw:.6g}"))
 
     def get_speed(self, axis: Axis) -> float:
+        """Read axis motion speed (SPD), in real mm/s.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Current speed in real mm/s.
+        """
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} SPD"))
 
     def set_accel(self, axis: Axis, value: float) -> float:
+        """Set axis acceleration (ACL), given real mm/s².
+
+        Args:
+            axis: Target axis.
+            value: Acceleration in real mm/s².
+
+        Returns:
+            Acceleration after command in real mm/s².
+        """
         raw = self._delta_to_raw(axis, value)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} ACL {raw:.6g}"))
 
     def get_accel(self, axis: Axis) -> float:
+        """Read axis acceleration (ACL), in real mm/s².
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Current acceleration in real mm/s².
+        """
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} ACL"))
 
     def set_decel(self, axis: Axis, value: float) -> float:
+        """Set axis deceleration (DCL), given real mm/s².
+
+        Args:
+            axis: Target axis.
+            value: Deceleration in real mm/s².
+
+        Returns:
+            Deceleration after command in real mm/s².
+        """
         raw = self._delta_to_raw(axis, value)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} DCL {raw:.6g}"))
 
     def get_decel(self, axis: Axis) -> float:
+        """Read axis deceleration (DCL), in real mm/s².
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Current deceleration in real mm/s².
+        """
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} DCL"))
 
     def set_negative_limit(self, axis: Axis, value: float) -> float:
-        """Set software negative travel limit (NLT), given real mm. Motion beyond this raises an error."""
+        """Set software negative travel limit (NLT), given real mm.
+
+        Motion beyond this limit will raise an error.
+
+        Args:
+            axis: Target axis.
+            value: Limit position in real mm.
+
+        Returns:
+            Limit position after command in real mm.
+        """
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} NLT {raw:.6g}"))
 
     def get_negative_limit(self, axis: Axis) -> float:
+        """Read software negative travel limit (NLT), in real mm.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Negative limit in real mm.
+        """
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} NLT"))
 
     def set_positive_limit(self, axis: Axis, value: float) -> float:
-        """Set software positive travel limit (PLT), given real mm."""
+        """Set software positive travel limit (PLT), given real mm.
+
+        Args:
+            axis: Target axis.
+            value: Limit position in real mm.
+
+        Returns:
+            Limit position after command in real mm.
+        """
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} PLT {raw:.6g}"))
 
     def get_positive_limit(self, axis: Axis) -> float:
+        """Read software positive travel limit (PLT), in real mm.
+
+        Args:
+            axis: Target axis.
+
+        Returns:
+            Positive limit in real mm.
+        """
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} PLT"))
 
     def validate_soft_limits(
@@ -688,15 +846,23 @@ class MMCCommands:
         self._send(f"{self._gx()} CLR")
 
     def group_begin_stop(self) -> None:
+        """Start controlled deceleration of coordinated group (BST)."""
         self._send(f"{self._gx()} BST")
 
     def group_abort(self) -> None:
+        """Immediate stop with no decel ramp for coordinated group (ABT)."""
         self._send(f"{self._gx()} ABT")
 
     def group_stop(self) -> None:
+        """Immediate stop of coordinated group (STP)."""
         self._send(f"{self._gx()} STP")
 
     def group_move_is_finished(self) -> bool:
+        """Poll whether coordinated group move has completed (MIF).
+
+        Returns:
+            True if move is finished, False if still in progress.
+        """
         return bool(self._send(f"{self._gx()} MIF"))
 
     def group_set_speed(self, value: float) -> float:
@@ -713,24 +879,55 @@ class MMCCommands:
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_get_speed(self) -> float:
+        """Read coordinated group speed (SPD), in real mm/s.
+
+        Returns:
+            Current group speed in real mm/s.
+        """
         result = self._send(f"{self._gx()} SPD")
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_set_accel(self, value: float) -> float:
+        """Set coordinated group acceleration (ACL), given real mm/s².
+
+        Args:
+            value: Acceleration in real mm/s².
+
+        Returns:
+            Acceleration after command in real mm/s².
+        """
         raw = self._delta_to_raw(self._group_axes[0], value) if self._group_axes else value
         result = self._send(f"{self._gx()} ACL {raw:.6g}")
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_get_accel(self) -> float:
+        """Read coordinated group acceleration (ACL), in real mm/s².
+
+        Returns:
+            Current group acceleration in real mm/s².
+        """
         result = self._send(f"{self._gx()} ACL")
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_set_decel(self, value: float) -> float:
+        """Set coordinated group deceleration (DCL), given real mm/s².
+
+        Args:
+            value: Deceleration in real mm/s².
+
+        Returns:
+            Deceleration after command in real mm/s².
+        """
         raw = self._delta_to_raw(self._group_axes[0], value) if self._group_axes else value
         result = self._send(f"{self._gx()} DCL {raw:.6g}")
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
     def group_get_decel(self) -> float:
+        """Read coordinated group deceleration (DCL), in real mm/s².
+
+        Returns:
+            Current group deceleration in real mm/s².
+        """
         result = self._send(f"{self._gx()} DCL")
         return self._delta_to_mm(self._group_axes[0], result) if self._group_axes else result
 
@@ -751,7 +948,12 @@ class MMCCommands:
         self._send(f"{self._ax(axis)} SCS {source_index}")
 
     def set_capture_trip(self, axis: Axis, trip_on_high: bool) -> None:
-        """Set capture trip polarity (SCT). True = trip on input HIGH."""
+        """Set capture trip polarity (SCT).
+
+        Args:
+            axis: Target axis.
+            trip_on_high: True = trip on input HIGH, False = trip on LOW.
+        """
         val = 1 if trip_on_high else 0
         self._send(f"{self._ax(axis)} SCT {val}")
 
@@ -785,12 +987,18 @@ class MMCCommands:
     # ------------------------------------------------------------------
 
     def read_input_bit(self, index: int) -> bool:
-        """Read native digital input by index (INB). No axis prefix required.
+        """Read native digital input by index (INB).
 
         Used for: limit switch status, brake status, external sensors. This
         hardware's native input bus has only 8 bits (INB 9+ raises error 31,
         despite generic docs allowing up to 48) — index mapping depends on
         controller wiring, see IOMap for the confirmed/unconfirmed channels.
+
+        Args:
+            index: Input bit index (1-8).
+
+        Returns:
+            Input state (True = HIGH, False = LOW).
         """
         return bool(self._send(f"INB {index}"))
 
@@ -798,6 +1006,10 @@ class MMCCommands:
         """Set native digital output by index (SOB).
 
         Used for: brake engagement/disengagement, indicator lights.
+
+        Args:
+            index: Output bit index.
+            state: Desired state (True = HIGH, False = LOW).
         """
         val = 1 if state else 0
         self._send(f"SOB {index} {val}")
@@ -968,8 +1180,9 @@ class MMCCommands:
 
 
 class AxisHandle:
-    """Binds one configured Axis to MMCCommands, exposed as lab.gantry.<name>
-    (and lab.gantry.axis("<Name>")) by GantryController — see controller.py.
+    """Binds one configured Axis to MMCCommands, exposed as lab.gantry.<name>.
+
+    And lab.gantry.axis("<Name>") by GantryController — see controller.py.
 
     Pure delegation to the matching MMCCommands method (same axis-prefixed
     ASCII commands, same units/conversion) — this class adds no new wire
@@ -990,6 +1203,14 @@ class AxisHandle:
         is_safe_mode: Callable[[], bool],
         io_map: Optional[IOMap] = None,
     ):
+        """Bind an axis to MMCCommands.
+
+        Args:
+            cmd: MMCCommands instance to delegate to.
+            axis: Target Axis object.
+            is_safe_mode: Callable returning True if safe-mode is active.
+            io_map: IOMap for brake control (optional).
+        """
         self._cmd = cmd
         self._axis = axis
         self._is_safe_mode = is_safe_mode
@@ -997,10 +1218,12 @@ class AxisHandle:
 
     @property
     def name(self) -> str:
+        """Axis name (e.g. 'X', 'Y', 'Z', 'Theta')."""
         return self._axis.name
 
     @property
     def index(self) -> int:
+        """Firmware axis index (1-based)."""
         return self._axis.index
 
     def _check_motion_allowed(self, description: str) -> None:
@@ -1014,35 +1237,45 @@ class AxisHandle:
     # -- speed / accel / decel -----------------------------------------
 
     def get_speed(self) -> float:
+        """Read axis speed (mm/s)."""
         return self._cmd.get_speed(self._axis)
 
     def set_speed(self, value: float) -> float:
+        """Set axis speed (mm/s)."""
         return self._cmd.set_speed(self._axis, value)
 
     def get_accel(self) -> float:
+        """Read axis acceleration (mm/s²)."""
         return self._cmd.get_accel(self._axis)
 
     def set_accel(self, value: float) -> float:
+        """Set axis acceleration (mm/s²)."""
         return self._cmd.set_accel(self._axis, value)
 
     def get_decel(self) -> float:
+        """Read axis deceleration (mm/s²)."""
         return self._cmd.get_decel(self._axis)
 
     def set_decel(self, value: float) -> float:
+        """Set axis deceleration (mm/s²)."""
         return self._cmd.set_decel(self._axis, value)
 
     # -- position --------------------------------------------------------
 
     def get_position(self) -> float:
+        """Read axis stepper position tracker (ACP), in real mm."""
         return self._cmd.get_actual_position(self._axis)
 
     def get_commanded_position(self) -> float:
+        """Read last commanded position (COP), in real mm."""
         return self._cmd.get_commanded_position(self._axis)
 
     def get_destination_position(self) -> float:
+        """Read move destination (DEP), in real mm."""
         return self._cmd.get_destination_position(self._axis)
 
     def get_encoder_position(self) -> float:
+        """Read encoder position (ENP), in real mm."""
         return self._cmd.get_encoder_position(self._axis)
 
     # -- motor -------------------------------------------------------------
@@ -1087,8 +1320,10 @@ class AxisHandle:
         self._poll_move_finished(timeout, predicted_s=predicted_move_s(distance, self._last_speed()))
 
     def move_by(self, delta: float, timeout: float = 30.0) -> None:
-        """Relative move (real mm), blocking until it finishes. See move_to()
-        for why this polls internally rather than using the blocking MVB.
+        """Relative move (real mm), blocking until it finishes.
+
+        See move_to() for why this polls internally rather than using the
+        blocking MVB.
         """
         self._check_motion_allowed("move_by")
         self._cmd.begin_move_by(self._axis, delta)
@@ -1134,24 +1369,48 @@ class AxisHandle:
             )
 
     def jog(self, speed: float) -> float:
-        """Continuous velocity motion (JOG); pass 0 to stop (not gated)."""
+        """Start continuous velocity motion (JOG); pass 0 to stop.
+
+        Not gated by safe_mode when stopping (speed=0).
+
+        Args:
+            speed: Velocity in mm/s (sign determines direction).
+
+        Returns:
+            Actual speed after command.
+        """
         if speed != 0:
             self._check_motion_allowed("jog")
         return self._cmd.jog(self._axis, speed)
 
     def stop(self) -> None:
-        """Immediate stop (STP) — never gated; stopping is always allowed."""
+        """Immediate stop (STP).
+
+        Never gated; stopping is always allowed.
+        """
         self._cmd.stop(self._axis)
 
     def abort(self) -> None:
-        """Immediate stop with no decel ramp (ABT) — never gated."""
+        """Immediate stop with no decel ramp (ABT).
+
+        Never gated; always allowed.
+        """
         self._cmd.abort(self._axis)
 
     def is_move_finished(self) -> bool:
+        """Poll whether axis move has completed (MIF).
+
+        Returns:
+            True if move is finished, False if still in progress.
+        """
         return self._cmd.move_is_finished(self._axis)
 
     def state(self) -> AxisState:
-        """Read all readable axis properties in one batch of queries."""
+        """Read all readable axis properties in one batch of queries.
+
+        Returns:
+            AxisState snapshot; individual failed queries recorded in errors dict.
+        """
         return self._cmd.read_axis_state(self._axis)
 
     # -- brakes (Y/Z only) -------------------------------------------------
@@ -1164,23 +1423,28 @@ class AxisHandle:
             )
 
     def disengage_brake(self) -> None:
-        """Disengage this axis's electromagnetic brake. Raises ValueError if
-        this axis has no brake (X/Theta), or if the underlying IOMap channel
-        hasn't been configured yet — see MMCCommands.disengage_brake.
+        """Disengage this axis's electromagnetic brake.
+
+        Raises ValueError if this axis has no brake (X/Theta), or if the
+        underlying IOMap channel hasn't been configured yet — see
+        MMCCommands.disengage_brake.
         """
         self._require_brake()
         self._cmd.disengage_brake(self._axis, self._io_map)
 
     def engage_brake(self) -> None:
-        """Engage this axis's electromagnetic brake. Raises ValueError if
-        this axis has no brake (X/Theta), or if the underlying IOMap channel
-        hasn't been configured yet — see MMCCommands.engage_brake.
+        """Engage this axis's electromagnetic brake.
+
+        Raises ValueError if this axis has no brake (X/Theta), or if the
+        underlying IOMap channel hasn't been configured yet — see
+        MMCCommands.engage_brake.
         """
         self._require_brake()
         self._cmd.engage_brake(self._axis, self._io_map)
 
     def brake_is_disengaged(self) -> bool:
         """True if this axis's brake is currently disengaged (released).
+
         Raises ValueError if this axis has no brake (X/Theta), or if the
         underlying IOMap channel hasn't been configured/probed yet — see
         MMCCommands.brake_is_disengaged (also: Z's status feedback is not

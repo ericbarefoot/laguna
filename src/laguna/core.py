@@ -28,6 +28,7 @@ from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
 if TYPE_CHECKING:
     from .rangefinder import OD2000Rangefinder, WTT12LRangefinder
     from .robot.macron.controller import GantryController
+    from .robot.macron.profiler import ProfileResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,22 +55,12 @@ class FlumeLab:
     explicitly via ``lab.add(subsystem)``.
 
     Attributes:
+        clock: Experiment clock (wall time + runtime).
+        scheduler: Action scheduler tied to the experiment clock.
+        event_log: Append-only CSV event log.
         gantry: Registered gantry controller when present.
         od2000: Registered OD2000 rangefinder when present.
         wtt12l: Registered WTT12L rangefinder when present.
-
-    Example::
-
-        lab = FlumeLab("config.yaml")
-        lab.add_all()  # builds + registers every subsystem present in config.yaml
-        lab.connect_all()
-        with lab.experiment() as clock:
-            lab.scheduler.run(duration=300)
-
-    Attributes:
-        clock:      Experiment clock (wall time + runtime)
-        scheduler:  Action scheduler tied to the experiment clock
-        event_log:  Append-only CSV event log
     """
 
     gantry: "GantryController"
@@ -83,6 +74,20 @@ class FlumeLab:
         speed_factor: Optional[float] = None,
         debug: bool = False,
     ) -> None:
+        """Initialize FlumeLab.
+
+        Args:
+            config_file: Path to YAML configuration file.
+            simulate: If True, rehearse with no hardware attached (see
+                laguna.simulation for details on what is and is not simulated).
+            speed_factor: Experiment seconds per real second. Only applies when
+                simulate=True; accelerating live hardware is not supported.
+            debug: If True, set all laguna loggers to DEBUG level, overriding
+                individual subsystem log_level config.
+
+        Raises:
+            ValueError: If speed_factor is provided without simulate=True.
+        """
         logger.info("Initializing FlumeLab system...")
 
         self.config = Config(config_file=config_file)
@@ -193,13 +198,12 @@ class FlumeLab:
         logger.info("FlumeLab timing backbone ready — add subsystems via lab.add()")
 
     def _configure_operational_log(self) -> None:
-        """Wire up the operational log tier: connections + broad motion at
-        INFO, low-level/tessellated detail at DEBUG — distinct from the
-        terse, archival event_log CSV (see laguna.subsystem_logging's
-        module docstring for the full split). Reuses standard Python
-        logging rather than a second structured file format; persisted
-        under the run directory (run.root/run.run_id/laguna.log) when one
-        is configured, terminal-only otherwise.
+        """Configure the operational log tier for this run.
+
+        Wires up connections and broad motion at INFO, low-level detail at
+        DEBUG. Persisted under the run directory (run.root/run.run_id/laguna.log)
+        when configured, terminal-only otherwise. Distinct from the terse,
+        archival event_log CSV (see laguna.subsystem_logging for details).
         """
         from .subsystem_logging import set_global_debug
 
@@ -367,26 +371,20 @@ class FlumeLab:
         resume: bool = False,
         checkpoint_file: Optional[str] = None,
     ) -> Iterator[ExperimentClock]:
-        """Context manager that starts/stops the clock and logs experiment boundaries.
+        """Context manager that starts and stops the clock and logs experiment boundaries.
 
         Yields the ExperimentClock so the caller can call clock.wait_until(),
-        clock.elapsed(), etc. directly inside the with-block.
-
-        A CheckpointStore is created automatically (use resume=True on restart).
-
-        Example::
-
-            lab = FlumeLab("config.yaml")
-            lab.connect_all()
-            with lab.experiment(resume=False) as clock:
-                lab.scheduler.repeat(every=5, action=lab.cameras.trigger_capture)
-                lab.scheduler.run(duration=300)
+        clock.elapsed(), etc. directly inside the with-block. A CheckpointStore
+        is created automatically.
 
         Args:
-            resume:          If True, reload a previous checkpoint file rather
-                             than starting fresh.
+            resume: If True, reload a previous checkpoint file rather than
+                starting fresh.
             checkpoint_file: Override the path from config
-                             (timing.checkpoint_file).
+                (timing.checkpoint_file).
+
+        Yields:
+            ExperimentClock: The experiment's clock for this run.
         """
         cp_path = checkpoint_file or self.config.get_value(
             "timing.checkpoint_file", "./experiment_checkpoint.json"
@@ -437,13 +435,10 @@ class FlumeLab:
     def start(self, duration: float) -> threading.Thread:
         """Start the experiment clock and scheduler in a background thread.
 
-        Intended for interactive / REPL use after main_interactive() returns.
-        Nothing runs until this is called.
-
         Args:
             duration: How long to run the scheduler, in experiment-time seconds.
-                      Stored so that resume() with no arguments continues for
-                      the remaining time.
+                Stored so that resume() with no arguments continues for the
+                remaining time.
 
         Returns:
             The scheduler thread (daemon). Call lab.stop() to pause early.
@@ -564,12 +559,11 @@ class FlumeLab:
         """Resume after stop(): restart scheduler loop in background thread.
 
         Args:
-            remaining_s: How long to run, in experiment-time seconds. If omitted,
-                         uses the time remaining from the original lab.start() call
-                         (i.e. start_duration − elapsed_runtime).
+            remaining_s: How long to run in experiment-time seconds. If omitted,
+                uses the time remaining from the original start() call.
 
         Returns:
-            The scheduler thread, so caller can .join() it if desired.
+            The scheduler thread.
         """
         if remaining_s is None:
             if self._duration is None:
@@ -590,13 +584,19 @@ class FlumeLab:
     # these don't cover).
     # ------------------------------------------------------------------
 
-    def move_to(self, vector: Optional[list] = None, **axes) -> bool:
+    def move_to(self, vector: Optional[list] = None, **axes: Optional[float]) -> bool:
         """Move the gantry to an absolute position.
 
-        Thin delegate to ``self.gantry.move_to()`` — see
-        GantryController.move_to() for the full vector
-        (``move_to([x, y, z, theta])``) vs. per-axis keyword
+        Thin delegate to ``self.gantry.move_to()``; see GantryController for
+        the full vector (``move_to([x, y, z, theta])``) vs. per-axis keyword
         (``move_to(X=100)``) forms.
+
+        Args:
+            vector: Optional [x, y, z, theta] position vector.
+            **axes: Keyword arguments for per-axis positioning (e.g., X=100).
+
+        Returns:
+            True if move was issued.
 
         Raises:
             RuntimeError: If no 'gantry' subsystem is registered.
@@ -612,26 +612,18 @@ class FlumeLab:
         experiment_point: list,
         speed: Optional[float] = None,
     ) -> bool:
-        """Move so `instrument` measures at a point in the *experiment* frame.
+        """Move so `instrument` measures at a point in the experiment frame.
 
-        The counterpart to move_to(): name the place you want measured rather
-        than the robot position that gets you there. Because each instrument
-        is mounted somewhere different, the same experiment point yields a
-        different gantry command per instrument — which is exactly what lets
-        you re-run a transect with a second sensor::
-
-            lab.place("od2000", [100, 200, 0])     # OD2000's dot on the target
-            lab.place("wtt12l", [100, 200, 0])     # WTT12L's dot on the SAME spot
-
-        Offsets and the experiment frame come from ``lab.frames`` (the
-        ``frames:`` config section). An instrument with no configured frame is
-        assumed to measure at the gantry's commanded point, so this reduces to
-        move_to() on an unconfigured rig.
+        Counterpart to move_to(): specifies the measurement target rather than
+        the robot position. Because each instrument is mounted somewhere
+        different, the same experiment point yields a different gantry command
+        per instrument, allowing the same scan to be re-run with a different
+        sensor. Offsets and the experiment frame come from ``lab.frames``.
 
         Args:
             instrument: Instrument key, e.g. ``"od2000"``.
             experiment_point: [x, y, z] in experiment coordinates.
-            speed: Optional feed rate, mm/s.
+            speed: Optional feed rate in mm/s.
 
         Returns:
             True if a move was issued.
@@ -655,7 +647,7 @@ class FlumeLab:
         end: Optional[list] = None,
         output: Optional[str] = None,
         feed_rate_mm_s: Optional[float] = None,
-    ):
+    ) -> "ProfileResult":
         """Move to `start` (if given) and scan to `end`, saving a topographic profile.
 
         `start`/`end` are full position vectors, one value per configured
@@ -680,8 +672,8 @@ class FlumeLab:
                 default, since this drives a real hardware move.
 
         Returns:
-            ProfileResult (path, metadata, DataFrame) — see
-            laguna.robot.macron.profiler.ProfileResult.
+            ProfileResult: Path, metadata, and DataFrame; see
+                ``laguna.robot.macron.profiler.ProfileResult``.
 
         Raises:
             RuntimeError: If no 'gantry' subsystem is registered.
@@ -834,43 +826,34 @@ class FlumeLab:
         }[tier]()
 
     def log_note(self, text: str, refers_to: Optional[int] = None) -> int:
-        """Add a free-text note to the event log — for a human to explain
-        what happened, alongside the automatic narrative every other
-        event-log row records.
+        """Add a free-text note to the event log.
 
-        The event log ships as metadata alongside published experiment
-        data, so this is the place to record anything an automated
-        subsystem action can't say for itself: why a run was paused, what
-        a sensor glitch looked like, a decision made mid-experiment. Call
-        it any time — pausing/stopping first is not required.
+        Allows recording context that automated subsystem actions cannot
+        express themselves: why a run was paused, what a sensor glitch
+        looked like, or a decision made mid-experiment. Can be called at
+        any time.
 
         Args:
-            text: The note itself.
-            refers_to: Optional event_id (returned by this method or any
-                subsystem's log_event()) this note explains — e.g. the
-                event_id of a failed scan you're annotating with the cause.
+            text: The note content.
+            refers_to: Optional event_id (from this method or a subsystem's
+                log_event()) this note explains.
 
         Returns:
-            This note's own event_id, so a later note can refer back to it.
+            This note's own event_id for reference by later notes.
         """
         return self.event_log.log(
             self.clock.elapsed(), "operator", "note", notes=text, refers_to=refers_to
         )
 
     def pause(self, reason: str = "manual") -> None:
-        """Pause the experiment — everything quiesces, nothing disconnects.
+        """Pause the experiment — quiesces all subsystems without disconnecting.
 
-        Halts the scheduler, pauses every subsystem, and **pauses the
-        experiment clock**, so runtime measures time under experimental
-        conditions rather than wall time. Recover with :meth:`resume_from_pause`.
+        Halts the scheduler, pauses every subsystem, and pauses the experiment
+        clock. Discarded data is logged via the event log. Refuses to downgrade
+        an active ESTOPPED state; call rearm() first.
 
-        Anything a subsystem discarded to get here — a part-finished scan,
-        most importantly — is written to the event log by
-        :meth:`_for_each_subsystem`.
-
-        Refuses to downgrade an active ESTOPPED state — a pause is milder
-        than an estop, and something already decided the rig needed the
-        harder stop. Call :meth:`rearm` first.
+        Args:
+            reason: Annotation for the event log.
         """
         if self._safety_state is SafetyState.ESTOPPED:
             logger.error(
@@ -888,14 +871,13 @@ class FlumeLab:
         self._safety_state = SafetyState.PAUSED
 
     def resume_from_pause(self) -> bool:
-        """Undo :meth:`pause` — restart the clock and restore setpoints.
+        """Undo pause() — restart the clock and restore setpoints.
 
-        Refuses while a pause trigger is still asserted, so the rig cannot be
-        resumed straight back into whatever tripped it. Clear the sentinel
-        (or fix the failing health check) first.
+        Refuses while a pause trigger is still asserted, preventing resumption
+        into the condition that tripped it. Clear the trigger first.
 
-        Named to avoid colliding with :meth:`resume`, which resumes the
-        *scheduler* for the remainder of a run and predates this.
+        Returns:
+            True if resume succeeded, False if a trigger is still asserted.
         """
         if self._safety_state is SafetyState.ESTOPPED:
             raise RuntimeError(
@@ -922,14 +904,12 @@ class FlumeLab:
     def end_run(self, reason: str = "manual") -> None:
         """Stop cleanly — quiesce everything into a disconnectable state.
 
-        The middle tier: harder than a pause (not resumable), gentler than an
-        estop (controlled deceleration, no stalling against brakes). Named
-        end_run() because ``FlumeLab.stop()`` has always meant "pause" to
-        existing scripts and to run_blocking()'s signal handlers.
+        Intermediate tier: harder than pause (not resumable), gentler than
+        estop (controlled deceleration). Refuses to downgrade an active
+        ESTOPPED state; call rearm() first.
 
-        Refuses to downgrade an active ESTOPPED state, for the same reason
-        as :meth:`pause`: an estop is the more severe tier, and something
-        already decided the rig needed it. Call :meth:`rearm` first.
+        Args:
+            reason: Annotation for the event log.
         """
         if self._safety_state is SafetyState.ESTOPPED:
             logger.error(
@@ -949,16 +929,13 @@ class FlumeLab:
     def estop(self, reason: str = "manual") -> None:
         """Emergency stop — bring everything to a halt as fast as possible.
 
-        Gantry zero-decel abort with brakes engaged and motors disabled, pump
-        off, both valves closed, acquisition aborted and any partial scan
-        discarded. Motion is stopped first, then hydraulics.
+        Gantry abort with brakes engaged, pump off, both valves closed, and
+        any partial scan discarded. Each subsystem is guarded individually so
+        one failure cannot prevent others from being made safe. Leaves the rig
+        in SafetyState.ESTOPPED; call rearm() to recover.
 
-        Never raises and never stops early: each subsystem is guarded
-        individually, so one that fails or is disconnected cannot prevent the
-        others from being made safe.
-
-        Leaves the rig in :attr:`SafetyState.ESTOPPED`. Recover with
-        :meth:`rearm`, which refuses while a trigger is still asserted.
+        Args:
+            reason: Annotation for the event log.
         """
         logger.critical("EMERGENCY STOP (%s)", reason)
         self.event_log.log(
@@ -981,20 +958,16 @@ class FlumeLab:
             )
 
     def rearm(self) -> bool:
-        """Return from ESTOPPED to RUNNING, if it is safe to do so.
+        """Return from ESTOPPED to RUNNING if safe.
 
-        Refuses while any trigger is still asserted — a sentinel still on
-        disk, the VFD's hardware e-stop still latched — so the rig cannot be
-        brought back up into a live emergency. Clear the cause first.
+        Refuses while any trigger is still asserted (e.g., a sentinel file on
+        disk or the VFD's hardware e-stop still latched), ensuring the rig
+        cannot be brought back up into a live emergency. Re-enables motors and
+        releases brakes via gantry.set_safe_mode(False).
 
-        Re-enables motors and releases brakes via the gantry's own
-        ``set_safe_mode(False)`` path, which does motor-on then brake-release
-        in that order and never the reverse.
-
-        If this cannot clear the controller — a PLC that needed a power cycle
-        — fall back to a full ``disconnect_all()``/``connect_all()``, noting
-        that a reconnect loses the gantry's position reference unless
-        ``restore_last_position()`` is used (see issue #23).
+        Returns:
+            True if re-arm succeeded, False if a trigger is still asserted or
+            the gantry could not be cleared.
         """
         tripped = self.safety_monitor.tripped_by()
         if tripped is not None:
@@ -1031,13 +1004,13 @@ class FlumeLab:
     def escalate(self, problem: str, tier: SafetyTier = SafetyTier.PAUSE) -> None:
         """Bring the experiment down because something went wrong elsewhere.
 
-        The hook for "this is worse than one failed action". A scan that could
-        not run, an instrument that has gone unreachable, or a scheduled move
-        that found the gantry already busy all mean the scripted plan is no
-        longer being followed — and letting the run continue collects
-        perishable data under conditions nobody recorded.
-
+        Call when the scripted plan is no longer being followed (e.g., a failed
+        scan, an unreachable instrument, or the gantry unexpectedly busy).
         Defaults to a pause, which is recoverable once the cause is fixed.
+
+        Args:
+            problem: Description for the event log.
+            tier: SafetyTier level (PAUSE, STOP, or ESTOP).
         """
         logger.error("Escalating to %s: %s", tier.name, problem)
         self._on_safety_trigger(tier, problem)
@@ -1047,24 +1020,19 @@ class FlumeLab:
         sentinels: Optional[dict] = None,
         extra_triggers: Optional[list] = None,
     ) -> "FlumeLab":
-        """Start watching for externally-demanded pause / stop / estop.
+        """Start watching for externally-demanded pause/stop/estop on a background thread.
 
-        All three tiers, not just estop: a health check that notices the
-        scanner has stopped returning surfaces, or a camera has stopped
-        producing frames, can ``touch PAUSE`` and halt the run gracefully
-        before more perishable data is lost — no code changes needed.
-
-        Polls on a background thread rather than using a signal handler:
-        Python delivers signals only in the main thread between bytecodes, so
-        a signal cannot interrupt a blocking serial read or SDK call.
+        Monitors sentinel files (default: ./PAUSE, ./STOP, ./ESTOP) and any
+        additional triggers for all three tiers. Polling on a background thread
+        ensures external signals can interrupt blocking hardware calls.
 
         Args:
-            sentinels: ``{tier_name: path}``, defaulting to
-                ``./PAUSE``, ``./STOP``, ``./ESTOP``. Pass ``{}`` to skip.
+            sentinels: Dict mapping tier names to paths; defaults to
+                PAUSE/STOP/ESTOP. Pass {} to skip file monitoring.
             extra_triggers: Additional trigger objects (see laguna.safety).
 
         Returns:
-            self, so this chains off the constructor.
+            self, for method chaining.
         """
         paths = DEFAULT_SENTINELS if sentinels is None else sentinels
         for tier_name, path in (paths or {}).items():
@@ -1088,16 +1056,16 @@ class FlumeLab:
         return self
 
     def emergency_stop(self) -> None:
-        """Deprecated alias for :meth:`estop`, kept for existing scripts.
-
-        The old behaviour also disconnected everything; estop() deliberately
-        does not, so the rig can be inspected and re-armed without losing the
-        gantry's position reference.
-        """
+        """Deprecated alias for estop(), kept for backwards compatibility."""
         self.estop(reason="emergency_stop() alias")
 
     def open_ocean_control_gui(self, gui_script_path: Optional[str] = None) -> None:
-        """Launch the OceanControl GUI as a subprocess."""
+        """Launch the OceanControl GUI as a subprocess.
+
+        Args:
+            gui_script_path: Optional path to the GUI script. Defaults to config
+                or a hardcoded path.
+        """
         import subprocess
         import sys
 

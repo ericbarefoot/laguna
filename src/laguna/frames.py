@@ -76,6 +76,14 @@ class AffineTransform:
     """
 
     def __init__(self, matrix: Optional[np.ndarray] = None) -> None:
+        """Initialize an affine transform.
+
+        Args:
+            matrix: 4x4 homogeneous matrix. Defaults to identity.
+
+        Raises:
+            ValueError: If matrix is not 4x4, not rigid, or invalid.
+        """
         m = np.eye(4) if matrix is None else np.asarray(matrix, dtype=float)
         if m.shape != (4, 4):
             raise ValueError(f"transform matrix must be 4x4, got {m.shape}")
@@ -104,12 +112,26 @@ class AffineTransform:
 
     @classmethod
     def identity(cls) -> "AffineTransform":
-        """The do-nothing transform."""
+        """Return the identity transform.
+
+        Returns:
+            Identity transform that leaves points unchanged.
+        """
         return cls()
 
     @classmethod
     def from_translation(cls, xyz: Sequence[float]) -> "AffineTransform":
-        """Pure offset, in mm."""
+        """Create a pure translation transform.
+
+        Args:
+            xyz: [x, y, z] offset in mm.
+
+        Returns:
+            Translation transform.
+
+        Raises:
+            ValueError: If xyz does not have 3 values.
+        """
         vec = np.asarray(xyz, dtype=float).ravel()
         if vec.size != 3:
             raise ValueError(f"translation must have 3 values, got {vec.size}")
@@ -119,7 +141,14 @@ class AffineTransform:
 
     @classmethod
     def from_rotation_z(cls, degrees: float) -> "AffineTransform":
-        """Rotation about Z — the usual case for a gantry-mounted instrument."""
+        """Create a rotation about Z.
+
+        Args:
+            degrees: Rotation angle in degrees.
+
+        Returns:
+            Rotation transform about Z axis.
+        """
         c, s = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
         m = np.eye(4)
         m[:2, :2] = [[c, -s], [s, c]]
@@ -127,11 +156,17 @@ class AffineTransform:
 
     @classmethod
     def from_axis_map(cls, **axes: str) -> "AffineTransform":
-        """Build from a sensor axis map, e.g. ``scan_x="-Y", scan_y="+X"``.
+        """Build from a sensor axis map.
 
-        Shares :class:`laguna.scanner.mounting.SensorMounting`'s parsing and
-        its rejection of mirroring maps, so the Gocator's 90-degree mounting
-        is expressed the same way in both places.
+        Args:
+            **axes: Axis map in the form e.g. ``scan_x="-Y", scan_y="+X"``.
+                Shares parsing with laguna.scanner.mounting.SensorMounting.
+
+        Returns:
+            Transform with the specified axis mapping.
+
+        Raises:
+            ValueError: If the axis map is invalid or mirrored.
         """
         from .scanner.mounting import SensorMounting
 
@@ -142,16 +177,20 @@ class AffineTransform:
 
     @classmethod
     def from_config(cls, config: Optional[Dict[str, Any]]) -> "AffineTransform":
-        """Build from a config block.
+        """Build from a config dictionary.
 
-        Recognised keys, applied in this order — rotation first, then the
-        offset, so ``translation`` is always read in the *target* frame and
-        means what a reader expects ("move the origin over there"):
+        Args:
+            config: Config block with recognized keys applied in this order:
+                matrix (4x4, overrides all), axes (sensor map), rotation_deg
+                (about Z), translation ([x, y, z] in mm). Rotation is applied
+                first, then translation, so translation is always read in the
+                target frame.
 
-          - ``matrix``: an explicit 4x4, overriding everything else.
-          - ``axes``: a sensor axis map (see :meth:`from_axis_map`).
-          - ``rotation_deg``: rotation about Z, degrees.
-          - ``translation``: [x, y, z] offset in mm.
+        Returns:
+            Transform from the config.
+
+        Raises:
+            ValueError: If config contains unknown keys or invalid values.
         """
         if not config:
             return cls.identity()
@@ -176,11 +215,19 @@ class AffineTransform:
     # -- algebra --------------------------------------------------------
 
     def __matmul__(self, other: "AffineTransform") -> "AffineTransform":
-        """Compose: ``(a @ b).apply(p)`` == ``a.apply(b.apply(p))``."""
+        """Compose two transforms.
+
+        Returns:
+            Composed transform such that (a @ b).apply(p) == a.apply(b.apply(p)).
+        """
         return AffineTransform(self.matrix @ other.matrix)
 
     def inverse(self) -> "AffineTransform":
-        """The reverse mapping — target frame back to source frame."""
+        """Compute the reverse mapping.
+
+        Returns:
+            Transform mapping from target frame back to source frame.
+        """
         rot = self.matrix[:3, :3]
         inv = np.eye(4)
         inv[:3, :3] = rot.T
@@ -189,20 +236,33 @@ class AffineTransform:
 
     @property
     def translation(self) -> np.ndarray:
-        """The offset component, mm."""
+        """The offset component in mm.
+
+        Returns:
+            [x, y, z] translation vector.
+        """
         return self.matrix[:3, 3].copy()
 
     @property
     def is_identity(self) -> bool:
-        """True if this transform leaves points untouched."""
+        """Check if this is the identity transform.
+
+        Returns:
+            True if this transform leaves points untouched.
+        """
         return bool(np.allclose(self.matrix, np.eye(4), atol=_RIGID_TOL))
 
     def apply(self, points: np.ndarray) -> np.ndarray:
-        """Map a point ``(3,)`` or an ``(N, 3)`` array into the target frame.
+        """Map points into the target frame.
 
-        Applies the rotation and translation in place on a copy, without
-        building an (N, 4) homogeneous array — these clouds run to tens of
-        millions of points.
+        Args:
+            points: (3,) single point or (N, 3) array of points.
+
+        Returns:
+            Transformed point(s) in the target frame, same shape as input.
+
+        Raises:
+            ValueError: If points is not (3,) or (N, 3).
         """
         pts = np.asarray(points, dtype=float)
         single = pts.ndim == 1
@@ -215,10 +275,19 @@ class AffineTransform:
         return out[0] if single else out
 
     def to_dict(self) -> Dict[str, Any]:
-        """Round-trippable config form."""
+        """Export to round-trippable config form.
+
+        Returns:
+            Dict with 'matrix' key containing the 4x4 matrix as a nested list.
+        """
         return {"matrix": self.matrix.tolist()}
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        """Return a string representation of the transform.
+
+        Returns:
+            Debugging representation showing translation.
+        """
         t = self.translation
         return f"AffineTransform(translation=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}])"
 
@@ -241,6 +310,19 @@ class InstrumentFrame:
         mount: Optional[AffineTransform] = None,
         reference_point: Sequence[float] = (0.0, 0.0, 0.0),
     ) -> None:
+        """Initialize an instrument frame.
+
+        Args:
+            name: Instrument key matching its config/subsystem name.
+            mount: Transform from instrument frame to gantry frame.
+                Defaults to identity.
+            reference_point: The point in the instrument's frame that
+                represents "where it measures" (e.g., laser dot). Defaults
+                to origin (0, 0, 0).
+
+        Raises:
+            ValueError: If reference_point does not have 3 values.
+        """
         self.name = name
         self.mount = mount or AffineTransform.identity()
         self.reference_point = np.asarray(reference_point, dtype=float).ravel()
@@ -252,12 +334,25 @@ class InstrumentFrame:
 
     @property
     def offset(self) -> np.ndarray:
-        """Return the gantry-frame offset from the commanded point to where it measures."""
+        """Get the gantry-frame offset to where this instrument measures.
+
+        Returns:
+            [x, y, z] offset from the gantry's commanded point to the
+            measurement point.
+        """
         return self.mount.apply(self.reference_point)
 
     @classmethod
     def from_config(cls, name: str, config: Optional[Dict[str, Any]]) -> "InstrumentFrame":
-        """Build from one ``frames.instruments.<name>`` config block."""
+        """Build from a frames.instruments config block.
+
+        Args:
+            name: Instrument key.
+            config: Config dict (see AffineTransform.from_config()).
+
+        Returns:
+            InstrumentFrame with the specified mount and reference point.
+        """
         config = dict(config or {})
         reference_point = config.pop("reference_point", (0.0, 0.0, 0.0))
         return cls(
@@ -267,6 +362,11 @@ class InstrumentFrame:
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        """Return a string representation of the instrument frame.
+
+        Returns:
+            Debugging representation showing name and offset.
+        """
         o = self.offset
         return f"InstrumentFrame({self.name!r}, offset=[{o[0]:.3f}, {o[1]:.3f}, {o[2]:.3f}])"
 
@@ -284,12 +384,31 @@ class FrameRegistry:
         experiment_from_gantry: Optional[AffineTransform] = None,
         instruments: Optional[Dict[str, InstrumentFrame]] = None,
     ) -> None:
+        """Initialize a frame registry.
+
+        Args:
+            experiment_from_gantry: Transform from gantry to experiment frame.
+                Defaults to identity.
+            instruments: Dict mapping instrument keys to InstrumentFrame objects.
+                Defaults to empty.
+        """
         self.experiment_from_gantry = experiment_from_gantry or AffineTransform.identity()
         self.instruments: Dict[str, InstrumentFrame] = dict(instruments or {})
 
     @classmethod
     def from_config(cls, config: Optional[Dict[str, Any]]) -> "FrameRegistry":
-        """Build from the ``frames:`` config section (None -> all identity)."""
+        """Build from the ``frames:`` config section.
+
+        Args:
+            config: Config dict with optional 'experiment' and 'instruments'
+                keys. Missing or None yields identity transforms.
+
+        Returns:
+            FrameRegistry with experiment frame and all instrument frames.
+
+        Raises:
+            ValueError: If config contains unknown keys.
+        """
         config = config or {}
         unknown = set(config) - {"experiment", "instruments"}
         if unknown:
@@ -309,17 +428,30 @@ class FrameRegistry:
     # ------------------------------------------------------------------
 
     def add(self, frame: InstrumentFrame) -> "FrameRegistry":
-        """Register an instrument's mount. Returns self, so calls chain."""
+        """Register an instrument's mount.
+
+        Args:
+            frame: InstrumentFrame to register.
+
+        Returns:
+            self, for method chaining.
+        """
         self.instruments[frame.name] = frame
         return self
 
     def frame_for(self, instrument: str) -> InstrumentFrame:
         """Look up an instrument, defaulting to a zero-offset frame.
 
-        An unconfigured instrument is treated as measuring exactly at the
-        gantry's commanded point — the honest default, and it keeps a rig
-        with no ``frames:`` section behaving as it always did. The lookup is
-        logged at debug level so a silently-missing offset can be traced.
+        An unconfigured instrument is treated as measuring at the gantry's
+        commanded point (the default), keeping unconfigured rigs behaving as
+        before.
+
+        Args:
+            instrument: Instrument key.
+
+        Returns:
+            InstrumentFrame for the instrument, or a zero-offset frame if
+            unconfigured.
         """
         frame = self.instruments.get(instrument)
         if frame is None:
@@ -357,11 +489,25 @@ class FrameRegistry:
         return self.experiment_from_gantry.apply(gantry_points)
 
     def gantry_to_experiment(self, points: np.ndarray) -> np.ndarray:
-        """Map points already in gantry coordinates into the experiment frame."""
+        """Map points from gantry coordinates to experiment frame.
+
+        Args:
+            points: (3,) or (N, 3) points in gantry coordinates.
+
+        Returns:
+            Points in experiment frame, same shape as input.
+        """
         return self.experiment_from_gantry.apply(points)
 
     def experiment_to_gantry(self, points: np.ndarray) -> np.ndarray:
-        """Map experiment coordinates back into gantry coordinates."""
+        """Map points from experiment frame to gantry coordinates.
+
+        Args:
+            points: (3,) or (N, 3) points in experiment coordinates.
+
+        Returns:
+            Points in gantry coordinates, same shape as input.
+        """
         return self.experiment_from_gantry.inverse().apply(points)
 
     # -- inverse: where do I send the robot? ----------------------------
@@ -397,12 +543,18 @@ class FrameRegistry:
         to_instrument: str,
         gantry_position: Sequence[float],
     ) -> np.ndarray:
-        """Gantry position putting `to_instrument` where `from_instrument` was.
+        """Compute gantry position to put to_instrument where from_instrument was.
 
-        The direct form of "re-scan that transect with the other sensor",
-        when you have the original gantry position rather than an experiment
-        coordinate. Independent of the experiment frame — it is purely the
-        difference of the two mounts.
+        Direct form of "re-scan with the other sensor" when you have the
+        original gantry position. Independent of the experiment frame.
+
+        Args:
+            from_instrument: Source instrument key.
+            to_instrument: Target instrument key.
+            gantry_position: [x, y, z, ...] original gantry position.
+
+        Returns:
+            [x, y, z, ...] gantry position for the target instrument.
         """
         delta = (
             self.frame_for(from_instrument).offset
@@ -484,7 +636,11 @@ class FrameRegistry:
         )
 
     def describe(self) -> Dict[str, Any]:
-        """Human-readable summary, for logs and get_status()."""
+        """Human-readable summary for logs and get_status().
+
+        Returns:
+            Dict with experiment frame translation and instrument offsets.
+        """
         return {
             "experiment_translation_mm": self.experiment_from_gantry.translation.tolist(),
             "experiment_is_identity": self.experiment_from_gantry.is_identity,

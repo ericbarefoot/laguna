@@ -1,14 +1,8 @@
-"""Shared HTTP client for on-demand (acyclic) reads/writes against an ifm
-AL1342 IO-Link master.
+"""HTTP client for on-demand reads/writes to an ifm AL1342 IO-Link master.
 
-Promoted out of duplicated urllib code in
-examples/example_06_od2000_acyclic_read.py and
-scripts/calibrate_rangefinder.py — both talked to the same two AL1342
-endpoints (pdin/getdata, iolwriteacyclic) independently. See
-docs/MQTT_AL1342_SETUP.md: the AL1342 has no DNS of its own (address it by
-raw IP) and this is plain HTTP POST, not MQTT — MQTT's timer-push
-mechanism has a ~2Hz floor unsuitable for on-demand single reads or acyclic
-writes.
+Provides functions to read PDIN payloads and write acyclic ISDU parameters
+via plain HTTP POST to the AL1342 (not MQTT), suitable for on-demand
+single reads or interactive writes.
 """
 
 from __future__ import annotations
@@ -18,11 +12,19 @@ import urllib.request
 
 
 def read_pdin_hex(al1342_ip: str, pdin_port: int, timeout: float = 5.0) -> str:
-    """Read the current pdin hex string from an IO-Link device on `pdin_port`.
+    """Read the current PDIN hex string from an IO-Link device on `pdin_port`.
+
+    Args:
+        al1342_ip: IP address of the AL1342 IO-Link master.
+        pdin_port: IO-Link port number (1-8).
+        timeout: HTTP request timeout in seconds (default 5.0).
+
+    Returns:
+        Hex-encoded PDIN payload string.
 
     Raises:
         RuntimeError: If the AL1342 returns a non-200 code (e.g. the port
-            number is wrong or the device isn't connected).
+            number is wrong or the device is not connected).
     """
     adr = f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/pdin/getdata"
     payload = json.dumps({"code": "request", "cid": -1, "adr": adr}).encode()
@@ -50,12 +52,15 @@ def write_acyclic(
     """Write an IO-Link acyclic parameter (ISDU) to the device on `pdin_port`.
 
     Args:
+        al1342_ip: IP address of the AL1342 IO-Link master.
+        pdin_port: IO-Link port number (1-8).
         index: IODD parameter index.
         subindex: IODD parameter subindex.
         value: Hex-encoded value string, per the device's IODD.
+        timeout: HTTP request timeout in seconds (default 5.0).
 
     Raises:
-        RuntimeError: If the AL1342 doesn't accept the write (e.g. wrong
+        RuntimeError: If the AL1342 does not accept the write (e.g. wrong
             pdin_port, or the device rejects the index/subindex).
     """
     payload = json.dumps({

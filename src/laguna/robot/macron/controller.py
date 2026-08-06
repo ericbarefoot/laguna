@@ -73,10 +73,12 @@ def _axis_index_by_name(axes_cfg: List[Dict[str, Any]], name: str) -> Optional[i
 
 
 def _lookup_axis(axes_cfg: List[Dict[str, Any]], name: str) -> Optional[Axis]:
-    """Resolve an axis by name: prefer an explicit axes_cfg entry, falling
-    back to the known named-axis singletons (X/Y/Z/Theta) so that
-    homing.order / gcode axis selection still works even when the config
-    omits the axes: list entirely (using the all-default axis set).
+    """Resolve an axis by name.
+
+    Prefer an explicit axes_cfg entry, falling back to the known
+    named-axis singletons (X/Y/Z/Theta) so that homing.order / gcode axis
+    selection still works even when the config omits the axes: list entirely
+    (using the all-default axis set).
     """
     index = _axis_index_by_name(axes_cfg, name)
     if index is not None:
@@ -119,6 +121,25 @@ class GantryController:
         position_checkpoint_file: Optional[str] = None,
         arbiter: Optional[Any] = None,
     ):
+        """Initialize the gantry controller.
+
+        Args:
+            connection: SnapConnection transport to the controller.
+            axes: Tuple of Axis objects to configure (default: X/Y/Z/Theta).
+            group_index: Coordinated group index for XY motion.
+            io_map: IOMap for brake/switch pin configuration.
+            homing_config: HomingConfig for homing parameters.
+            fences: List of exclusion zone fences.
+            gcode_axes: XY axes for coordinated group (default X/Y).
+            gcode_z_axis: Z axis for gcode (default Z_AXIS).
+            gcode_theta_axis: Theta (rotary) axis (default THETA_AXIS).
+            theta_group_index: Coordinated group index for Z/Theta.
+            safe_mode: Whether no-motion restrictions are active.
+            mm_per_unit: Real mm per raw controller unit (unit conversion).
+            coordinate_offset_mm: Per-axis position offsets in mm.
+            position_checkpoint_file: Path to position persistence file.
+            arbiter: Motion arbiter for serializing operations.
+        """
         self._connection = connection
         #: Shared gantry lock — see laguna.robot.motion_arbiter.
         self.arbiter = arbiter or DEFAULT_ARBITER
@@ -217,10 +238,12 @@ class GantryController:
             raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}") from exc
 
     def axis(self, name: str) -> AxisHandle:
-        """Return the AxisHandle for a configured axis by name (case-sensitive,
-        matches the 'name' field in config's gantry.axes list — e.g. "X",
-        "Y", "Z", "Theta"). Equivalent to the dynamic lab.gantry.<name.lower()>
-        attribute, but useful when the axis name is only known at runtime.
+        """Return the AxisHandle for a configured axis by name.
+
+        Case-sensitive, matches the 'name' field in config's gantry.axes
+        list — e.g. "X", "Y", "Z", "Theta". Equivalent to the dynamic
+        lab.gantry.<name.lower()> attribute, but useful when the axis name
+        is only known at runtime.
         """
         try:
             return self._axis_handles[name]
@@ -242,23 +265,27 @@ class GantryController:
         )
 
     def engage_brake(self, axis: "Axis | AxisHandle | str") -> None:
-        """Engage the electromagnetic brake on the given axis (Y or Z only —
-        raises ValueError for axes without a brake). Accepts an axis name
-        ("Y"), an Axis object, or an AxisHandle (e.g. lab.gantry.y) — same
-        effect as lab.gantry.y.engage_brake(), just callable with the axis
-        as an argument instead. See AxisHandle.engage_brake in commands.py.
+        """Engage the electromagnetic brake on the given axis.
+
+        Y or Z only — raises ValueError for axes without a brake. Accepts
+        an axis name ("Y"), an Axis object, or an AxisHandle (e.g.
+        lab.gantry.y) — same effect as lab.gantry.y.engage_brake(), just
+        callable with the axis as an argument instead. See AxisHandle.engage_brake
+        in commands.py.
         """
         self._resolve_axis_handle(axis).engage_brake()
 
     def disengage_brake(self, axis: "Axis | AxisHandle | str") -> None:
-        """Disengage the electromagnetic brake on the given axis (Y or Z
-        only — raises ValueError for axes without a brake). See
+        """Disengage the electromagnetic brake on the given axis.
+
+        Y or Z only — raises ValueError for axes without a brake. See
         engage_brake() above for accepted `axis` forms.
         """
         self._resolve_axis_handle(axis).disengage_brake()
 
     def brake_is_disengaged(self, axis: "Axis | AxisHandle | str") -> bool:
         """True if the given axis's brake is currently disengaged (released).
+
         See engage_brake() above for accepted `axis` forms.
         """
         return self._resolve_axis_handle(axis).brake_is_disengaged()
@@ -309,6 +336,11 @@ class GantryController:
     # ------------------------------------------------------------------
 
     def connect(self) -> bool:
+        """Open the connection to the Snap2Motion controller.
+
+        Returns:
+            True if successfully connected.
+        """
         try:
             self._connection.connect()
             self._is_connected = self._connection.is_connected
@@ -392,10 +424,16 @@ class GantryController:
                 logger.info("%s: brake engaged", axis.name)
 
     def disconnect(self) -> None:
+        """Close the connection to the Snap2Motion controller."""
         self._connection.disconnect()
         self._is_connected = False
 
     def get_status(self) -> Dict[str, Any]:
+        """Get the current status of the gantry controller.
+
+        Returns:
+            Dictionary with connection status and axis information.
+        """
         status: Dict[str, Any] = {
             "subsystem": self.subsystem_name,
             "is_connected": self._is_connected,
@@ -436,10 +474,12 @@ class GantryController:
         return None
 
     def _persist_position(self) -> None:
-        """Best-effort snapshot of every axis's live position to the position
-        checkpoint file, if one is configured (position_checkpoint_file — see
-        position_store.py). Never raises: a persistence failure must not
-        break the caller's actual operation.
+        """Snapshot every axis's live position to the position checkpoint file.
+
+        Best-effort snapshot to the position checkpoint file, if one is
+        configured (position_checkpoint_file — see position_store.py). Never
+        raises: a persistence failure must not break the caller's actual
+        operation.
 
         Called at the end of move_to(), set_position(), stop(), and
         soft_stop() — deliberately including the two stop paths, not just
@@ -570,8 +610,11 @@ class GantryController:
 
         Args:
             vector: Full-length position vector, or None to use keywords.
-            X, Y, Z, Theta: Per-axis absolute targets (real mm; Theta in
-                whatever unit that axis's raw-to-real conversion yields).
+            X: Absolute X target in real mm.
+            Y: Absolute Y target in real mm.
+            Z: Absolute Z target in real mm.
+            Theta: Absolute Theta target in whatever unit that axis's
+                raw-to-real conversion yields.
             speed: Optional feed rate (mm/s) applied to the move(s).
 
         Returns:
@@ -709,8 +752,11 @@ class GantryController:
 
         Args:
             vector: Full-length position vector, or None to use keywords.
-            X, Y, Z, Theta: Per-axis new position values (real mm; Theta in
-                whatever unit that axis's raw-to-real conversion yields).
+            X: New X position in real mm.
+            Y: New Y position in real mm.
+            Z: New Z position in real mm.
+            Theta: New Theta position in whatever unit that axis's
+                raw-to-real conversion yields.
 
         Returns:
             True if every given axis's position register was set.
@@ -751,14 +797,13 @@ class GantryController:
         return True
 
     def soft_stop(self) -> None:
-        """Decelerate every configured axis to a stop, leaving brakes and
-        motors alone.
+        """Decelerate every configured axis to a stop.
 
-        The gentle counterpart to stop(): each axis decelerates using its
-        own accel/decel ramp (BST) rather than a zero-decel abort, and
-        nothing is disabled — so the gantry is immediately ready for
-        another move_to() with no re-enable cycle. Use this to cancel an
-        ordinary move; use stop() for an emergency.
+        Leaves brakes and motors alone. The gentle counterpart to stop():
+        each axis decelerates using its own accel/decel ramp (BST) rather
+        than a zero-decel abort, and nothing is disabled — so the gantry is
+        immediately ready for another move_to() with no re-enable cycle. Use
+        this to cancel an ordinary move; use stop() for an emergency.
 
         Never raises: one axis failing to stop is logged and does not
         prevent the rest from getting their stop command.
@@ -807,8 +852,10 @@ class GantryController:
         return None
 
     def set_safe_mode(self, enabled: bool) -> bool:
-        """Enable or disable safe_mode, reconnecting the transport if needed
-        so the change actually takes effect, and syncing Y/Z's brakes to match.
+        """Enable or disable safe_mode.
+
+        Reconnects the transport if needed so the change actually takes
+        effect, and syncs Y/Z's brakes to match.
 
         Setting ``self.connection.safe_mode`` directly is not enough for the
         pi_agent transport: gantry_agent.py enforces its own independent
@@ -881,10 +928,10 @@ class GantryController:
             self.cmd.set_motor(axis, True)
 
     def disable(self) -> None:
-        """Turn motor drive off for all configured axes (MTR only), allowing
-        manual repositioning.
+        """Turn motor drive off for all configured axes.
 
-        Does NOT send ENA — see enable().
+        Allows manual repositioning (MTR only). Does NOT send ENA — see
+        enable().
         """
         for axis in self._axes:
             self.cmd.set_motor(axis, False)
@@ -1015,8 +1062,9 @@ def _build_homing_config(homing_cfg: Dict[str, Any], axes_cfg: List[Dict[str, An
 
 
 def _resolve_gcode_axes(axes_cfg: List[Dict[str, Any]]) -> Tuple[Axis, Axis]:
-    """Pick the X/Y axes by name for the GCodeExecutor's commander-node
-    coordinated group.
+    """Pick the X/Y axes for the GCodeExecutor's commander-node group.
+
+    By name for the coordinated group.
 
     Z/Theta are deliberately not included — they cannot join this group on
     this hardware (different PLC node) and are passed separately as the

@@ -57,6 +57,12 @@ class MotionArbiter:
     """
 
     def __init__(self, timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
+        """Create an arbiter with no current holder.
+
+        Args:
+            timeout_s: Default seconds to wait for the gantry before raising
+                :class:`MotionBusyError`.
+        """
         self._lock = threading.RLock()
         self._timeout_s = timeout_s
         self._holder: Optional[str] = None
@@ -69,6 +75,7 @@ class MotionArbiter:
 
     @property
     def is_held(self) -> bool:
+        """True if any thread currently holds the gantry."""
         return self._holder is not None
 
     @contextmanager

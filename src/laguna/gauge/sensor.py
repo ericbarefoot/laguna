@@ -142,10 +142,11 @@ class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
     def read_mm(self) -> float:
         """Read and return instantaneous water surface elevation in mm.
 
-        Triggers a synchronous read on the underlying Massa sensor (a
-        request/response exchange over serial), updates the cached
-        `_last_read` used by get_status(), and returns the elevation for
-        the first configured sensor ID.
+        Performs a synchronous serial read from the Massa sensor and updates
+        the internal cache used by get_status().
+
+        Returns:
+            Water surface elevation in mm.
         """
         result = self._sensor.read()
         self._last_read = result

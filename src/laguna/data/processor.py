@@ -39,10 +39,10 @@ class DataProcessor:
         logger.info(f"Data processor initialized (output: {self.output_directory})")
 
     def add_data_point(self, data: Dict[str, Any]) -> None:
-        """Add a data point to the buffer.
+        """Add a single data point to the buffer.
 
         Args:
-            data: Dictionary containing sensor/system data
+            data: Dictionary containing sensor/system data.
         """
         self.data_buffer.append(data)
 
@@ -53,13 +53,13 @@ class DataProcessor:
         """Add multiple data points to the buffer.
 
         Args:
-            data_list: List of data dictionaries
+            data_list: List of data dictionaries.
         """
         self.data_buffer.extend(data_list)
         logger.debug(f"Added {len(data_list)} data points (total: {len(self.data_buffer)})")
 
     def clear_buffer(self) -> None:
-        """Clear the data buffer."""
+        """Clear all data from the buffer."""
         self.data_buffer.clear()
         logger.debug("Data buffer cleared")
 
@@ -89,19 +89,12 @@ class DataProcessor:
     def save_data(self, filename: str, data: Optional[List[Dict[str, Any]]] = None) -> bool:
         """Save processed data to file.
 
-        Not implemented — data streaming/packaging is deliberately out of
-        scope for the co-scripting work (see docs/COSCRIPTING_ROADMAP.md).
-        Raises rather than reporting success for a no-op, which used to
-        write nothing to disk while logging "Saved N data points" and
-        returning True — an active hazard for any caller trusting the
-        return value.
-
         Args:
-            filename: Output filename (without path)
-            data: Data to save (uses buffer if not provided)
+            filename: Output filename (without path).
+            data: Data to save; uses buffer if None.
 
         Raises:
-            NotImplementedError: Always.
+            NotImplementedError: HDF5/CSV export is not implemented.
         """
         raise NotImplementedError(
             "DataProcessor.save_data() does not write anything yet — "
@@ -113,10 +106,10 @@ class DataProcessor:
         """Export processed data in specified format.
 
         Args:
-            format: Export format ('csv', 'hdf5', 'json')
+            format: Export format (csv, hdf5, json).
 
         Returns:
-            Path to exported file or None if failed
+            Path to exported file, or None if buffer empty or export failed.
         """
         if not self.data_buffer:
             logger.warning("No data to export")

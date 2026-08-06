@@ -21,18 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 class MqttSubscriber:
-    """MQTT subscriber that buffers incoming messages per topic.
+    """MQTT subscriber with per-topic message buffering.
 
-    Follows the laguna subsystem contract: connect()/disconnect()/get_status().
-    paho's network loop runs in a background thread (loop_start); all callbacks
-    are called from that thread. Message queues are thread-safe.
-
-    Args:
-        config: Dict with keys: broker_host, broker_port, client_id,
-            keepalive, topics (list of initial topics to subscribe), qos.
-        event_log: Optional EventLog instance; if provided, each incoming
-            message is logged there immediately (in the paho thread).
-        clock: Unused; reserved for future ExperimentClock integration.
+    Wraps paho-mqtt with the standard laguna subsystem interface
+    (connect/disconnect/get_status). The paho network loop runs in a
+    background thread; all callbacks are thread-safe.
     """
 
     subsystem_name = "mqtt"
@@ -43,6 +36,16 @@ class MqttSubscriber:
         event_log=None,
         clock=None,
     ):
+        """Build the subscriber from a config dict; does not open a connection.
+
+        Args:
+            config: Subsystem configuration dictionary with keys:
+                broker_host, broker_port, client_id, keepalive,
+                topics (list of initial topics to subscribe), qos.
+            event_log: Optional EventLog instance; if provided, each incoming
+                message is logged immediately (in the paho thread).
+            clock: Unused; reserved for future ExperimentClock integration.
+        """
         self._host = config.get("broker_host", "red.lab")
         self._port = int(config.get("broker_port", 1883))
         # Suffixed with a per-instance UUID so two subsystems built from the
@@ -180,6 +183,7 @@ class MqttSubscriber:
     # ------------------------------------------------------------------
 
     def _on_connect(self, client, userdata, flags, rc):
+        """Handle broker connection completion (paho callback)."""
         if rc == 0:
             self._is_connected = True
             for topic in self._topics:
@@ -189,11 +193,13 @@ class MqttSubscriber:
             logger.error("MQTT connection refused (rc=%d)", rc)
 
     def _on_disconnect(self, client, userdata, rc):
+        """Handle broker disconnection (paho callback)."""
         self._is_connected = False
         if rc != 0:
             logger.warning("MQTT disconnected unexpectedly (rc=%d); will retry", rc)
 
     def _on_message(self, client, userdata, msg):
+        """Handle inbound message (paho callback)."""
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
         except Exception:

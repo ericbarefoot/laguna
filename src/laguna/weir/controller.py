@@ -124,7 +124,11 @@ class WeirController(ABC):
 
     @abstractmethod
     def resume(self) -> Optional[str]:
-        """Nothing to restore — the weir holds its elevation mechanically."""
+        """Resume motion (no-op: elevation is mechanically held).
+
+        Returns:
+            None.
+        """
         ...
 
     @abstractmethod
@@ -363,9 +367,11 @@ class SaflWeirController(WeirController, SubsystemLogging):
     # ------------------------------------------------------------------
 
     def _halt(self) -> Optional[str]:
-        """Halt any in-progress move. Never raises — shared by every tier,
-        because the weir holds its elevation mechanically and so has exactly
-        one safe action regardless of severity."""
+        """Halt any in-progress move.
+
+        Returns:
+            Note about any issues encountered, or None if successful.
+        """
         try:
             self._require_connected()
             self._motor.stop()
@@ -379,7 +385,11 @@ class SaflWeirController(WeirController, SubsystemLogging):
         return self._halt()
 
     def resume(self) -> Optional[str]:
-        """Nothing to restore — the weir holds its elevation mechanically."""
+        """Resume motion (no-op: elevation is mechanically held).
+
+        Returns:
+            None.
+        """
         return None
 
     def stop(self) -> Optional[str]:

@@ -55,15 +55,15 @@ class DslrCameraSubsystem(SubsystemLogging):
 
         Args:
             config_path: Path to dualcam YAML config (cameras.yaml).
-                         Not required when constructed via from_config().
+                Not required when constructed via from_config().
             dualcam_path: Optional path to dualcam-timelapse repo root.
-                         If provided, added to sys.path before import.
-            log_level / event_log_verbosity: see laguna.subsystem_logging
-                (both default 'INFO').
+                If provided, added to sys.path before import.
+            log_level: Logging level (default 'INFO'); see laguna.subsystem_logging.
+            event_log_verbosity: Event log verbosity (default 'INFO');
+                see laguna.subsystem_logging.
             simulated: Skip gphoto2/USB entirely — connect()/capture_all()
                 succeed without touching real cameras, returning placeholder
-                filenames instead of real images (default False; see
-                laguna.simulation's module docstring).
+                filenames instead of real images (default False).
         """
         self.config_path = Path(config_path) if config_path else None
         self.dualcam_path = Path(dualcam_path) if dualcam_path else None
@@ -77,9 +77,16 @@ class DslrCameraSubsystem(SubsystemLogging):
 
     @classmethod
     def from_config(cls, config: "Config") -> "DslrCameraSubsystem":
-        """Build from the lab's Config: its 'dslr_cameras:' section, plus
-        config.config_file to resolve output_dir paths and persist detected
-        port assignments back to the same experiment YAML they came from.
+        """Build from the lab's Config: its 'dslr_cameras:' section.
+
+        Uses config.config_file to resolve relative output_dir paths and to persist
+        detected USB port assignments back to the experiment YAML.
+
+        Args:
+            config: The lab's Config object.
+
+        Returns:
+            A DslrCameraSubsystem instance configured from config['dslr_cameras'].
 
         Raises:
             ValueError: If config.config_file is None (a Config built from
