@@ -7,13 +7,13 @@ master already in use for the OD2000 (see
 read — it covers the AL1342's HTTP control interface and `gettree`
 discovery in detail; this doc doesn't repeat that material).
 
-**Status: working, but via the analog output, not native IO-Link.** The
-WTT12L's own IO-Link process data never validated on this AL1342 — every
-attempt returned "invalid process data." The sensor's analog output (Qa),
-digitized through an ifm DP4200 IO-Link analog-input bridge, does work and
-is confirmed against two physical reference distances. See "What actually
-happened on hardware" below before reading the rest of this doc as
-prescriptive — it's a record of the investigation, not a clean recipe.
+The WTT12L is operational via its analog output, not native IO-Link. Native
+IO-Link process data has never validated on this AL1342 — all attempts
+returned "invalid process data" (error code 530). The sensor's analog output
+(Qa), digitized through an ifm DP4200 IO-Link analog-input bridge, works and
+has been confirmed against two physical reference distances. The sections
+below describe both the working analog approach and the investigation into
+why native IO-Link failed, in case the native path is revisited in the future.
 
 ---
 
@@ -41,22 +41,22 @@ prescriptive — it's a record of the investigation, not a clean recipe.
 
 ---
 
-## What actually happened on hardware (2026-07-28)
+## Hardware integration and validation
 
-### Physical connection took two tries
+### Physical connection
 
-First attempt (wired to physical port **X01**) showed the AL1342 port
-correctly configured for IO-Link (`mode = 3`) but `status = 0` ("State not
-connected") — no device seen at all. Root cause was wiring/power, not
-software: after rechecking connections and confirming the sensor's laser
-was actually lit, it turned out to be plugged into physical port **X07**,
-not X01. **Don't assume the physical port label matches where you think
-you plugged in — verify by scanning all 8 ports' `productname`, same as
-the OD2000 doc recommends, rather than trusting the physical label alone.**
+Initial troubleshooting revealed the AL1342 port was correctly configured for
+IO-Link (`mode = 3`) but showed `status = 0` ("State not connected") — no
+device detected. The root cause was physical: the sensor was actually
+connected to physical port **X07**, not X01, despite labeling suggesting
+otherwise. **Verify the actual connection by scanning all 8 ports'
+`productname` (using the same discovery approach as documented for the OD2000),
+rather than trusting physical port labels alone.** The AL1342 HTTP interface
+makes this verification straightforward and avoids miswired connections.
 
-### Native IO-Link process data never validated
+### Native IO-Link process data — not functional
 
-Once found on port 7, identification worked cleanly:
+Device identification works on port 7:
 
 ```bash
 curl -X POST http://192.168.1.251/ -H 'Content-Type: application/json' \
@@ -68,22 +68,20 @@ curl -X POST http://192.168.1.251/ -H 'Content-Type: application/json' \
 `serial` = 25170048, `status` = 2 ("State operate" — link layer up, cyclic
 comms established).
 
-But `pdin/getdata` consistently returned:
+However, `pdin/getdata` consistently returns:
 
 ```json
 {"cid":-1,"error":"00","code":530}
 ```
 
-**Code 530 = "The requested data is invalid" ("invalid process data")** —
-confirmed from ifm's own AL13xx diagnostic-codes table (a sibling master
-model's manual; the AL1342 doesn't publish its own copy of this table
-anywhere we found, but the IoT Core response-code scheme is shared across
-the AL1xxx family). This is distinct from `503` ("Service Unavailable" —
-no device / wrong port mode, which is what showed up on the empty ports)
-— the link was genuinely up, but the master was refusing to hand back the
-process data as valid.
+**Code 530 = "The requested data is invalid" ("invalid process data").** This
+is confirmed from ifm's AL13xx diagnostic-codes table (published in sibling
+master models' manuals; the AL1342 itself doesn't publish its own, but the
+IoT Core response-code scheme is shared across the AL1xxx family). This
+differs from code 503 ("Service Unavailable"), which appears on empty ports
+— the link is up, but the master refuses to return process data as valid.
 
-Every dynamic ISDU read also failed, with a different, IO-Link-level error:
+All dynamic ISDU reads also fail with a different error:
 
 ```bash
 curl -X POST http://192.168.1.251/ -H 'Content-Type: application/json' \
@@ -91,37 +89,38 @@ curl -X POST http://192.168.1.251/ -H 'Content-Type: application/json' \
 # {"cid":-1,"error":"8011","code":531}
 ```
 
-`8011 = IDX_NOTAVAIL` (index not available), for indices 36 (Device
-Status), 37 (Detailed Device Status), 83 (Detection/Operation mode), 97
-(Sender configuration — the exact index that works fine on the OD2000), 120
-(Process data select), and 229 (Distance to object). Meanwhile the *static*
+Error 8011 = `IDX_NOTAVAIL` (index not available). This affects indices 36
+(Device Status), 37 (Detailed Device Status), 83 (Detection/Operation mode),
+97 (Sender configuration — the same index that works on the OD2000), 120
+(Process data select), and 229 (Distance to object). By contrast, static
 identification indices — 16 (Vendor Name), 18 (Product Name), 21 (Serial
-Number) — read back correctly. That split (static ID readable, everything
-live/dynamic refused) survived a full power-cycle of the sensor and moving
-a target through the sensing range (300-1115 mm tried), so it wasn't a
-"target out of range" issue as first suspected. **Root cause not
-isolated** — plausible candidates, untested: the device may need an
-explicit configuration/teach step before it exposes the full photoelectric
-ISDU set (the generic "Technical Information" doc this repo's decode was
-built from explicitly warns not every documented index is implemented on
-every device), or there's a firmware/profile mismatch between this unit and
-the IODD the AL1342 expects. `decode_wtt12l_pdin()` in
-[`src/laguna/rangefinder/decoders.py`](../src/laguna/rangefinder/decoders.py)
-is kept in the code as the documented byte layout, but is unvalidated and
-currently unreachable — don't trust it against real hardware yet.
+Number) — read back correctly. This split (static ID readable, dynamic
+refused) persists across full power-cycles and targets moved through the
+sensing range (300–1115 mm), ruling out out-of-range conditions.
+
+**Root cause not identified.** Plausible explanations, untested:
+- The device may require an explicit configuration or teach step before
+  exposing the full photoelectric ISDU set (the generic SICK "Technical
+  Information" documentation explicitly warns that not every documented
+  index is implemented on every device).
+- There may be a firmware or profile mismatch between this unit and the IODD
+  the AL1342 expects.
+
+`decode_wtt12l_pdin()` in
+[`src/laguna/rangefinder/decoders.py`](https://github.com/ericbarefoot/laguna/blob/develop/src/laguna/rangefinder/decoders.py)
+preserves the documented byte layout but is unvalidated and currently
+unreachable — it should not be trusted against real hardware until the
+native IO-Link fault is resolved.
 
 ### Working path: analog output through a DP4200 bridge
 
-Rather than keep chasing the native IO-Link fault, an ifm DP4200 IO-Link
-analog-input module was wired in series with the WTT12L's Qa (analog, pin
-2) output and plugged into AL1342 port 7 in place of the WTT12L's own
-IO-Link connection. **The AL1342's IO-Link ports have no analog-input
-capability of their own** — port `mode` is one of `Disabled` / `DI` / `DO`
-/ `IO-Link` only, nothing analog — so a bridge device that itself speaks
-IO-Link (like the DP4200) is required to get an analog signal into this
-system at all.
+An ifm DP4200 IO-Link analog-input module bridges the WTT12L's analog
+output (Qa, pin 2) to the AL1342. **The AL1342's IO-Link ports lack analog
+input capability** — their modes are `Disabled`, `DI`, `DO`, or `IO-Link`
+only. A bridge device that speaks IO-Link (like the DP4200) is necessary
+to digitize an analog signal into the system.
 
-Confirmed on port 7 after the swap:
+On port 7 after wiring the DP4200:
 
 ```bash
 curl -X POST http://192.168.1.251/ -H 'Content-Type: application/json' \
@@ -129,8 +128,8 @@ curl -X POST http://192.168.1.251/ -H 'Content-Type: application/json' \
 # {"cid":-1,"data":{"value":"DP4200"},"code":200}
 ```
 
-`vendorid` = 310, `deviceid` = 610 (both ifm, as expected — different from
-SICK's 26). `pdin/getdata` returns valid data immediately, no 530 errors.
+`vendorid` = 310, `deviceid` = 610 (ifm, as expected). `pdin/getdata`
+returns valid data with no 530 errors.
 
 **Process data: 4 bytes (8 hex chars), big-endian, two 16-bit channel
 fields.**
@@ -140,71 +139,65 @@ fields.**
 | 0-1 | Channel 1 raw reading |
 | 2-3 | Channel 2 raw reading |
 
-Two physical readings anchor the decode:
+Two physical readings provide calibration data:
 
 | Distance | pdin | Ch1 raw | Ch2 raw |
 |---|---|---|---|
 | 600 mm | `2890FD01` | `0x2890` = 10384 | `0xFD01` = 64769 |
 | 1115 mm | `3F02FD01` (jittered 3F01-3F06 across repeats) | `0x3F02` ≈ 16130 | `0xFD01` = 64769 |
 
-**Channel 2 is unused** — identical `0xFD01` at both distances, doesn't
-track the target at all. Consistent with an unconnected/open second input
-on the DP4200 (only channel 1 is wired to the WTT12L). Not decoded.
+**Channel 2 is unused** — the value `0xFD01` is identical at both distances
+and does not track target motion, indicating an unconnected second input on
+the DP4200. Only channel 1 is wired to the WTT12L.
 
-**Channel 1 = current in µA**, i.e. divide by 1000 for mA. Both readings
-fall inside the WTT12L's 4-20 mA analog span (10.384 mA and 16.130 mA), and
-back-solving each independently for the sensor's un-taught default full-scale
-distance (datasheet: 4 mA = 100 mm, 20 mA = max range) gives 1354 mm and
-1439 mm respectively — both close to the WTT12L-A2523's actual rated max
-range of 1,400 mm. Two independent readings agreeing with the datasheet
-spec is a reasonable confirmation, not just a coincidence.
+**Channel 1 = current in µA** (divide by 1000 for mA). Both readings are
+within the WTT12L's 4–20 mA analog range (10.384 mA and 16.130 mA). Using
+the un-taught default full-scale mapping (datasheet: 4 mA = 100 mm, 20 mA =
+max range), these readings reverse-solve to 1354 mm and 1439 mm respectively
+— both consistent with the WTT12L-A2523's rated max range of 1,400 mm.
 
 ```
 current_mA = channel1_raw / 1000
 distance_mm = 100 + (current_mA - 4) / 16 * 1300
 ```
 
-Forward-checking this formula against the two calibration points gives
-~619 mm (vs. actual 600 mm) and ~1086 mm (vs. actual 1115 mm) — 19 and
-29 mm off respectively, within the sensor's own ±15-20 mm accuracy spec
-plus tape-measure/target-placement slop. **Expect more error here than the
-OD2000 or a hypothetically-working native WTT12L reading** — this is going
-through an extra analog conversion stage the OD2000 doesn't have.
+This formula yields ~619 mm and ~1086 mm for the two calibration points
+(vs. actual 600 mm and 1115 mm), errors of 19 and 29 mm respectively.
+These fall within the sensor's stated ±15–20 mm accuracy plus measurement
+noise (tape-measure precision, target placement). **Expect higher error
+than the OD2000 or a working native WTT12L path** — this adds an extra
+analog conversion stage the OD2000 does not have.
 
 `decode_dp4200_wtt12l_analog_pdin()` in
-[`src/laguna/rangefinder/decoders.py`](../src/laguna/rangefinder/decoders.py)
-implements this, with `near_mm`/`far_mm` as overridable parameters in case
-the sensor ever gets taught a different span than the un-taught default.
+[`src/laguna/rangefinder/decoders.py`](https://github.com/ericbarefoot/laguna/blob/develop/src/laguna/rangefinder/decoders.py)
+implements this formula. The `near_mm` and `far_mm` parameters are
+overridable if the sensor is later taught to a different span than the
+default un-taught range.
 
-### Consequence: no programmatic laser control on this path
+### Laser control limitation on this path
 
 The OD2000's laser on/off control (`_set_laser()` in `gantry_agent.py`)
 works by writing ISDU index 97 ("Sender configuration") directly to the
-sensor over IO-Link acyclic service data. **That's not available here.**
-The DP4200 is a distinct IO-Link device sitting between the AL1342 and the
-WTT12L — an `iolwriteacyclic` call against port 7 now addresses the
-DP4200's own parameter space, not the WTT12L's, since the WTT12L isn't
-the thing actually on the IO-Link bus anymore. There is no pass-through:
-the DP4200 only forwards the analog signal value, not IO-Link service
-requests to whatever's feeding its analog input.
+sensor over IO-Link. **This is not available with the DP4200 bridge.** The
+DP4200 is a separate IO-Link device between the AL1342 and WTT12L.
+Acyclic write calls to port 7 now address the DP4200's parameter space,
+not the WTT12L's, since the WTT12L is no longer directly on the IO-Link
+bus. The DP4200 forwards only the analog signal value, not IO-Link service
+requests upstream to the WTT12L's firmware.
 
-Two ways to regain laser control, neither exercised yet:
-1. **Wire it externally instead**: pin 5 (GY, "Sender off") is a
-   high-active hardware input on the WTT12L itself — driving it directly
-   (e.g. from a spare digital output elsewhere in the system, or an
-   AL1342 port configured as `DO`) would toggle the laser without going
-   through IO-Link at all. Needs an extra wire from pin 5 to whatever
-   drives it.
-2. **Resolve the native IO-Link fault** — if the 530/8011 errors get
-   root-caused and fixed, `_set_laser()`'s exact call shape should work
-   unmodified against port 7 (same ISDU 97 convention SICK uses across
-   this product line), and you'd get index 97 write access back along with
-   valid `pdin`.
+To recover laser control, either:
+1. **Wire the laser control externally**: pin 5 (GY, "Sender off") is a
+   high-active hardware input on the WTT12L. Driving it directly from a
+   spare digital output (elsewhere in the system or an AL1342 port in `DO`
+   mode) toggles the laser without IO-Link. Requires one additional wire.
+2. **Resolve the native IO-Link fault**: if the 530/8011 errors are
+   root-caused, `_set_laser()` should work unmodified against port 7
+   (SICK uses ISDU 97 consistently across this product line), restoring
+   both laser control and valid `pdin`.
 
-If the application doesn't need to turn the laser off programmatically,
-this is moot — the WTT12L's laser runs continuously by default like most
-SICK photoelectric proximity sensors, same as the OD2000 before
-`_set_laser()` was added.
+If the application does not require programmatic laser control, this
+limitation is irrelevant — the WTT12L's laser operates continuously by
+default, like most SICK photoelectric sensors.
 
 ---
 
@@ -227,14 +220,17 @@ path later.
   persistent `http.client.HTTPConnection` polling (not `urllib`) if a
   faster/scan-feeding rate is ever needed.
 
-## Open questions
+## Known limitations and open issues
 
-- Why did the WTT12L's native IO-Link process data validate the link layer
-  (`status = operate`) but refuse `pdin` and every dynamic ISDU? Not
-  root-caused.
-- Is the DP4200's channel-1-as-µA interpretation exactly right, or is there
-  a small offset/scale error hiding inside the ~20-30 mm decode residual?
-  A third calibration point at a very different distance (e.g. near the
-  100 mm or 1400 mm ends of the range) would tighten this up.
-- Does the DP4200 have its own ISDU-configurable input range/scaling that
-  might explain the residual error, or is it running on its own default?
+- **Native IO-Link fault unresolved**: The WTT12L's IO-Link link layer
+  establishes (`status = operate`), but `pdin` and all dynamic ISDU reads
+  return errors. Root cause not identified; see "Native IO-Link process
+  data — not functional" above for details and plausible explanations.
+- **Decode accuracy**: The DP4200 analog path introduces ~20–30 mm decode
+  residuals beyond the sensor's ±15–20 mm spec. The channel-1-as-µA
+  interpretation is calibrated to two points; a third measurement at a
+  very different distance (e.g. near 100 mm or 1,400 mm) would clarify
+  whether a small offset or scale error is present.
+- **DP4200 internal scaling**: Unknown whether the DP4200 has
+  ISDU-configurable input range/scaling parameters that might improve
+  accuracy, or if it operates on its own default.
