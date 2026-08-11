@@ -131,6 +131,17 @@ points = lab.frames.place_scan(scan)                  # (N, 3) experiment mm
 points = lab.frames.place_scan(scan, gantry_start=[700, 0, 0])   # explicit
 ```
 
+**Travel direction matters, separately from mounting.** The Gocator is
+encoderless — its own Y is just acquisition order (first frame captured to
+last), not tied to any real-world direction. `place_scan()` anchors the
+first-acquired point to the pass's real starting position and orients
+everything else by the recorded `gantry_start_mm -> gantry_end_mm` direction
+for *that* pass. This is independent of `gocator.mounting`'s rotation, which
+is a fixed rig constant and doesn't vary by pass — see
+[scanner.md](scanner.md), "Y is acquisition order, not a lab-frame
+direction," for the mechanism and what happens if you place scans some
+other way.
+
 ---
 
 ## Working out the offsets

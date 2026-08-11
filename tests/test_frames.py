@@ -208,11 +208,13 @@ class TestFrameRegistry:
             InstrumentFrame("x", reference_point=[1, 2])
 
 
-def make_scan(mounting=None, **meta):
+def make_scan(mounting=None, y_mm=None, x_mm=None, **meta):
+    x_mm = np.array([0.0, 10.0]) if x_mm is None else x_mm
+    y_mm = np.array([0.0, 20.0]) if y_mm is None else y_mm
     return SurfaceScan(
-        z_mm=np.array([[1.0, 2.0], [3.0, 4.0]]),
-        x_mm=np.array([0.0, 10.0]),
-        y_mm=np.array([0.0, 20.0]),
+        z_mm=np.ones((len(y_mm), len(x_mm))),
+        x_mm=x_mm,
+        y_mm=y_mm,
         metadata=meta,
         is_uniform=True,
         mounting=mounting or SensorMounting(),
@@ -265,3 +267,63 @@ class TestPlaceScan:
             gantry_start_mm=0.0,
         )
         assert registry.place_scan(scan).shape == (4, 3)
+
+    def test_negative_direction_pass_is_not_mirrored(self):
+        """The sensor is encoderless: its own Y is just acquisition order,
+        centred symmetrically around 0 regardless of which real-world
+        direction the gantry moved. Without correcting for the recorded
+        travel direction (gantry_start_mm -> gantry_end_mm), a pass that
+        travels in the negative direction along its axis comes out mirrored
+        — this is the bug this test guards against.
+        """
+        registry = FrameRegistry.from_config({"instruments": {"gocator": {"translation": [0.0, 0.0, 0.0]}}})
+        mounting = SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z")
+        scan = make_scan(
+            mounting,
+            y_mm=np.array([-175.0, -87.5, 0.0, 87.5, 175.0]),
+            gantry_axis="X",
+            gantry_start_mm=1449.99,
+            gantry_end_mm=1100.0,
+        )
+        # 5 rows x 2 cols (x_mm has 2 entries) -> each row appears twice;
+        # take one column's worth to check the per-row progression.
+        pts = registry.place_scan(scan)
+        row_values = pts[::2, 0]
+        expected = [1449.99, 1362.49, 1274.99, 1187.49, 1099.99]
+        np.testing.assert_allclose(row_values, expected, atol=1e-2)  # float32 (default dtype)
+        # Monotonically decreasing (matching the real negative-direction
+        # travel), not increasing — that's what "not mirrored" means here.
+        assert np.all(np.diff(row_values) < 0)
+
+    def test_positive_direction_pass_is_anchored_to_the_real_start(self):
+        """Same fix, opposite direction — also confirms the old flat-offset
+        formula's ~half-pass-length systematic offset (from not anchoring
+        to the first-acquired point) is gone: row 0 must land exactly on
+        gantry_start_mm, not gantry_start_mm - length/2.
+        """
+        registry = FrameRegistry.from_config({"instruments": {"gocator": {"translation": [0.0, 0.0, 0.0]}}})
+        mounting = SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z")
+        scan = make_scan(
+            mounting,
+            y_mm=np.array([-175.0, -87.5, 0.0, 87.5, 175.0]),
+            gantry_axis="X",
+            gantry_start_mm=1100.0,
+            gantry_end_mm=1449.99,
+        )
+        pts = registry.place_scan(scan)
+        row_values = pts[::2, 0]
+        expected = [1100.0, 1187.5, 1275.0, 1362.5, 1449.99]
+        np.testing.assert_allclose(row_values, expected, atol=1e-2)  # float32 (default dtype)
+        assert np.all(np.diff(row_values) > 0)
+
+    def test_missing_gantry_end_falls_back_to_positive_with_a_warning(self, caplog):
+        """No gantry_end_mm means the travel direction can't be determined
+        — falls back to the old assume-positive behaviour rather than
+        raising, since older saved scans may not have it, but warns since
+        the result could be mirrored if that assumption is wrong."""
+        registry = FrameRegistry.from_config({"instruments": {"gocator": {"translation": [0.0, 0.0, 0.0]}}})
+        scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)  # no gantry_end_mm
+        with caplog.at_level("WARNING"):
+            pts = registry.place_scan(scan)
+        assert pts[:, 0].min() == pytest.approx(700.0)
+        assert any("can't be determined" in r.message for r in caplog.records)

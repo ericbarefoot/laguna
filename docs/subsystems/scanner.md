@@ -176,13 +176,43 @@ to guess which frame a file is in.
 The default is the **identity map**, so nothing changes until you configure
 a mounting. CLI override: `--mounting scan_x=-Y,scan_y=+X,scan_z=+Z`.
 
-> **Verify the sign before trusting it.** The axis *pairing* is confirmed
-> from data; whether sensor +X points to gantry +Y or −Y is not, and cannot
-> be determined from the scans alone. Scan something asymmetric and check the
-> result isn't rotated 180°. Getting it wrong rotates the data in-plane; it
-> cannot mirror it, because **a mirroring map is rejected outright** — a bare
-> X↔Y swap has determinant −1 and would reflect real geometry, so
+> **Sign confirmed 2026-08-11: sensor +X is gantry −Y, and vice versa** (on
+> this rig's mounting, matching the `scan_x: -Y` example above) — the axis
+> *pairing* was already confirmed from data (see 2026-08-02 above); this
+> settles the previously-open sign question too. If re-verifying on a
+> different mounting: scan something asymmetric and check the result isn't
+> rotated 180°. Getting the sign wrong rotates the data in-plane; it cannot
+> mirror it, because **a mirroring map is rejected outright** — a bare X↔Y
+> swap has determinant −1 and would reflect real geometry, so
 > `SensorMounting` requires a proper rotation (flip exactly one sign).
+
+### Y is acquisition order, not a lab-frame direction — travel direction matters too
+
+The mounting's rotation is a **fixed, per-rig constant** — it says which
+gantry axis sensor Y corresponds to, once, forever (until the sensor is
+remounted). It says nothing about which *real-world direction along that
+axis* a given pass actually traveled, and it can't: the sensor is fully
+encoderless (`GO_TRIGGER_TIME`, software-triggered — see `scan_with_gantry()`
+in the [API reference](../reference/scanner.md)), so sensor Y is nothing
+but **acquisition order** — row 0 is whatever was captured first, the last
+row whatever was captured last, symmetric around 0 regardless of which way
+the gantry physically moved.
+
+That means a pass's *travel-axis* real-world orientation depends on the sign
+of `gantry_end_mm - gantry_start_mm` for that specific pass (both recorded by
+`scan_with_gantry()`), independently of the mounting rotation. Confirmed on
+hardware 2026-08-11: scanning in the negative direction along the travel axis
+produced a mirror image relative to a positive-direction pass of the same
+object — `laguna.frames.FrameRegistry.place_scan()` was applying the fixed
+mounting rotation but never checking which direction *this* pass actually
+went, so it silently assumed positive every time. Fixed in `place_scan()`,
+which now anchors the first-acquired point to the pass's real starting
+position and orients the rest by the recorded start→end direction — see its
+docstring. `SurfaceScan.to_points()`/`gantry_travel_mm` are unaffected: they
+only apply the fixed mounting rotation, by design (the per-pass travel
+direction isn't knowable from the scan grid alone, only from the
+gantry-side metadata `place_scan()` also has). If you place scans some other
+way (bypassing `place_scan()`), you need this same correction yourself.
 
 ## Matching feed rate to frame rate
 
