@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from ..config import Config
+    from ..timing.clock import ExperimentClock
+    from ..timing.event_log import EventLog
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +35,8 @@ class MqttSubscriber:
     def __init__(
         self,
         config: Dict[str, Any],
-        event_log=None,
-        clock=None,
+        event_log: Optional["EventLog"] = None,
+        clock: Optional["ExperimentClock"] = None,
     ):
         """Build the subscriber from a config dict; does not open a connection.
 

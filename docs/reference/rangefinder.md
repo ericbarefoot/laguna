@@ -21,3 +21,10 @@ scanning path that fuses these readings with gantry motion.
 ## Calibration
 
 ::: laguna.rangefinder.calibration
+
+## MQTT subscriber
+
+Background subscriber feeding continuous-monitoring readings — currently
+the rangefinder subsystem's only caller.
+
+::: laguna.mqtt.subscriber

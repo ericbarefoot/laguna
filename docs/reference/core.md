@@ -8,3 +8,13 @@ drives it.
 ::: laguna.core
 
 ::: laguna.config
+
+## Subsystem registry
+
+::: laguna.registry
+
+## Subsystem logging
+
+Two-tier logging (event log vs. operational log) shared by every subsystem.
+
+::: laguna.subsystem_logging
