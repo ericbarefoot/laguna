@@ -124,6 +124,26 @@ class TestFromConfigAxesAndIOMap:
         assert controller.theta_cmd._group == 7
         assert controller.gcode._theta_group_index == 7
 
+    def test_per_axis_mm_per_unit_override_reaches_both_mmc_commands(self):
+        """An axis's "mm_per_unit" key in config's axes list (e.g. Z's
+        confirmed 13.5, distinct from the shared mm_per_acp_unit default)
+        must reach both self.cmd and self.theta_cmd — Z is addressed
+        through either depending on whether it's moving alone or grouped
+        with Theta (see GCodeExecutor._begin_z_leg / _begin_zt_leg).
+        """
+        cfg = dict(BASE_CONFIG, mm_per_acp_unit=15.0)
+        cfg["axes"] = [
+            {"name": "X", "index": 1},
+            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Z", "index": 5, "mm_per_unit": 13.5},
+            {"name": "Theta", "index": 6},
+        ]
+        controller = GantryController.from_config(_cfg(cfg))
+        assert controller.cmd._axis_mm_per_unit == {"Z": 13.5}
+        assert controller.theta_cmd._axis_mm_per_unit == {"Z": 13.5}
+        assert controller.cmd._unit_for(Z_AXIS) == 13.5
+        assert controller.cmd._unit_for(X_AXIS) == 15.0  # unaffected, still the shared default
+
 
 class TestFromConfigHomingAndFences:
     def test_homing_order_resolved_from_names(self):
@@ -178,7 +198,8 @@ class TestSubsystemInterface:
         assert controller.connection is conn
 
     def test_connect_reports_true_on_success(self):
-        controller, conn = self._make_controller()
+        responses = {"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"}
+        controller, conn = self._make_controller(responses)
         assert controller.connect() is True
         assert conn.is_connected is True
 
@@ -261,11 +282,15 @@ class TestMoveTo:
             "C1 INI 1 2": "0",
             "C1 BMT 10 0": "0",
             "C1 MIF": "1",
+            "A1 ACP": "150",  # post-move resync of X/Y from hardware
+            "A2 ACP": "0",
             "A6 ACP": "0",
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
-        assert conn.sent == ["C1 INI 1 2", "C1 BMT 10 0", "C1 MIF", "A6 ACP"]
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 BMT 10 0", "C1 MIF", "A1 ACP", "A2 ACP", "A6 ACP",
+        ]
 
     def test_vector_move_length_mismatch_raises(self):
         controller, _conn = self._make_controller({})
@@ -292,11 +317,13 @@ class TestMoveTo:
             "C1 SPD 0.133333": "0.133333",
             "C1 BMT 10 0": "0",
             "C1 MIF": "1",
+            "A1 ACP": "150",  # post-move resync of X/Y from hardware
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to(X=150.0, speed=2.0) is True
         assert conn.sent == [
             "A2 ACP", "A5 ACP", "C1 INI 1 2", "C1 SPD 0.133333", "C1 BMT 10 0", "C1 MIF",
+            "A1 ACP", "A2 ACP",
         ]
 
     def test_keyword_move_is_fence_checked(self):
@@ -490,18 +517,35 @@ class TestSetPosition:
         return GantryController(connection=conn, mm_per_unit=mm_per_unit), conn
 
     def test_keyword_form_writes_only_the_given_axes(self):
-        controller, conn = self._make_controller({"A1 ACP 10": "10"})
+        responses = {
+            "A1 ACP 10": "10",
+            # set_position() resyncs gcode's _current_pos afterward — see
+            # sync_position_from_hardware.
+            "A1 ACP": "10", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
+        }
+        controller, conn = self._make_controller(responses)
         assert controller.set_position(X=150.0) is True
-        assert conn.sent == ["A1 ACP 10"]      # 150mm / 15 = 10 raw
+        assert conn.sent == ["A1 ACP 10", "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP"]
 
     def test_vector_form_writes_every_axis(self):
-        responses = {"A1 ACP 1": "1", "A2 ACP 2": "2", "A5 ACP 3": "3", "A6 ACP 4": "4"}
+        responses = {
+            "A1 ACP 1": "1", "A2 ACP 2": "2", "A5 ACP 3": "3", "A6 ACP 4": "4",
+            # set_position() resyncs gcode's _current_pos afterward:
+            "A1 ACP": "1", "A2 ACP": "2", "A5 ACP": "3", "A6 ACP": "4",
+        }
         controller, conn = self._make_controller(responses)
         controller.set_position([15.0, 30.0, 45.0, 4.0])   # Theta unconverted
-        assert conn.sent == ["A1 ACP 1", "A2 ACP 2", "A5 ACP 3", "A6 ACP 4"]
+        assert conn.sent == [
+            "A1 ACP 1", "A2 ACP 2", "A5 ACP 3", "A6 ACP 4",
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",  # resync
+        ]
 
     def test_commands_no_motion(self):
-        controller, conn = self._make_controller({"A1 ACP 10": "10"})
+        responses = {
+            "A1 ACP 10": "10",
+            "A1 ACP": "10", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
+        }
+        controller, conn = self._make_controller(responses)
         controller.set_position(X=150.0)
         assert not any(m in c for c in conn.sent for m in ("BMT", "BMB", "MVT", "JOG"))
 
@@ -527,12 +571,19 @@ class TestSoftStop:
 
     def test_sends_bst_to_every_axis(self):
         responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        # soft_stop() resyncs gcode's _current_pos afterward (best-effort,
+        # never raises) — see sync_position_from_hardware.
+        responses.update({f"A{i} ACP": "0" for i in (1, 2, 5, 6)})
         controller, conn = self._make_controller(responses)
         controller.soft_stop()
-        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+        assert conn.sent == [
+            "A1 BST", "A2 BST", "A5 BST", "A6 BST",
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",
+        ]
 
     def test_leaves_brakes_and_motors_alone(self):
         responses = {f"A{i} BST": "0" for i in (1, 2, 5, 6)}
+        responses.update({f"A{i} ACP": "0" for i in (1, 2, 5, 6)})
         controller, conn = self._make_controller(responses)
         controller.soft_stop()
         assert not any(("SOB" in c or "MTR" in c) for c in conn.sent)
@@ -540,7 +591,10 @@ class TestSoftStop:
     def test_one_failing_axis_does_not_stop_the_others(self):
         controller, conn = self._make_controller({})  # every command unscripted
         controller.soft_stop()                        # must not raise
-        assert conn.sent == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+        assert conn.sent[:4] == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+        # The resync attempt afterward also fails (unscripted A1 ACP), but
+        # is caught and logged, not raised — see soft_stop()'s try/except.
+        assert conn.sent[4:] == ["A1 ACP"]
 
 
 class TestPositionPersistence:
@@ -623,12 +677,14 @@ class TestPositionPersistence:
         GantryPositionStore(path).save({"X": 11.0, "Y": 22.0, "Z": 33.0, "Theta": 44.0})
         responses = {
             "A1 ACP 11": "11", "A2 ACP 22": "22", "A5 ACP 33": "33", "A6 ACP 44": "44",
-            # set_position()'s own end-of-call persistence re-reads every axis:
+            # set_position()'s own end-of-call persistence re-reads every axis,
+            # and connect() now resyncs _current_pos from the same reads:
             "A1 ACP": "11", "A2 ACP": "22", "A5 ACP": "33", "A6 ACP": "44",
         }
         conn = FakeSnapConnection(responses)
         controller = GantryController(connection=conn, position_checkpoint_file=path)
         controller.connect()
+        conn.sent.clear()
 
         assert controller.restore_last_position() is True
         assert conn.sent[:4] == ["A1 ACP 11", "A2 ACP 22", "A5 ACP 33", "A6 ACP 44"]
@@ -667,6 +723,8 @@ class TestConnectBrakeRelease:
     RESPONSES = {
         "A2 MTR 1": "1", "SOB 4 1": "0",   # Y: motor on, brake released
         "A5 MTR 1": "1", "SOB 5 1": "0",   # Z: motor on, brake released
+        # connect()'s own _current_pos resync (sync_position_from_hardware):
+        "A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
     }
 
     def _make_controller(self, safe_mode, responses=None):
@@ -676,7 +734,10 @@ class TestConnectBrakeRelease:
     def test_releases_brakes_when_motion_is_permitted(self):
         controller, conn = self._make_controller(safe_mode=False)
         assert controller.connect() is True
-        assert conn.sent == ["A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1"]
+        assert conn.sent == [
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",  # _current_pos resync
+            "A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1",
+        ]
 
     def test_motor_on_strictly_before_brake_release(self):
         """Z's brake is fail-safe/spring-engaged: releasing it before the
@@ -697,12 +758,12 @@ class TestConnectBrakeRelease:
         guarantee has to cover."""
         controller, conn = self._make_controller(safe_mode=True)
         assert controller.connect() is True
-        assert conn.sent == []
+        assert conn.sent == ["A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP"]  # _current_pos resync only
 
     def test_only_touches_braked_axes(self):
         controller, conn = self._make_controller(safe_mode=False)
         controller.connect()
-        assert not any(c.startswith(("A1 ", "A6 ")) for c in conn.sent)
+        assert not any(c.startswith(("A1 ", "A6 ")) and "ACP" not in c for c in conn.sent)
 
     def test_a_failing_axis_does_not_block_the_other(self):
         """A faulted axis is logged and skipped, not allowed to abort the
@@ -711,6 +772,7 @@ class TestConnectBrakeRelease:
         responses = {
             "A2 MTR 1": SnapMotionError(70),   # Y's motor won't come on
             "A5 MTR 1": "1", "SOB 5 1": "0",
+            "A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
         }
         controller, conn = self._make_controller(safe_mode=False, responses=responses)
         assert controller.connect() is True             # must not raise
@@ -725,6 +787,8 @@ class TestSetSafeMode:
         conn = FakeSnapConnection(responses or {
             "A2 MTR 1": "1", "SOB 4 1": "0", "A5 MTR 1": "1", "SOB 5 1": "0",
             "SOB 4 0": "0", "SOB 5 0": "0",
+            # connect()'s own _current_pos resync (sync_position_from_hardware):
+            "A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
         })
         return GantryController(connection=conn, safe_mode=safe_mode), conn
 

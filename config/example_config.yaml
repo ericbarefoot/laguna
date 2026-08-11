@@ -105,11 +105,15 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
                                 # exposed/commandable motion axes.
     - {name: X, index: 1}
     - {name: Y, index: 2, brake_output: 4, brake_status_input: 8}   # SOB 4 / INB 8 confirmed (commander)
-    - {name: Z, index: 5, brake_output: 5}                          # SOB 5 confirmed (commander);
+    - {name: Z, index: 5, brake_output: 5, mm_per_unit: 13.5}        # SOB 5 confirmed (commander);
                                                                      # brake_status_input lives on the
                                                                      # responder's own input bank and has
                                                                      # no ASCII addressing path — see
-                                                                     # IOMap docstring in commands.py
+                                                                     # IOMap docstring in commands.py.
+                                                                     # mm_per_unit override: confirmed
+                                                                     # 13.5, not the shared 15.0 default,
+                                                                     # on hardware 2026-08-10 — see
+                                                                     # docs/archive/GANTRY_UNIT_CALIBRATION.md
     - {name: Theta, index: 6}   # limit switch lives on the responder — same caveat as Z's brake status
   homing:                      # deprioritized — not currently used, but the driver supports it
     speed_mm_s: 10.0
@@ -117,11 +121,15 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
     order: [Z, X, Y]
   fences: []                   # populate once the work envelope / exclusion zones are known
     # - {type: box, name: bed, x: [0, 500], y: [0, 300], z: [0, 5]}
-  # TEMPORARY: 1 raw controller (ACP) unit = this many real mm on X/Y/Z —
-  # confirmed 15.0 on hardware 2026-07-28, see docs/GANTRY_UNIT_CALIBRATION.md.
-  # The single toggle: change to 1.0 (and gantry_agent.py's matching
-  # MM_PER_ACP_UNIT constant) once the DSM project's axis scale is fixed at
-  # the source — nothing else needs to change.
+  # TEMPORARY: 1 raw controller (ACP) unit = this many real mm — default for
+  # any axis without its own "mm_per_unit" override above (see Z's, which
+  # is confirmed off from this shared value). Originally measured 15.0 for
+  # X/Y/Z uniformly on 2026-07-28, see
+  # docs/archive/GANTRY_UNIT_CALIBRATION.md — that "uniform across axes"
+  # finding didn't hold up on Z under a second measurement. Once the DSM
+  # project's axis scale is fixed at the source, change this to 1.0, drop
+  # the per-axis overrides, and update gantry_agent.py's matching
+  # MM_PER_ACP_UNIT constant.
   mm_per_acp_unit: 15.0
   # Real-mm translation from the gantry's raw zero to a real-world origin.
   coordinate_offset: {X: 0.0, Y: 0.0, Z: 0.0, Theta: 0.0}

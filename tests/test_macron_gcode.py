@@ -238,11 +238,15 @@ class TestExecutorLinearMoves:
             "C1 SPD 20": "20",
             "C1 BMT 10 0": "0",
             "C1 MIF": "1",
+            "A1 ACP": "10",  # post-move resync of X/Y from hardware
+            "A2 ACP": "0",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 F1200")
         executor.execute(trajectory)
-        assert conn.sent == ["C1 INI 1 2", "C1 SPD 20", "C1 BMT 10 0", "C1 MIF"]
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 SPD 20", "C1 BMT 10 0", "C1 MIF", "A1 ACP", "A2 ACP",
+        ]
 
     def test_group_init_is_sent_once_not_per_execute(self):
         """INI is remembered across execute() calls — a 40-move
@@ -254,6 +258,8 @@ class TestExecutorLinearMoves:
             "C1 BMT 10 0": "0",
             "C1 BMT 20 0": "0",
             "C1 MIF": "1",
+            "A1 ACP": "10",  # post-move resync of X/Y from hardware
+            "A2 ACP": "0",
         }
         executor, conn = _make_executor(responses)
         for target in ("G1 X10 F1200", "G1 X20 F1200"):
@@ -266,7 +272,14 @@ class TestExecutorLinearMoves:
         """A power-cycle/reflash can clear the controller's group state —
         GantryController.connect() calls this so the next move re-inits.
         """
-        responses = {"C1 INI 1 2": "0", "C1 SPD 20": "20", "C1 BMT 10 0": "0", "C1 MIF": "1"}
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 SPD 20": "20",
+            "C1 BMT 10 0": "0",
+            "C1 MIF": "1",
+            "A1 ACP": "10",  # post-move resync of X/Y from hardware
+            "A2 ACP": "0",
+        }
         executor, conn = _make_executor(responses)
         executor.execute(executor.plan("G1 X10 F1200"))
         executor.reset_group_init()
@@ -285,6 +298,8 @@ class TestExecutorLinearMoves:
             "C1 INI 1 2": "0",
             "C1 BMT 5 0": "0",
             "C1 MIF": mif_response,
+            "A1 ACP": "5",  # post-move resync of X/Y from hardware
+            "A2 ACP": "0",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X5")
@@ -298,17 +313,18 @@ class TestExecutorLinearMoves:
         X/Y here (3mm vs 10mm), so it's the "short" leg: before firing
         either BMT, the executor reads X/Y's currently-configured ramp
         (C1 ACL/DCL, the scaling reference) *and* Z's own currently-
-        configured ramp (A5 ACL/DCL, so it can be restored afterward), and
-        scales Z's speed *and* accel/decel down by k=3/10=0.3, so both
-        legs' trapezoids take the same time — not just the same nominal F.
-        X/Y (the "long" leg) is left at the plain nominal feed rate and
-        whatever ramp it already had. Once both legs finish, Z's ramp is
-        restored to its own original (unscaled) values — this driver
-        otherwise never touches ACL/DCL, so a scaled-down value must not
-        outlive this one move (see _execute_concurrent_pair's docstring).
-        It still never sends a 3-axis group command (`C1 INI 1 2 5`,
-        confirmed on the bench to return error 1010): Z stays on its own
-        single-axis command since Theta isn't moving with it.
+        configured ramp and speed (A5 ACL/DCL/SPD, so they can be restored
+        afterward), and scales Z's speed *and* accel/decel down by
+        k=3/10=0.3, so both legs' trapezoids take the same time — not just
+        the same nominal F. X/Y (the "long" leg) is left at the plain
+        nominal feed rate and whatever ramp it already had. Once both legs
+        finish, Z's ramp *and* speed are restored to their own original
+        (unscaled) values — this driver otherwise never touches
+        ACL/DCL/SPD, so a scaled-down value must not outlive this one move
+        (see _execute_concurrent_pair's docstring). It still never sends a
+        3-axis group command (`C1 INI 1 2 5`, confirmed on the bench to
+        return error 1010): Z stays on its own single-axis command since
+        Theta isn't moving with it.
         """
         responses = {
             "C1 INI 1 2": "0",
@@ -316,6 +332,7 @@ class TestExecutorLinearMoves:
             "C1 DCL": "40",
             "A5 ACL": "25",  # Z's own ramp before this move — restored after
             "A5 DCL": "20",
+            "A5 SPD": "8",  # Z's own speed before this move — restored after
             "A5 ACL 15": "15",
             "A5 DCL 12": "12",
             "A5 SPD 3": "3",
@@ -326,19 +343,148 @@ class TestExecutorLinearMoves:
             "C1 MIF": "1",
             "A5 ACL 25": "25",  # restore
             "A5 DCL 20": "20",
+            "A5 SPD 8": "8",  # restore
+            "A1 ACP": "10",  # post-move resync of X/Y/Z from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "3",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 Z3 F600")
         executor.execute(trajectory)
         assert conn.sent == [
             "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
-            "A5 ACL", "A5 DCL",  # read Z's own ramp (to restore later)
+            "A5 ACL", "A5 DCL", "A5 SPD",  # read Z's own ramp/speed (to restore later)
             "A5 ACL 15", "A5 DCL 12", "A5 SPD 3", "A5 BMT 3",  # Z, scaled by k=0.3
             "C1 SPD 10", "C1 BMT 10 0",  # X/Y, unscaled
             "A5 MIF", "C1 MIF",
-            "A5 ACL 25", "A5 DCL 20",  # Z's ramp restored
+            "A5 ACL 25", "A5 DCL 20", "A5 SPD 8",  # Z's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A5 ACP",  # resync _current_pos from hardware
         ]
         assert "C1 INI 1 2 5" not in conn.sent
+
+    def test_skips_scaling_when_reference_ramp_is_zero_or_negative(self):
+        """If the scaling-reference leg's ACL/DCL reads back as 0 or
+        negative — e.g. the X/Y group was just C1 INI'd this session and
+        nothing has ever set its ACL/DCL, per _read_xy_ramp's "querying
+        ACL/DCL before INI is untested" note — scaling Z's ramp by k would
+        send a 0-or-negative ACL/DCL to the controller, which the ASCII
+        API rejects outright (escape codes 16/17, "User Accels/Decels 0 Or
+        Negative"). The executor must detect this and skip scaling for
+        this move (both legs unscaled) rather than sending it.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "0",  # never explicitly set on this group yet
+            "C1 DCL": "0",
+            "A5 SPD 10": "10",  # nominal feed rate (F600 -> 10mm/s), not scaled
+            "A5 BMT 3": "0",
+            "A5 MIF": "1",
+            "C1 SPD 10": "10",
+            "C1 BMT 10 0": "0",
+            "C1 MIF": "1",
+            "A1 ACP": "10",  # post-move resync of X/Y/Z from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "3",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference) — 0/0
+            "A5 SPD 10", "A5 BMT 3",  # Z, unscaled — nominal feed rate, ramp untouched
+            "C1 SPD 10", "C1 BMT 10 0",  # X/Y, unscaled
+            "A5 MIF", "C1 MIF",
+            "A1 ACP", "A2 ACP", "A5 ACP",  # resync _current_pos from hardware
+        ]
+        assert "A5 ACL" not in conn.sent
+        assert "A5 DCL" not in conn.sent
+
+    def test_scales_the_short_leg_even_with_no_f_word(self):
+        """A move with no F word at all used to skip scaling entirely,
+        leaving each leg at whatever SPD it already independently had —
+        which could differ arbitrarily and desync completion by seconds
+        even though nothing about this move asked for that. Now the
+        "nominal" speed the long leg (X/Y here) keeps is read live from
+        its own currently-configured SPD (C1 SPD, no argument) instead of
+        requiring an F word to supply it, and the short leg (Z) is scaled
+        from that reading exactly as it would be from an explicit F.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "C1 SPD": "20",  # X/Y's own current speed — the implied nominal feed
+            "A5 ACL": "25",  # Z's own ramp before this move — restored after
+            "A5 DCL": "20",
+            "A5 SPD": "8",  # Z's own speed before this move — restored after
+            "A5 ACL 15": "15",
+            "A5 DCL 12": "12",
+            "A5 SPD 6": "6",  # 0.3 * 20 (nominal read from C1 SPD, not an F word)
+            "A5 BMT 3": "0",
+            "A5 MIF": "1",
+            "C1 BMT 10 0": "0",  # no C1 SPD sent — X/Y stays at the 20 it already had
+            "C1 MIF": "1",
+            "A5 ACL 25": "25",  # restore
+            "A5 DCL 20": "20",
+            "A5 SPD 8": "8",  # restore
+            "A1 ACP": "10",  # post-move resync of X/Y/Z from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "3",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3")  # no F word
+        executor.execute(trajectory)
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
+            "C1 SPD",  # read X/Y's own speed — the implied nominal feed
+            "A5 ACL", "A5 DCL", "A5 SPD",  # read Z's own ramp/speed (to restore later)
+            "A5 ACL 15", "A5 DCL 12", "A5 SPD 6", "A5 BMT 3",  # Z, scaled by k=0.3
+            "C1 BMT 10 0",  # X/Y, unscaled — no SPD sent, already at the nominal
+            "A5 MIF", "C1 MIF",
+            "A5 ACL 25", "A5 DCL 20", "A5 SPD 8",  # Z's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A5 ACP",  # resync _current_pos from hardware
+        ]
+
+    def test_second_legs_poll_wait_is_reduced_by_the_first_legs_elapsed_time(self, monkeypatch):
+        """Both BMTs are already on the wire and physically running
+        concurrently before either poll starts — polling them is
+        necessarily sequential in Python, but the second poll's
+        predicted-duration sleep must not restart from zero. A well-
+        synced pair finishes at nearly the same real time; without
+        subtracting however long the first poll's own wait already
+        consumed, the second poll would blindly sleep through its full
+        predicted duration *again* on top of that — this is what made the
+        REPL return ~10-15s after the gantry had visibly already stopped.
+        """
+        fake_clock = {"t": 100.0}
+        monkeypatch.setattr("laguna.robot.macron.gcode.time.monotonic", lambda: fake_clock["t"])
+
+        responses = {
+            "C1 INI 1 2": "0", "C1 ACL": "50", "C1 DCL": "40",
+            "A5 ACL": "25", "A5 DCL": "20", "A5 SPD": "8",
+            "A5 ACL 15": "15", "A5 DCL 12": "12", "A5 SPD 3": "3", "A5 BMT 3": "0",
+            "C1 SPD 10": "10", "C1 BMT 10 0": "0",
+            "A5 ACL 25": "25", "A5 DCL 20": "20", "A5 SPD 8": "8",
+            "A1 ACP": "10", "A2 ACP": "0", "A5 ACP": "3",
+        }
+        executor, conn = _make_executor(responses)
+
+        def fake_poll_z_leg(*args, **kwargs):
+            fake_clock["t"] += 5.0  # simulate this poll's own wait taking 5s
+
+        monkeypatch.setattr(executor, "_poll_z_leg", fake_poll_z_leg)
+
+        captured = {}
+
+        def fake_poll_xy_leg(*args, **kwargs):
+            captured["already_elapsed_s"] = kwargs.get("already_elapsed_s")
+
+        monkeypatch.setattr(executor, "_poll_xy_leg", fake_poll_xy_leg)
+
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        executor.execute(trajectory)
+
+        assert captured["already_elapsed_s"] == pytest.approx(5.0)
 
     def test_moves_z_and_theta_concurrently_with_the_xy_group_scaled_to_match_duration(self):
         """A move touching X/Y, Z, and Theta (A) together fires the Z/Theta
@@ -348,7 +494,7 @@ class TestExecutorLinearMoves:
         max(|delta Z|, |delta Theta|) = max(3, 2) = 3 (Z dominates), still
         less than X/Y's 10mm, so its speed and ramp are scaled by k=0.3
         from X/Y's ramp, same as the Z-only case above — and its own prior
-        ramp is restored afterward the same way.
+        ramp *and speed* are restored afterward the same way.
         """
         responses = {
             "C1 INI 1 2": "0",
@@ -357,6 +503,7 @@ class TestExecutorLinearMoves:
             "C2 INI 5 6": "0",
             "C2 ACL": "25",  # Z/Theta's own ramp before this move — restored after
             "C2 DCL": "20",
+            "C2 SPD": "8",  # Z/Theta's own speed before this move — restored after
             "C2 ACL 15": "15",
             "C2 DCL 12": "12",
             "C2 SPD 3": "3",
@@ -367,17 +514,23 @@ class TestExecutorLinearMoves:
             "C1 MIF": "1",
             "C2 ACL 25": "25",  # restore
             "C2 DCL 20": "20",
+            "C2 SPD 8": "8",  # restore
+            "A1 ACP": "10",  # post-move resync of X/Y/Z/Theta from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "3",
+            "A6 ACP": "2",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 Z3 A2 F600")
         executor.execute(trajectory)
         assert conn.sent == [
             "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
-            "C2 INI 5 6", "C2 ACL", "C2 DCL",  # read Z/Theta's own ramp (to restore later)
+            "C2 INI 5 6", "C2 ACL", "C2 DCL", "C2 SPD",  # read Z/Theta's own ramp/speed (to restore later)
             "C2 ACL 15", "C2 DCL 12", "C2 SPD 3", "C2 BMT 3 2",  # Z/Theta, scaled
             "C1 SPD 10", "C1 BMT 10 0",  # X/Y, unscaled
             "C2 MIF", "C1 MIF",
-            "C2 ACL 25", "C2 DCL 20",  # Z/Theta's ramp restored
+            "C2 ACL 25", "C2 DCL 20", "C2 SPD 8",  # Z/Theta's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",  # resync _current_pos/_current_theta from hardware
         ]
 
     def test_moves_z_concurrently_with_z_as_the_long_leg(self):
@@ -386,7 +539,10 @@ class TestExecutorLinearMoves:
         untouched) and X/Y is scaled down by k=5/20=0.25 from Z's
         currently-configured ramp, read via single-axis A5 ACL/DCL
         queries (no group involved for a plain Z leg). X/Y's own prior
-        ramp is read too (C1 ACL/DCL) and restored once both legs finish.
+        ramp and speed are read too (C1 ACL/DCL/SPD) and restored once
+        both legs finish — otherwise a later X/Y move issued with no F
+        word (e.g. a direct AxisHandle.move_to()) would silently run at
+        this leftover scaled-down speed.
         """
         responses = {
             "A5 ACL": "20",
@@ -394,6 +550,7 @@ class TestExecutorLinearMoves:
             "C1 INI 1 2": "0",
             "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
             "C1 DCL": "10",
+            "C1 SPD": "8",  # X/Y's own speed before this move — restored after
             "A5 SPD 10": "10",
             "A5 BMT 20": "0",
             "A5 MIF": "1",
@@ -404,17 +561,22 @@ class TestExecutorLinearMoves:
             "C1 MIF": "1",
             "C1 ACL 12": "12",  # restore
             "C1 DCL 10": "10",
+            "C1 SPD 8": "8",  # restore
+            "A1 ACP": "5",  # post-move resync of X/Y/Z from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "20",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X5 Z20 F600")
         executor.execute(trajectory)
         assert conn.sent == [
             "A5 ACL", "A5 DCL",  # read Z's ramp (scaling reference)
-            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL", "C1 SPD",  # read X/Y's own ramp/speed (to restore later)
             "A5 SPD 10", "A5 BMT 20",  # Z, unscaled
             "C1 ACL 5", "C1 DCL 4", "C1 SPD 2.5", "C1 BMT 5 0",  # X/Y, scaled by k=0.25
             "A5 MIF", "C1 MIF",
-            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+            "C1 ACL 12", "C1 DCL 10", "C1 SPD 8",  # X/Y's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A5 ACP",  # resync _current_pos from hardware
         ]
 
     def test_moves_z_and_theta_concurrently_with_z_theta_as_the_long_leg(self):
@@ -423,7 +585,8 @@ class TestExecutorLinearMoves:
         max(|delta Z|, |delta Theta|) = max(20, 15) = 20 (Z dominates),
         still further than X/Y's 5mm, so Z/Theta stays "long" and X/Y is
         scaled down by k=5/20=0.25 from the group's currently-configured
-        ramp (C2 ACL/DCL); X/Y's own prior ramp is restored afterward.
+        ramp (C2 ACL/DCL); X/Y's own prior ramp *and speed* are restored
+        afterward.
         """
         responses = {
             "C2 INI 5 6": "0",
@@ -432,6 +595,7 @@ class TestExecutorLinearMoves:
             "C1 INI 1 2": "0",
             "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
             "C1 DCL": "10",
+            "C1 SPD": "8",  # X/Y's own speed before this move — restored after
             "C2 SPD 10": "10",
             "C2 BMT 20 15": "0",
             "C2 MIF": "1",
@@ -442,17 +606,23 @@ class TestExecutorLinearMoves:
             "C1 MIF": "1",
             "C1 ACL 12": "12",  # restore
             "C1 DCL 10": "10",
+            "C1 SPD 8": "8",  # restore
+            "A1 ACP": "5",  # post-move resync of X/Y/Z/Theta from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "20",
+            "A6 ACP": "15",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X5 Z20 A15 F600")
         executor.execute(trajectory)
         assert conn.sent == [
             "C2 INI 5 6", "C2 ACL", "C2 DCL",  # read Z/Theta's ramp (scaling reference)
-            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL", "C1 SPD",  # read X/Y's own ramp/speed (to restore later)
             "C2 SPD 10", "C2 BMT 20 15",  # Z/Theta, unscaled
             "C1 ACL 5", "C1 DCL 4", "C1 SPD 2.5", "C1 BMT 5 0",  # X/Y, scaled by k=0.25
             "C2 MIF", "C1 MIF",
-            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+            "C1 ACL 12", "C1 DCL 10", "C1 SPD 8",  # X/Y's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",  # resync _current_pos/_current_theta from hardware
         ]
 
     def test_zt_distance_is_dominated_by_theta_not_just_z(self):
@@ -471,6 +641,7 @@ class TestExecutorLinearMoves:
             "C1 INI 1 2": "0",
             "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
             "C1 DCL": "10",
+            "C1 SPD": "8",  # X/Y's own speed before this move — restored after
             "C2 SPD 10": "10",
             "C2 BMT 2 50": "0",
             "C2 MIF": "1",
@@ -481,17 +652,23 @@ class TestExecutorLinearMoves:
             "C1 MIF": "1",
             "C1 ACL 12": "12",  # restore
             "C1 DCL 10": "10",
+            "C1 SPD 8": "8",  # restore
+            "A1 ACP": "5",  # post-move resync of X/Y/Z/Theta from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "2",
+            "A6 ACP": "50",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X5 Z2 A50 F600")
         executor.execute(trajectory)
         assert conn.sent == [
             "C2 INI 5 6", "C2 ACL", "C2 DCL",  # read Z/Theta's ramp (scaling reference)
-            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL", "C1 SPD",  # read X/Y's own ramp/speed (to restore later)
             "C2 SPD 10", "C2 BMT 2 50",  # Z/Theta, unscaled — Theta dominates, so it's the "long" leg
             "C1 ACL 2", "C1 DCL 1.6", "C1 SPD 1", "C1 BMT 5 0",  # X/Y, scaled by k=0.1
             "C2 MIF", "C1 MIF",
-            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+            "C1 ACL 12", "C1 DCL 10", "C1 SPD 8",  # X/Y's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",  # resync _current_pos/_current_theta from hardware
         ]
 
     def test_ramp_is_restored_even_if_a_leg_times_out(self, monkeypatch):
@@ -511,6 +688,7 @@ class TestExecutorLinearMoves:
             "C1 DCL": "40",
             "A5 ACL": "25",  # Z's own ramp before this move
             "A5 DCL": "20",
+            "A5 SPD": "8",  # Z's own speed before this move
             "A5 ACL 15": "15",
             "A5 DCL 12": "12",
             "A5 SPD 3": "3",
@@ -520,13 +698,14 @@ class TestExecutorLinearMoves:
             "C1 BMT 10 0": "0",
             "A5 ACL 25": "25",  # restore, even though the move timed out
             "A5 DCL 20": "20",
+            "A5 SPD 8": "8",  # restore, even though the move timed out
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X10 Z3 F600")
         with pytest.raises(SnapMotionError):
             executor.execute(trajectory)
         assert "A5 ABT" in conn.sent
-        assert conn.sent[-2:] == ["A5 ACL 25", "A5 DCL 20"]
+        assert conn.sent[-3:] == ["A5 ACL 25", "A5 DCL 20", "A5 SPD 8"]
 
     def test_z_and_theta_without_xy_uses_the_theta_group_alone(self):
         """A move touching only Z and Theta (no X/Y) needs no concurrency —
@@ -538,21 +717,25 @@ class TestExecutorLinearMoves:
             "C2 SPD 10": "10",
             "C2 BMT 3 90": "0",
             "C2 MIF": "1",
+            "A5 ACP": "3",  # post-move resync of Z/Theta from hardware
+            "A6 ACP": "90",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 Z3 A90 F600")
         executor.execute(trajectory)
-        assert conn.sent == ["C2 INI 5 6", "C2 SPD 10", "C2 BMT 3 90", "C2 MIF"]
+        assert conn.sent == [
+            "C2 INI 5 6", "C2 SPD 10", "C2 BMT 3 90", "C2 MIF", "A5 ACP", "A6 ACP",
+        ]
 
     def test_theta_only_move_uses_a_single_axis_command(self):
         """A move touching only Theta (no X/Y/Z) never touches either
         coordinated group.
         """
-        responses = {"A6 SPD 10": "10", "A6 BMT 90": "0", "A6 MIF": "1"}
+        responses = {"A6 SPD 10": "10", "A6 BMT 90": "0", "A6 MIF": "1", "A6 ACP": "90"}
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 A90 F600")
         executor.execute(trajectory)
-        assert conn.sent == ["A6 SPD 10", "A6 BMT 90", "A6 MIF"]
+        assert conn.sent == ["A6 SPD 10", "A6 BMT 90", "A6 MIF", "A6 ACP"]
 
     def test_z_theta_group_requires_theta_cmd(self):
         """A move needing the Z/Theta group without a configured theta_cmd
@@ -608,8 +791,8 @@ class TestExecutorLinearMoves:
         rate, ramp untouched) and X/Y is the "short" one — scaled by
         k=5/20=0.25 from Theta's currently-configured ramp (read via
         single-axis A6 ACL/DCL queries, not a group — Theta alone never
-        touches C2). X/Y's own prior ramp is read too and restored once
-        both legs finish.
+        touches C2). X/Y's own prior ramp *and speed* are read too and
+        restored once both legs finish.
         """
         responses = {
             "A6 ACL": "20",
@@ -617,6 +800,7 @@ class TestExecutorLinearMoves:
             "C1 INI 1 2": "0",
             "C1 ACL": "12",  # X/Y's own ramp before this move — restored after
             "C1 DCL": "10",
+            "C1 SPD": "8",  # X/Y's own speed before this move — restored after
             "A6 SPD 10": "10",
             "A6 BMT 20": "0",
             "A6 MIF": "1",
@@ -627,17 +811,22 @@ class TestExecutorLinearMoves:
             "C1 MIF": "1",
             "C1 ACL 12": "12",  # restore
             "C1 DCL 10": "10",
+            "C1 SPD 8": "8",  # restore
+            "A1 ACP": "5",  # post-move resync of X/Y/Theta from hardware
+            "A2 ACP": "0",
+            "A6 ACP": "20",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X5 A20 F600")
         executor.execute(trajectory)
         assert conn.sent == [
             "A6 ACL", "A6 DCL",  # read Theta's ramp (scaling reference)
-            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's own ramp (to restore later)
+            "C1 INI 1 2", "C1 ACL", "C1 DCL", "C1 SPD",  # read X/Y's own ramp/speed (to restore later)
             "A6 SPD 10", "A6 BMT 20",  # Theta, unscaled
             "C1 ACL 5", "C1 DCL 4", "C1 SPD 2.5", "C1 BMT 5 0",  # X/Y, scaled by k=0.25
             "A6 MIF", "C1 MIF",
-            "C1 ACL 12", "C1 DCL 10",  # X/Y's ramp restored
+            "C1 ACL 12", "C1 DCL 10", "C1 SPD 8",  # X/Y's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A6 ACP",  # resync _current_pos/_current_theta from hardware
         ]
 
     def test_moves_x_and_theta_concurrently_with_theta_as_the_short_leg(self):
@@ -645,8 +834,8 @@ class TestExecutorLinearMoves:
         Theta (20 vs 5), so X/Y is "long" (nominal feed rate, ramp
         untouched, X/Y's ramp read via C1 ACL/DCL) and Theta is scaled
         down by k=5/20=0.25 — the single-axis-responder mirror of the Z
-        "short leg" case. Theta's own prior ramp is restored once both
-        legs finish.
+        "short leg" case. Theta's own prior ramp *and speed* are restored
+        once both legs finish.
         """
         responses = {
             "C1 INI 1 2": "0",
@@ -654,6 +843,7 @@ class TestExecutorLinearMoves:
             "C1 DCL": "16",
             "A6 ACL": "25",  # Theta's own ramp before this move — restored after
             "A6 DCL": "20",
+            "A6 SPD": "8",  # Theta's own speed before this move — restored after
             "A6 ACL 5": "5",
             "A6 DCL 4": "4",
             "A6 SPD 2.5": "2.5",
@@ -664,17 +854,22 @@ class TestExecutorLinearMoves:
             "C1 MIF": "1",
             "A6 ACL 25": "25",  # restore
             "A6 DCL 20": "20",
+            "A6 SPD 8": "8",  # restore
+            "A1 ACP": "20",  # post-move resync of X/Y/Theta from hardware
+            "A2 ACP": "0",
+            "A6 ACP": "5",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 X20 A5 F600")
         executor.execute(trajectory)
         assert conn.sent == [
             "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
-            "A6 ACL", "A6 DCL",  # read Theta's own ramp (to restore later)
+            "A6 ACL", "A6 DCL", "A6 SPD",  # read Theta's own ramp/speed (to restore later)
             "A6 ACL 5", "A6 DCL 4", "A6 SPD 2.5", "A6 BMT 5",  # Theta, scaled by k=0.25
             "C1 SPD 10", "C1 BMT 20 0",  # X/Y, unscaled
             "A6 MIF", "C1 MIF",
-            "A6 ACL 25", "A6 DCL 20",  # Theta's ramp restored
+            "A6 ACL 25", "A6 DCL 20", "A6 SPD 8",  # Theta's ramp/speed restored
+            "A1 ACP", "A2 ACP", "A6 ACP",  # resync _current_pos/_current_theta from hardware
         ]
 
     def test_z_only_move_uses_a_single_axis_command_no_ramp_scaling(self):
@@ -682,11 +877,11 @@ class TestExecutorLinearMoves:
         as an XY-only or Theta-only move — no concurrency, no ramp
         decomposition, ACL/DCL never touched.
         """
-        responses = {"A5 SPD 10": "10", "A5 BMT 3": "0", "A5 MIF": "1"}
+        responses = {"A5 SPD 10": "10", "A5 BMT 3": "0", "A5 MIF": "1", "A5 ACP": "3"}
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G1 Z3 F600")
         executor.execute(trajectory)
-        assert conn.sent == ["A5 SPD 10", "A5 BMT 3", "A5 MIF"]
+        assert conn.sent == ["A5 SPD 10", "A5 BMT 3", "A5 MIF", "A5 ACP"]
 
     def test_dry_run_sends_nothing(self):
         executor, conn = _make_executor({}, dry_run=True)
@@ -716,7 +911,7 @@ class TestExecutorLinearMoves:
     def test_confirm_cb_receives_the_move(self):
         seen = []
         executor, conn = _make_executor(
-            {"C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 MIF": "1"},
+            {"C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 MIF": "1", "A1 ACP": "10", "A2 ACP": "0"},
             confirm_cb=lambda move: seen.append(move) or True,
         )
         trajectory = executor.plan("G1 X10")

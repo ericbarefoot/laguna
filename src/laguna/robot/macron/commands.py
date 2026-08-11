@@ -76,6 +76,32 @@ SPARSE_POLL_INTERVAL_S = 0.5
 # first poll before completion rather than long after it.
 PREDICTED_SLEEP_FRACTION = 0.85
 
+# Default timeout_s for poll_until_move_finished, when the caller doesn't
+# pass an explicit one: max(MIN_TIMEOUT_S, predicted_s * TIMEOUT_MARGIN).
+# A flat 30s regardless of the move's own expected duration meant a short
+# move that actually got stuck wasn't caught for up to 30s, while a
+# legitimately long/slow move could get aborted just for taking longer
+# than an arbitrary constant. Scaling with predicted_s fixes both: short
+# moves still get MIN_TIMEOUT_S of slack (predicted_s already undercounts
+# by excluding accel/decel ramp time — see predicted_move_s — so some
+# floor is still needed even for a short move), and long moves get
+# proportionally more room instead of racing a fixed ceiling. Doesn't
+# touch the sparse-polling shape above (initial predicted sleep, then
+# SPARSE_POLL_INTERVAL_S) — only how far out the deadline sits.
+MIN_TIMEOUT_S = 10.0
+TIMEOUT_MARGIN = 1.2
+
+
+def resolve_timeout_s(predicted_s: float, timeout_s: Optional[float]) -> float:
+    """The effective timeout_s poll_until_move_finished will use.
+
+    Same formula it applies internally when `timeout_s` is None — exposed
+    so callers that report the actual value in a timeout message (once
+    `timeout_s` may itself be None, standing for "use the default") don't
+    have to duplicate the formula.
+    """
+    return timeout_s if timeout_s is not None else max(MIN_TIMEOUT_S, predicted_s * TIMEOUT_MARGIN)
+
 
 def predicted_move_s(distance: float, speed: Optional[float]) -> float:
     """Nominal duration of a move, for sparse move-completion polling.
@@ -99,14 +125,16 @@ def predicted_move_s(distance: float, speed: Optional[float]) -> float:
 def poll_until_move_finished(
     is_finished: Callable[[], bool],
     predicted_s: float = 0.0,
-    timeout_s: float = 30.0,
+    timeout_s: Optional[float] = None,
 ) -> bool:
     """Wait for a move to finish, querying the controller as little as possible.
 
     Sleeps through PREDICTED_SLEEP_FRACTION of `predicted_s` before the
     first `is_finished()` call, then polls every SPARSE_POLL_INTERVAL_S.
     See this module's "Move-completion polling" note for why the tight
-    polling this replaces is actively harmful on this hardware.
+    polling this replaces is actively harmful on this hardware — this
+    default-timeout scaling changes only how far out the deadline sits,
+    never that sparse shape.
 
     Args:
         is_finished: Callable returning True once the move has completed —
@@ -117,12 +145,15 @@ def poll_until_move_finished(
             starts immediately, still at the sparse interval.
         timeout_s: Give up after this long. The initial predicted sleep
             counts against it, and is clamped so it can never overshoot it.
+            Defaults to `max(MIN_TIMEOUT_S, predicted_s * TIMEOUT_MARGIN)`
+            when omitted — see those constants above for why.
 
     Returns:
         True if the move finished, False if `timeout_s` elapsed first. The
         caller decides what a timeout means (abort and raise, or warn and
         continue) — see the call sites in gcode.py/homing.py/controller.py.
     """
+    timeout_s = resolve_timeout_s(predicted_s, timeout_s)
     deadline = time.monotonic() + timeout_s
     initial_sleep = max(0.0, min(predicted_s * PREDICTED_SLEEP_FRACTION, timeout_s))
     if initial_sleep > 0:
@@ -360,10 +391,12 @@ class MMCCommands:
     value to set, omit it (or pass None) to read the current value.
 
     All position/velocity values are in real mm / mm/s — this class converts
-    to/from the controller's raw ACP user units internally via mm_per_unit
-    and coordinate_offset_mm (see docs/archive/GANTRY_UNIT_CALIBRATION.md: on this
-    hardware 1 raw unit = 15mm on X/Y/Z, not 1mm, until that's fixed at the
-    Snap2Motion/DSM source). This is deliberately the single choke point for
+    to/from the controller's raw ACP user units internally via mm_per_unit/
+    axis_mm_per_unit and coordinate_offset_mm (see
+    docs/archive/GANTRY_UNIT_CALIBRATION.md: on this hardware 1 raw unit is
+    not 1mm, until that's fixed at the Snap2Motion/DSM source — and not
+    even uniformly the same wrong ratio across axes, see
+    axis_mm_per_unit). This is deliberately the single choke point for
     that conversion — every position/velocity-reading or -writing method
     below applies it, so callers never see raw units. Theta (rotary) is
     exempt — it has its own separate, already-correct conversion, unrelated
@@ -375,6 +408,7 @@ class MMCCommands:
         connection: SnapConnection,
         group_index: int = 1,
         mm_per_unit: float = 1.0,
+        axis_mm_per_unit: Optional[Dict[str, float]] = None,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
         group_axes: tuple[Axis, ...] = (X_AXIS, Y_AXIS, Z_AXIS),
     ):
@@ -383,12 +417,20 @@ class MMCCommands:
         Args:
             connection: Transport to send formatted ASCII commands over.
             group_index: Coordinated-group index (the `C<N>` prefix).
-            mm_per_unit: Real mm per raw controller (ACP) unit, applied to
-                every linear-axis (X/Y/Z) position/velocity value. Defaults
-                to 1.0 (no conversion) — pass the value from
-                config's `gantry.mm_per_acp_unit` to apply the
-                docs/archive/GANTRY_UNIT_CALIBRATION.md workaround. Not applied to
-                Theta.
+            mm_per_unit: Default real mm per raw controller (ACP) unit,
+                applied to any linear axis (X/Y/Z) not overridden in
+                `axis_mm_per_unit`. Defaults to 1.0 (no conversion) — pass
+                the value from config's `gantry.mm_per_acp_unit` to apply
+                the docs/archive/GANTRY_UNIT_CALIBRATION.md workaround. Not
+                applied to Theta.
+            axis_mm_per_unit: Optional {axis_name: mm_per_unit} overrides
+                for axes whose real ratio differs from the shared default
+                — confirmed necessary for Z on this hardware (measured
+                13.5 mm/unit vs. X/Y's 15.0 on 2026-08-10; the 2026-07-28
+                calibration's "all three axes match" finding didn't hold
+                up under a second measurement, exactly the re-verification
+                its own doc called for and never got). Axes not present
+                use `mm_per_unit`.
             coordinate_offset_mm: Optional {axis_name: offset_mm} real-mm
                 translation from the gantry's raw zero to a real-world
                 origin, applied to position (not velocity/delta) values for
@@ -401,6 +443,7 @@ class MMCCommands:
         self._conn = connection
         self._group = group_index
         self._mm_per_unit = mm_per_unit
+        self._axis_mm_per_unit = axis_mm_per_unit or {}
         self._offset = coordinate_offset_mm or {}
         self._group_axes = group_axes
 
@@ -432,29 +475,33 @@ class MMCCommands:
     def _is_linear(axis: Axis) -> bool:
         return axis.name != "Theta"
 
+    def _unit_for(self, axis: Axis) -> float:
+        """This axis's mm_per_unit — the override if one's configured, else the shared default."""
+        return self._axis_mm_per_unit.get(axis.name, self._mm_per_unit)
+
     def _pos_to_raw(self, axis: Axis, value_mm: float) -> float:
         """Real mm -> raw units for an absolute position (applies offset)."""
         if not self._is_linear(axis):
             return value_mm
-        return (value_mm - self._offset.get(axis.name, 0.0)) / self._mm_per_unit
+        return (value_mm - self._offset.get(axis.name, 0.0)) / self._unit_for(axis)
 
     def _pos_to_mm(self, axis: Axis, value_raw: float) -> float:
         """Raw units -> real mm for an absolute position (applies offset)."""
         if not self._is_linear(axis):
             return value_raw
-        return value_raw * self._mm_per_unit + self._offset.get(axis.name, 0.0)
+        return value_raw * self._unit_for(axis) + self._offset.get(axis.name, 0.0)
 
     def _delta_to_raw(self, axis: Axis, value_mm: float) -> float:
         """Real mm(/s) -> raw units for a relative delta/velocity/accel (no offset)."""
         if not self._is_linear(axis):
             return value_mm
-        return value_mm / self._mm_per_unit
+        return value_mm / self._unit_for(axis)
 
     def _delta_to_mm(self, axis: Axis, value_raw: float) -> float:
         """Raw units -> real mm(/s) for a relative delta/velocity/accel (no offset)."""
         if not self._is_linear(axis):
             return value_raw
-        return value_raw * self._mm_per_unit
+        return value_raw * self._unit_for(axis)
 
     def _group_pos_to_raw(self, *positions: float) -> tuple:
         return tuple(self._pos_to_raw(axis, v) for axis, v in zip(self._group_axes, positions))
@@ -1298,7 +1345,7 @@ class AxisHandle:
 
     # -- motion (safe_mode-gated) -------------------------------------
 
-    def move_to(self, position: float, timeout: float = 30.0) -> None:
+    def move_to(self, position: float, timeout: Optional[float] = None) -> None:
         """Move to an absolute position (real mm), blocking until it finishes.
 
         Issues a non-blocking begin_move_to (BMT) and polls, rather than
@@ -1308,7 +1355,9 @@ class AxisHandle:
         the move is legitimately in progress. (MMCCommands.move_to is
         banned outright for that reason.) Polling keeps every wire
         round-trip short, while `timeout` governs how long this call waits
-        for the move itself.
+        for the move itself. Defaults to poll_until_move_finished's own
+        predicted-duration-scaled timeout when omitted — see that
+        function's docstring.
 
         Raises:
             SnapMotionError: If the move doesn't finish within `timeout`
@@ -1319,11 +1368,11 @@ class AxisHandle:
         self._cmd.begin_move_to(self._axis, position)
         self._poll_move_finished(timeout, predicted_s=predicted_move_s(distance, self._last_speed()))
 
-    def move_by(self, delta: float, timeout: float = 30.0) -> None:
+    def move_by(self, delta: float, timeout: Optional[float] = None) -> None:
         """Relative move (real mm), blocking until it finishes.
 
         See move_to() for why this polls internally rather than using the
-        blocking MVB.
+        blocking MVB, and for `timeout`'s default.
         """
         self._check_motion_allowed("move_by")
         self._cmd.begin_move_by(self._axis, delta)
@@ -1351,7 +1400,7 @@ class AxisHandle:
         except SnapMotionError:
             return None
 
-    def _poll_move_finished(self, timeout: float, predicted_s: float = 0.0) -> None:
+    def _poll_move_finished(self, timeout: Optional[float], predicted_s: float = 0.0) -> None:
         """Wait for this axis's move, querying MIF as little as possible.
 
         Uses the shared sparse poller rather than a tight loop — see the
@@ -1364,8 +1413,9 @@ class AxisHandle:
             timeout_s=timeout,
         ):
             self._cmd.abort(self._axis)
+            effective_timeout = resolve_timeout_s(predicted_s, timeout)
             raise SnapMotionError(
-                0, f"{self._axis.name} move did not finish within {timeout:.0f}s — aborted"
+                0, f"{self._axis.name} move did not finish within {effective_timeout:.0f}s — aborted"
             )
 
     def jog(self, speed: float) -> float:

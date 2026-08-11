@@ -117,7 +117,14 @@ class Config:
                 "axes": [
                     {"name": "X", "index": 1},
                     {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
-                    {"name": "Z", "index": 5, "brake_output": 5},
+                    # mm_per_unit override: confirmed 13.5 mm/unit on hardware
+                    # 2026-08-10 (measured 90mm actual travel for a
+                    # 100mm-commanded move), not the shared 15.0 default —
+                    # see docs/archive/GANTRY_UNIT_CALIBRATION.md and
+                    # MMCCommands.__init__'s axis_mm_per_unit docstring. X/Y
+                    # were not re-measured this session and still use the
+                    # shared default.
+                    {"name": "Z", "index": 5, "brake_output": 5, "mm_per_unit": 13.5},
                     {"name": "Theta", "index": 6},
                 ],
                 "homing": {
@@ -127,11 +134,16 @@ class Config:
                 },
                 "fences": [],
                 # TEMPORARY: 1 raw controller (ACP) unit measures as this many real
-                # mm on X/Y/Z — confirmed 15.0 on hardware 2026-07-28, see
-                # docs/archive/GANTRY_UNIT_CALIBRATION.md. This is the single toggle: once
-                # the Snap2Motion/DSM project's axis scale is fixed at the source,
-                # change this to 1.0 (and gantry_agent.py's matching
-                # MM_PER_ACP_UNIT constant) — nothing else needs to change.
+                # mm — default/fallback for any axis without its own override
+                # in "axes" above (see Z's "mm_per_unit" key: confirmed off
+                # from this shared value on 2026-08-10). Originally measured
+                # 15.0 for X/Y/Z uniformly on 2026-07-28, see
+                # docs/archive/GANTRY_UNIT_CALIBRATION.md — that "uniform
+                # across axes" finding didn't hold up on Z under a second
+                # measurement. Once the Snap2Motion/DSM project's axis scale
+                # is fixed at the source, change this to 1.0, remove the
+                # per-axis overrides, and update gantry_agent.py's matching
+                # MM_PER_ACP_UNIT constant.
                 "mm_per_acp_unit": 15.0,
                 # Real-mm translation from the gantry's raw zero to a real-world
                 # origin, applied on top of mm_per_acp_unit. Not a rotation/affine

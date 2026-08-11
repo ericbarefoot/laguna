@@ -30,6 +30,22 @@ class TestPositionConversion:
         cmd = MMCCommands(conn)
         assert cmd.get_actual_position(X_AXIS) == 10.0
 
+    def test_axis_mm_per_unit_overrides_the_shared_default(self):
+        # Z confirmed at 13.5 mm/unit on hardware 2026-08-10, distinct from
+        # the shared 15.0 default X/Y still use — see
+        # docs/archive/GANTRY_UNIT_CALIBRATION.md.
+        conn = FakeSnapConnection({"A5 ACP": "10", "A1 ACP": "10"})
+        cmd = MMCCommands(conn, mm_per_unit=15.0, axis_mm_per_unit={"Z": 13.5})
+        assert cmd.get_actual_position(Z_AXIS) == 135.0
+        assert cmd.get_actual_position(X_AXIS) == 150.0  # unaffected, still the shared default
+
+    def test_axis_mm_per_unit_applies_to_velocity_and_raw_writes_too(self):
+        conn = FakeSnapConnection({"A5 SPD 10": "10", "A5 BMT 10": "0"})
+        cmd = MMCCommands(conn, mm_per_unit=15.0, axis_mm_per_unit={"Z": 13.5})
+        assert cmd.set_speed(Z_AXIS, 135.0) == 135.0
+        cmd.begin_move_to(Z_AXIS, 135.0)
+        assert conn.sent == ["A5 SPD 10", "A5 BMT 10"]
+
     def test_set_actual_position_converts_mm_to_raw_and_back(self):
         conn = FakeSnapConnection({"A1 ACP 10": "10"})
         cmd = MMCCommands(conn, mm_per_unit=15.0)
