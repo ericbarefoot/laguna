@@ -579,6 +579,22 @@ class FrameRegistry:
         ``scan.metadata["gantry_start_mm"]`` (with the axis in
         ``gantry_axis``); pass `gantry_start` explicitly to override.
 
+        **Travel direction.** The sensor is fully encoderless (software/time
+        triggered — see ``scan_with_gantry()``), so its own Y is just
+        acquisition order: row 0 is whatever was captured first, the last
+        row whatever was captured last, always centred symmetrically around
+        0 regardless of which real-world direction the gantry actually
+        moved. This method anchors the *first-acquired* point to the pass's
+        real starting position and orients everything else by the recorded
+        ``gantry_start_mm -> gantry_end_mm`` direction (needs both — see
+        ``scan_with_gantry()``, which records them together). Skipping that
+        orientation step — i.e. just adding the starting position as a flat
+        offset, which is what this method used to do — silently mirrors the
+        travel axis for any pass that travels in the negative direction
+        along its axis, since acquisition order no longer matches increasing
+        position; see ``docs/subsystems/scanner.md``, "Sensor axes are not
+        gantry axes."
+
         Args:
             scan: The scan to place.
             instrument: Which instrument frame to use.
@@ -593,8 +609,11 @@ class FrameRegistry:
             ValueError: If no starting position is given and the metadata
                 doesn't carry one.
         """
+        origin = {"X": 0, "Y": 1, "Z": 2}
+        axis = scan.metadata.get("gantry_axis")
+        travel_col = origin.get(axis)
+
         if gantry_start is None:
-            axis = scan.metadata.get("gantry_axis")
             start = scan.metadata.get("gantry_start_mm")
             if axis is None or start is None:
                 raise ValueError(
@@ -603,14 +622,15 @@ class FrameRegistry:
                     "'gantry_start_mm' (only scan_with_gantry() records them), "
                     "so pass gantry_start=[x, y, z] explicitly."
                 )
-            origin = {"X": 0, "Y": 1, "Z": 2}
-            if axis not in origin:
+            if travel_col is None:
                 raise ValueError(
                     f"scan metadata names gantry axis {axis!r}, which is not "
                     "one of X/Y/Z — pass gantry_start explicitly."
                 )
             gantry_start = [0.0, 0.0, 0.0]
-            gantry_start[origin[axis]] = float(start)
+            gantry_start[travel_col] = float(start)
+        else:
+            gantry_start = list(gantry_start)
 
         # The scan's points are already gantry-*oriented*: SurfaceScan applies
         # its own mounting rotation in to_points(). So this instrument frame
@@ -630,6 +650,40 @@ class FrameRegistry:
             )
 
         points = scan.to_points(dtype=dtype)
+
+        # See "Travel direction" above. points[0, travel_col] is the
+        # gantry-oriented value of whichever point was acquired first
+        # (to_points() with drop_invalid=True — the default here — walks
+        # cells in acquisition order, so the first surviving point is from
+        # the lowest-numbered row/column with any valid return, even if
+        # the very first row was entirely invalid). Re-anchoring relative
+        # to that, in the recorded travel direction, replaces the old flat
+        # "+= gantry_start" — which also means this fixes a pre-existing
+        # ~half-pass-length offset that applied even to positive-direction
+        # passes, not just the direction/mirroring for negative ones.
+        if travel_col is not None and points.shape[0] > 0:
+            end = scan.metadata.get("gantry_end_mm")
+            start_for_sign = scan.metadata.get("gantry_start_mm")
+            if end is not None and start_for_sign is not None:
+                travel_sign = 1.0 if float(end) >= float(start_for_sign) else -1.0
+            else:
+                travel_sign = 1.0
+                logger.warning(
+                    "place_scan(): scan metadata has 'gantry_axis' but not "
+                    "both 'gantry_start_mm'/'gantry_end_mm', so the direction "
+                    "this pass actually traveled can't be determined — "
+                    "assuming positive. Geometry will be mirrored along %s "
+                    "if that assumption is wrong.", axis,
+                )
+            anchor = float(points[0, travel_col])
+            points[:, travel_col] = (
+                float(gantry_start[travel_col])
+                + travel_sign * (points[:, travel_col] - anchor)
+            )
+            # This axis is now fully resolved above — the flat offset below
+            # must not add gantry_start[travel_col] a second time.
+            gantry_start[travel_col] = 0.0
+
         offset = frame.offset + np.asarray(gantry_start, dtype=float)
         return self.experiment_from_gantry.apply(points + offset).astype(
             dtype, copy=False

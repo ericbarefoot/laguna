@@ -99,6 +99,7 @@ nav:
   - API reference:
       - Overview: reference/index.md
       - Core & config: reference/core.md
+      - Safety: reference/safety.md
       - Macron gantry driver: reference/macron.md
       - Camera: reference/camera.md
       - Weir: reference/weir.md
@@ -106,9 +107,12 @@ nav:
       - Rangefinder: reference/rangefinder.md
       - Scanner: reference/scanner.md
       - Flow: reference/flow.md
+      - Reference frames: reference/frames.md
+      - Survey: reference/survey.md
       - Schedule: reference/schedule.md
       - Timing: reference/timing.md
       - Experiment runner: reference/experiment.md
+      - Simulation: reference/simulation.md
       - Data & storage: reference/data_storage.md
   - Changelog: CHANGELOG.md
   - Archive:

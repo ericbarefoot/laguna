@@ -257,6 +257,42 @@ class TestPollUntilMoveFinished:
         # the deadline rather than being abandoned a poll early.
         assert sparse == [pytest.approx(2.0), 0.5]
 
+    def test_default_timeout_uses_the_floor_for_a_short_predicted_move(self, sparse):
+        # predicted_s=2.0 * TIMEOUT_MARGIN(1.2) = 2.4, below MIN_TIMEOUT_S
+        # (10.0) — a short move that actually gets stuck must not wait a
+        # flat 30s to be caught; the floor still gives it a reasonable
+        # amount of slack (predicted_s excludes accel/decel ramp time), but
+        # not an excessive one.
+        assert poll_until_move_finished(lambda: False, predicted_s=2.0) is False
+        # up-front sleep is 0.85*2.0=1.7, then sparse retries until the
+        # 10.0s floor elapses: 1.7 + 8*0.5 = 5.7... the exact retry count
+        # only matters insofar as the deadline is respected — check the
+        # total elapsed instead of an exact sleep sequence.
+        assert sum(sparse) == pytest.approx(10.0, abs=0.5)
+
+    def test_default_timeout_scales_up_for_a_long_predicted_move(self, sparse):
+        # predicted_s=20.0 * TIMEOUT_MARGIN(1.2) = 24.0, above the 10.0
+        # floor — a legitimately long move gets proportionally more room
+        # instead of racing a fixed 30s (or, worse, being cut off before
+        # its own predicted duration if the floor were lower than this).
+        assert poll_until_move_finished(lambda: False, predicted_s=20.0) is False
+        assert sum(sparse) == pytest.approx(24.0, abs=1.0)
+
+    def test_explicit_timeout_still_overrides_the_default(self, sparse):
+        # Passing timeout_s explicitly (even 0.0) must bypass the
+        # predicted-duration-scaled default entirely — existing callers
+        # that want a fixed timeout must not be silently rescaled.
+        assert poll_until_move_finished(lambda: False, predicted_s=20.0, timeout_s=3.0) is False
+        assert sum(sparse) == pytest.approx(3.0, abs=1.0)
+
+    def test_resolve_timeout_s_matches_poll_until_move_finished(self):
+        from laguna.robot.macron.commands import resolve_timeout_s
+
+        assert resolve_timeout_s(predicted_s=2.0, timeout_s=None) == 10.0  # floor wins
+        assert resolve_timeout_s(predicted_s=20.0, timeout_s=None) == pytest.approx(24.0)
+        assert resolve_timeout_s(predicted_s=20.0, timeout_s=5.0) == 5.0  # explicit wins
+        assert resolve_timeout_s(predicted_s=0.0, timeout_s=0.0) == 0.0  # explicit 0.0 is not None
+
 
 class TestEnaBanned:
     """ENA is refused at every layer. Addressing it on a responder-node axis

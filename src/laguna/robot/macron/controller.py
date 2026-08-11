@@ -28,6 +28,7 @@ from .commands import (
     Z_AXIS,
     poll_until_move_finished,
     predicted_move_s,
+    resolve_timeout_s,
 )
 from .connection import EthernetConnection, RS232Connection, SnapConnection, SnapMotionError
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
@@ -117,6 +118,7 @@ class GantryController:
         theta_group_index: int = 2,
         safe_mode: bool = True,
         mm_per_unit: float = 1.0,
+        axis_mm_per_unit: Optional[Dict[str, float]] = None,
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
         position_checkpoint_file: Optional[str] = None,
         arbiter: Optional[Any] = None,
@@ -135,7 +137,10 @@ class GantryController:
             gcode_theta_axis: Theta (rotary) axis (default THETA_AXIS).
             theta_group_index: Coordinated group index for Z/Theta.
             safe_mode: Whether no-motion restrictions are active.
-            mm_per_unit: Real mm per raw controller unit (unit conversion).
+            mm_per_unit: Default real mm per raw controller unit, for any
+                linear axis not overridden in axis_mm_per_unit.
+            axis_mm_per_unit: Per-axis mm_per_unit overrides — see
+                MMCCommands.__init__.
             coordinate_offset_mm: Per-axis position offsets in mm.
             position_checkpoint_file: Path to position persistence file.
             arbiter: Motion arbiter for serializing operations.
@@ -161,6 +166,7 @@ class GantryController:
             connection,
             group_index=group_index,
             mm_per_unit=mm_per_unit,
+            axis_mm_per_unit=axis_mm_per_unit,
             coordinate_offset_mm=coordinate_offset_mm,
             group_axes=gcode_axes,
         )
@@ -175,6 +181,7 @@ class GantryController:
             connection,
             group_index=theta_group_index,
             mm_per_unit=mm_per_unit,
+            axis_mm_per_unit=axis_mm_per_unit,
             coordinate_offset_mm=coordinate_offset_mm,
             group_axes=(gcode_z_axis, gcode_theta_axis),
         )
@@ -309,6 +316,9 @@ class GantryController:
         gcode_axes = _resolve_gcode_axes(axes_cfg)
         gcode_z_axis = _lookup_axis(axes_cfg, "Z") or Z_AXIS
         gcode_theta_axis = _lookup_axis(axes_cfg, "Theta") or THETA_AXIS
+        axis_mm_per_unit = {
+            a["name"]: a["mm_per_unit"] for a in axes_cfg if "mm_per_unit" in a
+        }
 
         return cls(
             connection=connection,
@@ -326,6 +336,7 @@ class GantryController:
             # Flip gantry.mm_per_acp_unit to 1.0 in config once fixed at the source;
             # nothing else needs to change.
             mm_per_unit=config.get("mm_per_acp_unit", 1.0),
+            axis_mm_per_unit=axis_mm_per_unit,
             coordinate_offset_mm=config.get("coordinate_offset"),
             position_checkpoint_file=config.get("position_checkpoint_file"),
         )
@@ -349,6 +360,15 @@ class GantryController:
             # next move re-send INI rather than assume it survived. See
             # GCodeExecutor._init_group.
             self.gcode.reset_group_init()
+            if self._is_connected:
+                # gcode's _current_pos/_current_theta default to (0,0,0)/0.0
+                # at construction and are never otherwise touched until a
+                # move updates them — reconnecting while the gantry is
+                # parked elsewhere would leave that cache believing it's at
+                # a phantom origin, silently no-oping the next move instead
+                # of actually moving it. See sync_position_from_hardware's
+                # docstring.
+                self.gcode.sync_position_from_hardware()
         except Exception as exc:
             logger.error("Failed to connect gantry: %s", exc)
             self._is_connected = False
@@ -793,6 +813,12 @@ class GantryController:
 
         for name, value in target_by_name.items():
             self.cmd.set_actual_position(axes_by_name[name], value)
+        # gcode's _current_pos/_current_theta cache doesn't know this
+        # register recalibration happened — without this, the next
+        # move_to() would still plan/classify legs against the pre-
+        # recalibration position. See sync_position_from_hardware's
+        # docstring.
+        self.gcode.sync_position_from_hardware()
         self._persist_position()
         return True
 
@@ -813,6 +839,18 @@ class GantryController:
                 self.cmd.begin_stop(axis)
             except Exception as exc:
                 logger.error("Error soft-stopping %s: %s", axis.name, exc)
+        # gcode's _current_pos/_current_theta cache would otherwise still
+        # believe wherever this interrupted move started from — the next
+        # move_to() could then silently no-op if its target happens to
+        # match that stale starting position. Best-effort: BST isn't
+        # blocking, so this reads position while still decelerating, not
+        # at final rest (same caveat as _persist_position() below), but
+        # that's still far closer to reality than the stale pre-move
+        # cache. See sync_position_from_hardware's docstring.
+        try:
+            self.gcode.sync_position_from_hardware()
+        except Exception as exc:
+            logger.error("Error resyncing gcode position after soft-stop: %s", exc)
         self._persist_position()
 
     # ------------------------------------------------------------------
@@ -848,6 +886,11 @@ class GantryController:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry emergency stop: %s", exc)
+        # See soft_stop()'s matching resync for why this can't be skipped.
+        try:
+            self.gcode.sync_position_from_hardware()
+        except Exception as exc:
+            logger.error("Error resyncing gcode position after estop: %s", exc)
         self._persist_position()
         return None
 
@@ -936,7 +979,7 @@ class GantryController:
         for axis in self._axes:
             self.cmd.set_motor(axis, False)
 
-    def wait_for_move(self, timeout: float = 30.0, predicted_s: float = 0.0) -> None:
+    def wait_for_move(self, timeout: Optional[float] = None, predicted_s: float = 0.0) -> None:
         """Block until the coordinated group's current move completes, or timeout elapses.
 
         Only tracks the coordinated (X/Y) group — a Theta-only move issued
@@ -950,7 +993,9 @@ class GantryController:
         interpolating — the pattern confirmed on hardware to make this
         controller stop answering the wire; see commands.py's module note.
         Pass `predicted_s` (distance / speed) when known so most of the
-        wait costs no wire traffic at all.
+        wait costs no wire traffic at all. `timeout` defaults to
+        poll_until_move_finished's own predicted-duration-scaled timeout
+        when omitted — see that function's docstring.
 
         Raises:
             TimeoutError: If the move hasn't finished within `timeout`.
@@ -958,10 +1003,11 @@ class GantryController:
         if not poll_until_move_finished(
             self.cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout
         ):
-            raise TimeoutError(f"Gantry move did not finish within {timeout:.0f}s")
+            effective_timeout = resolve_timeout_s(predicted_s, timeout)
+            raise TimeoutError(f"Gantry move did not finish within {effective_timeout:.0f}s")
 
     def _wait_for_axis_move_finished(
-        self, axis: Axis, timeout: float = 30.0, predicted_s: float = 0.0
+        self, axis: Axis, timeout: Optional[float] = None, predicted_s: float = 0.0
     ) -> None:
         """Block until a single axis's move-finished flag is set, aborting on timeout.
 
@@ -969,13 +1015,15 @@ class GantryController:
         Theta branch of move_to() now that it issues a non-blocking
         begin_move_to instead of a blocking move_to() (banned — see
         commands.py). Polls sparsely via commands.poll_until_move_finished
-        — see that function's module note.
+        — see that function's module note. `timeout` default matches
+        wait_for_move's.
         """
         if not poll_until_move_finished(
             lambda: self.cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout
         ):
             self.cmd.abort(axis)
-            raise TimeoutError(f"{axis.name} move did not finish within {timeout:.0f}s — aborted")
+            effective_timeout = resolve_timeout_s(predicted_s, timeout)
+            raise TimeoutError(f"{axis.name} move did not finish within {effective_timeout:.0f}s — aborted")
 
 
 def _build_transport(config: Dict[str, Any]) -> SnapConnection:

@@ -22,9 +22,12 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ..motion_arbiter import DEFAULT_ARBITER
+
+if TYPE_CHECKING:
+    from .controller import GantryController
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +67,7 @@ class TopographicProfiler:
 
     def __init__(
         self,
-        gantry,
+        gantry: "GantryController",
         pi_host: str,
         pi_user: str,
         pi_key: Optional[str] = None,

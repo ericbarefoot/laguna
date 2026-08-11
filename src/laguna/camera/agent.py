@@ -35,10 +35,10 @@ def capture_at_time(target_time: float, output_dir: str = "/tmp/laguna_captures"
         output_dir: Directory to write captured image files (default /tmp/laguna_captures).
 
     Returns:
-        Dict with either:
-        - On success: filename, target_time, capture_time_start, capture_time_end,
-          capture_time_mid, capture_duration_ms, latency_ms.
-        - On error: error key with a string description.
+        On success, a dict with filename, target_time, capture_time_start,
+        capture_time_end, capture_time_mid, capture_duration_ms, and
+        latency_ms. On failure, a dict with an "error" key holding a string
+        description.
     """
     _log("Starting — importing picamzero...")
     try:

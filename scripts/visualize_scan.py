@@ -79,13 +79,36 @@ def axis_labels(meta: dict) -> tuple:
 
 
 def plot_scan(z: np.ndarray, x: np.ndarray, y: np.ndarray, meta: dict, title: str):
-    """Build the 2x2 diagnostic figure. Returns the Figure."""
+    """Build the 2x2 diagnostic figure. Returns the Figure.
+
+    ``x``/``y`` are 1D (uniform surface, resampled onto an even grid) or 2D
+    (point cloud, native per-column sensor spacing — see
+    laguna.scanner.pointcloud's module docstring). Point-cloud X spacing is
+    NOT uniform across a row (confirmed on real scans in data/scans/:
+    consecutive-column spacing ranges ~1.1-4.6mm within a single row, not a
+    single constant) — imshow()'s `extent=` draws its whole array across one
+    flat [xmin, xmax] span assuming every column is the same width, so a
+    non-uniform-X point cloud rendered that way is geometrically warped
+    regardless of how correct the *metadata*'s frame_rate/travel_speed are
+    (those only govern Y spacing, which is genuinely uniform — the X
+    warping is real and independent of them). Rendered as a real scatter of
+    each cell's own (x, y) instead — correct for non-uniform spacing, and
+    tolerates the NaN x/y that invalid-return cells carry in this mode
+    (pcolormesh doesn't: it requires finite mesh coordinates everywhere,
+    even for masked/invalid *values*).
+    """
     col_label, row_label = axis_labels(meta)
     row_stride = max(1, z.shape[0] // 400)
     col_stride = max(1, z.shape[1] // 1200)
+    non_uniform_xy = x.ndim == 2
+
     zd = z[::row_stride, ::col_stride]
-    xd = x[::col_stride]
-    yd = y[::row_stride]
+    if non_uniform_xy:
+        xd = x[::row_stride, ::col_stride]
+        yd = y[::row_stride, ::col_stride]
+    else:
+        xd = x[::col_stride]
+        yd = y[::row_stride]
 
     valid = ~np.isnan(z)
     valid_frac = valid.sum() / z.size
@@ -93,14 +116,26 @@ def plot_scan(z: np.ndarray, x: np.ndarray, y: np.ndarray, meta: dict, title: st
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 
+    vmin = np.nanpercentile(z, 1) if zvalid.size else 0
+    vmax = np.nanpercentile(z, 99) if zvalid.size else 1
+
     ax = axes[0, 0]
-    im = ax.imshow(
-        zd, aspect="equal", origin="lower",
-        extent=[xd.min(), xd.max(), yd.min(), yd.max()],
-        cmap="viridis",
-        vmin=np.nanpercentile(z, 1) if zvalid.size else 0,
-        vmax=np.nanpercentile(z, 99) if zvalid.size else 1,
-    )
+    if non_uniform_xy:
+        # A point can be a valid Z return but still carry a NaN x/y (or the
+        # reverse) — scatter only where all three are finite.
+        valid_d = ~np.isnan(zd) & ~np.isnan(xd) & ~np.isnan(yd)
+        im = ax.scatter(
+            xd[valid_d], yd[valid_d], c=zd[valid_d], s=1, marker=".",
+            cmap="viridis", vmin=vmin, vmax=vmax,
+        )
+        ax.set_aspect("equal")
+        ax.set_facecolor("black")
+    else:
+        im = ax.imshow(
+            zd, aspect="equal", origin="lower",
+            extent=[np.nanmin(xd), np.nanmax(xd), np.nanmin(yd), np.nanmax(yd)],
+            cmap="viridis", vmin=vmin, vmax=vmax,
+        )
     ax.set_xlabel(col_label)
     ax.set_ylabel(row_label)
     ax.set_title(f"Z heatmap (downsampled) — {valid_frac * 100:.1f}% valid returns")
@@ -119,19 +154,27 @@ def plot_scan(z: np.ndarray, x: np.ndarray, y: np.ndarray, meta: dict, title: st
     ax.set_ylabel("count")
 
     ax = axes[1, 0]
-    valid_d = valid[::row_stride, ::col_stride]
-    ax.imshow(valid_d, aspect="equal", origin="lower",
-              extent=[xd.min(), xd.max(), yd.min(), yd.max()], cmap="gray")
+    if non_uniform_xy:
+        # Invalid-return cells generally have no known (x, y) either, so
+        # there's no meaningful spatial "black" region to show for them —
+        # just plot where valid returns actually landed.
+        ax.scatter(xd[valid_d], yd[valid_d], c="white", s=1, marker=".")
+        ax.set_aspect("equal")
+        ax.set_facecolor("black")
+    else:
+        valid_d = valid[::row_stride, ::col_stride]
+        ax.imshow(valid_d, aspect="equal", origin="lower",
+                  extent=[np.nanmin(xd), np.nanmax(xd), np.nanmin(yd), np.nanmax(yd)], cmap="gray")
     ax.set_xlabel(col_label)
     ax.set_ylabel(row_label)
     ax.set_title("Valid-return mask (white = got a return, black = 0x8000/no data)")
 
-    mid_row = z.shape[0] // 2
-    ax = axes[1, 1]
-    ax.plot(x, z[mid_row], lw=0.5)
-    ax.set_xlabel(col_label)
-    ax.set_ylabel("Z (mm, height)")
-    ax.set_title(f"Single profile across the laser line (row {mid_row}, {y[mid_row]:.2f}mm along travel)")
+    # mid_row = z.shape[0] // 2
+    # ax = axes[1, 1]
+    # ax.plot(x, z[mid_row], lw=0.5)
+    # ax.set_xlabel(col_label)
+    # ax.set_ylabel("Z (mm, height)")
+    # ax.set_title(f"Single profile across the laser line (row {mid_row}, {y[mid_row]:.2f}mm along travel)")
 
     fig.suptitle(title, fontsize=11)
     fig.tight_layout()

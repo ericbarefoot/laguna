@@ -24,3 +24,10 @@ bring-up.
 ## Settings
 
 ::: laguna.scanner.settings
+
+## Simulation
+
+A GoSdk stand-in returning synthetic surfaces, for `simulate=True` rehearsal
+— see [Simulation](simulation.md) for the full-experiment version.
+
+::: laguna.scanner.simulation

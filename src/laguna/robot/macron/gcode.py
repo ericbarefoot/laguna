@@ -122,7 +122,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .commands import (
     Axis, MMCCommands, THETA_AXIS, X_AXIS, Y_AXIS, Z_AXIS,
-    poll_until_move_finished, predicted_move_s,
+    poll_until_move_finished, predicted_move_s, resolve_timeout_s,
 )
 from .connection import SnapMotionError
 from .fences import CheckedTrajectory, FenceViolation, Point3D, TrajectoryChecker
@@ -826,6 +826,32 @@ class GCodeExecutor:
         self._group_initialized = False
         self._theta_group_initialized = False
 
+    def sync_position_from_hardware(self) -> None:
+        """Refresh `_current_pos`/`_current_theta` from a live ACP read of every axis.
+
+        `_current_pos`/`_current_theta` default to (0, 0, 0)/0.0 at
+        construction — a fine placeholder only until this is called, never
+        a claim about where the gantry actually is. Nothing seeds them
+        from hardware afterward except this and each real move's own
+        post-move resync (_sync_position_from_hardware, the touched-axes-
+        only version) — so a controller that reconnects (or is freshly
+        constructed) while the gantry is parked away from wherever the
+        cache defaults to will otherwise plan every subsequent move
+        against a phantom starting position. Concretely: the gantry
+        physically at (100, 100, 200), a reconnect, then
+        `move_to([0, 0, 0, 0])` — target (0,0,0) matches the still-default
+        (0,0,0) cache, `_leg_kinds` sees nothing moved, and the call
+        no-ops instead of homing. Call this once connected, before any
+        move relies on `_current_pos` being true.
+        """
+        x_axis, y_axis = self._axes
+        self._current_pos = (
+            self._cmd.get_actual_position(x_axis),
+            self._cmd.get_actual_position(y_axis),
+            self._cmd.get_actual_position(self._z_axis),
+        )
+        self._current_theta = self._cmd.get_actual_position(self._theta_axis)
+
     def _leg_kinds(self, move: GCodeMove) -> Tuple[bool, str]:
         """Classify a LINEAR move into (touches_xy, responder_kind).
 
@@ -853,10 +879,57 @@ class GCodeExecutor:
         return touches_xy, responder
 
     def _advance_position(self, move: GCodeMove) -> None:
-        """Update `_current_pos`/`_current_theta` to reflect a completed move."""
+        """Update `_current_pos`/`_current_theta` to the commanded target (dry-run only).
+
+        Assumes move.target/move.theta were reached exactly — fine for
+        dry-run, which never touches hardware. Real moves use
+        _sync_position_from_hardware() instead; see that method's
+        docstring for why trusting the commanded target isn't safe once
+        real motion is involved.
+        """
         self._current_pos = move.target
         if move.theta is not None:
             self._current_theta = move.theta
+
+    def _sync_position_from_hardware(self, touches_xy: bool, responder: str) -> None:
+        """Refresh `_current_pos`/`_current_theta` from a live ACP read, for whichever axes this move touched.
+
+        Raw controller units don't divide evenly into real mm (see
+        MMCCommands._pos_to_mm/_pos_to_raw), so the position actually
+        reached after a move is almost never bit-for-bit equal to the
+        commanded float target — trusting the target (the old behaviour)
+        let that quantization residue silently diverge from hardware
+        truth. GantryController.move_to() backfills any axis it doesn't
+        explicitly target with a *live* get_actual_position() read (see
+        its docstring), so on the next move that live reading could
+        differ from this executor's stale cached target by more than
+        _POSITION_EPSILON_MM — _leg_kinds then sees a phantom "moved" on
+        an axis nobody asked to move, forcing an unwanted
+        _execute_concurrent_pair leg whose near-zero distance scales
+        ACL/DCL down to 0 raw units (ASCII escape 16/17, "0 Or
+        Negative"). Re-reading actual position for exactly the axes this
+        move commanded keeps the cache honest instead of drifting.
+
+        Only the axes this move actually commanded are re-read — axes it
+        didn't touch were already reconciled the last time they moved (or
+        are still at their initial/homed value), so re-reading them here
+        would just be wasted round-trips.
+        """
+        if touches_xy:
+            x_axis, y_axis = self._axes
+            self._current_pos = (
+                self._cmd.get_actual_position(x_axis),
+                self._cmd.get_actual_position(y_axis),
+                self._current_pos[2],
+            )
+        if responder in ("z", "z_theta"):
+            self._current_pos = (
+                self._current_pos[0],
+                self._current_pos[1],
+                self._cmd.get_actual_position(self._z_axis),
+            )
+        if responder in ("theta", "z_theta"):
+            self._current_theta = self._cmd.get_actual_position(self._theta_axis)
 
     def _execute_linear(self, move: GCodeMove) -> None:
         """Run one LINEAR move via whichever leg(s) it actually needs.
@@ -866,7 +939,9 @@ class GCodeExecutor:
         Theta can't be sent as one group command (node-topology limit —
         see module docstring), so it runs as two concurrent legs via
         _execute_concurrent_pair. Updates `_current_pos`/`_current_theta`
-        regardless of dry-run.
+        regardless of dry-run — from the commanded target in dry-run (no
+        hardware to read), from a live ACP re-read for a real move (see
+        _sync_position_from_hardware).
 
         Raises:
             GCodeExecutionAborted: If confirm_cb rejects this move.
@@ -902,7 +977,7 @@ class GCodeExecutor:
             self._execute_zt_leg(move)
         # responder == "none" and not touches_xy: nothing actually moves.
 
-        self._advance_position(move)
+        self._sync_position_from_hardware(touches_xy, responder)
 
     def _begin_z_leg(
         self, move: GCodeMove, speed: Optional[float] = None, ramp: Optional[Tuple[float, float]] = None
@@ -916,10 +991,17 @@ class GCodeExecutor:
             self._cmd.set_speed(self._z_axis, speed)
         self._cmd.begin_move_to(self._z_axis, move.target[2])
 
-    def _poll_z_leg(self, move: GCodeMove, current_pos: Point3D, speed: Optional[float] = None) -> None:
+    def _poll_z_leg(
+        self,
+        move: GCodeMove,
+        current_pos: Point3D,
+        speed: Optional[float] = None,
+        already_elapsed_s: float = 0.0,
+    ) -> None:
         distance = abs(move.target[2] - current_pos[2])
         speed = move.feed_mm_s if speed is None else speed
-        self._poll_axis_move_finished(self._z_axis, predicted_s=predicted_move_s(distance, speed))
+        predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
+        self._poll_axis_move_finished(self._z_axis, predicted_s=predicted_s)
 
     def _execute_z_leg(self, move: GCodeMove) -> None:
         """Move Z alone via a single-axis command."""
@@ -940,11 +1022,16 @@ class GCodeExecutor:
         self._cmd.begin_move_to(self._theta_axis, move.theta)
 
     def _poll_theta_leg(
-        self, move: GCodeMove, current_theta: float, speed: Optional[float] = None
+        self,
+        move: GCodeMove,
+        current_theta: float,
+        speed: Optional[float] = None,
+        already_elapsed_s: float = 0.0,
     ) -> None:
         distance = abs(move.theta - current_theta)
         speed = move.feed_mm_s if speed is None else speed
-        self._poll_axis_move_finished(self._theta_axis, predicted_s=predicted_move_s(distance, speed))
+        predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
+        self._poll_axis_move_finished(self._theta_axis, predicted_s=predicted_s)
 
     def _execute_theta_leg(self, move: GCodeMove) -> None:
         """Move Theta alone via a single-axis command."""
@@ -971,10 +1058,12 @@ class GCodeExecutor:
         current_pos: Point3D,
         current_theta: float,
         speed: Optional[float] = None,
+        already_elapsed_s: float = 0.0,
     ) -> None:
         distance = _zt_distance(move, current_pos, current_theta)
         speed = move.feed_mm_s if speed is None else speed
-        self._poll_theta_group_move_finished(predicted_s=predicted_move_s(distance, speed))
+        predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
+        self._poll_theta_group_move_finished(predicted_s=predicted_s)
 
     def _execute_zt_leg(self, move: GCodeMove) -> None:
         """Move Z and Theta together via coordinated group.
@@ -1001,16 +1090,45 @@ class GCodeExecutor:
             self._cmd.group_set_speed(speed)
         self._cmd.group_begin_move_to(move.target[0], move.target[1])
 
-    def _poll_xy_leg(self, move: GCodeMove, current_pos: Point3D, speed: Optional[float] = None) -> None:
+    def _poll_xy_leg(
+        self,
+        move: GCodeMove,
+        current_pos: Point3D,
+        speed: Optional[float] = None,
+        already_elapsed_s: float = 0.0,
+    ) -> None:
         distance = math.hypot(move.target[0] - current_pos[0], move.target[1] - current_pos[1])
         speed = move.feed_mm_s if speed is None else speed
-        self._poll_group_move_finished(predicted_s=predicted_move_s(distance, speed))
+        predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
+        self._poll_group_move_finished(predicted_s=predicted_s)
 
     def _execute_xy_leg(self, move: GCodeMove) -> None:
         """Move X/Y via the commander-node coordinated group."""
         current_pos = self._current_pos
         self._begin_xy_leg(move)
         self._poll_xy_leg(move, current_pos)
+
+    def _read_xy_speed(self) -> float:
+        """Return the X/Y group's currently configured SPD.
+
+        For restoring after _execute_concurrent_pair scales it down — see
+        that method.
+        """
+        self._init_group()
+        return self._cmd.group_get_speed()
+
+    def _read_responder_speed(self, responder: str) -> float:
+        """Return the responder leg's currently configured SPD.
+
+        Mirrors _read_xy_speed for the other side of
+        _execute_concurrent_pair.
+        """
+        if responder == "z":
+            return self._cmd.get_speed(self._z_axis)
+        if responder == "theta":
+            return self._cmd.get_speed(self._theta_axis)
+        self._init_theta_group()
+        return self._theta_cmd.group_get_speed()
 
     def _read_xy_ramp(self) -> Tuple[float, float]:
         """Return the X/Y group's currently configured (accel, decel).
@@ -1026,6 +1144,9 @@ class GCodeExecutor:
     def _set_xy_ramp(self, accel: float, decel: float) -> None:
         self._cmd.group_set_accel(accel)
         self._cmd.group_set_decel(decel)
+
+    def _set_xy_speed(self, speed: float) -> None:
+        self._cmd.group_set_speed(speed)
 
     def _read_responder_ramp(self, responder: str) -> Tuple[float, float]:
         """Return the responder leg's currently configured (accel, decel).
@@ -1051,6 +1172,14 @@ class GCodeExecutor:
             self._theta_cmd.group_set_accel(accel)
             self._theta_cmd.group_set_decel(decel)
 
+    def _set_responder_speed(self, responder: str, speed: float) -> None:
+        if responder == "z":
+            self._cmd.set_speed(self._z_axis, speed)
+        elif responder == "theta":
+            self._cmd.set_speed(self._theta_axis, speed)
+        else:  # "z_theta"
+            self._theta_cmd.group_set_speed(speed)
+
     def _execute_concurrent_pair(self, move: GCodeMove, responder: str) -> None:
         """Fire the responder and commander legs as independent non-blocking BMTs.
 
@@ -1072,17 +1201,34 @@ class GCodeExecutor:
         would (see the module docstring's "concurrent responder/commander
         legs" note for why even this still isn't a guaranteed diagonal).
 
-        The shorter leg's *own* pre-scaling ramp is read and restored once
-        both legs finish — this driver otherwise never touches ACL/DCL
-        (every other move leaves it at whatever the controller already
-        has), so a scaled-down value must not outlive this one move. Left
-        stale, it would silently slow every later move on that axis
-        (including how fast pause()/stop() can decelerate it) until some
-        future concurrent-pair move happened to overwrite it again.
+        The shorter leg's *own* pre-scaling SPD and ramp are read and
+        restored once both legs finish — this driver otherwise never
+        touches ACL/DCL/SPD (every other move leaves them at whatever the
+        controller already has), so a scaled-down value must not outlive
+        this one move. Left stale, it would silently slow every later move
+        on that axis (including how fast pause()/stop() can decelerate it)
+        until some future concurrent-pair move happened to overwrite it
+        again.
 
-        Skipped (both legs get the plain nominal feed rate, ramp
-        untouched) when the move has no F word at all — there's no
-        nominal speed to decompose from.
+        The "nominal" speed the longer leg keeps and the shorter leg
+        scales from is the move's F word if it has one — if not (no F at
+        all), it's read live from whatever SPD the longer leg's axis/group
+        is currently configured at, so the legs still get duration-matched
+        instead of each running at its own independently-stale SPD (the
+        original bug this whole scheme exists to prevent, just triggered
+        by two different axes never having matched to begin with rather
+        than one drifting after a prior scaled move). The longer leg's own
+        SPD is never rewritten in this case — it's already exactly the
+        value just read, so leaving it alone is correct, not an oversight.
+
+        Skipped entirely (both legs left untouched, running at whatever
+        SPD/ACL/DCL each already has) only if the reference leg's
+        currently-configured ACL/DCL reads back as 0 or negative (e.g.
+        right after group INI, before this session has ever set a ramp on
+        it — querying ACL/DCL immediately after INI is untested): scaling
+        a 0-or-negative reference produces a 0-or-negative ACL/DCL for the
+        other leg, which the controller rejects outright (ASCII escape
+        codes 16/17, "User Accels/Decels 0 Or Negative").
         """
         current_pos = self._current_pos
         current_theta = self._current_theta
@@ -1101,20 +1247,48 @@ class GCodeExecutor:
         responder_ramp: Optional[Tuple[float, float]] = None
         restore_xy_ramp: Optional[Tuple[float, float]] = None
         restore_responder_ramp: Optional[Tuple[float, float]] = None
+        restore_xy_speed: Optional[float] = None
+        restore_responder_speed: Optional[float] = None
 
-        if move.feed_mm_s is not None and dist_xy > 0 and dist_responder > 0:
+        if dist_xy > 0 and dist_responder > 0:
             if dist_xy >= dist_responder:
                 k = dist_responder / dist_xy
                 ref_accel, ref_decel = self._read_xy_ramp()
-                restore_responder_ramp = self._read_responder_ramp(responder)
-                responder_speed = k * move.feed_mm_s
-                responder_ramp = (k * ref_accel, k * ref_decel)
+                if ref_accel > 0 and ref_decel > 0:
+                    nominal_feed = (
+                        move.feed_mm_s if move.feed_mm_s is not None else self._read_xy_speed()
+                    )
+                    restore_responder_ramp = self._read_responder_ramp(responder)
+                    restore_responder_speed = self._read_responder_speed(responder)
+                    responder_speed = k * nominal_feed
+                    responder_ramp = (k * ref_accel, k * ref_decel)
+                else:
+                    logger.warning(
+                        "X/Y group ACL/DCL read back as %r/%r (0 or negative) — "
+                        "skipping concurrent-pair scaling for this move; legs "
+                        "will not be duration-matched",
+                        ref_accel, ref_decel,
+                    )
             else:
                 k = dist_xy / dist_responder
                 ref_accel, ref_decel = self._read_responder_ramp(responder)
-                restore_xy_ramp = self._read_xy_ramp()
-                xy_speed = k * move.feed_mm_s
-                xy_ramp = (k * ref_accel, k * ref_decel)
+                if ref_accel > 0 and ref_decel > 0:
+                    nominal_feed = (
+                        move.feed_mm_s
+                        if move.feed_mm_s is not None
+                        else self._read_responder_speed(responder)
+                    )
+                    restore_xy_ramp = self._read_xy_ramp()
+                    restore_xy_speed = self._read_xy_speed()
+                    xy_speed = k * nominal_feed
+                    xy_ramp = (k * ref_accel, k * ref_decel)
+                else:
+                    logger.warning(
+                        "%s ACL/DCL read back as %r/%r (0 or negative) — "
+                        "skipping concurrent-pair scaling for this move; legs "
+                        "will not be duration-matched",
+                        responder, ref_accel, ref_decel,
+                    )
 
         # Everything from here on must restore whichever ramp was scaled,
         # even if a leg never finishes (poll_until_move_finished timeout,
@@ -1132,14 +1306,30 @@ class GCodeExecutor:
             else:  # "z_theta"
                 self._begin_zt_leg(move, speed=responder_speed, ramp=responder_ramp)
             self._begin_xy_leg(move, speed=xy_speed, ramp=xy_ramp)
+            fired_at = time.monotonic()
 
+            # Both BMTs are already on the wire and physically running
+            # concurrently by this point — polling them is necessarily
+            # sequential (one Python call at a time), but each poll's
+            # predicted-duration sleep must count from `fired_at`, not
+            # from whenever its own poll call happens to start. Without
+            # already_elapsed_s, the second leg polled here would blindly
+            # sleep through its own full predicted duration *again*, on
+            # top of however long the first leg's poll already took —
+            # even though (successfully duration-matched) it likely
+            # finished at almost the same real time as the first leg.
+            # That's what was making the REPL return ~10-15s after the
+            # gantry had visibly already stopped.
             if responder == "z":
                 self._poll_z_leg(move, current_pos, speed=responder_speed)
             elif responder == "theta":
                 self._poll_theta_leg(move, current_theta, speed=responder_speed)
             else:  # "z_theta"
                 self._poll_zt_leg(move, current_pos, current_theta, speed=responder_speed)
-            self._poll_xy_leg(move, current_pos, speed=xy_speed)
+            self._poll_xy_leg(
+                move, current_pos, speed=xy_speed,
+                already_elapsed_s=time.monotonic() - fired_at,
+            )
         finally:
             # Best-effort: if the try block above already failed (e.g. a
             # poll timeout), that's the failure the caller needs to see —
@@ -1149,12 +1339,16 @@ class GCodeExecutor:
             try:
                 if restore_responder_ramp is not None:
                     self._set_responder_ramp(responder, *restore_responder_ramp)
+                if restore_responder_speed is not None:
+                    self._set_responder_speed(responder, restore_responder_speed)
                 if restore_xy_ramp is not None:
                     self._set_xy_ramp(*restore_xy_ramp)
+                if restore_xy_speed is not None:
+                    self._set_xy_speed(restore_xy_speed)
             except Exception:
                 logger.exception(
-                    "Failed to restore ramp after a concurrent-pair move — "
-                    "an axis may be left with a scaled-down ACL/DCL"
+                    "Failed to restore ramp/speed after a concurrent-pair move — "
+                    "an axis may be left with a scaled-down ACL/DCL/SPD"
                 )
 
     def _describe_linear(self, move: GCodeMove, touches_xy: bool, responder: str) -> str:
@@ -1192,7 +1386,9 @@ class GCodeExecutor:
             )
         return "; ".join(parts)
 
-    def _poll_group_move_finished(self, timeout_s: float = 30.0, predicted_s: float = 0.0) -> None:
+    def _poll_group_move_finished(
+        self, timeout_s: Optional[float] = None, predicted_s: float = 0.0
+    ) -> None:
         """Block until the X/Y group's move-finished flag is set, aborting the move on timeout.
 
         Polls sparsely via commands.poll_until_move_finished — querying
@@ -1200,7 +1396,9 @@ class GCodeExecutor:
         destabilized this controller; see that function's module note.
 
         Args:
-            timeout_s: Maximum seconds to wait before aborting (default 30).
+            timeout_s: Maximum seconds to wait before aborting. Defaults
+                to poll_until_move_finished's own predicted-duration-scaled
+                timeout when omitted — see that function's docstring.
             predicted_s: Expected move duration, slept through before the
                 first query (see _predicted_move_s).
 
@@ -1213,13 +1411,19 @@ class GCodeExecutor:
             self._cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s
         ):
             self._cmd.group_abort()
-            raise SnapMotionError(0, f"X/Y group move did not finish within {timeout_s:.0f}s — aborted")
+            effective_timeout = resolve_timeout_s(predicted_s, timeout_s)
+            raise SnapMotionError(
+                0, f"X/Y group move did not finish within {effective_timeout:.0f}s — aborted"
+            )
 
-    def _poll_theta_group_move_finished(self, timeout_s: float = 30.0, predicted_s: float = 0.0) -> None:
+    def _poll_theta_group_move_finished(
+        self, timeout_s: Optional[float] = None, predicted_s: float = 0.0
+    ) -> None:
         """Block until the Z/Theta group's move-finished flag is set, aborting the move on timeout.
 
         Mirrors _poll_group_move_finished, against `theta_cmd` instead of
-        `cmd` — same sparse-polling discipline, same reason.
+        `cmd` — same sparse-polling discipline, same reason, same
+        `timeout_s` default.
 
         Raises:
             SnapMotionError: If the move hasn't finished within
@@ -1230,16 +1434,21 @@ class GCodeExecutor:
             self._theta_cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s
         ):
             self._theta_cmd.group_abort()
-            raise SnapMotionError(0, f"Z/Theta group move did not finish within {timeout_s:.0f}s — aborted")
+            effective_timeout = resolve_timeout_s(predicted_s, timeout_s)
+            raise SnapMotionError(
+                0, f"Z/Theta group move did not finish within {effective_timeout:.0f}s — aborted"
+            )
 
-    def _poll_axis_move_finished(self, axis: Axis, timeout_s: float = 30.0, predicted_s: float = 0.0) -> None:
+    def _poll_axis_move_finished(
+        self, axis: Axis, timeout_s: Optional[float] = None, predicted_s: float = 0.0
+    ) -> None:
         """Block until a single axis's move-finished flag is set, aborting the move on timeout.
 
         Used for the independent Z and Theta legs. Polls sparsely for the
         same reason as the group pollers (see commands.py) — single-axis
         polling was never shown to destabilize the controller the way
         group polling was, but there's no reason to query harder than
-        needed.
+        needed. Same `timeout_s` default as the group pollers.
 
         Raises:
             SnapMotionError: If the move hasn't finished within
@@ -1250,7 +1459,10 @@ class GCodeExecutor:
             lambda: self._cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout_s
         ):
             self._cmd.abort(axis)
-            raise SnapMotionError(0, f"{axis.name} move did not finish within {timeout_s:.0f}s — aborted")
+            effective_timeout = resolve_timeout_s(predicted_s, timeout_s)
+            raise SnapMotionError(
+                0, f"{axis.name} move did not finish within {effective_timeout:.0f}s — aborted"
+            )
 
     def _execute_home(self, move: GCodeMove) -> None:
         """Run a G28 HOME move: confirm, then delegate to HomingProcedure.home_all().

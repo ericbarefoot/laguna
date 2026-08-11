@@ -29,6 +29,24 @@ background — this page is the generated API surface underneath both.
 
 ::: laguna.robot.macron.controller
 
+## Motion arbiter
+
+One lock over the gantry, so two things (a scheduled action and a
+manually-issued move, say) can't drive it at once.
+
+::: laguna.robot.motion_arbiter
+
+## Position store
+
+Persists the gantry's last-known axis positions across power cycles — the
+recovery path while `home()` is disabled (see its module docstring).
+
+::: laguna.robot.macron.position_store
+
+## Topographic profiler
+
+::: laguna.robot.macron.profiler
+
 ## Pi bridge
 
 ::: laguna.robot.macron.pi_bridge

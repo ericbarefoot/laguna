@@ -374,6 +374,9 @@ class FakeGo:
     def GoSetup_FrameRateLimitMax(self, setup):
         return self.frame_rate_limit_max
 
+    def GoSetup_MaxFrameRateEnabled(self, setup):
+        return self.max_frame_rate_enabled
+
     def GoSurfaceGeneration_GenerationType(self, surface):
         return self.generation_type
 
@@ -787,6 +790,67 @@ class TestConfigure:
         assert applied["start_trigger"] == "software"
 
 
+class TestFrameRate:
+    """Standalone frame-rate getter/setter, split out of configure() so a
+    caller can change just the rate without re-running the rest of the
+    encoderless recipe."""
+
+    def test_get_reports_rate_limits_and_max_mode(self, scanner):
+        fr = scanner.get_frame_rate()
+        assert fr["hz"] == pytest.approx(scanner._fake.go.frame_rate)
+        assert fr["limit_min"] == pytest.approx(scanner._fake.go.frame_rate_limit_min)
+        assert fr["limit_max"] == pytest.approx(scanner._fake.go.frame_rate_limit_max)
+        assert fr["max_mode"] is False
+
+    def test_set_explicit_rate(self, scanner):
+        applied = scanner.set_frame_rate(hz=100.0)
+        assert scanner._fake.go.frame_rate == pytest.approx(100.0)
+        assert applied["frame_rate_hz"] == pytest.approx(100.0)
+        assert applied["frame_rate_max"] is False
+        assert "GoSetup_EnableMaxFrameRate" in scanner._fake.call_names()  # disabled first
+
+    def test_set_max_mode_reads_back_achieved_rate(self, scanner):
+        applied = scanner.set_frame_rate(max_mode=True)
+        assert scanner._fake.go.max_frame_rate_enabled is True
+        assert applied["frame_rate_max"] is True
+        assert applied["frame_rate_hz"] == pytest.approx(scanner._fake.go.frame_rate_limit_max)
+
+    def test_hz_and_max_mode_are_mutually_exclusive(self, scanner):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            scanner.set_frame_rate(hz=100.0, max_mode=True)
+
+    def test_neither_given_raises(self, scanner):
+        with pytest.raises(ValueError, match="needs hz="):
+            scanner.set_frame_rate()
+
+    def test_rate_above_sensor_limit_rejected(self, scanner):
+        with pytest.raises(ValueError, match="outside the sensor's current supported"):
+            scanner.set_frame_rate(hz=99999.0)
+
+    def test_flush_can_be_deferred(self, scanner):
+        scanner.set_frame_rate(hz=100.0, flush=False)
+        assert "GoSensor_Flush" not in scanner._fake.call_names()
+
+    def test_direct_call_is_not_clobbered_by_a_later_unrelated_configure(self, scanner):
+        """Same cache-desync bug as TestActiveArea's matching test: without
+        updating self._frame_rate_hz/self._frame_rate_max here,
+        configure() re-applying them on every call (regardless of what
+        this particular call is actually about) would silently revert a
+        direct set_frame_rate() call.
+        """
+        scanner.configure(frame_rate_hz=50.0)
+        scanner.set_frame_rate(hz=120.0)  # direct call, bypassing configure()
+        scanner.configure(exposure_us=500.0)  # unrelated setting
+        assert scanner._fake.go.frame_rate == pytest.approx(120.0)
+
+    def test_configure_still_applies_frame_rate_hz(self, scanner):
+        """configure() keeps its own frame_rate_hz/frame_rate_max kwargs —
+        set_frame_rate() is an addition, not a replacement."""
+        applied = scanner.configure(frame_rate_hz=150.0)
+        assert applied["frame_rate_hz"] == pytest.approx(150.0)
+        assert scanner._fake.go.frame_rate == pytest.approx(150.0)
+
+
 # ---------------------------------------------------------------------------
 # Scan lifecycle
 # ---------------------------------------------------------------------------
@@ -1158,6 +1222,32 @@ class TestActiveArea:
         assert scanner._fake.go.active_area["height"] == pytest.approx(150.0)
         assert scanner._fake.go.active_area["z"] == pytest.approx(400.0)
 
+    def test_direct_call_is_not_clobbered_by_a_later_unrelated_configure(self, scanner):
+        """configure() re-applies self._active_area on every call (so a
+        configure() that only changes frame_rate doesn't lose a
+        previously-configured active area). Before this fix, a direct
+        set_active_area() call never updated that cache — only configure()
+        itself did — so the next configure() call for anything else
+        silently reverted to whatever configure() last knew about.
+        """
+        scanner.configure(active_area={"height": 150.0, "z": 400.0})
+        scanner.set_active_area(height=250.0)  # direct call, bypassing configure()
+
+        scanner.configure(frame_rate_hz=100.0)  # unrelated setting
+
+        assert scanner._fake.go.active_area["height"] == pytest.approx(250.0)
+        assert scanner._fake.go.active_area["z"] == pytest.approx(400.0)  # untouched field preserved
+
+    def test_direct_call_before_any_configure_is_not_clobbered_either(self, scanner):
+        """Same bug, simpler trigger: no configure(active_area=...) ever
+        happened, so self._active_area started at None/{} — a later
+        configure() for anything else must not reset the area back to
+        whatever the sensor's own default was.
+        """
+        scanner.set_active_area(height=250.0)
+        scanner.configure(frame_rate_hz=100.0)
+        assert scanner._fake.go.active_area["height"] == pytest.approx(250.0)
+
     def test_configure_applies_active_area_from_config(self, monkeypatch):
         fake = FakeLib()
         monkeypatch.setattr(
@@ -1229,6 +1319,15 @@ class TestSubsampling:
         scanner.configure(subsampling={"x": 4})
         assert scanner._fake.go.x_subsampling == 4
 
+    def test_direct_call_is_not_clobbered_by_a_later_unrelated_configure(self, scanner):
+        """See TestActiveArea's matching test — same cache-desync bug,
+        same fix, applies identically to every configure()-tracked setter.
+        """
+        scanner.configure(subsampling={"x": 4})
+        scanner.set_subsampling(x=2)  # direct call, bypassing configure()
+        scanner.configure(frame_rate_hz=100.0)  # unrelated setting
+        assert scanner._fake.go.x_subsampling == 2
+
 
 class TestSpacingInterval:
     def test_get_reports_type_as_words_and_limits(self, scanner):
@@ -1258,6 +1357,15 @@ class TestSpacingInterval:
         scanner.configure(uniform_spacing=False)
         with pytest.raises(UniformSpacingRequiredError, match="point-cloud mode"):
             scanner.set_spacing_interval(type="balanced")
+
+    def test_direct_call_is_not_clobbered_by_a_later_unrelated_configure(self, scanner):
+        """See TestActiveArea's matching test — same cache-desync bug,
+        same fix, applies identically to every configure()-tracked setter.
+        """
+        scanner.configure(spacing_interval={"type": "balanced"})
+        scanner.set_spacing_interval(type="max_speed")  # direct call
+        scanner.configure(frame_rate_hz=100.0)  # unrelated setting
+        assert scanner.get_spacing_interval()["type"] == "max_speed"
 
 
 class TestFilters:
@@ -1321,6 +1429,15 @@ class TestFilters:
     def test_unavailable_when_uniform_spacing_off(self, scanner):
         scanner.configure(uniform_spacing=False)
         assert scanner.get_filters()["x_smoothing"]["available"] is False
+
+    def test_direct_call_is_not_clobbered_by_a_later_unrelated_configure(self, scanner):
+        """See TestActiveArea's matching test — same cache-desync bug,
+        same fix, applies identically to every configure()-tracked setter.
+        """
+        scanner.configure(filters={"x_median": True})
+        scanner.set_filters(x_median=False)  # direct call, bypassing configure()
+        scanner.configure(frame_rate_hz=100.0)  # unrelated setting
+        assert scanner.get_filters()["x_median"]["enabled"] is False
 
 
 class TestUniformSpacingGuardInConfigure:
