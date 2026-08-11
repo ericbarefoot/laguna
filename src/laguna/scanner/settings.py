@@ -222,6 +222,15 @@ class GocatorSettingsMixin:
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
 
+        # configure() re-applies self._active_area on every call (any field
+        # it's already tracking, not just ones this particular configure()
+        # call touches) — without updating it here too, a direct
+        # set_active_area() call would be silently reverted by the next
+        # configure() call for an unrelated setting (e.g. just frame_rate),
+        # back to whatever configure() last knew about. Merge rather than
+        # replace, matching "only the fields you pass are written" above.
+        self._active_area = {**(self._active_area or {}), **given}
+
         applied = self.get_active_area()
         logger.info(
             "Gocator active area set: %s -> %s",
@@ -334,6 +343,14 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+
+        # See set_active_area()'s matching comment: configure() re-applies
+        # self._subsampling on every call, so a direct set_subsampling()
+        # call has to update it too or the next unrelated configure() call
+        # would silently revert it.
+        given = {k: v for k, v in (("x", x), ("z", z)) if v is not None}
+        self._subsampling = {**(self._subsampling or {}), **given}
+
         applied = self.get_subsampling()
         logger.info("Gocator subsampling set: x=%s z=%s", applied["x"], applied["z"])
         return applied
@@ -429,6 +446,13 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+
+        # See set_active_area()'s matching comment. Uses the resolved
+        # `type` (defaulted to "custom" above when omitted), not the raw
+        # parameter, so the cache reflects what was actually applied.
+        given = {k: v for k, v in (("type", type), ("value_mm", value_mm)) if v is not None}
+        self._spacing_interval = {**(self._spacing_interval or {}), **given}
+
         applied = self.get_spacing_interval()
         logger.info("Gocator spacing interval set: %s", applied)
         return applied
@@ -534,6 +558,10 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+
+        # See set_active_area()'s matching comment.
+        self._filters = {**(self._filters or {}), **filters}
+
         applied = self.get_filters()
         logger.info(
             "Gocator filters set: %s",
@@ -667,6 +695,120 @@ class GocatorSettingsMixin:
             result["y_spacing_mm"], result["x_resolution_mm"], ceiling,
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Frame rate
+    # ------------------------------------------------------------------
+
+    def get_frame_rate(self) -> Dict[str, Any]:
+        """Read the sensor's current profile frame rate and live ceiling.
+
+        The ceiling is dynamic — it depends on field of view (active
+        area), exposure, and uniform spacing, and on whether max-frame-
+        rate mode is enabled at all (see docs/subsystems/scanner.md).
+
+        Returns:
+            Dict with ``hz`` (current rate), ``limit_min``/``limit_max``
+            (the sensor's live range), and ``max_mode`` (whether max-
+            frame-rate mode is currently enabled).
+        """
+        lib = self._require_connected()
+        setup = lib.handle("GoSensor_Setup", self._sensor)
+        return {
+            "hz": float(lib.go.GoSetup_FrameRate(setup)),
+            "limit_min": float(lib.go.GoSetup_FrameRateLimitMin(setup)),
+            "limit_max": float(lib.go.GoSetup_FrameRateLimitMax(setup)),
+            "max_mode": bool(lib.go.GoSetup_MaxFrameRateEnabled(setup)),
+        }
+
+    def set_frame_rate(
+        self,
+        hz: Optional[float] = None,
+        max_mode: Optional[bool] = None,
+        flush: bool = True,
+    ) -> Dict[str, Any]:
+        """Set the profile frame rate — an explicit Hz, or max-frame-rate mode.
+
+        Mirrors configure()'s frame_rate_hz/frame_rate_max handling, split
+        out as a standalone setter for changing just the rate without
+        re-running the rest of the encoderless recipe (scan mode, trigger
+        source, surface generation, ...) that configure() also touches.
+
+        Args:
+            hz: Explicit frame rate, Hz. Validated against the sensor's
+                current live ceiling (see get_frame_rate). Mutually
+                exclusive with max_mode.
+            max_mode: If true, (re-)enable max-frame-rate mode and use
+                whatever rate the sensor reports after flushing —
+                regardless of prior state, same as configure()'s
+                frame_rate_max. Mutually exclusive with hz.
+            flush: Push to the sensor with GoSensor_Flush. Pass False to
+                batch this with other changes and flush once yourself —
+                the achieved-rate readback below is still accurate either
+                way, since GoSetup's getters reflect staged (not-yet-
+                flushed) values immediately.
+
+        Returns:
+            Dict with ``frame_rate_hz`` and ``frame_rate_max`` — the
+            values actually applied (read back from the sensor).
+
+        Raises:
+            RuntimeError: If not connected.
+            ValueError: If both hz and max_mode are given, neither is
+                given, or hz is outside the sensor's current range.
+            GoSdkError: If any SDK call fails.
+        """
+        if hz is not None and max_mode:
+            raise ValueError(
+                "set_frame_rate() got both hz and max_mode=True — these are "
+                "mutually exclusive. Pass an explicit rate, or max_mode=True "
+                "to use the sensor's current maximum, not both."
+            )
+        if hz is None and not max_mode:
+            raise ValueError("set_frame_rate() needs hz= and/or max_mode=True")
+
+        lib = self._require_connected()
+        setup = lib.handle("GoSensor_Setup", self._sensor)
+
+        if max_mode:
+            lib.call("GoSetup_EnableMaxFrameRate", setup, _g.kBool(_g.kTRUE))
+        else:
+            lo = float(lib.go.GoSetup_FrameRateLimitMin(setup))
+            hi = float(lib.go.GoSetup_FrameRateLimitMax(setup))
+            if hi > 0 and not (lo <= float(hz) <= hi):
+                raise ValueError(
+                    f"frame_rate hz={hz} is outside the sensor's current supported "
+                    f"range [{lo:.3f}, {hi:.3f}] Hz. The upper limit depends on "
+                    "field of view, exposure, and uniform spacing — lower the "
+                    "rate, or relax those settings to raise the ceiling."
+                )
+            lib.call("GoSetup_EnableMaxFrameRate", setup, _g.kBool(_g.kFALSE))
+            lib.call("GoSetup_SetFrameRate", setup, _g.k64f(float(hz)))
+
+        if flush:
+            lib.call("GoSensor_Flush", self._sensor)
+
+        achieved = float(lib.go.GoSetup_FrameRate(setup))
+        if not max_mode and abs(achieved - float(hz)) > 1e-3:
+            logger.warning(
+                "Sensor accepted frame rate %.3f Hz but reports %.3f Hz; "
+                "using the reported value for Y-spacing bookkeeping.",
+                float(hz), achieved,
+            )
+
+        # See set_active_area()'s matching comment: configure() re-applies
+        # self._frame_rate_hz/self._frame_rate_max whenever a caller
+        # doesn't explicitly override them, so this direct call has to
+        # update both or the next unrelated configure() call would
+        # silently revert the rate.
+        self._frame_rate_hz = achieved
+        self._frame_rate_max = bool(max_mode)
+
+        logger.info(
+            "Gocator frame rate set: hz=%s max_mode=%s -> %.3f Hz",
+            hz, max_mode, achieved,
+        )
+        return {"frame_rate_hz": self._frame_rate_hz, "frame_rate_max": self._frame_rate_max}
 
     def configure(
         self,
