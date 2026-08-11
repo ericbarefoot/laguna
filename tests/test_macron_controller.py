@@ -281,6 +281,7 @@ class TestMoveTo:
         responses = {
             "C1 INI 1 2": "0",
             "C1 BMT 10 0": "0",
+            "C1 SPD": "20",  # no F word/speed given — read X/Y's own speed to predict duration
             "C1 MIF": "1",
             "A1 ACP": "150",  # post-move resync of X/Y from hardware
             "A2 ACP": "0",
@@ -289,7 +290,7 @@ class TestMoveTo:
         controller, conn = self._make_controller(responses)
         assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
         assert conn.sent == [
-            "C1 INI 1 2", "C1 BMT 10 0", "C1 MIF", "A1 ACP", "A2 ACP", "A6 ACP",
+            "C1 INI 1 2", "C1 BMT 10 0", "C1 SPD", "C1 MIF", "A1 ACP", "A2 ACP", "A6 ACP",
         ]
 
     def test_vector_move_length_mismatch_raises(self):

@@ -1000,6 +1000,13 @@ class GCodeExecutor:
     ) -> None:
         distance = abs(move.target[2] - current_pos[2])
         speed = move.feed_mm_s if speed is None else speed
+        if speed is None:
+            # No F word and no caller-supplied speed: begin_z_leg left the
+            # axis's SPD untouched, so read it back live rather than
+            # predicting off an unknown speed — predicted_move_s(d, None)
+            # is 0.0, which collapses the timeout to MIN_TIMEOUT_S
+            # regardless of how long the move actually takes.
+            speed = self._read_responder_speed("z")
         predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
         self._poll_axis_move_finished(self._z_axis, predicted_s=predicted_s)
 
@@ -1030,6 +1037,9 @@ class GCodeExecutor:
     ) -> None:
         distance = abs(move.theta - current_theta)
         speed = move.feed_mm_s if speed is None else speed
+        if speed is None:
+            # See _poll_z_leg's note — same live-read fallback.
+            speed = self._read_responder_speed("theta")
         predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
         self._poll_axis_move_finished(self._theta_axis, predicted_s=predicted_s)
 
@@ -1062,6 +1072,9 @@ class GCodeExecutor:
     ) -> None:
         distance = _zt_distance(move, current_pos, current_theta)
         speed = move.feed_mm_s if speed is None else speed
+        if speed is None:
+            # See _poll_z_leg's note — same live-read fallback.
+            speed = self._read_responder_speed("z_theta")
         predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
         self._poll_theta_group_move_finished(predicted_s=predicted_s)
 
@@ -1099,6 +1112,9 @@ class GCodeExecutor:
     ) -> None:
         distance = math.hypot(move.target[0] - current_pos[0], move.target[1] - current_pos[1])
         speed = move.feed_mm_s if speed is None else speed
+        if speed is None:
+            # See _poll_z_leg's note — same live-read fallback.
+            speed = self._read_xy_speed()
         predicted_s = max(0.0, predicted_move_s(distance, speed) - already_elapsed_s)
         self._poll_group_move_finished(predicted_s=predicted_s)
 

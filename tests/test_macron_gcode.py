@@ -11,6 +11,7 @@ import pytest
 from laguna.robot.macron.commands import MMCCommands, THETA_AXIS, X_AXIS, Y_AXIS, Z_AXIS
 from laguna.robot.macron.connection import SnapMotionError
 from laguna.robot.macron.fences import BoxFence, FenceRegistry, FenceViolation, TrajectoryChecker
+from laguna.robot.macron import gcode as gcode_module
 from laguna.robot.macron.gcode import (
     GCodeError,
     GCodeExecutionAborted,
@@ -297,6 +298,7 @@ class TestExecutorLinearMoves:
         responses = {
             "C1 INI 1 2": "0",
             "C1 BMT 5 0": "0",
+            "C1 SPD": "20",  # no F word — read X/Y's own speed to predict duration
             "C1 MIF": mif_response,
             "A1 ACP": "5",  # post-move resync of X/Y from hardware
             "A2 ACP": "0",
@@ -305,6 +307,36 @@ class TestExecutorLinearMoves:
         trajectory = executor.plan("G1 X5")
         executor.execute(trajectory)
         assert conn.sent.count("C1 MIF") == 3
+
+    def test_no_f_word_predicts_off_the_axis_own_slow_speed_not_zero(self, monkeypatch):
+        """A move with no F word used to predict a 0.0s duration (speed
+        unknown), which floors the timeout at MIN_TIMEOUT_S regardless of
+        how slow the axis is actually configured — a legitimately slow
+        move (e.g. X/Y left at 1 mm/s from an earlier command) would then
+        time out on a move that was still correctly in progress. Reading
+        X/Y's own currently-configured SPD fixes that: predicted_move_s is
+        now called with the live-read speed (1, from "C1 SPD"), not None.
+        """
+        seen_speeds = []
+        real_predicted_move_s = gcode_module.predicted_move_s
+        monkeypatch.setattr(
+            gcode_module,
+            "predicted_move_s",
+            lambda distance, speed: (seen_speeds.append(speed), real_predicted_move_s(distance, speed))[1],
+        )
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 BMT 200 0": "0",
+            "C1 SPD": "1",  # slow — X/Y left at 1 mm/s from some earlier move
+            "C1 MIF": "1",
+            "A1 ACP": "200",
+            "A2 ACP": "0",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X200")  # no F word
+        executor.execute(trajectory)
+        assert conn.sent.count("C1 SPD") == 1
+        assert seen_speeds == [1.0]  # not None — the old speed=None/predicted_s=0.0 bug
 
     def test_moves_z_concurrently_with_the_xy_group_scaled_to_match_duration(self):
         """A move touching both Z and X/Y fires the Z leg and the XY group
@@ -440,7 +472,10 @@ class TestExecutorLinearMoves:
             "A5 ACL", "A5 DCL", "A5 SPD",  # read Z's own ramp/speed (to restore later)
             "A5 ACL 15", "A5 DCL 12", "A5 SPD 6", "A5 BMT 3",  # Z, scaled by k=0.3
             "C1 BMT 10 0",  # X/Y, unscaled — no SPD sent, already at the nominal
-            "A5 MIF", "C1 MIF",
+            "A5 MIF",
+            # X/Y's own SPD was never assigned above (it's already the value
+            # just read) — _poll_xy_leg's duration prediction reads it again.
+            "C1 SPD", "C1 MIF",
             "A5 ACL 25", "A5 DCL 20", "A5 SPD 8",  # Z's ramp/speed restored
             "A1 ACP", "A2 ACP", "A5 ACP",  # resync _current_pos from hardware
         ]
@@ -911,7 +946,14 @@ class TestExecutorLinearMoves:
     def test_confirm_cb_receives_the_move(self):
         seen = []
         executor, conn = _make_executor(
-            {"C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 MIF": "1", "A1 ACP": "10", "A2 ACP": "0"},
+            {
+                "C1 INI 1 2": "0",
+                "C1 BMT 10 0": "0",
+                "C1 SPD": "20",  # no F word — read X/Y's own speed to predict duration
+                "C1 MIF": "1",
+                "A1 ACP": "10",
+                "A2 ACP": "0",
+            },
             confirm_cb=lambda move: seen.append(move) or True,
         )
         trajectory = executor.plan("G1 X10")
