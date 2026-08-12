@@ -74,6 +74,7 @@ nav:
       - Rehearsing with simulate=True: guides/simulate.md
       - Scheduling a multi-subsystem experiment: guides/scheduled-experiment.md
       - Driving the gantry safely: guides/gantry-motion.md
+      - "Plan: gantry geometry visualization": guides/gantry-geometry-visualization-plan.md
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
@@ -109,6 +110,7 @@ nav:
       - Flow: reference/flow.md
       - Reference frames: reference/frames.md
       - Survey: reference/survey.md
+      - Visualization: reference/viz.md
       - Schedule: reference/schedule.md
       - Timing: reference/timing.md
       - Experiment runner: reference/experiment.md

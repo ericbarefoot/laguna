@@ -349,9 +349,21 @@ class GantryController:
     def connect(self) -> bool:
         """Open the connection to the Snap2Motion controller.
 
+        A no-op if already connected. Calling ``self._connection.connect()``
+        a second time (e.g. PiGantryConnection) overwrites its live
+        SSH channel/agent-process handles with a fresh session *before*
+        tearing down the old ones — leaking the old SSH session, its reader
+        thread, and the remote gantry_agent.py process, which holds the
+        serial port exclusively, so the new agent can't get ready either.
+        Both ends up unrecoverable without killing the whole process. See
+        PiGantryConnection.connect()'s docstring for the leak mechanics.
+
         Returns:
-            True if successfully connected.
+            True if successfully connected (or already was).
         """
+        if self._is_connected and self._connection.is_connected:
+            logger.info("connect() called while already connected — no-op")
+            return True
         try:
             self._connection.connect()
             self._is_connected = self._connection.is_connected

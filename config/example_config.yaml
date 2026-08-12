@@ -191,20 +191,29 @@ gocator:
                                # omit to leave as-is. Disabling it also raises the max
                                # scan rate. See docs/subsystems/scanner.md.
   # mounting:                 # How the sensor's OWN axes sit on the gantry. The
-  #   scan_x: -Y              # sensor names X = across the laser line, Y = travel,
-  #   scan_y: +X              # Z = range — these are NOT the gantry's axes. On this
-  #   scan_z: +Z              # rig the sensor is rotated 90 deg about Z, so a gantry
-                               # move along X appears as the sensor's Y (confirmed from
-                               # scans on 2026-08-02: axis="X" for 200/300mm gave
-                               # sensor-Y spans of 199.8/299.9mm).
+  #   scan_x: +Y              # sensor names X = across the laser line, Y = travel,
+  #   scan_y: -X              # Z = range — these are NOT the gantry's axes. On the
+  #   scan_z: +Z              # lab's rig (192.168.1.10) the sensor is rotated 90 deg
+                               # about Z, so a gantry move along X appears as the
+                               # sensor's Y. Two wrong guesses before these values
+                               # (2026-08-11): a physical "eyeball" check of the mount
+                               # got the sign backward, and a follow-up "does the
+                               # oriented X coordinate track the gantry's travel
+                               # direction" numeric argument also pointed the wrong
+                               # way and produced a mirrored scan. What actually
+                               # settled it: rendering an oriented real scan and
+                               # judging by eye whether the geometry looks mirrored.
+                               # scan_y's sign (-X, not +X) isn't a free choice once
+                               # scan_x/scan_z are set — it's forced by the determinant
+                               # check below (a bare axis swap mirrors the data).
                                # Uncomment to get scans reported in GANTRY coordinates
                                # (to_points() and every export). Left commented, the
                                # default is the identity map = raw sensor frame.
-                               # VERIFY THE SIGN before trusting it: the axis pairing
-                               # is confirmed from data, but whether sensor +X points
-                               # to gantry +Y or -Y is not — scan something asymmetric
-                               # and check it isn't 180-deg rotated. A mirroring map
-                               # (a bare swap, no sign flip) is rejected outright.
+                               # THIS IS RIG-SPECIFIC — a different sensor mount needs
+                               # its own physical check (or empirical derivation from
+                               # a scan of something asymmetric — don't guess the sign
+                               # from data alone). A mirroring map (a bare swap, no
+                               # sign flip) is rejected outright regardless.
                                # See docs/subsystems/scanner.md and scanner/mounting.py.
   # active_area:              # Sensor region of interest, mm. THE main lever for
   #   z: 400                  # scan speed: a smaller area (above all in Z) means

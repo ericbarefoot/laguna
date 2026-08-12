@@ -49,9 +49,13 @@ Config::
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .scanner.pointcloud import SurfaceScan
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +541,31 @@ class FrameRegistry:
         )
         return target_gantry - self.frame_for(instrument).offset
 
+    def experiment_point_for(
+        self,
+        instrument: str,
+        gantry_position: Sequence[float],
+    ) -> np.ndarray:
+        """Experiment-frame point `instrument` is measuring at a commanded gantry position.
+
+        Inverse of :meth:`gantry_target_for`: that method answers "what do I
+        command to put this instrument on this experiment point"; this
+        answers "given wherever the gantry actually is, what experiment
+        point is this instrument measuring right now." Useful for
+        translating a paused/aborted pass's last commanded position back
+        into experiment coordinates, or for logging what a pass actually
+        covered rather than what it was asked to.
+
+        Args:
+            instrument: Instrument key.
+            gantry_position: Commanded gantry position, gantry frame.
+
+        Returns:
+            ``(3,)`` point in experiment coordinates.
+        """
+        measured_gantry = np.asarray(gantry_position, dtype=float) + self.frame_for(instrument).offset
+        return self.gantry_to_experiment(measured_gantry)
+
     def retarget(
         self,
         from_instrument: str,
@@ -562,133 +591,6 @@ class FrameRegistry:
         )
         return np.asarray(gantry_position, dtype=float) + delta
 
-    def place_scan(
-        self,
-        scan: Any,
-        instrument: str = "gocator",
-        gantry_start: Optional[Sequence[float]] = None,
-        dtype: Any = np.float32,
-    ) -> np.ndarray:
-        """Flatten a scan into experiment-frame points.
-
-        Takes a :class:`~laguna.scanner.pointcloud.SurfaceScan`.
-        A surface's own coordinates are relative to where the pass began —
-        the travel axis runs from roughly -length/2 to +length/2, not from
-        the gantry position. Placing it therefore needs the pass's starting
-        gantry position, which ``scan_with_gantry()`` already records in
-        ``scan.metadata["gantry_start_mm"]`` (with the axis in
-        ``gantry_axis``); pass `gantry_start` explicitly to override.
-
-        **Travel direction.** The sensor is fully encoderless (software/time
-        triggered — see ``scan_with_gantry()``), so its own Y is just
-        acquisition order: row 0 is whatever was captured first, the last
-        row whatever was captured last, always centred symmetrically around
-        0 regardless of which real-world direction the gantry actually
-        moved. This method anchors the *first-acquired* point to the pass's
-        real starting position and orients everything else by the recorded
-        ``gantry_start_mm -> gantry_end_mm`` direction (needs both — see
-        ``scan_with_gantry()``, which records them together). Skipping that
-        orientation step — i.e. just adding the starting position as a flat
-        offset, which is what this method used to do — silently mirrors the
-        travel axis for any pass that travels in the negative direction
-        along its axis, since acquisition order no longer matches increasing
-        position; see ``docs/subsystems/scanner.md``, "Sensor axes are not
-        gantry axes."
-
-        Args:
-            scan: The scan to place.
-            instrument: Which instrument frame to use.
-            gantry_start: Full [x, y, z] gantry position at the start of the
-                pass. Reconstructed from the scan's metadata when omitted.
-            dtype: Output dtype for the flattened points.
-
-        Returns:
-            (N, 3) experiment-frame points, mm.
-
-        Raises:
-            ValueError: If no starting position is given and the metadata
-                doesn't carry one.
-        """
-        origin = {"X": 0, "Y": 1, "Z": 2}
-        axis = scan.metadata.get("gantry_axis")
-        travel_col = origin.get(axis)
-
-        if gantry_start is None:
-            start = scan.metadata.get("gantry_start_mm")
-            if axis is None or start is None:
-                raise ValueError(
-                    "place_scan() needs the gantry position where the pass "
-                    "began; the scan's metadata has no 'gantry_axis'/"
-                    "'gantry_start_mm' (only scan_with_gantry() records them), "
-                    "so pass gantry_start=[x, y, z] explicitly."
-                )
-            if travel_col is None:
-                raise ValueError(
-                    f"scan metadata names gantry axis {axis!r}, which is not "
-                    "one of X/Y/Z — pass gantry_start explicitly."
-                )
-            gantry_start = [0.0, 0.0, 0.0]
-            gantry_start[travel_col] = float(start)
-        else:
-            gantry_start = list(gantry_start)
-
-        # The scan's points are already gantry-*oriented*: SurfaceScan applies
-        # its own mounting rotation in to_points(). So this instrument frame
-        # must supply the translation only — a rotation here as well would
-        # apply the sensor's turn twice, silently.
-        frame = self.frame_for(instrument)
-        scan_rotated = not getattr(scan, "mounting", None) or not scan.mounting.is_identity
-        frame_rotates = not np.allclose(frame.mount.matrix[:3, :3], np.eye(3), atol=_RIGID_TOL)
-        if scan_rotated and frame_rotates:
-            raise ValueError(
-                f"the scan is already rotated into gantry orientation by its "
-                f"own mounting, and frames.instruments.{instrument} also "
-                "specifies a rotation ('axes'/'rotation_deg') — applying both "
-                "would turn the data twice. Keep the axis map in one place: "
-                f"gocator.mounting for the scan, and give "
-                f"frames.instruments.{instrument} only a translation."
-            )
-
-        points = scan.to_points(dtype=dtype)
-
-        # See "Travel direction" above. points[0, travel_col] is the
-        # gantry-oriented value of whichever point was acquired first
-        # (to_points() with drop_invalid=True — the default here — walks
-        # cells in acquisition order, so the first surviving point is from
-        # the lowest-numbered row/column with any valid return, even if
-        # the very first row was entirely invalid). Re-anchoring relative
-        # to that, in the recorded travel direction, replaces the old flat
-        # "+= gantry_start" — which also means this fixes a pre-existing
-        # ~half-pass-length offset that applied even to positive-direction
-        # passes, not just the direction/mirroring for negative ones.
-        if travel_col is not None and points.shape[0] > 0:
-            end = scan.metadata.get("gantry_end_mm")
-            start_for_sign = scan.metadata.get("gantry_start_mm")
-            if end is not None and start_for_sign is not None:
-                travel_sign = 1.0 if float(end) >= float(start_for_sign) else -1.0
-            else:
-                travel_sign = 1.0
-                logger.warning(
-                    "place_scan(): scan metadata has 'gantry_axis' but not "
-                    "both 'gantry_start_mm'/'gantry_end_mm', so the direction "
-                    "this pass actually traveled can't be determined — "
-                    "assuming positive. Geometry will be mirrored along %s "
-                    "if that assumption is wrong.", axis,
-                )
-            anchor = float(points[0, travel_col])
-            points[:, travel_col] = (
-                float(gantry_start[travel_col])
-                + travel_sign * (points[:, travel_col] - anchor)
-            )
-            # This axis is now fully resolved above — the flat offset below
-            # must not add gantry_start[travel_col] a second time.
-            gantry_start[travel_col] = 0.0
-
-        offset = frame.offset + np.asarray(gantry_start, dtype=float)
-        return self.experiment_from_gantry.apply(points + offset).astype(
-            dtype, copy=False
-        )
-
     def describe(self) -> Dict[str, Any]:
         """Human-readable summary for logs and get_status().
 
@@ -705,8 +607,203 @@ class FrameRegistry:
         }
 
 
+def orient_scan(
+    scan: "SurfaceScan",
+    *,
+    instrument: str = "gocator",
+    frames: FrameRegistry,
+    gantry_start: Optional[Sequence[float]] = None,
+    dtype: Any = np.float32,
+    output: Optional[Union[str, Path]] = None,
+) -> "SurfaceScan":
+    """Return a copy of `scan` with every point already in experiment coordinates.
+
+    Explicit and separate from acquisition, mirroring
+    :func:`~laguna.robot.macron.profiler.orient_profile` for the rangefinder
+    transect case — same purpose (place raw sensor data in the shared
+    experiment frame), same call shape (raw object in, same type out, an
+    optional file `output`), different sensor geometry underneath.
+
+    A surface's own coordinates are relative to where the pass began — the
+    travel axis runs from roughly -length/2 to +length/2, not from the
+    gantry position. Orienting it therefore needs the pass's starting
+    gantry position, which ``scan_with_gantry()`` already records in
+    ``scan.metadata["gantry_start_mm"]`` (with the axis in
+    ``gantry_axis``); pass `gantry_start` explicitly to override.
+
+    **Travel direction.** The sensor is fully encoderless (software/time
+    triggered — see ``scan_with_gantry()``), so its own Y is just
+    acquisition order: row 0 is whatever was captured first, the last row
+    whatever was captured last, always centred symmetrically around 0
+    regardless of which real-world direction the gantry actually moved.
+    This anchors the *first-acquired* point to the pass's real starting
+    position and orients everything else by the recorded
+    ``gantry_start_mm -> gantry_end_mm`` direction (needs both — see
+    ``scan_with_gantry()``, which records them together). Skipping that
+    orientation step — i.e. just adding the starting position as a flat
+    offset — silently mirrors the travel axis for any pass that travels in
+    the negative direction along its axis, since acquisition order no
+    longer matches increasing position; see ``docs/subsystems/scanner.md``,
+    "Sensor axes are not gantry axes."
+
+    **Returned shape.** The transform can rotate (the experiment frame's
+    ``rotation_deg``, or an instrument mount's ``axes``), which a uniform
+    grid's separate 1D `x_mm`/`y_mm` centre arrays can't represent once
+    every cell's X/Y no longer lines up with its row/column. The returned
+    scan is therefore always per-cell (``is_uniform=False``), same physical
+    row/column layout as `scan`, with `mounting` reset to identity — the
+    transform is now baked into the coordinates themselves, so
+    ``to_points()``/``grid_axes``/``gantry_*_mm`` on the *result* no longer
+    mean "apply the mount," just "read the stored values." Every cell is
+    kept (not just valid ones), so ``save_npz()`` on the result still
+    reflects the original grid, NaNs included.
+
+    Args:
+        scan: The scan to orient.
+        instrument: Which instrument frame to use.
+        frames: The lab's FrameRegistry.
+        gantry_start: Full [x, y, z] gantry position at the start of the
+            pass. Reconstructed from the scan's metadata when omitted.
+        dtype: Output dtype for the transformed grid.
+        output: Optional path to also write the oriented scan to — format
+            inferred from the suffix (.csv/.las/.laz/.ply/.npz).
+
+    Returns:
+        A new SurfaceScan, in experiment coordinates.
+
+    Raises:
+        ValueError: If no starting position is given and the metadata
+            doesn't carry one, or `output`'s suffix isn't recognized.
+    """
+    from .scanner.pointcloud import SensorMounting, SurfaceScan
+
+    origin = {"X": 0, "Y": 1, "Z": 2}
+    axis = scan.metadata.get("gantry_axis")
+    travel_col = origin.get(axis)
+
+    if gantry_start is None:
+        full_start = scan.metadata.get("gantry_start")
+        if full_start is not None:
+            # The two static axes' real position, not just the travel axis
+            # — see scan_with_gantry()'s metadata. Falls back below only for
+            # scans made before this was recorded.
+            gantry_start = list(full_start)
+        else:
+            start = scan.metadata.get("gantry_start_mm")
+            if axis is None or start is None:
+                raise ValueError(
+                    "orient_scan() needs the gantry position where the pass "
+                    "began; the scan's metadata has no 'gantry_start' (or, "
+                    "for older scans, 'gantry_axis'/'gantry_start_mm' — only "
+                    "scan_with_gantry() records these), so pass "
+                    "gantry_start=[x, y, z] explicitly."
+                )
+            if travel_col is None:
+                raise ValueError(
+                    f"scan metadata names gantry axis {axis!r}, which is not "
+                    "one of X/Y/Z — pass gantry_start explicitly."
+                )
+            # Static axes assumed 0 here, since only the travel axis's real
+            # position was ever recorded for scans this old — pass
+            # gantry_start explicitly for a scan where that assumption is
+            # wrong (it very often is).
+            gantry_start = [0.0, 0.0, 0.0]
+            gantry_start[travel_col] = float(start)
+    else:
+        gantry_start = list(gantry_start)
+
+    # The scan's points are already gantry-*oriented*: SurfaceScan applies
+    # its own mounting rotation in to_points(). So this instrument frame
+    # must supply the translation only — a rotation here as well would
+    # apply the sensor's turn twice, silently.
+    frame = frames.frame_for(instrument)
+    scan_rotated = not getattr(scan, "mounting", None) or not scan.mounting.is_identity
+    frame_rotates = not np.allclose(frame.mount.matrix[:3, :3], np.eye(3), atol=_RIGID_TOL)
+    if scan_rotated and frame_rotates:
+        raise ValueError(
+            f"the scan is already rotated into gantry orientation by its "
+            f"own mounting, and frames.instruments.{instrument} also "
+            "specifies a rotation ('axes'/'rotation_deg') — applying both "
+            "would turn the data twice. Keep the axis map in one place: "
+            f"gocator.mounting for the scan, and give "
+            f"frames.instruments.{instrument} only a translation."
+        )
+
+    # Two flattenings: valid-only to find the anchor (same "first acquired"
+    # semantics orient_scan() always used), full-grid (NaNs kept) to build
+    # the returned scan without silently dropping cells.
+    valid_points = scan.to_points(drop_invalid=True, dtype=np.float64)
+    full_points = scan.to_points(drop_invalid=False, dtype=np.float64)
+
+    if travel_col is not None and full_points.shape[0] > 0:
+        end = scan.metadata.get("gantry_end_mm")
+        start_for_sign = scan.metadata.get("gantry_start_mm")
+        if end is not None and start_for_sign is not None:
+            travel_sign = 1.0 if float(end) >= float(start_for_sign) else -1.0
+        else:
+            travel_sign = 1.0
+            logger.warning(
+                "orient_scan(): scan metadata has 'gantry_axis' but not "
+                "both 'gantry_start_mm'/'gantry_end_mm', so the direction "
+                "this pass actually traveled can't be determined — "
+                "assuming positive. Geometry will be mirrored along %s "
+                "if that assumption is wrong.", axis,
+            )
+        # anchor is the first-ACQUIRED point, i.e. from the valid-only
+        # flattening (drop_invalid=True walks cells in acquisition order —
+        # see the original note this replaced). Falls back to the full
+        # grid's own first cell only if literally every cell is invalid,
+        # since there's nothing else to anchor to then.
+        if valid_points.shape[0] > 0:
+            anchor = float(valid_points[0, travel_col])
+        else:
+            anchor = float(full_points[0, travel_col])
+        full_points[:, travel_col] = (
+            float(gantry_start[travel_col])
+            + travel_sign * (full_points[:, travel_col] - anchor)
+        )
+        # This axis is now fully resolved above — the flat offset below
+        # must not add gantry_start[travel_col] a second time.
+        gantry_start[travel_col] = 0.0
+
+    offset = frame.offset + np.asarray(gantry_start, dtype=float)
+    transformed = frames.experiment_from_gantry.apply(full_points + offset)
+
+    rows, cols = scan.z_mm.shape
+    grid = transformed.reshape(rows, cols, 3).astype(dtype, copy=False)
+    oriented = SurfaceScan(
+        x_mm=grid[:, :, 0],
+        y_mm=grid[:, :, 1],
+        z_mm=grid[:, :, 2],
+        metadata=dict(scan.metadata),
+        is_uniform=False,
+        mounting=SensorMounting(),
+    )
+
+    if output is not None:
+        output_path = Path(output)
+        suffix = output_path.suffix.lower()
+        writers = {
+            ".csv": oriented.save_csv,
+            ".las": oriented.save_las,
+            ".laz": oriented.save_las,
+            ".ply": oriented.save_ply,
+            ".npz": lambda p: oriented.save_npz(p),
+        }
+        writer = writers.get(suffix)
+        if writer is None:
+            raise ValueError(
+                f"orient_scan(): unknown output format {suffix!r} "
+                f"(expected one of {sorted(writers)})"
+            )
+        writer(output_path)
+
+    return oriented
+
+
 __all__ = [
     "AffineTransform",
     "InstrumentFrame",
     "FrameRegistry",
+    "orient_scan",
 ]

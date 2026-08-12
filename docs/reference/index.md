@@ -20,7 +20,8 @@ exhaustive *what* — every public class, method, and parameter.
 | [Scanner](scanner.md) | Gocator 2690 3D laser scanner, simulation stand-in |
 | [Flow](flow.md) | Pump / solenoid flow control |
 | [Reference frames](frames.md) | `FrameRegistry` — one coordinate system for every instrument |
-| [Survey](survey.md) | Multi-pass coverage: `RasterSurvey`, `RepeatTransect` |
+| [Survey](survey.md) | Multi-pass coverage: `Tile`, `Traverse` |
+| [Visualization](viz.md) | `plot_acquisition()`, `plot_trajectory()` — quick-look plots for scans/profiles/planned passes |
 | [Schedule](schedule.md) | Time-elevation schedule loading and interpolation |
 | [Timing](timing.md) | Experiment clock, scheduler, checkpointing, event log |
 | [Experiment runner](experiment.md) | YAML-driven experiment setup and blocking run, run context |

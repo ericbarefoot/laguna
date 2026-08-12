@@ -964,13 +964,14 @@ class FakeAxisHandle:
     than the ungated raw `gantry.cmd` path.
     """
 
-    def __init__(self, name, calls, safe_mode=False):
+    def __init__(self, name, calls, safe_mode=False, position=0.0):
         self.name = name
         self._calls = calls
         self._safe_mode = safe_mode
+        self._position = position
 
     def get_position(self):
-        return 0.0
+        return self._position
 
     def set_speed(self, value):
         self._calls.append(("set_speed", self.name, value))
@@ -985,11 +986,16 @@ class FakeAxisHandle:
 
 
 class FakeGantry:
-    def __init__(self, safe_mode=False):
+    def __init__(self, safe_mode=False, positions=None):
+        from laguna.robot.macron.commands import Axis
+
         self.calls: list = []
+        positions = positions or {}
         self._handles = {
-            name: FakeAxisHandle(name, self.calls, safe_mode) for name in ("X", "Y")
+            name: FakeAxisHandle(name, self.calls, safe_mode, positions.get(name, 0.0))
+            for name in ("X", "Y")
         }
+        self._axes = [Axis(name, i + 1) for i, name in enumerate(self._handles)]
 
     def axis(self, name):
         try:
@@ -1022,6 +1028,18 @@ class TestScanWithGantry:
         assert names.index("GoSystem_Start") < names.index("GoSensor_Trigger")
         assert scan.metadata["gantry_axis"] == "X"
         assert scan.metadata["gantry_feed_rate_mm_s"] == pytest.approx(20.0)
+
+    def test_metadata_records_full_gantry_position(self, scanner):
+        """gantry_start_mm alone only records the travel axis — orient_scan()
+        otherwise has no way to know the static axis's real position and
+        silently assumes 0, which is almost never true (the actual bug this
+        guards: a scan's Y coordinates landing off in experiment space)."""
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 100.0, "Y": 250.0})
+        scan = scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+        )
+        assert scan.metadata["gantry_start"] == [100.0, 250.0]
 
     def test_feed_rate_becomes_sensor_travel_speed(self, scanner):
         """The whole scheme depends on these two matching."""
@@ -1614,6 +1632,15 @@ class TestSaveScan:
             scanner.save_scan(make_scan(), formats=("npz", "nope"))
         assert list(tmp_path.glob("*")) == []
 
+    def test_bare_string_format_is_one_format_not_its_characters(self, tmp_path, monkeypatch):
+        """formats="laz" is a str, which is itself a Sequence[str] — without
+        normalizing it, tuple("laz") silently became ('l', 'a', 'z') and
+        raised "Unknown scan format: 'l'" instead of saving one LAZ file."""
+        pytest.importorskip("laspy")
+        pytest.importorskip("lazrs")
+        written = self._scanner(tmp_path, monkeypatch).save_scan(make_scan(), formats="laz")
+        assert set(written) == {"laz"}
+
     def test_point_formats_share_one_to_points_call(self, tmp_path, monkeypatch):
         """The flattened array runs to hundreds of MB on a real scan, so it
         must be built once and passed to each writer, not per format."""
@@ -1704,6 +1731,38 @@ class TestSurfaceScan:
         loaded = np.load(path, allow_pickle=True)
         assert loaded["z_mm"].shape == (2, 2)
         assert np.isnan(loaded["z_mm"][1, 0])
+
+    def test_from_npz_round_trips_grid_metadata_and_mounting(self, tmp_path):
+        """The only save format with a loader — SurveyRunner discards the
+        SurfaceScan once a pass finishes, so .npz is the sole way to get a
+        scan back for orient_scan() or any other reprocessing later."""
+        mounting = SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z")
+        scan = SurfaceScan(
+            z_mm=np.array([[1.0, 2.0], [np.nan, 4.0]]),
+            x_mm=np.array([0.0, 1.0]),
+            y_mm=np.array([0.0, 2.0]),
+            metadata={"gantry_axis": "X", "gantry_start_mm": 700.0, "gantry_end_mm": 1000.0},
+            is_uniform=True,
+            mounting=mounting,
+        )
+        path = scan.save_npz(tmp_path / "scan.npz")
+        loaded = SurfaceScan.from_npz(path)
+
+        np.testing.assert_array_equal(loaded.z_mm, scan.z_mm)
+        np.testing.assert_array_equal(loaded.x_mm, scan.x_mm)
+        np.testing.assert_array_equal(loaded.y_mm, scan.y_mm)
+        assert loaded.is_uniform == scan.is_uniform
+        assert loaded.mounting.to_dict() == scan.mounting.to_dict()
+        assert loaded.metadata["gantry_axis"] == "X"
+        assert loaded.metadata["gantry_start_mm"] == 700.0
+        assert loaded.metadata["gantry_end_mm"] == 1000.0
+        assert "mounting" not in loaded.metadata  # restored to .mounting, not left duplicated
+        assert "grid_axes" not in loaded.metadata  # derived, not stored state
+
+    def test_from_npz_default_mounting_round_trips_as_identity(self, tmp_path):
+        path = make_scan().save_npz(tmp_path / "scan.npz")
+        loaded = SurfaceScan.from_npz(path)
+        assert loaded.mounting.is_identity
 
     def test_to_points_matches_the_meshgrid_path_it_replaced(self):
         """to_points() indexes x/y by valid cell instead of building full

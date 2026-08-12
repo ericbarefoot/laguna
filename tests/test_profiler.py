@@ -14,8 +14,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from laguna.frames import FrameRegistry
+from laguna.rangefinder.calibration import LinearCalibration
 from laguna.robot.macron.connection import SnapMotionError
-from laguna.robot.macron.profiler import ProfileResult, TopographicProfiler
+from laguna.robot.macron.profiler import ProfileResult, TopographicProfiler, orient_profile
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +284,12 @@ class TestProfilerScan:
         assert result.path.exists()
         assert len(fake_client.sftp.gets) >= 1
 
+    def test_csv_filename_includes_sensor_name(self, tmp_path):
+        """A directory holding both OD2000 and WTT12L output should be
+        sortable/greppable without opening each file."""
+        result, _, _ = self._run_scan(tmp_path)
+        assert "od2000" in result.path.name
+
     def test_metadata_includes_scan_params(self, tmp_path):
         result, _, _ = self._run_scan(tmp_path)
         assert result.metadata["axis"] == "A1"
@@ -347,3 +355,157 @@ class TestProfilerStop:
         profiler, conn = _make_profiler()
         profiler.stop()
         assert conn.stop_scan_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# orient_profile()
+# ---------------------------------------------------------------------------
+
+
+class TestOrientProfile:
+    def _frames(self, od2000_translation=(10.0, 0.0, -15.0)):
+        # Identity experiment frame keeps expected numbers simple — this
+        # test is about the mount-offset + travel-axis math, not the
+        # experiment origin, which is exercised separately in test_frames.py.
+        return FrameRegistry.from_config({
+            "instruments": {"od2000": {"translation": list(od2000_translation)}},
+        })
+
+    def _result(self, **metadata):
+        import pandas as pd
+
+        df = pd.DataFrame({
+            "pos_mm": [100.0, 150.0, 200.0],
+            "distance_mm": [5.0, 6.0, 7.0],
+        })
+        meta = {"gantry_axis": "X", "gantry_start": [100.0, 50.0, 0.0]}
+        meta.update(metadata)
+        return ProfileResult(path=Path("/nonexistent.csv"), metadata=meta, df=df)
+
+    def test_places_samples_along_the_travel_axis(self):
+        """X varies with pos_mm (the travel axis) plus the mount offset; Y
+        stays at the static gantry_start value; Z is the calibrated height
+        plus the mount's constant Z offset."""
+        calibration = LinearCalibration(device="od2000", slope=1.0, intercept=0.0, r_squared=1.0)
+        df = orient_profile(
+            self._result(), instrument="od2000", frames=self._frames(), calibration=calibration,
+        )
+        assert list(df["experiment_x_mm"]) == [110.0, 160.0, 210.0]
+        assert list(df["experiment_y_mm"]) == [50.0, 50.0, 50.0]
+        assert list(df["experiment_z_mm"]) == [-10.0, -9.0, -8.0]  # height - 15 mount offset
+        assert list(df["height_mm"]) == [5.0, 6.0, 7.0]
+
+    def test_raw_columns_are_untouched(self):
+        calibration = LinearCalibration(device="od2000", slope=2.0, intercept=1.0, r_squared=1.0)
+        result = self._result()
+        df = orient_profile(result, instrument="od2000", frames=self._frames(), calibration=calibration)
+        assert list(df["pos_mm"]) == [100.0, 150.0, 200.0]
+        assert list(df["distance_mm"]) == [5.0, 6.0, 7.0]
+        # the original DataFrame object must not be mutated either
+        assert "height_mm" not in result.df.columns
+
+    def test_config_calibration_file_is_loaded_automatically(self, tmp_path):
+        """Mirrors RangefinderSubsystem's own calibration_file handling —
+        the common case (use whatever's configured for this instrument)
+        shouldn't require the caller to find and load the file by hand."""
+        calibration = LinearCalibration(device="od2000", slope=1.0, intercept=0.0, r_squared=1.0)
+        cal_path = tmp_path / "od2000-cal.csv"
+        calibration.to_csv(cal_path)
+
+        df = orient_profile(
+            self._result(), instrument="od2000", frames=self._frames(),
+            config={"calibration_file": str(cal_path)},
+        )
+        assert list(df["height_mm"]) == [5.0, 6.0, 7.0]
+
+    def test_explicit_calibration_takes_precedence_over_config(self, tmp_path):
+        configured = LinearCalibration(device="od2000", slope=1.0, intercept=0.0, r_squared=1.0)
+        cal_path = tmp_path / "od2000-cal.csv"
+        configured.to_csv(cal_path)
+        explicit = LinearCalibration(device="od2000", slope=2.0, intercept=0.0, r_squared=1.0)
+
+        df = orient_profile(
+            self._result(), instrument="od2000", frames=self._frames(),
+            calibration=explicit, config={"calibration_file": str(cal_path)},
+        )
+        assert list(df["height_mm"]) == [10.0, 12.0, 14.0]  # explicit's slope=2, not config's 1
+
+    def test_config_without_calibration_file_key_leaves_z_uncalibrated(self):
+        df = orient_profile(
+            self._result(), instrument="od2000", frames=self._frames(), config={},
+        )
+        assert "height_mm" not in df.columns
+
+    def test_no_calibration_leaves_z_as_the_constant_mount_offset_only(self):
+        df = orient_profile(self._result(), instrument="od2000", frames=self._frames())
+        assert "height_mm" not in df.columns
+        assert list(df["experiment_z_mm"]) == [-15.0, -15.0, -15.0]
+
+    def test_missing_gantry_metadata_raises(self):
+        result = self._result(gantry_axis=None, gantry_start=None)
+        with pytest.raises(ValueError, match="gantry_axis"):
+            orient_profile(result, instrument="od2000", frames=self._frames())
+
+    def test_explicit_axis_and_gantry_start_override_metadata(self):
+        """A ProfileResult reconstructed from disk (e.g. a scan made before
+        gantry_axis/gantry_start were persisted to the _meta.json sidecar)
+        can still be oriented by supplying them directly."""
+        result = self._result(gantry_axis=None, gantry_start=None)
+        df = orient_profile(
+            result, instrument="od2000", frames=self._frames(),
+            axis="X", gantry_start=[100.0, 50.0, 0.0],
+        )
+        assert list(df["experiment_x_mm"]) == [110.0, 160.0, 210.0]
+
+    def test_explicit_gantry_start_takes_precedence_over_metadata(self):
+        """The travel axis (X here) always comes from pos_mm regardless of
+        gantry_start — only the two static axes (Y here) are affected by
+        the override."""
+        result = self._result()  # metadata already has gantry_start=[100, 50, 0]
+        df = orient_profile(
+            result, instrument="od2000", frames=self._frames(),
+            gantry_start=[100.0, 0.0, 0.0],
+        )
+        assert list(df["experiment_y_mm"]) == [0.0, 0.0, 0.0]  # was [50, 50, 50]
+
+    def test_unknown_axis_name_raises(self):
+        result = self._result(gantry_axis="Q")
+        with pytest.raises(ValueError, match="not one of X/Y/Z"):
+            orient_profile(result, instrument="od2000", frames=self._frames())
+
+    def test_missing_calibration_column_raises(self):
+        """wtt12l calibrates against current_ma, not distance_mm — a CSV
+        without it must fail clearly rather than silently calibrating
+        against the wrong column."""
+        calibration = LinearCalibration(device="wtt12l", slope=1.0, intercept=0.0, r_squared=1.0)
+        result = self._result()  # only has distance_mm, not current_ma
+        with pytest.raises(ValueError, match="current_ma"):
+            orient_profile(result, instrument="wtt12l", frames=self._frames(), calibration=calibration)
+
+    def test_output_writes_csv_without_touching_the_original(self, tmp_path):
+        original = tmp_path / "raw.csv"
+        original.write_text("pos_mm,distance_mm\n100,5\n")
+        result = self._result()
+        result.path = original
+        out_path = tmp_path / "oriented.csv"
+
+        calibration = LinearCalibration(device="od2000", slope=1.0, intercept=0.0, r_squared=1.0)
+        orient_profile(
+            result, instrument="od2000", frames=self._frames(),
+            calibration=calibration, output=str(out_path),
+        )
+        assert out_path.exists()
+        assert "experiment_x_mm" in out_path.read_text()
+        assert original.read_text() == "pos_mm,distance_mm\n100,5\n"
+
+    def test_loads_from_disk_when_df_not_preloaded(self, tmp_path):
+        csv_path = tmp_path / "raw.csv"
+        csv_path.write_text("pos_mm,distance_mm\n100,5\n150,6\n200,7\n")
+        result = ProfileResult(
+            path=csv_path,
+            metadata={"gantry_axis": "X", "gantry_start": [100.0, 50.0, 0.0]},
+            df=None,
+        )
+        calibration = LinearCalibration(device="od2000", slope=1.0, intercept=0.0, r_squared=1.0)
+        df = orient_profile(result, instrument="od2000", frames=self._frames(), calibration=calibration)
+        assert list(df["height_mm"]) == [5.0, 6.0, 7.0]

@@ -346,7 +346,10 @@ class SurfaceScan:
         """Write the full grid (including NaNs) plus metadata as .npz.
 
         Preserves the grid structure that CSV/PLY flatten away — the right
-        choice for reprocessing (e.g. re-deriving Y from a corrected velocity).
+        choice for reprocessing (e.g. re-deriving Y from a corrected
+        velocity, or later ``orient_scan()``, which needs the gantry_axis/
+        gantry_start_mm/gantry_end_mm this carries in `metadata`). Load a
+        saved file back with :meth:`from_npz`.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -362,6 +365,41 @@ class SurfaceScan:
             metadata=np.array([repr(metadata)], dtype=object),
         )
         return path
+
+    @classmethod
+    def from_npz(cls, path: str | Path) -> "SurfaceScan":
+        """Reconstruct a SurfaceScan saved by :meth:`save_npz`.
+
+        The only format that round-trips faithfully — LAS/PLY/CSV flatten
+        the grid to a bare point list with no NaN structure, mounting, or
+        metadata (gantry_axis/gantry_start_mm/etc.) to reconstruct from.
+        Save to ``.npz`` (alongside whatever export format you actually
+        want) for any scan you'll want to re-derive or ``orient_scan()``
+        later — a survey pass that only saves LAZ/PLY has nothing left to
+        reload once the run ends.
+
+        Args:
+            path: A file written by ``save_npz()``.
+
+        Returns:
+            The reconstructed SurfaceScan, with metadata and mounting
+            restored (not just the grid).
+        """
+        import ast
+
+        path = Path(path)
+        with np.load(path, allow_pickle=True) as data:
+            metadata = ast.literal_eval(str(data["metadata"][0]))
+            mounting_dict = metadata.pop("mounting", None)
+            metadata.pop("grid_axes", None)  # derived from mounting, not stored state
+            return cls(
+                z_mm=data["z_mm"],
+                x_mm=data["x_mm"],
+                y_mm=data["y_mm"],
+                metadata=metadata,
+                is_uniform=bool(data["is_uniform"]),
+                mounting=SensorMounting.from_config(mounting_dict),
+            )
 
     def rescale_y(self, actual_speed_mm_s: float) -> "SurfaceScan":
         """Return a copy with Y rescaled for a corrected travel speed.

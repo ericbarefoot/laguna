@@ -8,6 +8,7 @@ This avoids hardcoding hardware assumptions in the core.
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+import json
 import logging
 import threading
 import time
@@ -647,14 +648,19 @@ class FlumeLab:
         end: Optional[list] = None,
         output: Optional[str] = None,
         feed_rate_mm_s: Optional[float] = None,
+        axis: Optional[str] = None,
     ) -> "ProfileResult":
         """Move to `start` (if given) and scan to `end`, saving a topographic profile.
 
         `start`/`end` are full position vectors, one value per configured
-        gantry axis (same order as move_to()'s vector form) — exactly one
-        component may differ between them, since a single scan pass only
-        moves one axis (see TopographicProfiler.scan()); that's the axis
-        actually scanned.
+        gantry axis (same order as move_to()'s vector form). A single scan
+        pass only moves one axis (see TopographicProfiler.scan()) — pass
+        `axis` to name it explicitly, which also skips inferring it from
+        `start`/`end`. Inference is fragile against real hardware: even a
+        nominally-unmoved axis can read back a few raw units off its prior
+        target (coarse mm_per_acp_unit quantization, in particular), which
+        inference sees as "differs" and raises on. Prefer `axis` whenever
+        the caller already knows it — as SurveyRunner does, from Pass.axis.
 
         Args:
             instrument: "od2000" or "wtt12l" (alias for "wtt12l_powerprox")
@@ -670,6 +676,9 @@ class FlumeLab:
                 default output_dir/timestamped path is used.
             feed_rate_mm_s: Scan speed in mm/s. Required — deliberately no
                 default, since this drives a real hardware move.
+            axis: Configured axis name to scan, e.g. "X". If omitted, it's
+                inferred as the single component where `start` and `end`
+                differ — see the fragility note above.
 
         Returns:
             ProfileResult: Path, metadata, and DataFrame; see
@@ -678,8 +687,9 @@ class FlumeLab:
         Raises:
             RuntimeError: If no 'gantry' subsystem is registered.
             ValueError: If `end` or `feed_rate_mm_s` is missing, `start`/
-                `end` don't match the configured axis count, or they don't
-                differ on exactly one axis.
+                `end` don't match the configured axis count, `axis` isn't
+                configured, or (without `axis`) they don't differ on
+                exactly one axis.
             KeyError: If no config section exists for `instrument`.
         """
         from laguna.robot.macron.profiler import TopographicProfiler
@@ -702,22 +712,29 @@ class FlumeLab:
             if start is not None:
                 self.move_to(start)
 
-            axis_names = [axis.name for axis in gantry._axes]
+            axis_names = [a.name for a in gantry._axes]
             if start is None:
-                start = [gantry.cmd.get_actual_position(axis) for axis in gantry._axes]
+                start = [gantry.cmd.get_actual_position(a) for a in gantry._axes]
             if len(start) != len(axis_names) or len(end) != len(axis_names):
                 raise ValueError(
                     f"start/end must have {len(axis_names)} values (one per configured axis: {axis_names})"
                 )
 
-            differing = [name for name, s, e in zip(axis_names, start, end) if abs(e - s) > 1e-9]
-            if len(differing) != 1:
-                raise ValueError(
-                    "acquire_scan() infers the scan axis as the single component where "
-                    f"start and end differ; got {len(differing)} differing axes: {differing}"
-                )
-            scan_axis = next(axis for axis in gantry._axes if axis.name == differing[0])
-            end_mm = end[axis_names.index(differing[0])]
+            if axis is not None:
+                if axis not in axis_names:
+                    raise ValueError(f"axis {axis!r} is not configured (have {axis_names})")
+                scan_axis = next(a for a in gantry._axes if a.name == axis)
+                end_mm = end[axis_names.index(axis)]
+            else:
+                differing = [name for name, s, e in zip(axis_names, start, end) if abs(e - s) > 1e-9]
+                if len(differing) != 1:
+                    raise ValueError(
+                        "acquire_scan() infers the scan axis as the single component where "
+                        f"start and end differ; got {len(differing)} differing axes: {differing} "
+                        "— pass axis=... explicitly to skip inference"
+                    )
+                scan_axis = next(a for a in gantry._axes if a.name == differing[0])
+                end_mm = end[axis_names.index(differing[0])]
 
             sensor = "wtt12l_powerprox" if instrument in ("wtt12l", "wtt12l_powerprox") else instrument
             rf_config = self.config.get(instrument)
@@ -748,10 +765,37 @@ class FlumeLab:
                 pi_key=gantry_ssh_key,
                 pdin_port=rf_config.get("pdin_port", 1),
                 al1342_host=al1342_host,
-                output_dir=str(Path(output).parent) if output else "/tmp",
+                output_dir=str(Path(output).parent) if output else rf_config.get("output_dir", "/tmp"),
                 sensor=sensor,
             )
             result = profiler.scan(axis=scan_axis.token(), end_mm=end_mm, feed_rate_mm_s=feed_rate_mm_s)
+            # Full commanded gantry position at scan start, not just the
+            # travel axis — orient_profile() needs the two static axes to
+            # place each sample in 3D, same as SurfaceScan.metadata's
+            # gantry_axis/gantry_start_mm does for frames.orient_scan().
+            # "start" is already the full per-axis vector this call
+            # positioned to.
+            result.metadata["gantry_axis"] = scan_axis.name
+            result.metadata["gantry_start"] = [
+                float(start[axis_names.index(n)]) for n in ("X", "Y", "Z") if n in axis_names
+            ]
+            # Persist alongside the CSV, not just in memory — orient_profile()
+            # needs these to place a scan reloaded from disk in a later
+            # session, and the remote agent's own sidecar (already on disk
+            # at this point, retrieved above) has no notion of the two
+            # static axes at all, only the travel axis's BLC token.
+            meta_path = Path(str(result.path).replace(".csv", "_meta.json"))
+            try:
+                on_disk = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                on_disk["gantry_axis"] = result.metadata["gantry_axis"]
+                on_disk["gantry_start"] = result.metadata["gantry_start"]
+                meta_path.write_text(json.dumps(on_disk, indent=2))
+            except Exception as exc:
+                logger.warning(
+                    "Could not persist gantry_axis/gantry_start to %s: %s — "
+                    "orient_profile() on this scan will need them passed "
+                    "explicitly if reloaded in a later session", meta_path, exc,
+                )
 
         if output:
             output_path = Path(output)

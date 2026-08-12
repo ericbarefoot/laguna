@@ -7,11 +7,11 @@ experiment, has been a hand-written loop in a script.
 
 Two shapes cover almost all of it:
 
-:class:`RasterSurvey` — tile a region with parallel passes, because the
-Gocator's laser fan is ~2 m across but a flume bed is wider, and one pass only
+:class:`Tile` — tile a region with parallel passes, because the Gocator's
+laser fan is ~2 m across but a flume bed is wider, and one pass only
 captures a strip.
 
-:class:`RepeatTransect` — re-run the same line, optionally with a different
+:class:`Traverse` — re-run the same line, optionally with a different
 instrument. This is what turns "scan the bed hourly" or "compare the OD2000
 and the WTT12L over the same ground" into a plan rather than a script.
 
@@ -26,6 +26,13 @@ hardware; execution is a separate step that can be checkpointed, resumed,
 or simply printed and inspected before anything moves. A survey is often the
 longest single operation an experiment performs, so being able to see the
 plan first matters.
+
+Two speeds, one shorthand
+--------------------------
+Every plan distinguishes ``scan_speed`` (the measuring traverse — often
+constrained by the sensor) from ``travel_speed`` (repositioning to a pass's
+start, which has no such constraint and can usually go faster). Pass
+``speed=`` instead to set both to the same value.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 #: Cartesian axis name -> index into a 3-component [x, y, z] vector. Shared
-#: by RasterSurvey and SurveyRunner rather than each keeping its own copy.
+#: by Tile and SurveyRunner rather than each keeping its own copy.
 _AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
 
 
@@ -54,7 +61,11 @@ class Pass:
         instrument: Which instrument measures this pass.
         axis: Gantry axis the traverse runs along, resolved from the
             geometry.
-        feed_rate_mm_s: Traverse speed, if the plan fixed one.
+        scan_speed: Measuring traverse speed, if the plan fixed one.
+        travel_speed: Speed for the pre-scan repositioning move to `start`,
+            if it should differ from `scan_speed`. Defaults to `scan_speed`
+            when omitted — repositioning at scan speed is slower than
+            necessary but always safe.
         label: Human-readable description, for logs and progress.
     """
 
@@ -63,7 +74,8 @@ class Pass:
     end: Tuple[float, float, float]
     instrument: str = "gocator"
     axis: str = "X"
-    feed_rate_mm_s: Optional[float] = None
+    scan_speed: Optional[float] = None
+    travel_speed: Optional[float] = None
     label: str = ""
 
     @property
@@ -75,17 +87,17 @@ class Pass:
         """
         return math.dist(self.start, self.end)
 
-    def duration_s(self, feed_rate_mm_s: Optional[float] = None) -> Optional[float]:
-        """Get the traverse duration at a given feed rate.
+    def duration_s(self, scan_speed: Optional[float] = None) -> Optional[float]:
+        """Get the traverse duration at a given scan speed.
 
         Args:
-            feed_rate_mm_s: Feed rate in mm/s. If not provided, uses the pass's
-                configured feed_rate_mm_s.
+            scan_speed: Speed in mm/s. If not provided, uses the pass's
+                configured scan_speed.
 
         Returns:
-            Duration in seconds, or None if no feed rate is available.
+            Duration in seconds, or None if no speed is available.
         """
-        rate = feed_rate_mm_s or self.feed_rate_mm_s
+        rate = scan_speed or self.scan_speed
         if not rate:
             return None
         return self.length_mm / rate
@@ -94,7 +106,7 @@ class Pass:
         """Export pass to a dictionary.
 
         Returns:
-            Dict with pass index, start/end, instrument, axis, feed rate, and label.
+            Dict with pass index, start/end, instrument, axis, speeds, and label.
         """
         return {
             "index": self.index,
@@ -102,7 +114,8 @@ class Pass:
             "end": list(self.end),
             "instrument": self.instrument,
             "axis": self.axis,
-            "feed_rate_mm_s": self.feed_rate_mm_s,
+            "scan_speed": self.scan_speed,
+            "travel_speed": self.travel_speed,
             "label": self.label,
         }
 
@@ -130,20 +143,20 @@ class Survey:
         """
         return len(self.passes())
 
-    def duration_s(self, feed_rate_mm_s: Optional[float] = None) -> Optional[float]:
+    def duration_s(self, scan_speed: Optional[float] = None) -> Optional[float]:
         """Get total traverse time, ignoring repositioning between passes.
 
         A lower bound, as the gantry repositioning and sensor settle time are
         not included.
 
         Args:
-            feed_rate_mm_s: Feed rate in mm/s. If not provided, uses each pass's
-                configured feed rate.
+            scan_speed: Speed in mm/s. If not provided, uses each pass's
+                configured scan speed.
 
         Returns:
-            Total duration in seconds, or None if any pass lacks a feed rate.
+            Total duration in seconds, or None if any pass lacks a speed.
         """
-        totals = [p.duration_s(feed_rate_mm_s) for p in self.passes()]
+        totals = [p.duration_s(scan_speed) for p in self.passes()]
         if any(t is None for t in totals):
             return None
         return sum(totals)
@@ -166,7 +179,7 @@ class Survey:
 
 
 @dataclass
-class RasterSurvey(Survey):
+class Tile(Survey):
     """Cover a rectangular region with parallel passes.
 
     The Gocator images a strip as wide as its active area, so a bed wider
@@ -191,7 +204,11 @@ class RasterSurvey(Survey):
             drive back to the same side every time. Halves the repositioning
             travel; set False if the instrument is direction-sensitive.
         instrument: Which instrument measures.
-        feed_rate_mm_s: Traverse speed for every pass.
+        scan_speed: Measuring traverse speed for every pass.
+        travel_speed: Repositioning speed to each pass's start, if it should
+            differ from scan_speed — see Pass.travel_speed.
+        speed: Convenience for setting scan_speed and travel_speed to the
+            same value. Ignored for whichever of the two is set explicitly.
     """
 
     origin: Sequence[float]
@@ -203,10 +220,12 @@ class RasterSurvey(Survey):
     step_axis: Optional[str] = None
     serpentine: bool = True
     instrument: str = "gocator"
-    feed_rate_mm_s: Optional[float] = None
+    scan_speed: Optional[float] = None
+    travel_speed: Optional[float] = None
+    speed: Optional[float] = None
 
     def __post_init__(self) -> None:
-        """Validate raster survey parameters."""
+        """Validate tile survey parameters."""
         if len(self.origin) != 3:
             raise ValueError(f"origin must have 3 components [x, y, z], got {self.origin!r}")
         if self.swath_mm <= 0:
@@ -225,6 +244,11 @@ class RasterSurvey(Survey):
             self.step_axis = "Y" if self.axis == "X" else "X"
         if self.step_axis == self.axis:
             raise ValueError("step_axis must differ from axis")
+        if self.speed is not None:
+            if self.scan_speed is None:
+                self.scan_speed = self.speed
+            if self.travel_speed is None:
+                self.travel_speed = self.speed
 
     @property
     def pitch_mm(self) -> float:
@@ -236,7 +260,7 @@ class RasterSurvey(Survey):
         return self.swath_mm * (1.0 - self.overlap)
 
     def passes(self) -> List[Pass]:
-        """Generate the planned passes for this raster survey.
+        """Generate the planned passes for this tile survey.
 
         Returns:
             List of Pass objects tiling the region.
@@ -276,8 +300,9 @@ class RasterSurvey(Survey):
                     end=tuple(float(v) for v in end),
                     instrument=self.instrument,
                     axis=self.axis,
-                    feed_rate_mm_s=self.feed_rate_mm_s,
-                    label=f"raster {i + 1}/{count}",
+                    scan_speed=self.scan_speed,
+                    travel_speed=self.travel_speed,
+                    label=f"tile {i + 1}/{count}",
                 )
             )
         return out
@@ -296,7 +321,7 @@ class RasterSurvey(Survey):
 
 
 @dataclass
-class RepeatTransect(Survey):
+class Traverse(Survey):
     """Re-run one line, optionally with several instruments.
 
     Two uses. Repeating a transect over an experiment gives a time series of
@@ -312,7 +337,11 @@ class RepeatTransect(Survey):
         instruments: One pass per instrument, in this order.
         repeats: How many times to run the whole set.
         axis: Gantry axis the line runs along.
-        feed_rate_mm_s: Traverse speed.
+        scan_speed: Measuring traverse speed.
+        travel_speed: Repositioning speed to the line's start, if it should
+            differ from scan_speed — see Pass.travel_speed.
+        speed: Convenience for setting scan_speed and travel_speed to the
+            same value. Ignored for whichever of the two is set explicitly.
     """
 
     start: Sequence[float]
@@ -320,10 +349,16 @@ class RepeatTransect(Survey):
     instruments: Sequence[str] = ("gocator",)
     repeats: int = 1
     axis: str = "X"
-    feed_rate_mm_s: Optional[float] = None
+    scan_speed: Optional[float] = None
+    travel_speed: Optional[float] = None
+    speed: Optional[float] = None
 
     def __post_init__(self) -> None:
-        """Validate repeat transect parameters."""
+        """Validate traverse parameters."""
+        if isinstance(self.instruments, str):
+            # A bare "wtt12l" is one instrument, not six — Sequence[str]
+            # would otherwise iterate it character by character.
+            self.instruments = (self.instruments,)
         if len(self.start) != 3:
             raise ValueError(f"start must have 3 components [x, y, z], got {self.start!r}")
         if len(self.end) != 3:
@@ -332,12 +367,17 @@ class RepeatTransect(Survey):
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
         if not self.instruments:
             raise ValueError("at least one instrument is required")
+        if self.speed is not None:
+            if self.scan_speed is None:
+                self.scan_speed = self.speed
+            if self.travel_speed is None:
+                self.travel_speed = self.speed
 
     def passes(self) -> List[Pass]:
-        """Generate the planned passes for this repeat transect survey.
+        """Generate the planned passes for this traverse.
 
         Returns:
-            List of Pass objects repeating the transect with each instrument.
+            List of Pass objects repeating the line with each instrument.
         """
         out: List[Pass] = []
         for r in range(self.repeats):
@@ -349,7 +389,8 @@ class RepeatTransect(Survey):
                         end=tuple(float(v) for v in self.end),
                         instrument=instrument,
                         axis=self.axis,
-                        feed_rate_mm_s=self.feed_rate_mm_s,
+                        scan_speed=self.scan_speed,
+                        travel_speed=self.travel_speed,
                         label=(
                             f"{instrument} repeat {r + 1}/{self.repeats}"
                             if self.repeats > 1
@@ -375,7 +416,7 @@ class SurveyRunner:
         survey: The plan.
         checkpoint: Optional CheckpointStore. Pass indices are marked
             complete as they finish, so a survey interrupted by a pause
-            resumes where it left off rather than starting over. A raster of
+            resumes where it left off rather than starting over. A tile of
             a wide bed can be the longest thing an experiment does.
     """
 
@@ -391,6 +432,12 @@ class SurveyRunner:
         self.survey = survey
         self.checkpoint = checkpoint
         self.completed: List[int] = []
+        #: Acquired SurfaceScan/ProfileResult objects, one per pass that
+        #: actually ran — only populated when run(keep_results=True). Empty
+        #: otherwise, since holding every scan in memory for a long survey
+        #: (a full-resolution Gocator surface is hundreds of MB) is real
+        #: cost most callers don't want by default.
+        self.results: List[Any] = []
 
     def pending(self) -> List[Pass]:
         """Get the list of passes not yet completed.
@@ -402,11 +449,17 @@ class SurveyRunner:
             return list(self.survey.passes())
         return [p for p in self.survey.passes() if not self.checkpoint.is_complete(p.index)]
 
-    def run(self, dry_run: bool = False) -> List[Pass]:
+    def run(self, dry_run: bool = False, keep_results: bool = False) -> List[Pass]:
         """Execute all pending passes in order.
 
         Args:
             dry_run: If True, log the plan without moving or measuring.
+            keep_results: If True, also collect each pass's acquired
+                SurfaceScan/ProfileResult into ``self.results`` (in the same
+                order as the returned passes — ``self.results[i]`` is what
+                ``done[i]`` measured). Off by default: a long survey holding
+                every scan in memory (a full-resolution Gocator surface is
+                hundreds of MB) is real cost most callers don't want.
 
         Returns:
             The passes that were executed.
@@ -419,7 +472,9 @@ class SurveyRunner:
             if dry_run:
                 done.append(p)
                 continue
-            self._run_pass(p)
+            result = self._run_pass(p)
+            if keep_results:
+                self.results.append(result)
             done.append(p)
             self.completed.append(p.index)
             if self.checkpoint is not None:
@@ -429,7 +484,7 @@ class SurveyRunner:
                 )
         return done
 
-    def _run_pass(self, p: Pass) -> None:
+    def _run_pass(self, p: Pass) -> Any:
         """Position and measure one pass.
 
         Logs success or failure to the event log, then re-raises on error so
@@ -438,13 +493,20 @@ class SurveyRunner:
         Args:
             p: Pass to execute.
 
+        Returns:
+            The acquired SurfaceScan (Gocator) or ProfileResult (rangefinder).
+
         Raises:
             ValueError: If the pass is missing required parameters.
             Any exception from scanner.acquire() or the profiler path.
         """
         # place() puts the INSTRUMENT's measuring point on the target, which
-        # is what makes one plan valid for several instruments.
-        self.lab.place(p.instrument, list(p.start), speed=p.feed_rate_mm_s)
+        # is what makes one plan valid for several instruments. Reposition
+        # at travel_speed if the pass sets one, falling back to scan speed —
+        # repositioning at scan speed is slower than necessary but always
+        # safe.
+        travel_speed = p.travel_speed if p.travel_speed is not None else p.scan_speed
+        self.lab.place(p.instrument, list(p.start), speed=travel_speed)
 
         scanner = getattr(self.lab, p.instrument, None)
         try:
@@ -456,7 +518,7 @@ class SurveyRunner:
                     gantry=gantry,
                     axis=p.axis,
                     end_mm=float(end_gantry[axis_index]),
-                    **({"feed_rate_mm_s": p.feed_rate_mm_s} if p.feed_rate_mm_s else {}),
+                    **({"feed_rate_mm_s": p.scan_speed} if p.scan_speed else {}),
                 )
                 result_note = f"points={scan.valid_count}" if scan is not None else "no data"
             else:
@@ -466,9 +528,9 @@ class SurveyRunner:
                 # survey/pass without one would otherwise fail deep inside
                 # FlumeLab.acquire_scan() with a message that doesn't name
                 # the pass.
-                if p.feed_rate_mm_s is None:
+                if p.scan_speed is None:
                     raise ValueError(
-                        f"pass {p.index} ({p.instrument}) has no feed_rate_mm_s — "
+                        f"pass {p.index} ({p.instrument}) has no scan_speed — "
                         "set it on the Survey or override this Pass; unlike "
                         "GocatorScanner.acquire(), the rangefinder profiler path "
                         "has no configured-spec fallback to fall back to."
@@ -476,8 +538,9 @@ class SurveyRunner:
                 result = self.lab.acquire_scan(
                     p.instrument,
                     start=None,
-                    end=list(self.lab.frames.gantry_target_for(p.instrument, list(p.end))),
-                    feed_rate_mm_s=p.feed_rate_mm_s,
+                    end=self._acquire_scan_end(p),
+                    feed_rate_mm_s=p.scan_speed,
+                    axis=p.axis,
                 )
                 result_note = f"file={result.path}"
         except Exception as exc:
@@ -490,6 +553,26 @@ class SurveyRunner:
             self.lab.clock.elapsed(), p.instrument, "survey_pass",
             result=result_note, notes=p.label or "",
         )
+        return scan if scanner is not None and hasattr(scanner, "acquire") else result
+
+    def _acquire_scan_end(self, p: Pass) -> List[float]:
+        """Build acquire_scan()'s full per-axis `end` from an experiment-frame target.
+
+        gantry_target_for() only returns X/Y/Z — Theta is outside the
+        Cartesian frame model (see FrameRegistry) — but acquire_scan()
+        requires one value per *configured* gantry axis, same as
+        move_to()'s vector form. Any axis outside X/Y/Z (Theta) is
+        backfilled with its live current position, same as move_to()'s
+        keyword form leaves unspecified axes untouched.
+        """
+        xyz = self.lab.frames.gantry_target_for(p.instrument, list(p.end))
+        by_name = {"X": float(xyz[0]), "Y": float(xyz[1]), "Z": float(xyz[2])}
+        gantry = self.lab.gantry
+        return [
+            by_name[axis.name] if axis.name in by_name
+            else gantry.cmd.get_actual_position(axis)
+            for axis in gantry._axes
+        ]
 
 
-__all__ = ["Pass", "Survey", "RasterSurvey", "RepeatTransect", "SurveyRunner"]
+__all__ = ["Pass", "Survey", "Tile", "Traverse", "SurveyRunner"]

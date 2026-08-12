@@ -11,14 +11,36 @@ bolted to:
 
 On this rig the sensor is mounted rotated 90 degrees about Z, so a gantry
 move along **X** produces the sensor's **Y** axis, and the laser fan lies
-along gantry **Y**. Confirmed from two scans on 2026-08-02: commanding
-``axis="X"`` for 200 mm and 300 mm produced sensor-Y spans of 199.8 mm and
-299.9 mm, while sensor X held a constant 2003 mm — the active-area width, not
-anything the gantry did.
+along gantry **Y**. The axis *pairing* was first inferred from data (two
+scans on 2026-08-02: commanding ``axis="X"`` for 200 mm and 300 mm produced
+sensor-Y spans of 199.8 mm and 299.9 mm, while sensor X held a constant
+2003 mm — the active-area width, not anything the gantry did).
+
+The *sign* took three tries to pin down (2026-08-11), and both wrong answers
+looked reasonable at the time: a physical "eyeball" check of the mount got
+it backward first; a follow-up numeric argument ("the oriented X coordinate
+should increase in the same direction the gantry actually travelled")
+sounded rigorous but also pointed the wrong way and produced a mirrored
+scan. What actually settled it: render an oriented real scan with
+:func:`~laguna.frames.orient_scan` / :func:`~laguna.viz.plot_acquisition`
+and look at whether the geometry itself is a mirror image of the real
+object — not a proxy metric, the real check.
 
 That is exactly the trap this module exists to close: without a transform,
 ``move_to(X=...)`` yields a picture whose *Y* axis is the motion, and every
 downstream reader has to remember the swap.
+
+Not the sensor's "Layout" web UI setting
+-----------------------------------------
+The Gocator web UI has a **Manage > Layout** page ("Layout Types", listing a
+main device and any others) — that is *not* this. It configures
+``GoLayout``/``GoOrientation`` (``WIDE``/``OPPOSITE``/``REVERSE``), which
+describes how multiple buddied sensors sit relative to *each other* in a
+multi-camera system. It has no bearing on how one sensor is bolted onto the
+gantry, and the SDK exposes no setting that does — checked the GoSdk C
+headers (``GoLayout.h``, ``GoTransform.h``) directly: nothing maps a single
+sensor's own axes to an external machine's frame. That relationship only
+exists here, in this module's `mounting:` config.
 
 Handedness matters, and is easy to get wrong
 --------------------------------------------
@@ -27,18 +49,22 @@ A bare X<->Y swap is **not** a rotation — its matrix determinant is -1, so it
 which is both wrong and hard to spot. A physically achievable mounting is
 always a proper rotation (determinant +1), so one axis must also flip sign.
 :class:`SensorMounting` rejects mirroring maps outright rather than letting
-a silent reflection through.
+a silent reflection through — which is also why `scan_y`'s sign below isn't
+a free choice: once `scan_x`/`scan_z` are fixed, the determinant check
+forces it.
 
 Config form::
 
     gocator:
       mounting:
-        scan_x: -Y      # sensor X (across the laser) -> gantry -Y
-        scan_y: +X      # sensor Y (travel)           -> gantry +X
-        scan_z: +Z      # sensor Z (range)            -> gantry +Z
+        scan_x: +Y      # sensor X (across the laser) -> gantry +Y
+        scan_y: -X      # sensor Y (travel)           -> gantry -X (forced sign)
+        scan_z: +Z      # sensor Z (range)             -> gantry +Z
 
 The default is the identity map (sensor frame == gantry frame), so behaviour
-is unchanged unless a mounting is configured.
+is unchanged unless a mounting is configured. This mapping is rig-specific —
+a different sensor mount needs its own physical check (or a careful
+empirical derivation like the one above), not a copy of these values.
 """
 
 from __future__ import annotations

@@ -203,6 +203,22 @@ class TestSubsystemInterface:
         assert controller.connect() is True
         assert conn.is_connected is True
 
+    def test_connect_while_already_connected_is_a_no_op(self):
+        """A second connect() call must not re-invoke the underlying
+        transport's connect() — on PiGantryConnection that overwrites the
+        live SSH channel/agent handles with a fresh session before tearing
+        down the old one, leaking the old SSH session, reader thread, and
+        remote gantry_agent.py process (which holds the serial port
+        exclusively), so the *new* agent can't get ready either — both ends
+        up unrecoverable short of killing the whole process."""
+        responses = {"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"}
+        controller, conn = self._make_controller(responses)
+        assert controller.connect() is True
+        sent_after_first_connect = list(conn.sent)
+        assert controller.connect() is True
+        assert conn.sent == sent_after_first_connect  # nothing sent to the wire again
+        assert conn.connect_calls == 1
+
     def test_disconnect_clears_connected_state(self):
         controller, conn = self._make_controller()
         controller.connect()

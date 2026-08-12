@@ -59,6 +59,9 @@ docs = [
 storage = [
     "boto3>=1.20",            # AWS S3 (paramiko for SFTP is now a core dependency)
 ]
+viz = [
+    "matplotlib>=3.7",        # laguna.viz.plot_acquisition() — quick-look scan/profile plots
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

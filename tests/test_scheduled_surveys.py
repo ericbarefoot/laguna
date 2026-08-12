@@ -153,7 +153,24 @@ class TestAcquireIsSchedulable:
                      "formats": ["npz"]},
         })
         scanner.acquire(gantry=FakeGantry())
-        assert scanner.saved == [("npz",)]
+        # acquire() passes formats through as-is now (real save_scan()
+        # normalizes it, including the bare-string case) — no more premature
+        # tuple(formats), which used to split a bare string like "laz" into
+        # its individual characters before save_scan() ever saw it.
+        assert scanner.saved == [["npz"]]
+
+    def test_bare_string_formats_config_is_one_format(self):
+        """A YAML `formats: laz` (no list brackets) parses to a plain str,
+        which used to be split into its characters by acquire()'s
+        tuple(formats) before save_scan() ever got a chance to normalize it —
+        "Unknown scan format: 'l'"."""
+        scanner = StubScanner({
+            "ip": "1.2.3.4",
+            "scan": {"axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0,
+                     "formats": "laz"},
+        })
+        scanner.acquire(gantry=FakeGantry())
+        assert scanner.saved == ["laz"]
 
     def test_no_save_when_no_formats_configured(self):
         scanner = StubScanner({

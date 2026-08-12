@@ -24,8 +24,10 @@ class FakeSnapConnection(SnapConnection):
         self.responses = dict(responses or {})
         self.sent: List[str] = []
         self._connected = False
+        self.connect_calls = 0
 
     def connect(self) -> None:
+        self.connect_calls += 1
         self._connected = True
 
     def disconnect(self) -> None:

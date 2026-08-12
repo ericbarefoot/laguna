@@ -797,6 +797,20 @@ class GocatorScanner(GocatorSettingsMixin):
             "gantry_feed_rate_mm_s": feed_rate_mm_s,
             "trigger_settle_s": settle_s,
         }
+        # Full commanded position, not just the travel axis — orient_scan()
+        # otherwise has no way to know the two static axes' real position
+        # and silently assumes 0, which is essentially never true. Same gap
+        # as FlumeLab.acquire_scan() had on the rangefinder path (now fixed
+        # there); best-effort since a live position read can fail without
+        # invalidating the scan itself.
+        try:
+            axis_names = [a.name for a in gantry._axes]
+            positions = {n: gantry.axis(n).get_position() for n in axis_names}
+            meta["gantry_start"] = [
+                float(positions[n]) for n in ("X", "Y", "Z") if n in axis_names
+            ]
+        except Exception as e:
+            logger.debug("Could not read full gantry position for scan metadata: %s", e)
         if metadata:
             meta.update(metadata)
 
@@ -903,7 +917,7 @@ class GocatorScanner(GocatorSettingsMixin):
                 settle_s=float(spec.get("settle_s", 0.5)),
             )
             if formats:
-                self.save_scan(scan, formats=tuple(formats))
+                self.save_scan(scan, formats=formats)
             if return_to_start:
                 # Repeat scans of the same transect need the axis back where
                 # it began, or each pass starts further along than the last.
@@ -948,6 +962,12 @@ class GocatorScanner(GocatorSettingsMixin):
             ValueError: On an unknown format name.
         """
         import datetime as _dt
+
+        if isinstance(formats, str):
+            # str is itself a Sequence[str] — tuple("laz") would silently
+            # split it into ('l', 'a', 'z') instead of treating it as one
+            # format name.
+            formats = (formats,)
 
         if name is None:
             # Millisecond resolution: two scans in the same second used to

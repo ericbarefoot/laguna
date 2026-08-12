@@ -218,6 +218,48 @@ class TestAcquireScan:
                 "od2000", start=[0, 0, 0, 0], end=[100, 50, 0, 0], feed_rate_mm_s=5.0
             )
 
+    def test_explicit_axis_skips_inference_even_with_noise_on_other_axes(self, lab, monkeypatch, tmp_path):
+        """A nominally-unmoved axis can read back a hair off its prior
+        target (coarse mm_per_acp_unit quantization, in particular) —
+        inference sees that as "differs" and raises even though the
+        caller (e.g. SurveyRunner, from Pass.axis) already knows exactly
+        which axis is being scanned."""
+        gantry = FakeGantry()
+        lab.add(gantry)
+
+        scan_calls = []
+
+        class FakeProfiler:
+            def __init__(self, **kwargs):
+                pass
+
+            def scan(self, axis, end_mm, feed_rate_mm_s):
+                scan_calls.append((axis, end_mm, feed_rate_mm_s))
+                from laguna.robot.macron.profiler import ProfileResult
+
+                csv_path = tmp_path / "profile_20260101_000000.csv"
+                csv_path.write_text("wall_time_unix,pos_mm\n")
+                return ProfileResult(path=csv_path, metadata={"samples": 0}, df=None)
+
+        monkeypatch.setattr("laguna.robot.macron.profiler.TopographicProfiler", FakeProfiler)
+
+        result = lab.acquire_scan(
+            "od2000",
+            start=[0, 0, 2, 0],
+            end=[100, 0.02, 2, 0],  # Y off by noise, not a real move
+            feed_rate_mm_s=5.0,
+            axis="X",
+        )
+        assert scan_calls == [("A1", 100, 5.0)]
+        assert result.metadata["samples"] == 0
+
+    def test_unconfigured_explicit_axis_raises(self, lab):
+        lab.add(FakeGantry())
+        with pytest.raises(ValueError, match="not configured"):
+            lab.acquire_scan(
+                "od2000", start=[0, 0, 0, 0], end=[100, 0, 0, 0], feed_rate_mm_s=5.0, axis="W"
+            )
+
     def test_infers_scan_axis_and_moves_to_start_first(self, lab, monkeypatch, tmp_path):
         gantry = FakeGantry()
         lab.add(gantry)
@@ -244,7 +286,95 @@ class TestAcquireScan:
 
         assert gantry.move_to_calls == [([0, 0, 2, 0], {})]
         assert scan_calls == [("A1", 100, 5.0)]  # X axis inferred, token A1
-        assert result.metadata == {"samples": 0}
+        assert result.metadata["samples"] == 0
+
+    def test_metadata_carries_full_gantry_position_for_orient_scan(self, lab, monkeypatch, tmp_path):
+        """orient_scan() needs the two static axes (not just the travel
+        axis) to place samples in 3D — gantry_axis/gantry_start must be the
+        axis *name* (not the BLC token acquire_scan() sends downstream) and
+        the full commanded position this call positioned to."""
+        gantry = FakeGantry()
+        lab.add(gantry)
+
+        class FakeProfiler:
+            def __init__(self, **kwargs):
+                pass
+
+            def scan(self, axis, end_mm, feed_rate_mm_s):
+                from laguna.robot.macron.profiler import ProfileResult
+
+                csv_path = tmp_path / "profile_20260101_000000.csv"
+                csv_path.write_text("wall_time_unix,pos_mm\n")
+                return ProfileResult(path=csv_path, metadata={}, df=None)
+
+        monkeypatch.setattr("laguna.robot.macron.profiler.TopographicProfiler", FakeProfiler)
+
+        result = lab.acquire_scan(
+            "od2000", start=[0, 10, 20, 30], end=[100, 10, 20, 30], feed_rate_mm_s=5.0
+        )
+        assert result.metadata["gantry_axis"] == "X"
+        assert result.metadata["gantry_start"] == [0.0, 10.0, 20.0]
+
+    def test_gantry_axis_and_start_are_persisted_to_the_meta_sidecar(self, lab, monkeypatch, tmp_path):
+        """gantry_axis/gantry_start only ever lived on the in-memory
+        ProfileResult — a scan reloaded from disk in a later session (a new
+        ProfileResult built from the retrieved _meta.json) had no way to
+        recover them, since the remote agent's own sidecar has no notion of
+        the two static axes at all."""
+        import json
+
+        gantry = FakeGantry()
+        lab.add(gantry)
+
+        class FakeProfiler:
+            def __init__(self, **kwargs):
+                pass
+
+            def scan(self, axis, end_mm, feed_rate_mm_s):
+                from laguna.robot.macron.profiler import ProfileResult
+
+                csv_path = tmp_path / "profile_20260101_000000.csv"
+                csv_path.write_text("wall_time_unix,pos_mm\n")
+                meta_path = tmp_path / "profile_20260101_000000_meta.json"
+                meta_path.write_text(json.dumps({"axis": "A1", "samples": 0}))
+                return ProfileResult(path=csv_path, metadata={"samples": 0}, df=None)
+
+        monkeypatch.setattr("laguna.robot.macron.profiler.TopographicProfiler", FakeProfiler)
+
+        lab.acquire_scan("od2000", start=[0, 10, 20, 30], end=[100, 10, 20, 30], feed_rate_mm_s=5.0)
+
+        on_disk = json.loads((tmp_path / "profile_20260101_000000_meta.json").read_text())
+        assert on_disk["gantry_axis"] == "X"
+        assert on_disk["gantry_start"] == [0.0, 10.0, 20.0]
+        assert on_disk["samples"] == 0  # existing sidecar content preserved, not overwritten
+
+    def test_uses_instrument_config_output_dir_when_no_output_given(self, lab, monkeypatch, tmp_path):
+        """output_dir was hardcoded to "/tmp" whenever the caller didn't pass
+        output= explicitly — which SurveyRunner never does — so the
+        instrument's configured output_dir was silently ignored on every
+        survey-driven scan."""
+        gantry = FakeGantry()
+        lab.add(gantry)
+        configured_dir = str(tmp_path / "scans")
+        lab.config.config_dict["od2000"]["output_dir"] = configured_dir
+
+        seen = {}
+
+        class FakeProfiler:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+            def scan(self, axis, end_mm, feed_rate_mm_s):
+                from laguna.robot.macron.profiler import ProfileResult
+
+                csv_path = tmp_path / "profile_20260101_000000.csv"
+                csv_path.write_text("wall_time_unix,pos_mm\n")
+                return ProfileResult(path=csv_path, metadata={}, df=None)
+
+        monkeypatch.setattr("laguna.robot.macron.profiler.TopographicProfiler", FakeProfiler)
+
+        lab.acquire_scan("od2000", end=[100, 0, 0, 0], feed_rate_mm_s=5.0)
+        assert seen["output_dir"] == configured_dir
 
     def test_output_path_renames_result_csv(self, lab, monkeypatch, tmp_path):
         gantry = FakeGantry()

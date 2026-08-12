@@ -8,7 +8,7 @@ gantry commands that land their measurement points on the same physical spot.
 import numpy as np
 import pytest
 
-from laguna.frames import AffineTransform, FrameRegistry, InstrumentFrame
+from laguna.frames import AffineTransform, FrameRegistry, InstrumentFrame, orient_scan
 from laguna.scanner.mounting import SensorMounting
 from laguna.scanner.pointcloud import SurfaceScan
 
@@ -137,6 +137,25 @@ class TestFrameRegistry:
             landed = registry.to_experiment(name, [0.0, 0.0, 0.0], gantry)
             np.testing.assert_allclose(landed, target, atol=1e-9)
 
+    def test_experiment_point_for_inverts_gantry_target_for(self, registry):
+        """The natural counterpart to gantry_target_for(): given wherever
+        the gantry actually is, what experiment point is this instrument
+        measuring right now."""
+        target = [100.0, 200.0, 0.0]
+        for name in ("od2000", "wtt12l", "gocator", "unconfigured"):
+            gantry = registry.gantry_target_for(name, target)
+            back = registry.experiment_point_for(name, gantry)
+            np.testing.assert_allclose(back, target, atol=1e-9)
+
+    def test_experiment_point_for_differs_per_instrument_at_the_same_gantry_position(self, registry):
+        """Two instruments commanded to the same gantry position are NOT
+        measuring the same experiment point — same asymmetry as
+        gantry_target_for(), just read the other direction."""
+        gantry = [500.0, 300.0, 0.0]
+        a = registry.experiment_point_for("od2000", gantry)
+        b = registry.experiment_point_for("wtt12l", gantry)
+        assert not np.allclose(a, b)
+
     def test_different_instruments_need_different_gantry_commands(self, registry):
         target = [100.0, 200.0, 0.0]
         a = registry.gantry_target_for("od2000", target)
@@ -221,29 +240,45 @@ def make_scan(mounting=None, y_mm=None, x_mm=None, **meta):
     )
 
 
-class TestPlaceScan:
+class TestOrientScan:
     def test_places_a_scan_using_metadata_start(self):
         registry = FrameRegistry.from_config(RIG)
         scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
-        pts = registry.place_scan(scan)
+        pts = orient_scan(scan, frames=registry).to_points()
         # travel (sensor Y, 0..20) sits on gantry X from 700, then +500 origin
         assert pts[:, 0].min() == pytest.approx(1200.0)
         assert pts[:, 2].min() == pytest.approx(1.0 - 325.0)
 
+    def test_full_gantry_start_metadata_gives_the_real_static_axis_position(self):
+        """gantry_start_mm alone only records the travel axis — the other
+        two axes used to be silently assumed to be at 0, which is almost
+        never true. scan_with_gantry() now also records the full commanded
+        position as metadata['gantry_start']; when present, use it instead
+        of guessing 0 for Y/Z."""
+        registry = FrameRegistry.from_config(RIG)
+        scan = make_scan(
+            gantry_axis="X", gantry_start_mm=700.0,
+            gantry_start=[700.0, 450.0, 20.0],  # real static Y/Z, not 0
+        )
+        pts = orient_scan(scan, frames=registry).to_points()
+        # Y: real static 450 + 300 (RIG's experiment translation) = 750,
+        # not 300 (which is what a wrongly-assumed-0 Y would have given).
+        assert pts[:, 1].min() == pytest.approx(750.0)
+
     def test_explicit_gantry_start_overrides_metadata(self):
         registry = FrameRegistry.from_config(RIG)
         scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
-        pts = registry.place_scan(scan, gantry_start=[0.0, 0.0, 0.0])
+        pts = orient_scan(scan, frames=registry, gantry_start=[0.0, 0.0, 0.0]).to_points()
         assert pts[:, 0].min() == pytest.approx(500.0)
 
     def test_missing_start_position_raises(self):
         with pytest.raises(ValueError, match="needs the gantry position"):
-            FrameRegistry.from_config(RIG).place_scan(make_scan())
+            orient_scan(make_scan(), frames=FrameRegistry.from_config(RIG))
 
     def test_unknown_axis_in_metadata_raises(self):
         scan = make_scan(gantry_axis="Theta", gantry_start_mm=1.0)
         with pytest.raises(ValueError, match="X/Y/Z"):
-            FrameRegistry.from_config(RIG).place_scan(scan)
+            orient_scan(scan, frames=FrameRegistry.from_config(RIG))
 
     def test_double_rotation_is_refused(self):
         """The scan already rotates itself into gantry orientation; a
@@ -257,7 +292,7 @@ class TestPlaceScan:
             gantry_start_mm=0.0,
         )
         with pytest.raises(ValueError, match="would turn the data twice"):
-            registry.place_scan(scan)
+            orient_scan(scan, frames=registry)
 
     def test_translation_only_frame_is_fine_with_a_rotated_scan(self):
         registry = FrameRegistry.from_config(RIG)
@@ -266,7 +301,7 @@ class TestPlaceScan:
             gantry_axis="X",
             gantry_start_mm=0.0,
         )
-        assert registry.place_scan(scan).shape == (4, 3)
+        assert orient_scan(scan, frames=registry).to_points().shape == (4, 3)
 
     def test_negative_direction_pass_is_not_mirrored(self):
         """The sensor is encoderless: its own Y is just acquisition order,
@@ -287,7 +322,7 @@ class TestPlaceScan:
         )
         # 5 rows x 2 cols (x_mm has 2 entries) -> each row appears twice;
         # take one column's worth to check the per-row progression.
-        pts = registry.place_scan(scan)
+        pts = orient_scan(scan, frames=registry).to_points()
         row_values = pts[::2, 0]
         expected = [1449.99, 1362.49, 1274.99, 1187.49, 1099.99]
         np.testing.assert_allclose(row_values, expected, atol=1e-2)  # float32 (default dtype)
@@ -310,7 +345,7 @@ class TestPlaceScan:
             gantry_start_mm=1100.0,
             gantry_end_mm=1449.99,
         )
-        pts = registry.place_scan(scan)
+        pts = orient_scan(scan, frames=registry).to_points()
         row_values = pts[::2, 0]
         expected = [1100.0, 1187.5, 1275.0, 1362.5, 1449.99]
         np.testing.assert_allclose(row_values, expected, atol=1e-2)  # float32 (default dtype)
@@ -324,6 +359,59 @@ class TestPlaceScan:
         registry = FrameRegistry.from_config({"instruments": {"gocator": {"translation": [0.0, 0.0, 0.0]}}})
         scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)  # no gantry_end_mm
         with caplog.at_level("WARNING"):
-            pts = registry.place_scan(scan)
+            pts = orient_scan(scan, frames=registry).to_points()
         assert pts[:, 0].min() == pytest.approx(700.0)
         assert any("can't be determined" in r.message for r in caplog.records)
+
+    def test_returns_a_surface_scan_not_a_raw_array(self):
+        registry = FrameRegistry.from_config(RIG)
+        scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
+        oriented = orient_scan(scan, frames=registry)
+        assert isinstance(oriented, SurfaceScan)
+        assert oriented is not scan  # original left untouched
+
+    def test_original_scan_is_not_mutated(self):
+        registry = FrameRegistry.from_config(RIG)
+        scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
+        original_x = scan.x_mm.copy()
+        orient_scan(scan, frames=registry)
+        np.testing.assert_array_equal(scan.x_mm, original_x)
+
+    def test_result_is_per_cell_with_identity_mounting(self):
+        """The transform can rotate, which a uniform grid's compact 1D
+        x_mm/y_mm can't represent in general — the result is always
+        downgraded to per-cell storage with mounting reset to identity, so
+        a second orient_scan() call (or to_points()) on it is a no-op
+        transform."""
+        registry = FrameRegistry.from_config(RIG)
+        scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
+        oriented = orient_scan(scan, frames=registry)
+        assert oriented.is_uniform is False
+        assert oriented.mounting.is_identity
+        assert oriented.z_mm.shape == scan.z_mm.shape
+
+    def test_invalid_cells_are_preserved_as_nan(self):
+        """save_npz() on the result should still reflect the original grid
+        — invalid cells must survive orientation as NaN, not get silently
+        dropped the way the old flatten-and-drop return value did."""
+        registry = FrameRegistry.from_config(RIG)
+        scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
+        scan.z_mm[0, 0] = np.nan
+        oriented = orient_scan(scan, frames=registry)
+        assert oriented.z_mm.shape == scan.z_mm.shape
+        assert np.isnan(oriented.z_mm[0, 0])
+        assert oriented.valid_count == scan.valid_count
+
+    def test_output_writes_a_file_inferred_from_suffix(self, tmp_path):
+        registry = FrameRegistry.from_config(RIG)
+        scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
+        out = tmp_path / "oriented.csv"
+        orient_scan(scan, frames=registry, output=out)
+        assert out.exists()
+        assert "x_mm,y_mm,z_mm" in out.read_text()
+
+    def test_output_unknown_suffix_raises(self, tmp_path):
+        registry = FrameRegistry.from_config(RIG)
+        scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
+        with pytest.raises(ValueError, match="unknown output format"):
+            orient_scan(scan, frames=registry, output=tmp_path / "oriented.txt")

@@ -7,26 +7,27 @@ the data is being stitched.
 
 import pytest
 
-from laguna.survey import Pass, RasterSurvey, RepeatTransect, SurveyRunner
+from laguna.robot.macron.commands import Axis
+from laguna.survey import Pass, Tile, Traverse, SurveyRunner
 
 
-class TestRasterGeometry:
-    def _raster(self, **kw):
+class TestTileGeometry:
+    def _tile(self, **kw):
         base = dict(origin=(0.0, 0.0, 0.0), length_mm=1000.0, width_mm=2000.0,
                     swath_mm=1000.0, overlap=0.0)
         base.update(kw)
-        return RasterSurvey(**base)
+        return Tile(**base)
 
     def test_exact_fit_needs_no_extra_pass(self):
-        assert len(self._raster(width_mm=2000.0, swath_mm=1000.0)) == 2
+        assert len(self._tile(width_mm=2000.0, swath_mm=1000.0)) == 2
 
     def test_a_partial_swath_still_gets_a_pass(self):
         """A region 2.5 swaths wide needs 3 passes. Rounding down would leave
         an unimaged strip, which is far worse than an extra pass."""
-        assert len(self._raster(width_mm=2500.0, swath_mm=1000.0)) == 3
+        assert len(self._tile(width_mm=2500.0, swath_mm=1000.0)) == 3
 
     def test_narrower_than_one_swath_is_a_single_pass(self):
-        assert len(self._raster(width_mm=200.0, swath_mm=1000.0)) == 1
+        assert len(self._tile(width_mm=200.0, swath_mm=1000.0)) == 1
 
     def test_width_exactly_one_swath_with_overlap_is_not_duplicated(self):
         """The overcounting bug: ceil(width / pitch) with overlap > 0 and
@@ -36,7 +37,7 @@ class TestRasterGeometry:
         (coverage_mm() >= width) can't catch this — a duplicate pass still
         "covers" the region, it just wastes a whole redundant traverse.
         """
-        survey = self._raster(width_mm=1000.0, swath_mm=1000.0, overlap=0.1)
+        survey = self._tile(width_mm=1000.0, swath_mm=1000.0, overlap=0.1)
         passes = survey.passes()
         assert len(passes) == 1
         offsets = {p.start[1] for p in passes}  # step axis defaults to Y
@@ -50,7 +51,7 @@ class TestRasterGeometry:
             (1000.0, 1000.0, 0.1), (900.0, 1000.0, 0.3), (1000.0, 1000.0, 0.0),
             (1500.0, 1000.0, 0.4), (2000.0, 1000.0, 0.1),
         ]:
-            survey = self._raster(width_mm=width, swath_mm=swath, overlap=overlap)
+            survey = self._tile(width_mm=width, swath_mm=swath, overlap=overlap)
             passes = survey.passes()
             offsets = [p.start[1] for p in passes]
             assert len(set(offsets)) == len(offsets), (
@@ -59,12 +60,12 @@ class TestRasterGeometry:
             )
 
     def test_overlap_increases_the_pass_count(self):
-        wide = self._raster(width_mm=2000.0, swath_mm=1000.0, overlap=0.0)
-        lapped = self._raster(width_mm=2000.0, swath_mm=1000.0, overlap=0.5)
+        wide = self._tile(width_mm=2000.0, swath_mm=1000.0, overlap=0.0)
+        lapped = self._tile(width_mm=2000.0, swath_mm=1000.0, overlap=0.5)
         assert len(lapped) > len(wide)
 
     def test_pitch_accounts_for_overlap(self):
-        assert self._raster(swath_mm=1000.0, overlap=0.2).pitch_mm == pytest.approx(800.0)
+        assert self._tile(swath_mm=1000.0, overlap=0.2).pitch_mm == pytest.approx(800.0)
 
     def test_coverage_is_never_less_than_the_region(self):
         """The property that actually matters: no gaps."""
@@ -72,36 +73,36 @@ class TestRasterGeometry:
             (2000.0, 1000.0, 0.0), (2500.0, 1000.0, 0.1),
             (1234.0, 500.0, 0.25), (100.0, 900.0, 0.1),
         ]:
-            survey = self._raster(width_mm=width, swath_mm=swath, overlap=overlap)
+            survey = self._tile(width_mm=width, swath_mm=swath, overlap=overlap)
             assert survey.coverage_mm() >= width - 1e-9, (
                 f"gap left with width={width} swath={swath} overlap={overlap}"
             )
 
     def test_passes_step_along_the_step_axis(self):
-        survey = self._raster(axis="X", width_mm=2000.0, swath_mm=1000.0)
+        survey = self._tile(axis="X", width_mm=2000.0, swath_mm=1000.0)
         offsets = [p.start[1] for p in survey]     # Y is the step axis
         assert offsets == sorted(offsets)
         assert offsets[0] == 0.0
 
     def test_traverse_runs_along_the_travel_axis(self):
-        p = self._raster(axis="X", length_mm=750.0).passes()[0]
+        p = self._tile(axis="X", length_mm=750.0).passes()[0]
         assert p.end[0] - p.start[0] == pytest.approx(750.0)
         assert p.end[1] == p.start[1]
 
     def test_serpentine_alternates_direction(self):
         """Halves repositioning travel — the gantry doesn't drive back to the
         same side after every pass."""
-        passes = self._raster(serpentine=True, width_mm=3000.0, swath_mm=1000.0).passes()
+        passes = self._tile(serpentine=True, width_mm=3000.0, swath_mm=1000.0).passes()
         assert passes[0].end[0] > passes[0].start[0]
         assert passes[1].end[0] < passes[1].start[0]
         assert passes[2].end[0] > passes[2].start[0]
 
     def test_serpentine_can_be_disabled(self):
-        passes = self._raster(serpentine=False, width_mm=3000.0, swath_mm=1000.0).passes()
+        passes = self._tile(serpentine=False, width_mm=3000.0, swath_mm=1000.0).passes()
         assert all(p.end[0] > p.start[0] for p in passes)
 
     def test_indices_are_sequential_from_zero(self):
-        assert [p.index for p in self._raster(width_mm=3000.0, swath_mm=1000.0)] == [0, 1, 2]
+        assert [p.index for p in self._tile(width_mm=3000.0, swath_mm=1000.0)] == [0, 1, 2]
 
     @pytest.mark.parametrize("kw,match", [
         ({"swath_mm": 0.0}, "swath_mm must be positive"),
@@ -112,27 +113,37 @@ class TestRasterGeometry:
     ])
     def test_impossible_geometry_is_rejected(self, kw, match):
         with pytest.raises(ValueError, match=match):
-            self._raster(**kw)
+            self._tile(**kw)
 
     def test_step_axis_must_differ_from_travel_axis(self):
         with pytest.raises(ValueError, match="must differ"):
-            self._raster(axis="X", step_axis="X")
+            self._tile(axis="X", step_axis="X")
 
     def test_origin_must_have_three_components(self):
         with pytest.raises(ValueError, match="3 components"):
-            self._raster(origin=(0.0, 0.0))
+            self._tile(origin=(0.0, 0.0))
+
+    def test_speed_sets_both_scan_and_travel_speed(self):
+        p = self._tile(speed=50.0).passes()[0]
+        assert p.scan_speed == 50.0
+        assert p.travel_speed == 50.0
+
+    def test_speed_does_not_override_an_explicit_travel_speed(self):
+        p = self._tile(speed=50.0, travel_speed=90.0).passes()[0]
+        assert p.scan_speed == 50.0
+        assert p.travel_speed == 90.0
 
 
-class TestRepeatTransect:
+class TestTraverse:
     def test_one_pass_per_instrument_per_repeat(self):
-        survey = RepeatTransect(
+        survey = Traverse(
             start=(0, 0, 0), end=(100, 0, 0),
             instruments=("od2000", "wtt12l"), repeats=3,
         )
         assert len(survey) == 6
 
     def test_instrument_order_is_preserved(self):
-        survey = RepeatTransect(
+        survey = Traverse(
             start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000", "wtt12l"),
         )
         assert [p.instrument for p in survey] == ["od2000", "wtt12l"]
@@ -141,49 +152,83 @@ class TestRepeatTransect:
         """The point of a multi-instrument transect — the frames layer makes
         the same experiment coordinates valid for differently-mounted
         instruments."""
-        survey = RepeatTransect(
+        survey = Traverse(
             start=(10, 20, 0), end=(110, 20, 0),
             instruments=("od2000", "wtt12l"), repeats=2,
         )
         assert len({(p.start, p.end) for p in survey}) == 1
 
+    def test_travel_speed_is_independent_of_scan_speed(self):
+        survey = Traverse(
+            start=(0, 0, 0), end=(100, 0, 0),
+            scan_speed=20.0, travel_speed=80.0,
+        )
+        assert survey.passes()[0].scan_speed == 20.0
+        assert survey.passes()[0].travel_speed == 80.0
+
+    def test_speed_sets_both_scan_and_travel_speed(self):
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0), speed=50.0)
+        assert survey.passes()[0].scan_speed == 50.0
+        assert survey.passes()[0].travel_speed == 50.0
+
+    def test_speed_does_not_override_an_explicit_scan_or_travel_speed(self):
+        survey = Traverse(
+            start=(0, 0, 0), end=(100, 0, 0),
+            speed=50.0, scan_speed=20.0,
+        )
+        assert survey.passes()[0].scan_speed == 20.0
+        assert survey.passes()[0].travel_speed == 50.0
+
     def test_repeats_must_be_positive(self):
         with pytest.raises(ValueError, match="repeats must be"):
-            RepeatTransect(start=(0, 0, 0), end=(1, 0, 0), repeats=0)
+            Traverse(start=(0, 0, 0), end=(1, 0, 0), repeats=0)
 
     def test_at_least_one_instrument_required(self):
         with pytest.raises(ValueError, match="at least one instrument"):
-            RepeatTransect(start=(0, 0, 0), end=(1, 0, 0), instruments=())
+            Traverse(start=(0, 0, 0), end=(1, 0, 0), instruments=())
+
+    def test_bare_string_instrument_is_one_instrument_not_six_characters(self):
+        """A bare instrument key ("wtt12l") is a str, which is itself a
+        Sequence[str] — without normalizing it, one instrument produced one
+        pass per character instead of a single pass."""
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0), instruments="wtt12l")
+        assert [p.instrument for p in survey] == ["wtt12l"]
 
     def test_start_must_have_three_components(self):
         with pytest.raises(ValueError, match="3 components"):
-            RepeatTransect(start=(0, 0), end=(1, 0, 0))
+            Traverse(start=(0, 0), end=(1, 0, 0))
 
     def test_end_must_have_three_components(self):
         with pytest.raises(ValueError, match="3 components"):
-            RepeatTransect(start=(0, 0, 0), end=(1, 0))
+            Traverse(start=(0, 0, 0), end=(1, 0))
 
 
 class TestCosting:
-    def test_duration_from_length_and_feed_rate(self):
-        survey = RasterSurvey(
+    def test_duration_from_length_and_scan_speed(self):
+        survey = Tile(
             origin=(0, 0, 0), length_mm=1000.0, width_mm=2000.0,
-            swath_mm=1000.0, overlap=0.0, feed_rate_mm_s=20.0,
+            swath_mm=1000.0, overlap=0.0, scan_speed=20.0,
         )
         # two passes, 1000mm each, at 20mm/s
         assert survey.duration_s() == pytest.approx(100.0)
 
-    def test_duration_is_none_without_a_feed_rate(self):
-        survey = RasterSurvey(origin=(0, 0, 0), length_mm=1000.0, width_mm=1000.0,
+    def test_duration_is_none_without_a_scan_speed(self):
+        survey = Tile(origin=(0, 0, 0), length_mm=1000.0, width_mm=1000.0,
                               swath_mm=1000.0)
         assert survey.duration_s() is None
 
     def test_describe_lists_every_pass(self):
-        survey = RasterSurvey(origin=(0, 0, 0), length_mm=100.0, width_mm=2000.0,
+        survey = Tile(origin=(0, 0, 0), length_mm=100.0, width_mm=2000.0,
                               swath_mm=1000.0, overlap=0.0)
         text = survey.describe()
         assert "2 passes" in text
-        assert text.count("raster") == 2
+        assert text.count("tile") == 2
+
+
+class FakeScan:
+    """Stand-in for a SurfaceScan — just enough for _run_pass's result_note."""
+
+    valid_count = 42
 
 
 class FakeScanner:
@@ -192,6 +237,7 @@ class FakeScanner:
 
     def acquire(self, gantry=None, **kw):
         self.acquired.append(kw)
+        return FakeScan()
 
 
 class FakeLab:
@@ -224,15 +270,15 @@ class FakeLab:
         self.event_log = _EventLog()
 
     def place(self, instrument, point, speed=None):
-        self.placed.append((instrument, tuple(point)))
+        self.placed.append((instrument, tuple(point), speed))
         return True
 
 
 class TestSurveyRunner:
     def _survey(self):
-        return RasterSurvey(
+        return Tile(
             origin=(0.0, 0.0, 0.0), length_mm=100.0, width_mm=2000.0,
-            swath_mm=1000.0, overlap=0.0, feed_rate_mm_s=20.0,
+            swath_mm=1000.0, overlap=0.0, scan_speed=20.0,
         )
 
     def test_dry_run_moves_nothing(self):
@@ -251,8 +297,48 @@ class TestSurveyRunner:
         # commanded point — that is what makes one plan valid for several.
         assert lab.placed[0][0] == "gocator"
 
+    def test_results_empty_by_default(self):
+        """Holding every scan in memory is real cost for a long survey — off
+        unless the caller explicitly opts in."""
+        lab = FakeLab()
+        SurveyRunner(lab, self._survey()).run()
+        runner = SurveyRunner(lab, self._survey())
+        runner.run()
+        assert runner.results == []
+
+    def test_keep_results_collects_one_per_pass_in_order(self):
+        lab = FakeLab()
+        runner = SurveyRunner(lab, self._survey())
+        done = runner.run(keep_results=True)
+        assert len(runner.results) == len(done) == 2
+        assert all(isinstance(r, FakeScan) for r in runner.results)
+
+    def test_keep_results_ignored_during_dry_run(self):
+        lab = FakeLab()
+        runner = SurveyRunner(lab, self._survey())
+        runner.run(dry_run=True, keep_results=True)
+        assert runner.results == []
+
+    def test_place_uses_scan_speed_when_no_travel_speed_set(self):
+        lab = FakeLab()
+        SurveyRunner(lab, self._survey()).run()
+        assert lab.placed[0][2] == 20.0  # the survey's scan_speed
+
+    def test_place_uses_travel_speed_when_set(self):
+        survey = Tile(
+            origin=(0.0, 0.0, 0.0), length_mm=100.0, width_mm=2000.0,
+            swath_mm=1000.0, overlap=0.0, scan_speed=20.0, travel_speed=80.0,
+        )
+        lab = FakeLab()
+        SurveyRunner(lab, survey).run()
+        assert lab.placed[0][2] == 80.0
+        # the scan itself still runs at scan_speed — travel_speed only
+        # affects the pre-scan repositioning move. scanner.acquire()'s own
+        # kwarg name (feed_rate_mm_s) is a separate, unrenamed API.
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 20.0
+
     def test_checkpoint_skips_completed_passes(self):
-        """A raster of a wide bed can be the longest thing an experiment
+        """A tile of a wide bed can be the longest thing an experiment
         does; an interruption must not restart it."""
 
         class Store:
@@ -289,9 +375,9 @@ class TestSurveyRunner:
         assert len(SurveyRunner(FakeLab(), self._survey()).pending()) == 2
 
     def test_each_pass_writes_an_event_log_row(self):
-        """A raster ran with no trace in the event log — the one
+        """A tile ran with no trace in the event log — the one
         cross-subsystem index other tooling reads — was indistinguishable
-        from a raster that never ran at all."""
+        from a tile that never ran at all."""
         lab = FakeLab()
         SurveyRunner(lab, self._survey()).run()
         assert len(lab.event_log.rows) == 2
@@ -318,12 +404,12 @@ class TestSurveyRunner:
         (args, kwargs) = lab.event_log.rows[0]
         assert "error" in kwargs.get("result", args[3] if len(args) > 3 else "")
 
-    def test_rangefinder_pass_without_a_feed_rate_raises_clearly(self):
+    def test_rangefinder_pass_without_a_scan_speed_raises_clearly(self):
         """acquire_scan() (the rangefinder path) has no configured-spec
         fallback the way GocatorScanner.acquire() does — a Pass reaching it
-        with feed_rate_mm_s=None used to fail deep inside FlumeLab with a
+        with scan_speed=None used to fail deep inside FlumeLab with a
         message that didn't name which pass or survey was responsible."""
-        survey = RepeatTransect(
+        survey = Traverse(
             start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000",),
         )
         lab = FakeLab()
@@ -333,5 +419,45 @@ class TestSurveyRunner:
             raise AssertionError("acquire_scan() should not be reached")
 
         lab.acquire_scan = _boom
-        with pytest.raises(ValueError, match="feed_rate_mm_s"):
+        with pytest.raises(ValueError, match="scan_speed"):
             SurveyRunner(lab, survey).run()
+
+    def test_rangefinder_pass_end_covers_every_configured_axis(self):
+        """gantry_target_for() only returns X/Y/Z — Theta is outside the
+        Cartesian frame model — but acquire_scan() requires one value per
+        *configured* gantry axis. A pass on a gantry with a Theta axis used
+        to build a 3-long end vector and fail deep inside acquire_scan()
+        with a length-mismatch ValueError."""
+        survey = Traverse(
+            start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000",), scan_speed=20.0,
+        )
+        lab = FakeLab()
+        lab.od2000 = object()  # no acquire() -> goes through acquire_scan()
+
+        class FakeGantry:
+            _axes = [Axis("X", 1), Axis("Y", 2), Axis("Z", 5), Axis("Theta", 6)]
+
+            class cmd:
+                @staticmethod
+                def get_actual_position(axis):
+                    return 42.0  # Theta's live position — not part of the frame model
+
+        lab.gantry = FakeGantry()
+
+        seen = {}
+
+        def _acquire_scan(instrument, start=None, end=None, feed_rate_mm_s=None, output=None, axis=None):
+            seen["end"] = end
+            seen["axis"] = axis
+
+            class _Result:
+                path = "fake.csv"
+
+            return _Result()
+
+        lab.acquire_scan = _acquire_scan
+        runner = SurveyRunner(lab, survey)
+        runner.run(keep_results=True)
+        assert seen["end"] == [100.0, 0.0, 0.0, 42.0]  # X, Y, Z, then Theta backfilled
+        assert seen["axis"] == "X"
+        assert runner.results[0].path == "fake.csv"  # ProfileResult, not the Gocator SurfaceScan branch

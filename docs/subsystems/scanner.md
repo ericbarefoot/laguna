@@ -203,16 +203,16 @@ of `gantry_end_mm - gantry_start_mm` for that specific pass (both recorded by
 `scan_with_gantry()`), independently of the mounting rotation. Confirmed on
 hardware 2026-08-11: scanning in the negative direction along the travel axis
 produced a mirror image relative to a positive-direction pass of the same
-object — `laguna.frames.FrameRegistry.place_scan()` was applying the fixed
-mounting rotation but never checking which direction *this* pass actually
-went, so it silently assumed positive every time. Fixed in `place_scan()`,
-which now anchors the first-acquired point to the pass's real starting
-position and orients the rest by the recorded start→end direction — see its
-docstring. `SurfaceScan.to_points()`/`gantry_travel_mm` are unaffected: they
-only apply the fixed mounting rotation, by design (the per-pass travel
-direction isn't knowable from the scan grid alone, only from the
-gantry-side metadata `place_scan()` also has). If you place scans some other
-way (bypassing `place_scan()`), you need this same correction yourself.
+object — `laguna.frames.orient_scan()` was applying the fixed mounting
+rotation but never checking which direction *this* pass actually went, so it
+silently assumed positive every time. Fixed in `orient_scan()`, which now
+anchors the first-acquired point to the pass's real starting position and
+orients the rest by the recorded start→end direction — see its docstring.
+`SurfaceScan.to_points()`/`gantry_travel_mm` are unaffected: they only apply
+the fixed mounting rotation, by design (the per-pass travel direction isn't
+knowable from the scan grid alone, only from the gantry-side metadata
+`orient_scan()` also has). If you place scans some other way (bypassing
+`orient_scan()`), you need this same correction yourself.
 
 ## Matching feed rate to frame rate
 
