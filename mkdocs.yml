@@ -74,6 +74,7 @@ nav:
       - Rehearsing with simulate=True: guides/simulate.md
       - Scheduling a multi-subsystem experiment: guides/scheduled-experiment.md
       - Driving the gantry safely: guides/gantry-motion.md
+      - Plotting saved scans and profiles: guides/plot-saved-acquisitions.md
       - "Plan: gantry geometry visualization": guides/gantry-geometry-visualization-plan.md
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md

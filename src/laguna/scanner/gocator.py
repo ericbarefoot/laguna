@@ -173,6 +173,19 @@ class GocatorScanner(GocatorSettingsMixin):
         #: back to the experiment that produced them — see laguna.run_context.
         self._run_stamp: Dict[str, Any] = {}
 
+    @property
+    def mounting(self) -> SensorMounting:
+        """How this sensor sits on the gantry (from ``gocator.mounting`` config).
+
+        The single authoritative rotation between sensor and gantry axes —
+        see :mod:`laguna.scanner.mounting`. Callers that need to convert a
+        sensor-frame delta into gantry directions themselves (e.g.
+        ``SurveyRunner``'s edge-align path) should use this rather than
+        ``frames.instruments.gocator``'s mount, which is deliberately kept
+        translation-only (see ``orient_scan()``'s double-rotation guard).
+        """
+        return self._mounting
+
     # ------------------------------------------------------------------
     # Subsystem lifecycle
     # ------------------------------------------------------------------

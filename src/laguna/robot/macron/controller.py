@@ -482,6 +482,15 @@ class GantryController:
         status["positions"] = positions
         return status
 
+    def get_position(self) -> List[float]:
+        """Get the current position vector.
+
+        Returns:
+            One value per configured axis, in ``self._axes`` order — the
+            same order move_to()'s and set_position()'s vector form use.
+        """
+        return [self.cmd.get_actual_position(axis) for axis in self._axes]
+
     def stop(self) -> Optional[str]:
         """End cleanly: decelerate on each axis's ramp, then park the brakes.
 

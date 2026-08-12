@@ -164,6 +164,27 @@ class TestDataPanel:
         assert len(data_ax.images) == 0
         assert len(data_ax.collections) >= 1  # scatter
 
+    def test_surface_panel_downsamples_a_flat_merged_scan_proportionally(self):
+        """Tile.stitch()'s merged output is a flat (1, N) grid — a
+        row/col-split stride locks row_stride at 1 (only one row) and caps
+        the whole panel at ~1200 plotted points regardless of how large N
+        actually is. A single flat stride over all N cells must scale with
+        N instead."""
+        n = 50_000
+        rng = np.random.default_rng(0)
+        scan = SurfaceScan(
+            z_mm=rng.uniform(0, 1, size=(1, n)),
+            x_mm=rng.uniform(0, 1000, size=(1, n)),
+            y_mm=rng.uniform(0, 1000, size=(1, n)),
+            is_uniform=False,
+        )
+        fig, axes = plot_acquisition(scan)
+        data_ax = axes[1, 1]
+        plotted = data_ax.collections[0].get_offsets().shape[0]
+        # old row/col-split logic would cap this near ~1200 no matter n;
+        # the fixed single-stride logic scales with n (n // stride).
+        assert plotted > 5000
+
     def test_surface_panel_handles_all_invalid(self):
         scan = SurfaceScan(
             z_mm=np.full((2, 2), np.nan), x_mm=np.array([0.0, 1.0]), y_mm=np.array([0.0, 1.0]),
@@ -182,6 +203,93 @@ class TestDataPanel:
         fig, axes = plot_acquisition(df)
         data_ax = axes[1, 1]
         assert "no calibration" in data_ax.get_ylabel()
+
+
+class TestDownsamplingKnobs:
+    def _big_flat_scan(self, n=20_000):
+        rng = np.random.default_rng(0)
+        return SurfaceScan(
+            z_mm=rng.uniform(0, 1, size=(1, n)),
+            x_mm=rng.uniform(0, 1000, size=(1, n)),
+            y_mm=rng.uniform(0, 1000, size=(1, n)),
+            is_uniform=False,
+        )
+
+    def test_max_points_caps_the_footprint_panels(self):
+        scan = self._big_flat_scan()
+        fig, axes = plot_acquisition(scan, max_points=500)
+        plotted = axes[0, 0].collections[0].get_offsets().shape[0]
+        assert plotted <= 500
+
+    def test_max_points_caps_the_heatmap_panel(self):
+        scan = self._big_flat_scan()
+        fig, axes = plot_acquisition(scan, max_points=500)
+        plotted = axes[1, 1].collections[0].get_offsets().shape[0]
+        assert plotted <= 500
+
+    def test_sample_fraction_scales_with_dataset_size(self):
+        scan = self._big_flat_scan(n=20_000)
+        fig, axes = plot_acquisition(scan, sample_fraction=0.1)
+        plotted = axes[0, 0].collections[0].get_offsets().shape[0]
+        assert 1500 <= plotted <= 2500  # ~10% of 20,000, stride-rounded
+
+    def test_sample_fraction_takes_precedence_over_max_points(self):
+        scan = self._big_flat_scan(n=20_000)
+        fig, axes = plot_acquisition(scan, max_points=1, sample_fraction=0.1)
+        plotted = axes[0, 0].collections[0].get_offsets().shape[0]
+        assert plotted > 1000  # sample_fraction's ~2000, not max_points' 1
+
+    def test_sample_fraction_out_of_range_rejected(self):
+        with pytest.raises(ValueError, match="sample_fraction"):
+            plot_acquisition(self._big_flat_scan(), sample_fraction=1.5)
+
+    def test_sample_fraction_zero_rejected(self):
+        with pytest.raises(ValueError, match="sample_fraction"):
+            plot_acquisition(self._big_flat_scan(), sample_fraction=0.0)
+
+    def test_non_positive_max_points_rejected(self):
+        with pytest.raises(ValueError, match="max_points"):
+            plot_acquisition(self._big_flat_scan(), max_points=0)
+
+    def test_downsampling_applies_to_uniform_heatmap_too(self):
+        """The imshow (uniform-grid) path uses a scaled row/col split, not
+        the flat stride — check it actually shrinks, not just the scatter
+        path exercised above."""
+        z = np.random.default_rng(0).uniform(0, 1, size=(2000, 3000))
+        scan = SurfaceScan(
+            z_mm=z, x_mm=np.linspace(0, 1000, 3000), y_mm=np.linspace(0, 1000, 2000),
+            is_uniform=True,
+        )
+        fig, axes = plot_acquisition(scan, max_points=1000)
+        im = axes[1, 1].images[0]
+        assert im.get_array().size <= 2000  # generous slack for rounding
+
+    def test_downsampling_applies_to_profile_panel(self):
+        big_df = pd.DataFrame({
+            "pos_mm": np.arange(10_000, dtype=float),
+            "height_mm": np.sin(np.arange(10_000)),
+            "experiment_x_mm": np.arange(10_000, dtype=float),
+            "experiment_y_mm": np.zeros(10_000),
+            "experiment_z_mm": np.zeros(10_000),
+        })
+        fig, axes = plot_acquisition(big_df, sample_fraction=0.01)
+        line = axes[1, 1].lines[0]
+        assert len(line.get_xdata()) <= 200
+
+    def test_cmap_is_applied_to_heatmap(self):
+        fig, axes = plot_acquisition(make_uniform_scan(), cmap="plasma")
+        assert axes[1, 1].images[0].get_cmap().name == "plasma"
+
+    def test_figsize_is_applied_to_a_new_figure(self):
+        fig, axes = plot_acquisition(make_uniform_scan(), figsize=(4.0, 3.0))
+        assert fig.get_size_inches() == pytest.approx([4.0, 3.0])
+
+    def test_figsize_ignored_when_fig_given(self):
+        import matplotlib.pyplot as plt
+
+        existing = plt.figure(figsize=(7.0, 5.0))
+        fig, axes = plot_acquisition(make_uniform_scan(), fig=existing, figsize=(1.0, 1.0))
+        assert fig.get_size_inches() == pytest.approx([7.0, 5.0])
 
 
 # ---------------------------------------------------------------------------

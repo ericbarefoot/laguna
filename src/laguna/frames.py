@@ -520,6 +520,7 @@ class FrameRegistry:
         self,
         instrument: str,
         experiment_point: Sequence[float],
+        reference_point: Optional[Sequence[float]] = None,
     ) -> np.ndarray:
         """Gantry position that puts `instrument`'s measurement point on a target.
 
@@ -531,6 +532,12 @@ class FrameRegistry:
         Args:
             instrument: Instrument key.
             experiment_point: Desired measurement location, experiment frame.
+            reference_point: Override the instrument's configured
+                reference point, in its own frame, for a one-off target
+                other than its usual measurement point — e.g. a Gocator
+                swath edge rather than its centerline (see
+                ``laguna.survey.SurveyRunner``). Defaults to the
+                instrument's configured reference point.
 
         Returns:
             ``(3,)`` gantry position to command, e.g. via
@@ -539,7 +546,13 @@ class FrameRegistry:
         target_gantry = self.experiment_to_gantry(
             np.asarray(experiment_point, dtype=float)
         )
-        return target_gantry - self.frame_for(instrument).offset
+        frame = self.frame_for(instrument)
+        offset = (
+            frame.mount.apply(np.asarray(reference_point, dtype=float))
+            if reference_point is not None
+            else frame.offset
+        )
+        return target_gantry - offset
 
     def experiment_point_for(
         self,

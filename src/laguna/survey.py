@@ -42,6 +42,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 #: Cartesian axis name -> index into a 3-component [x, y, z] vector. Shared
@@ -67,6 +69,13 @@ class Pass:
             when omitted — repositioning at scan speed is slower than
             necessary but always safe.
         label: Human-readable description, for logs and progress.
+        edge_align: If True, `start`/`end`'s `step_axis` coordinate names
+            the swath's near edge rather than the instrument's usual
+            (centerline) measurement point — see :class:`Tile`. Set by
+            :class:`Tile`, left False by :class:`Traverse` (a single line
+            has no swath edge to align).
+        step_axis: Axis the swath is offset across, required when
+            `edge_align` is True — see :attr:`Tile.step_axis`.
     """
 
     index: int
@@ -77,6 +86,8 @@ class Pass:
     scan_speed: Optional[float] = None
     travel_speed: Optional[float] = None
     label: str = ""
+    edge_align: bool = False
+    step_axis: Optional[str] = None
 
     @property
     def length_mm(self) -> float:
@@ -117,6 +128,8 @@ class Pass:
             "scan_speed": self.scan_speed,
             "travel_speed": self.travel_speed,
             "label": self.label,
+            "edge_align": self.edge_align,
+            "step_axis": self.step_axis,
         }
 
 
@@ -209,6 +222,13 @@ class Tile(Survey):
             differ from scan_speed — see Pass.travel_speed.
         speed: Convenience for setting scan_speed and travel_speed to the
             same value. Ignored for whichever of the two is set explicitly.
+
+    Each pass's ``step_axis`` coordinate names the swath's **near edge**,
+    not its centerline — ``SurveyRunner`` reads the instrument's live
+    active area (and the frame's mount rotation) to place that edge
+    correctly rather than assuming the instrument's configured reference
+    point is already edge-aligned (it normally isn't: a Gocator's own
+    coordinate origin is its centerline). See ``Pass.edge_align``.
     """
 
     origin: Sequence[float]
@@ -303,6 +323,8 @@ class Tile(Survey):
                     scan_speed=self.scan_speed,
                     travel_speed=self.travel_speed,
                     label=f"tile {i + 1}/{count}",
+                    edge_align=True,
+                    step_axis=self.step_axis,
                 )
             )
         return out
@@ -318,6 +340,83 @@ class Tile(Survey):
         first = passes[0].start[step_i]
         last = passes[-1].start[step_i]
         return (last - first) + self.swath_mm
+
+    def stitch(
+        self,
+        passes: Sequence[Pass],
+        results: Sequence[Any],
+        frames: Any,
+    ) -> Any:
+        """Naively merge this tile's per-pass scans into one SurfaceScan.
+
+        "Naive": each pass is placed into shared experiment coordinates via
+        :func:`~laguna.frames.orient_scan` (mount rotation + that pass's
+        actual commanded gantry position — unaffected by whichever
+        ``reference_point`` ``SurveyRunner`` used to get the gantry there,
+        since ``orient_scan`` works from where the gantry *actually ended
+        up*, not how it was targeted), then every pass's points are simply
+        concatenated. It does **not** use the overlap between adjacent
+        swaths to register or correct passes against each other — no ICP,
+        no cross-correlation, nothing that would catch travel-speed wander
+        or a small position error between passes. It trusts the calibrated
+        frames outright. ``overlap`` exists for a future registration step
+        to consume (see this class's own docstring); this doesn't consume
+        it yet.
+
+        Args:
+            passes: The passes that were actually run, e.g. the list
+                ``SurveyRunner.run()`` returns. Same length and order as
+                `results`.
+            results: Each pass's raw (un-oriented) SurfaceScan, e.g.
+                ``SurveyRunner.results`` from a ``run(keep_results=True)``
+                call.
+            frames: The lab's FrameRegistry, for orienting each pass into
+                shared experiment coordinates.
+
+        Returns:
+            One :class:`~laguna.scanner.pointcloud.SurfaceScan` covering
+            the whole tile, in experiment coordinates, as a flat ``(1, N)``
+            non-uniform grid of every valid point from every pass —
+            exportable exactly like any other SurfaceScan
+            (``save_csv``/``save_las``/``save_ply``/``save_npz``).
+
+        Raises:
+            ValueError: If `passes` and `results` differ in length, or
+                either is empty.
+        """
+        from .frames import orient_scan
+        from .scanner.pointcloud import SensorMounting, SurfaceScan
+
+        if len(passes) != len(results):
+            raise ValueError(
+                f"stitch() needs one result per pass — got {len(passes)} "
+                f"passes and {len(results)} results"
+            )
+        if not passes:
+            raise ValueError("stitch() needs at least one pass/result to merge")
+
+        oriented = [
+            orient_scan(scan, instrument=p.instrument, frames=frames)
+            for p, scan in zip(passes, results)
+        ]
+        points = np.concatenate([o.to_points(drop_invalid=True) for o in oriented], axis=0)
+
+        metadata = {
+            "stitched": True,
+            "stitch_method": "naive-concatenate",
+            "stitch_pass_count": len(passes),
+            "stitch_pass_labels": [p.label or p.instrument for p in passes],
+            "stitch_pass_point_counts": [o.valid_count for o in oriented],
+            "stitch_instruments": sorted({p.instrument for p in passes}),
+        }
+        return SurfaceScan(
+            x_mm=points[:, 0].reshape(1, -1),
+            y_mm=points[:, 1].reshape(1, -1),
+            z_mm=points[:, 2].reshape(1, -1),
+            metadata=metadata,
+            is_uniform=False,
+            mounting=SensorMounting(),
+        )
 
 
 @dataclass
@@ -466,13 +565,24 @@ class SurveyRunner:
         """
         done: List[Pass] = []
         for p in self.pending():
+            reference_point = self._resolve_reference_point(p)
+            gantry_start = self.lab.frames.gantry_target_for(
+                p.instrument, list(p.start), reference_point=reference_point
+            )
+            gantry_end = self.lab.frames.gantry_target_for(
+                p.instrument, list(p.end), reference_point=reference_point
+            )
             logger.info(
-                "Survey pass %d/%d — %s", p.index + 1, len(self.survey), p.label or p.instrument
+                "Survey pass %d/%d — %s | experiment %s -> %s | gantry %s -> %s",
+                p.index + 1, len(self.survey), p.label or p.instrument,
+                tuple(round(v, 1) for v in p.start), tuple(round(v, 1) for v in p.end),
+                tuple(round(float(v), 1) for v in gantry_start),
+                tuple(round(float(v), 1) for v in gantry_end),
             )
             if dry_run:
                 done.append(p)
                 continue
-            result = self._run_pass(p)
+            result = self._run_pass(p, reference_point)
             if keep_results:
                 self.results.append(result)
             done.append(p)
@@ -484,7 +594,7 @@ class SurveyRunner:
                 )
         return done
 
-    def _run_pass(self, p: Pass) -> Any:
+    def _run_pass(self, p: Pass, reference_point: Optional[List[float]] = None) -> Any:
         """Position and measure one pass.
 
         Logs success or failure to the event log, then re-raises on error so
@@ -492,6 +602,10 @@ class SurveyRunner:
 
         Args:
             p: Pass to execute.
+            reference_point: Pre-resolved via ``_resolve_reference_point()``
+                — taken as a parameter rather than resolved again here so
+                the actual placement matches what ``run()`` already logged
+                (and to avoid a second live ``get_active_area()`` call).
 
         Returns:
             The acquired SurfaceScan (Gocator) or ProfileResult (rangefinder).
@@ -506,9 +620,11 @@ class SurveyRunner:
         # repositioning at scan speed is slower than necessary but always
         # safe.
         travel_speed = p.travel_speed if p.travel_speed is not None else p.scan_speed
-        self.lab.place(p.instrument, list(p.start), speed=travel_speed)
-
         scanner = getattr(self.lab, p.instrument, None)
+        self.lab.place(
+            p.instrument, list(p.start), speed=travel_speed, reference_point=reference_point
+        )
+
         try:
             if scanner is not None and hasattr(scanner, "acquire"):
                 gantry = getattr(self.lab, "gantry", None)
@@ -554,6 +670,82 @@ class SurveyRunner:
             result=result_note, notes=p.label or "",
         )
         return scan if scanner is not None and hasattr(scanner, "acquire") else result
+
+    def _resolve_reference_point(self, p: Pass) -> Optional[List[float]]:
+        """The reference point `place()` should use for `p`, or None for the
+        instrument's usual (configured) one.
+
+        Shared by ``run()``'s per-pass log line and ``_run_pass()``'s actual
+        placement, so the logged gantry target — dry-run or real — is always
+        the one that would actually be commanded, not a stand-in.
+
+        Args:
+            p: The pass to resolve a reference point for.
+
+        Returns:
+            ``[x, y, z]`` — see ``_edge_reference_point()`` for the frame
+            it's in — or None if `p` isn't edge-aligned or the instrument
+            has no live active area (e.g. not yet connected, or a
+            rangefinder with no such concept).
+        """
+        if not (p.edge_align and p.step_axis is not None):
+            return None
+        scanner = getattr(self.lab, p.instrument, None)
+        if scanner is None or not hasattr(scanner, "get_active_area"):
+            return None
+        return self._edge_reference_point(p, scanner)
+
+    def _edge_reference_point(self, p: Pass, scanner: Any) -> List[float]:
+        """Reference point sitting at the swath's near edge, for `place()`.
+
+        A Tile pass's ``step_axis`` coordinate names the swath's near
+        edge (see ``Tile``'s docstring), but an instrument's *configured*
+        reference point is its own coordinate origin — for the Gocator,
+        the centerline of whatever active area is set, not either edge.
+        Reading the sensor's own X (cross-laser) span live off
+        ``get_active_area()`` and substituting it as the reference point
+        (via ``place(reference_point=...)``) lands the actual edge where
+        Tile intended, instead of straddling it by half a swath.
+
+        Which physical boundary (the active area's min or max X) counts
+        as "near" depends on the mount's rotation between sensor and
+        gantry axes — read live off the scanner's own ``mounting`` (see
+        ``laguna.scanner.mounting``) rather than re-deriving the sign here.
+
+        Rotated here, not left to ``place()``: ``frames.instruments.gocator``
+        is deliberately translation-only (``orient_scan()`` refuses to run
+        if it also carries a rotation, since the scan's own ``mounting``
+        already provides one — see that config block's comment). So the
+        value returned is already rotated into gantry directions, not the
+        sensor's own frame — safe here specifically because
+        ``frames.instruments.gocator``'s mount has no rotation of its own
+        to compose with, so passing an already-rotated delta through it
+        via ``place(reference_point=...)`` is a plain translation add, not
+        a double transform.
+
+        Args:
+            p: The edge-aligned pass (``p.edge_align`` and ``p.step_axis``
+                must both be set).
+            scanner: The instrument, with a working ``get_active_area()``
+                and ``mounting``.
+
+        Returns:
+            ``[x, y, z]``, gantry-oriented — see above.
+        """
+        area = scanner.get_active_area()
+        mounting = scanner.mounting
+        step_i = _AXIS_INDEX[p.step_axis]
+        # matrix[:3, :3] column 0 is where sensor +X (across the laser)
+        # points in gantry/experiment space; its component along step_axis
+        # says whether increasing sensor X moves toward or away from the
+        # pass's near (offset) edge.
+        sign_along_step = mounting.matrix[step_i, 0]
+        if sign_along_step >= 0:
+            edge_x = area["x_mm"]
+        else:
+            edge_x = area["x_mm"] + area["width_mm"]
+        delta_gantry = mounting.apply_to_points(np.array([[edge_x, 0.0, 0.0]]))[0]
+        return [float(v) for v in delta_gantry]
 
     def _acquire_scan_end(self, p: Pass) -> List[float]:
         """Build acquire_scan()'s full per-axis `end` from an experiment-frame target.

@@ -5,9 +5,11 @@ leaves an unimaged gap down the middle of a bed, and nobody notices until
 the data is being stitched.
 """
 
+import numpy as np
 import pytest
 
 from laguna.robot.macron.commands import Axis
+from laguna.scanner.mounting import SensorMounting
 from laguna.survey import Pass, Tile, Traverse, SurveyRunner
 
 
@@ -225,6 +227,89 @@ class TestCosting:
         assert text.count("tile") == 2
 
 
+def _raw_scan(gantry_start, gantry_end_mm=20.0):
+    """A tiny raw (un-oriented) uniform surface, as scan_with_gantry() would
+    hand SurveyRunner — 2x2 cells, no NaNs, travel along gantry X."""
+    from laguna.scanner.pointcloud import SensorMounting, SurfaceScan
+
+    return SurfaceScan(
+        z_mm=np.ones((2, 2)),
+        x_mm=np.array([0.0, 10.0]),
+        y_mm=np.array([0.0, 20.0]),
+        metadata={
+            "gantry_axis": "X",
+            "gantry_start_mm": gantry_start[0],
+            "gantry_end_mm": gantry_end_mm,
+            "gantry_start": list(gantry_start),
+        },
+        is_uniform=True,
+        mounting=SensorMounting(),
+    )
+
+
+class TestTileStitch:
+    def _passes(self):
+        return [
+            Pass(index=0, start=(0.0, 0.0, 0.0), end=(20.0, 0.0, 0.0),
+                 instrument="gocator", axis="X", label="tile 1/2"),
+            Pass(index=1, start=(0.0, 500.0, 0.0), end=(20.0, 500.0, 0.0),
+                 instrument="gocator", axis="X", label="tile 2/2"),
+        ]
+
+    def _frames(self):
+        from laguna.frames import FrameRegistry
+
+        return FrameRegistry.from_config({"instruments": {"gocator": {"translation": [0, 0, 0]}}})
+
+    def test_merges_every_pass_into_one_flat_scan(self):
+        tile = Tile(origin=(0, 0, 0), length_mm=20.0, width_mm=520.0, swath_mm=500.0)
+        passes = self._passes()
+        results = [_raw_scan([0.0, 0.0, 0.0]), _raw_scan([0.0, 500.0, 0.0])]
+        merged = tile.stitch(passes, results, self._frames())
+        assert merged.shape == (1, 8)  # 2 passes x 4 cells each, no NaNs
+        assert merged.valid_count == 8
+
+    def test_stitched_points_land_at_each_pass_own_offset(self):
+        """The point of stitching: pass 2's points show up 500mm further in
+        Y than pass 1's, not on top of them."""
+        tile = Tile(origin=(0, 0, 0), length_mm=20.0, width_mm=520.0, swath_mm=500.0)
+        passes = self._passes()
+        results = [_raw_scan([0.0, 0.0, 0.0]), _raw_scan([0.0, 500.0, 0.0])]
+        merged = tile.stitch(passes, results, self._frames())
+        y = merged.to_points()[:, 1]
+        assert y.min() == pytest.approx(0.0)
+        assert y.max() == pytest.approx(520.0)  # 500 offset + 20 sensor-local extent
+
+    def test_metadata_records_the_merge(self):
+        tile = Tile(origin=(0, 0, 0), length_mm=20.0, width_mm=520.0, swath_mm=500.0)
+        passes = self._passes()
+        results = [_raw_scan([0.0, 0.0, 0.0]), _raw_scan([0.0, 500.0, 0.0])]
+        merged = tile.stitch(passes, results, self._frames())
+        assert merged.metadata["stitched"] is True
+        assert merged.metadata["stitch_pass_count"] == 2
+        assert merged.metadata["stitch_pass_labels"] == ["tile 1/2", "tile 2/2"]
+        assert merged.metadata["stitch_pass_point_counts"] == [4, 4]
+        assert merged.metadata["stitch_instruments"] == ["gocator"]
+
+    def test_result_is_exportable_like_any_surface_scan(self, tmp_path):
+        tile = Tile(origin=(0, 0, 0), length_mm=20.0, width_mm=520.0, swath_mm=500.0)
+        passes = self._passes()
+        results = [_raw_scan([0.0, 0.0, 0.0]), _raw_scan([0.0, 500.0, 0.0])]
+        merged = tile.stitch(passes, results, self._frames())
+        path = merged.save_csv(tmp_path / "stitched.csv")
+        assert path.exists()
+
+    def test_mismatched_lengths_rejected(self):
+        tile = Tile(origin=(0, 0, 0), length_mm=20.0, width_mm=520.0, swath_mm=500.0)
+        with pytest.raises(ValueError, match="one result per pass"):
+            tile.stitch(self._passes(), [_raw_scan([0.0, 0.0, 0.0])], self._frames())
+
+    def test_empty_rejected(self):
+        tile = Tile(origin=(0, 0, 0), length_mm=20.0, width_mm=520.0, swath_mm=500.0)
+        with pytest.raises(ValueError, match="at least one"):
+            tile.stitch([], [], self._frames())
+
+
 class FakeScan:
     """Stand-in for a SurfaceScan — just enough for _run_pass's result_note."""
 
@@ -238,6 +323,23 @@ class FakeScanner:
     def acquire(self, gantry=None, **kw):
         self.acquired.append(kw)
         return FakeScan()
+
+
+class FakeScannerWithActiveArea(FakeScanner):
+    """A FakeScanner that also reports a live active area and mounting, for
+    edge-align tests. Mounting lives here (not on FakeLab's frames), matching
+    the real GocatorScanner.mounting/frames.instruments.gocator split —
+    frames.instruments.gocator is deliberately translation-only, since
+    orient_scan() refuses to run if both it and the scan's own mounting
+    carry a rotation."""
+
+    def __init__(self, x_mm=-750.0, width_mm=1500.0, mounting=None):
+        super().__init__()
+        self._active_area = {"x_mm": x_mm, "width_mm": width_mm}
+        self.mounting = mounting or SensorMounting()
+
+    def get_active_area(self):
+        return dict(self._active_area)
 
 
 class FakeLab:
@@ -269,8 +371,8 @@ class FakeLab:
 
         self.event_log = _EventLog()
 
-    def place(self, instrument, point, speed=None):
-        self.placed.append((instrument, tuple(point), speed))
+    def place(self, instrument, point, speed=None, reference_point=None):
+        self.placed.append((instrument, tuple(point), speed, reference_point))
         return True
 
 
@@ -287,6 +389,34 @@ class TestSurveyRunner:
         assert len(done) == 2
         assert lab.placed == []
         assert lab.gocator.acquired == []
+
+    def test_dry_run_logs_experiment_and_gantry_coordinates(self, caplog):
+        """The sanity-check use case: read the plan in both frames before
+        committing to real motion, without needing to run it for real."""
+        import logging
+
+        lab = FakeLab()
+        with caplog.at_level(logging.INFO, logger="laguna.survey"):
+            SurveyRunner(lab, self._survey()).run(dry_run=True)
+        assert "experiment" in caplog.text
+        assert "gantry" in caplog.text
+        # tile origin (0,0,0), no mount offset configured for this FakeLab —
+        # experiment and gantry coincide, so both frames show the same values.
+        assert "(0.0, 0.0, 0.0)" in caplog.text
+
+    def test_logged_gantry_target_matches_what_actually_gets_commanded(self, caplog):
+        """The logged gantry target must be computed the same way as the
+        actual placement — same resolved reference_point, not a stand-in."""
+        import logging
+
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea(x_mm=-750.0, width_mm=1500.0)
+        with caplog.at_level(logging.INFO, logger="laguna.survey"):
+            SurveyRunner(lab, self._survey()).run()
+        # identity mount here (FakeLab's default) -> min edge (-750) is used,
+        # giving gantry_target = experiment(0,0,0) - offset(-750,0,0) = (750,0,0)
+        assert lab.placed[0][3] == [-750.0, 0.0, 0.0]  # reference_point actually placed with
+        assert "(750.0, 0.0, 0.0)" in caplog.text
 
     def test_each_pass_positions_the_instrument_then_measures(self):
         lab = FakeLab()
@@ -336,6 +466,48 @@ class TestSurveyRunner:
         # affects the pre-scan repositioning move. scanner.acquire()'s own
         # kwarg name (feed_rate_mm_s) is a separate, unrenamed API.
         assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 20.0
+
+    def test_edge_align_uses_active_area_min_edge_with_identity_mount(self):
+        """No mounting rotation configured: sensor X and step_axis (Y) point
+        the same way (matrix[step_i, 0] >= 0), so the near/offset edge is
+        the active area's minimum X."""
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea(x_mm=-750.0, width_mm=1500.0)
+        SurveyRunner(lab, self._survey()).run()
+        assert lab.placed[0][3] == [-750.0, 0.0, 0.0]
+
+    def test_edge_align_uses_active_area_max_edge_when_mount_sign_flips(self):
+        """With the real rig's mounting (scan_x: -Y), increasing sensor X
+        moves toward -step_axis, so the near/offset edge is the FAR
+        (max-X) boundary of the active area, not the min. The reference
+        point comes back already rotated into gantry directions — sensor
+        X=750 (the max edge) lands on gantry -Y — since it's read off the
+        scanner's own mounting, not frames.instruments.gocator (which stays
+        translation-only; see that config block's comment)."""
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea(
+            x_mm=-750.0, width_mm=1500.0,
+            mounting=SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z"),
+        )
+        SurveyRunner(lab, self._survey()).run()
+        assert lab.placed[0][3] == [0.0, -750.0, 0.0]
+
+    def test_edge_align_skipped_when_scanner_has_no_active_area(self):
+        """FakeScanner (no get_active_area) is the common case for
+        rangefinder-style instruments — must not crash, must fall back to
+        the instrument's normal configured reference point."""
+        lab = FakeLab()
+        SurveyRunner(lab, self._survey()).run()
+        assert lab.placed[0][3] is None
+
+    def test_traverse_never_edge_aligns(self):
+        """A Traverse pass has no swath to align — even an instrument that
+        supports get_active_area() must not get a reference_point override."""
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0), instruments=("gocator",))
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea()
+        SurveyRunner(lab, survey).run()
+        assert lab.placed[0][3] is None
 
     def test_checkpoint_skips_completed_passes(self):
         """A tile of a wide bed can be the longest thing an experiment

@@ -23,6 +23,7 @@ assumption is wrong, not the test):
 from __future__ import annotations
 
 import ctypes
+import logging
 import re
 import time
 
@@ -1567,9 +1568,14 @@ class TestSolveScanRates:
     def test_default_travel_axis_is_y(self, scanner):
         assert scanner.solve_scan_rates()["travel_axis"] == "Y"
 
-    def test_frame_rate_above_live_ceiling_rejected(self, scanner):
-        with pytest.raises(ValueError, match="exceeds the sensor's live ceiling"):
-            scanner.solve_scan_rates(frame_rate_hz=99999.0, y_spacing_mm=0.1)
+    def test_frame_rate_above_live_ceiling_warns_but_still_returns(self, scanner, caplog):
+        """Purely informative — unlike configure()/set_frame_rate(), this
+        writes nothing to the sensor, so an over-ceiling result is worth
+        flagging loudly, not failing on."""
+        with caplog.at_level(logging.WARNING):
+            r = scanner.solve_scan_rates(frame_rate_hz=99999.0, y_spacing_mm=0.1)
+        assert r["frame_rate_hz"] == pytest.approx(99999.0)
+        assert "exceeds the sensor's live ceiling" in caplog.text
 
     def test_inconsistent_triple_rejected(self, scanner):
         with pytest.raises(ValueError, match="inconsistent"):

@@ -239,6 +239,12 @@ class TestSubsystemInterface:
         status = controller.get_status()
         assert status["positions"] == {"X": 1.0, "Y": 2.0, "Z": 5.0, "Theta": 6.0}
 
+    def test_get_position_returns_vector_in_axes_order(self):
+        responses = {"A1 ACP": "1.000", "A2 ACP": "2.000", "A5 ACP": "5.000", "A6 ACP": "6.000"}
+        controller, _conn = self._make_controller(responses)
+        controller.connect()
+        assert controller.get_position() == [1.0, 2.0, 5.0, 6.0]
+
     def test_estop_aborts_all_axes(self):
         """estop() is the zero-decel abort. This used to be what stop() did;
         the unified safety vocabulary moved it here (see laguna.safety)."""

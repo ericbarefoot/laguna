@@ -131,11 +131,16 @@ gocator:
     scan_x: -Y
     scan_y: +X
     scan_z: +Z
-  travel_speed_mm_s: 20.0     # MUST match the gantry feed rate used to scan —
+  travel_speed_mm_s: 100     # MUST match the gantry feed rate used to scan —
                                # this is what scales the Y (travel) axis, since
                                # there is no encoder. Writes to sensor flash,
                                # so laguna only pushes it when it changes.
-  frame_rate_hz: 200          # profile trigger rate; omit for the sensor's max.
+  frame_rate_hz: 75
+                               # profile trigger rate. Omitting this does NOT
+                               # adopt the sensor's max — it leaves whatever
+                               # mode/rate is already in sensor flash
+                               # unchanged (see GocatorScanner's docstring).
+                               # Set frame_rate_max: true instead to force max.
                                # Y spacing = travel_speed / frame_rate
                                # (20 mm/s at 200 Hz = 0.1 mm between profiles).
                                # NOT the datasheet's 10 kHz headline: the real
@@ -147,8 +152,15 @@ gocator:
                                # re-validates after flushing and raises if the
                                # sensor can't deliver the requested rate —
                                # see docs/subsystems/scanner.md.
-  fixed_length_mm: 200.0      # surface length along travel; cover the scan distance
-  exposure_us: null           # laser exposure; omit to leave the sensor's setting
+  active_area:
+    x: -722.0        # origin, across-laser
+    # y: 0.0        # origin, along travel
+    z: -130.0        # origin, range/standoff
+    width: 1422.0 # extent in X (across laser)
+    # length: 200.0 # extent in Y (along travel)
+    height: 200.0 # extent in Z (range/standoff) — cutting this helps frame rate most
+  # fixed_length_mm: 200.0      # surface length along travel; cover the scan distance
+  exposure_us: 200           # laser exposure; omit to leave the sensor's setting
   uniform_spacing: null       # true/false to force X resampling on/off; omit to
                                # leave as-is. Disabling it raises the max scan rate.
   output_dir: ./data/scans
@@ -163,6 +175,12 @@ frames:
     translation: [-467,-281,0]
   instruments:
     gocator:
+      # No axes: here on purpose, even though the sensor IS physically
+      # rotated — that rotation lives solely in gocator.mounting above.
+      # orient_scan() refuses to run if both this block and the scan's own
+      # mounting carry a rotation (would double-rotate the data); SurveyRunner's
+      # edge-align path (survey.py) pre-rotates via the scanner's own
+      # .mounting instead of relying on this transform, for the same reason.
       translation: [-382,-83,0]
       # translation: [-467,-280,0] # measured to OD2000 point
     wtt12l:

@@ -601,7 +601,11 @@ class GocatorSettingsMixin:
         Args:
             feed_rate_mm_s: Travel speed, mm/s.
             frame_rate_hz: Profile rate, Hz. Defaults to the sensor's live
-                ceiling; a value above it is rejected.
+                ceiling; a value above it is logged as a warning, not
+                rejected — this method is purely informative and writes
+                nothing to the sensor, unlike ``configure()``/
+                ``set_frame_rate()``, which still raise for the same case
+                since they'd actually try to apply it.
             y_spacing_mm: Spacing between profiles along travel, mm.
             x_resolution_mm: Across-laser sample pitch, mm. Defaults to the
                 sensor's configured spacing interval.
@@ -611,12 +615,14 @@ class GocatorSettingsMixin:
             ``x_resolution_mm``, ``frame_rate_max_hz`` (the live ceiling),
             ``travel_axis`` (the gantry axis this feed rate applies to),
             ``isotropic`` (is Y spacing <= X resolution), and
-            ``aspect_ratio`` (y_spacing / x_resolution).
+            ``aspect_ratio`` (y_spacing / x_resolution). ``frame_rate_hz``
+            may exceed ``frame_rate_max_hz`` — compare them if the caller
+            needs to know rather than just log it.
 
         Raises:
             RuntimeError: If not connected.
-            ValueError: If all three are given and inconsistent, if any is
-                non-positive, or if the frame rate exceeds the live ceiling.
+            ValueError: If all three are given and inconsistent, or if any
+                is non-positive.
         """
         lib = self._require_connected()
         setup = lib.handle("GoSensor_Setup", self._sensor)
@@ -669,12 +675,18 @@ class GocatorSettingsMixin:
                 y_spacing_mm = float(feed_rate_mm_s) / float(frame_rate_hz)
 
         if ceiling > 0 and float(frame_rate_hz) > ceiling + 1e-6:
-            raise ValueError(
-                f"frame_rate_hz={float(frame_rate_hz):.3f} exceeds the sensor's "
-                f"live ceiling of {ceiling:.3f} Hz in its current configuration. "
-                "Raise the ceiling first — shrink the active area, use "
-                "x subsampling, or enable uniform spacing (each measured to "
-                "help; see docs/subsystems/scanner.md) — or lower the feed rate."
+            # Informative only — this method writes nothing to the sensor,
+            # so an over-ceiling result is something to flag loudly and let
+            # the caller decide about, not fail on. configure()/
+            # set_frame_rate() still raise for the same condition, since
+            # those actually try to apply it.
+            logger.warning(
+                "solve_scan_rates: frame_rate_hz=%.3f exceeds the sensor's live "
+                "ceiling of %.3f Hz in its current configuration. Raise the "
+                "ceiling first — shrink the active area, use x subsampling, or "
+                "enable uniform spacing (each measured to help; see "
+                "docs/subsystems/scanner.md) — or lower the feed rate.",
+                float(frame_rate_hz), ceiling,
             )
 
         travel_axis = self._mounting.grid_axes()[0]

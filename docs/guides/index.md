@@ -15,6 +15,9 @@ while writing this documentation.
   checkpoint/resume.
 - **[Driving the gantry safely](gantry-motion.md)** — `safe_mode`, fence
   checking, moves, and topographic scans.
+- **[Plotting saved scans and profiles](plot-saved-acquisitions.md)** —
+  reload a saved Gocator scan or rangefinder transect and run it through
+  `plot_acquisition()`, offline, no hardware needed.
 
 For the terse, generated-from-docstrings API surface (every public
 class/method with its signature), see [API reference](../reference/index.md).

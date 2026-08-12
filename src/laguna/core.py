@@ -612,6 +612,7 @@ class FlumeLab:
         instrument: str,
         experiment_point: list,
         speed: Optional[float] = None,
+        reference_point: Optional[list] = None,
     ) -> bool:
         """Move so `instrument` measures at a point in the experiment frame.
 
@@ -625,6 +626,9 @@ class FlumeLab:
             instrument: Instrument key, e.g. ``"od2000"``.
             experiment_point: [x, y, z] in experiment coordinates.
             speed: Optional feed rate in mm/s.
+            reference_point: Override the instrument's configured
+                reference point, in its own frame — see
+                ``FrameRegistry.gantry_target_for()``.
 
         Returns:
             True if a move was issued.
@@ -632,7 +636,9 @@ class FlumeLab:
         Raises:
             RuntimeError: If no 'gantry' subsystem is registered.
         """
-        target = self.frames.gantry_target_for(instrument, experiment_point)
+        target = self.frames.gantry_target_for(
+            instrument, experiment_point, reference_point=reference_point
+        )
         logger.info(
             "place(%s, %s) -> gantry %s",
             instrument, list(experiment_point), [round(v, 3) for v in target],

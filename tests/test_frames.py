@@ -226,6 +226,28 @@ class TestFrameRegistry:
         with pytest.raises(ValueError, match="reference_point"):
             InstrumentFrame("x", reference_point=[1, 2])
 
+    def test_gantry_target_for_reference_point_override(self, registry):
+        """A one-off target other than the instrument's configured
+        measurement point — e.g. a Gocator swath edge instead of its
+        centerline — without touching the registered InstrumentFrame."""
+        default = registry.gantry_target_for("gocator", [0, 0, 0])
+        overridden = registry.gantry_target_for("gocator", [0, 0, 0], reference_point=[10, 0, 0])
+        np.testing.assert_allclose(overridden - default, [-10, 0, 0])
+
+    def test_gantry_target_for_reference_point_override_uses_mount_rotation(self):
+        """The override still goes through the instrument's own mount
+        rotation, not gantry-frame axes directly — this is what makes it
+        correct for a rotated mount like the Gocator's."""
+        r = FrameRegistry().add(
+            InstrumentFrame(
+                "gocator",
+                mount=AffineTransform.from_axis_map(scan_x="-Y", scan_y="+X", scan_z="+Z"),
+            )
+        )
+        # sensor +X (across the laser) maps to gantry -Y under this mount.
+        target = r.gantry_target_for("gocator", [0, 0, 0], reference_point=[10, 0, 0])
+        np.testing.assert_allclose(target, [0, 10, 0])
+
 
 def make_scan(mounting=None, y_mm=None, x_mm=None, **meta):
     x_mm = np.array([0.0, 10.0]) if x_mm is None else x_mm

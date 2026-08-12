@@ -8,7 +8,11 @@ Two entry points, both experiment-frame only, both returning ``(fig, axes)``:
 :func:`~laguna.robot.macron.profiler.orient_profile` returns) and produces a
 four-panel figure: XY/XZ/YZ projections of the data, plus a panel of the
 data itself (a Z heatmap for a scan, height vs. travel distance for a
-profile).
+profile). Every panel downsamples independently (deterministic stride, not
+random) to a shared budget — ``max_points`` (a count) or ``sample_fraction``
+(a proportion, and the one to reach for on a huge scan you just want a quick
+look at) — so a multi-million-point ``Tile.stitch()`` merge plots as fast
+as a single small pass.
 
 :func:`plot_trajectory` — the same XY/XZ/YZ layout, but for a **planned**
 :class:`~laguna.survey.Survey`/list of :class:`~laguna.survey.Pass` instead
@@ -60,6 +64,41 @@ _PLANES: dict = {
     "yz": (1, 2, "Y", "Z"),
 }
 
+#: Default per-panel point budget — ~400x1200, the historical heatmap-panel
+#: figure — now applied uniformly to every panel via max_points/
+#: sample_fraction on plot_acquisition().
+_DEFAULT_MAX_POINTS = 400 * 1200
+
+
+def _resolve_target_points(
+    total: int, max_points: int, sample_fraction: Optional[float]
+) -> int:
+    """How many of `total` points/cells a panel should aim to plot.
+
+    Raises:
+        ValueError: If `sample_fraction` is given outside (0, 1], or
+            `max_points` is not positive.
+    """
+    if sample_fraction is not None:
+        if not 0 < sample_fraction <= 1:
+            raise ValueError(
+                f"sample_fraction must be in (0, 1], got {sample_fraction!r}"
+            )
+        return max(1, round(total * sample_fraction))
+    if max_points <= 0:
+        raise ValueError(f"max_points must be positive, got {max_points!r}")
+    return max_points
+
+
+def _stride_for(total: int, target: int) -> int:
+    """Uniform stride that brings `total` items down to roughly `target`.
+
+    Deterministic (not random sampling) — same method scripts/visualize_scan.py
+    uses, and cheap/fast, which matters since this runs on data that can be
+    in the millions of points.
+    """
+    return max(1, total // target) if target > 0 else 1
+
 
 @dataclass
 class Landmark:
@@ -90,6 +129,10 @@ def plot_acquisition(
     landmarks: Optional[Sequence[Landmark]] = None,
     fig: Optional["Figure"] = None,
     title: Optional[str] = None,
+    max_points: int = _DEFAULT_MAX_POINTS,
+    sample_fraction: Optional[float] = None,
+    figsize: Tuple[float, float] = (11, 9),
+    cmap: str = "viridis",
 ) -> Tuple["Figure", Any]:
     """Plot a scan or profile's XY/XZ/YZ footprint against landmarks, plus its data.
 
@@ -105,6 +148,21 @@ def plot_acquisition(
         fig: Existing Figure to plot into (its own ``subplots(2, 2)`` — any
             existing content is replaced). Omit to create a new one.
         title: Figure title. Defaults to a summary of `data`.
+        max_points: Cap on how many points each panel draws — the
+            footprint (XY/XZ/YZ) panels and the data panel (Z heatmap or
+            point-cloud scatter) each independently downsample (uniform
+            stride, not random — deterministic and fast even on a
+            multi-million-point scan) to roughly this many. Lower it to
+            speed up plotting a huge scan (e.g. a ``Tile.stitch()`` merge);
+            ignored if `sample_fraction` is given. Defaults to 480,000
+            (400x1200), the historical heatmap-panel figure.
+        sample_fraction: Plot roughly this fraction (0, 1] of each panel's
+            points instead of a fixed count — e.g. ``0.1`` for a quick 10%
+            look at a huge scan regardless of its actual size. Takes
+            precedence over `max_points` when given.
+        figsize: Size for a newly created figure. Ignored if `fig` is
+            given — its own size is used instead.
+        cmap: Colormap for the data panel's Z heatmap/point-cloud scatter.
 
     Returns:
         ``(fig, axes)`` — `fig` is `fig` if given, otherwise newly created;
@@ -115,7 +173,9 @@ def plot_acquisition(
         ImportError: If matplotlib isn't installed.
         TypeError: If `data` isn't a recognized type.
         ValueError: If a DataFrame/ProfileResult lacks the experiment_x_mm/
-            y_mm/z_mm columns ``orient_profile()`` produces.
+            y_mm/z_mm columns ``orient_profile()`` produces, if
+            `sample_fraction` is given outside (0, 1], or if `max_points`
+            is not positive.
     """
     try:
         import matplotlib.pyplot as plt
@@ -125,17 +185,22 @@ def plot_acquisition(
             "dependency: pip install 'laguna[viz]'"
         ) from e
 
-    points, panel = _extract(data)
+    points, panel = _extract(data, max_points=max_points, sample_fraction=sample_fraction, cmap=cmap)
+    # Validated and applied here, before creating any figure, so a bad
+    # max_points/sample_fraction fails fast rather than after a figure is
+    # already allocated.
+    footprint_target = _resolve_target_points(len(points), max_points, sample_fraction)
+    footprint_points = points[::_stride_for(len(points), footprint_target)]
 
     if fig is None:
-        fig = plt.figure(figsize=(11, 9))
+        fig = plt.figure(figsize=figsize)
     axes = fig.subplots(2, 2)
     ax_xy, ax_xz = axes[0]
     ax_yz, ax_data = axes[1]
 
-    _plot_plane(ax_xy, points, landmarks, "xy")
-    _plot_plane(ax_xz, points, landmarks, "xz")
-    _plot_plane(ax_yz, points, landmarks, "yz")
+    _plot_plane(ax_xy, footprint_points, landmarks, "xy")
+    _plot_plane(ax_xz, footprint_points, landmarks, "xz")
+    _plot_plane(ax_yz, footprint_points, landmarks, "yz")
     panel(ax_data)
 
     fig.suptitle(title or _default_title(data, points))
@@ -209,7 +274,9 @@ def plot_trajectory(
 # ---------------------------------------------------------------------------
 
 
-def _extract(data: Any):
+def _extract(
+    data: Any, max_points: int, sample_fraction: Optional[float], cmap: str
+):
     """Return ((N, 3) experiment-frame points, panel(ax) -> None)."""
     from .robot.macron.profiler import ProfileResult
     from .scanner.pointcloud import SurfaceScan
@@ -224,17 +291,19 @@ def _extract(data: Any):
                 "with the data"
             )
         points = data.to_points(drop_invalid=True, dtype=np.float64)
-        return points, lambda ax: _plot_surface_panel(ax, data)
+        return points, lambda ax: _plot_surface_panel(
+            ax, data, max_points=max_points, sample_fraction=sample_fraction, cmap=cmap
+        )
 
     if isinstance(data, ProfileResult):
-        return _extract_profile(data.df)
+        return _extract_profile(data.df, max_points, sample_fraction)
 
     try:
         import pandas as pd
     except ImportError:
         pd = None
     if pd is not None and isinstance(data, pd.DataFrame):
-        return _extract_profile(data)
+        return _extract_profile(data, max_points, sample_fraction)
 
     raise TypeError(
         f"plot_acquisition() doesn't know how to handle {type(data)!r} — "
@@ -242,7 +311,9 @@ def _extract(data: Any):
     )
 
 
-def _extract_profile(df: Optional["pd.DataFrame"]):
+def _extract_profile(
+    df: Optional["pd.DataFrame"], max_points: int, sample_fraction: Optional[float]
+):
     if df is None:
         raise ValueError("plot_acquisition(): no DataFrame available on this ProfileResult")
     required = ("experiment_x_mm", "experiment_y_mm", "experiment_z_mm")
@@ -253,7 +324,9 @@ def _extract_profile(df: Optional["pd.DataFrame"]):
             "laguna.robot.macron.profiler.orient_profile() first"
         )
     points = df[list(required)].to_numpy(dtype=float)
-    return points, lambda ax: _plot_profile_panel(ax, df)
+    return points, lambda ax: _plot_profile_panel(
+        ax, df, max_points=max_points, sample_fraction=sample_fraction
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,52 +396,68 @@ def _draw_landmarks(ax: Any, landmarks: Optional[Sequence[Landmark]], plane: str
 # ---------------------------------------------------------------------------
 
 
-def _plot_surface_panel(ax: Any, scan: "SurfaceScan") -> None:
+def _plot_surface_panel(
+    ax: Any,
+    scan: "SurfaceScan",
+    max_points: int = _DEFAULT_MAX_POINTS,
+    sample_fraction: Optional[float] = None,
+    cmap: str = "viridis",
+) -> None:
     """Z heatmap, downsampled — same method as scripts/visualize_scan.py.
 
     ``x_mm``/``y_mm`` 1D (uniform surface) renders via ``imshow`` with a
     flat extent; 2D (point cloud — including any scan run through
-    ``orient_scan()``, which always downgrades to per-cell storage) renders
-    as a real scatter of each cell's own (x, y), since imshow's extent
-    assumes uniform column spacing that a point cloud doesn't have — see
-    that script's ``plot_scan()`` docstring for the full rationale.
+    ``orient_scan()``, which always downgrades to per-cell storage, and
+    ``Tile.stitch()``'s merged output, a flat ``(1, N)`` grid) renders as a
+    real scatter of each cell's own (x, y), since imshow's extent assumes
+    uniform column spacing that a point cloud doesn't have — see that
+    script's ``plot_scan()`` docstring for the full rationale.
     """
     z, x, y = scan.z_mm, scan.x_mm, scan.y_mm
     non_uniform_xy = x.ndim == 2
-    row_stride = max(1, z.shape[0] // 400)
-    col_stride = max(1, z.shape[1] // 1200)
-
-    zd = z[::row_stride, ::col_stride]
-    if non_uniform_xy:
-        xd = x[::row_stride, ::col_stride]
-        yd = y[::row_stride, ::col_stride]
-    else:
-        xd = x[::col_stride]
-        yd = y[::row_stride]
 
     valid = ~np.isnan(z)
     valid_frac = valid.sum() / z.size if z.size else 0.0
-    zvalid = z[valid]
-    if zvalid.size == 0:
+    if not valid.any():
         ax.text(0.5, 0.5, "no valid points", ha="center", va="center", transform=ax.transAxes)
         return
     vmin, vmax = np.nanpercentile(z, 1), np.nanpercentile(z, 99)
 
     if non_uniform_xy:
+        # A single flat stride over every cell, not a separate row/col
+        # stride — scatter doesn't care about grid shape, and a row/col
+        # split silently caps the total plotted points at the column
+        # budget alone for any grid with few rows (e.g. Tile.stitch()'s
+        # (1, N) merge), however large N actually is.
+        target = _resolve_target_points(z.size, max_points, sample_fraction)
+        stride = _stride_for(z.size, target)
+        zd, xd, yd = z.ravel()[::stride], x.ravel()[::stride], y.ravel()[::stride]
         # A point can be a valid Z return but still carry a NaN x/y (or the
         # reverse) — plot only where all three are finite.
         valid_d = ~np.isnan(zd) & ~np.isnan(xd) & ~np.isnan(yd)
         im = ax.scatter(
             xd[valid_d], yd[valid_d], c=zd[valid_d], s=1, marker=".",
-            cmap="viridis", vmin=vmin, vmax=vmax,
+            cmap=cmap, vmin=vmin, vmax=vmax,
         )
         ax.set_aspect("equal")
         ax.set_facecolor("black")
     else:
+        # Two strides, not one flat stride, so imshow's 2D structure (and
+        # its extent, derived from xd/yd) stays valid — scaled off the
+        # default 400x1200 split so a custom max_points/sample_fraction
+        # still lands near its target cell count while keeping that
+        # row:col ratio.
+        target = _resolve_target_points(z.shape[0] * z.shape[1], max_points, sample_fraction)
+        scale = (target / _DEFAULT_MAX_POINTS) ** 0.5
+        row_stride = max(1, z.shape[0] // max(1, round(400 * scale)))
+        col_stride = max(1, z.shape[1] // max(1, round(1200 * scale)))
+        zd = z[::row_stride, ::col_stride]
+        xd = x[::col_stride]
+        yd = y[::row_stride]
         im = ax.imshow(
             zd, aspect="equal", origin="lower",
             extent=[np.nanmin(xd), np.nanmax(xd), np.nanmin(yd), np.nanmax(yd)],
-            cmap="viridis", vmin=vmin, vmax=vmax,
+            cmap=cmap, vmin=vmin, vmax=vmax,
         )
     ax.set_xlabel("X (mm)")
     ax.set_ylabel("Y (mm)")
@@ -376,7 +465,12 @@ def _plot_surface_panel(ax: Any, scan: "SurfaceScan") -> None:
     ax.figure.colorbar(im, ax=ax, label="Z (mm)")
 
 
-def _plot_profile_panel(ax: Any, df: "pd.DataFrame") -> None:
+def _plot_profile_panel(
+    ax: Any,
+    df: "pd.DataFrame",
+    max_points: int = _DEFAULT_MAX_POINTS,
+    sample_fraction: Optional[float] = None,
+) -> None:
     if "height_mm" in df.columns:
         y_col, y_label = "height_mm", "calibrated height (mm)"
     elif "pos_mm" in df.columns:
@@ -385,6 +479,8 @@ def _plot_profile_panel(ax: Any, df: "pd.DataFrame") -> None:
     else:
         ax.text(0.5, 0.5, "no data columns found", ha="center", va="center", transform=ax.transAxes)
         return
+    target = _resolve_target_points(len(df), max_points, sample_fraction)
+    df = df.iloc[::_stride_for(len(df), target)]
     x = df["pos_mm"] if "pos_mm" in df.columns else range(len(df))
     ax.plot(x, df[y_col], color="tab:blue", linewidth=1)
     ax.set_xlabel("travel position (mm)" if "pos_mm" in df.columns else "sample")
