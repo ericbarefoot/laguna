@@ -21,6 +21,14 @@ bring-up.
 
 ::: laguna.scanner.pointcloud
 
+## Profile utilities
+
+Single-line (Profile mode) container and conversion — see the [subsystem
+guide](../subsystems/scanner.md#profile-mode-a-single-line) for when to use
+`scan_profile()` instead of a surface scan.
+
+::: laguna.scanner.profile
+
 ## Settings
 
 ::: laguna.scanner.settings

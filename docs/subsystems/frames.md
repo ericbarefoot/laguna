@@ -158,6 +158,35 @@ other way.
 
 ---
 
+## Placing a Gocator profile
+
+A profile (see [scanner.md](scanner.md#profile-mode-a-single-line)) has no
+travel axis — it's one instantaneous exposure, not a pass — so placing one
+only needs the gantry position it was captured *at*, not a start/end/
+direction reconstruction:
+
+```python
+from laguna.frames import orient_gocator_profile
+
+profile = lab.gocator.scan_profile(
+    metadata={"gantry_position": lab.gantry.get_status()["positions"]}
+)
+points = orient_gocator_profile(profile, frames=lab.frames)            # (N, 3) mm, experiment frame
+points = orient_gocator_profile(profile, frames=lab.frames, output="profile.csv")
+```
+
+Unlike `orient_scan()`, this returns a plain `(N, 3)` NumPy array, not a
+`GocatorProfile` — after the mounting/experiment rotation a profile's two
+sensor axes (X, Z) can each land in any of the three experiment columns, so
+there's no natural "profile-shaped" container left to put the result in.
+`gantry_position` is read from `profile.metadata["gantry_position"]` when
+not passed explicitly — stamp it at capture time (as above) or supply it
+directly. Same double-rotation guard as `orient_scan()`: keep the axis
+rotation in `gocator.mounting` only, and give `frames.instruments.gocator`
+a translation.
+
+---
+
 ## FYI: the Gocator has a source-level mirror setting (skeleton — WIP)
 
 > **Status: not yet fully characterized.** Filed here as a placeholder while

@@ -3,7 +3,8 @@
 LMI Gocator 2690 line-laser 3D surface scanner. Lives in
 `src/laguna/scanner/` — `gosdk.py` (ctypes binding), `gocator.py`
 (acquisition lifecycle), `settings.py` (configuration surface),
-`pointcloud.py` (surface -> point cloud + export), `mounting.py`
+`pointcloud.py` (surface -> point cloud + export), `profile.py` (single-line
+-> `GocatorProfile` + export, see "Profile mode" below), `mounting.py`
 (sensor-to-gantry axes).
 
 Distinct from [Rangefinder](rangefinder.md): the OD2000/WTT12L are
@@ -323,6 +324,60 @@ LAS/LAZ needs an optional dependency:
 ```bash
 pip install 'laguna[scanner]'
 ```
+
+---
+
+## Profile mode: a single line
+
+Everything above is **surface mode** (`GO_MODE_SURFACE`): a gantry pass
+stitches many profiles into a 3D grid. The sensor also has a **profile
+mode** (`GO_MODE_PROFILE`) for a single 2D X-Z line from one instantaneous
+exposure — no gantry motion, no travel scaling, no surface-generation state
+machine. Use it when you want one cross-section, not a 3D scan.
+
+```python
+lab.add("gocator", mode="profile")   # or gocator.mode: profile in config
+lab.connect_all()
+
+profile = lab.gocator.scan_profile()   # stationary — commands no motion
+print(profile.z_mm.shape)              # (n,) heights along the laser line
+points = profile.to_points()           # (N, 2) [x, z] in mm, invalid dropped
+
+lab.gocator.save_profile(profile, formats=("npz", "csv"))
+```
+
+`configure(mode="profile")` (what `scan_profile()` calls for you) sets
+`GO_MODE_PROFILE` and `GO_TRIGGER_SOFTWARE` — one `GoSensor_Trigger()` call
+fires one exposure, per the SDK's own doc comment: "will trigger individual
+frames in Profile or Surface mode." It **skips** the fixed-length
+surface-generation block and the `GoTransform_SetSpeed` travel-speed write
+entirely — neither has any meaning for a single line — and rejects
+`fixed_length_mm`/`travel_speed_mm_s` if you pass them alongside
+`mode="profile"`, since those are surface-only settings misapplied here.
+
+Active area, exposure, and `uniform_spacing` still apply — the last one
+selects the profile flavor exactly as it does for surfaces:
+
+| Message type | Contents | `GocatorProfile.is_uniform` | Emitted when |
+|---|---|---|---|
+| `UNIFORM_PROFILE` (7) | Z only per sample; X implied by index × resolution | `True` | `uniform_spacing: true` |
+| `PROFILE_POINT_CLOUD` (5) | explicit (x, z) raw pair per sample (un-resampled) | `False` | `uniform_spacing: false` |
+
+`scan_profile()` returns a `GocatorProfile` — a 1-D container (`z_mm`,
+`x_mm`), not a `SurfaceScan`. There's no travel axis and no mounting-frame Y
+concern, so it skips `grid_axes`/`gantry_travel_mm`/`rescale_y()`. It only
+saves to `npz`/`csv` — LAS/PLY are 3-D point-cloud formats with no
+meaningful fit for a single line.
+
+`acquire()` (the zero-argument scheduler entry point) dispatches on the
+scanner's configured mode: with `mode: profile`, it runs a stationary
+capture and needs no `gantry:` section or `axis`/`end_mm`/`feed_rate_mm_s`
+scan spec — only `gocator.scan.formats` (if you want it saved) is read.
+
+`GocatorProfile` carries the sensor's `mounting`, same as `SurfaceScan` —
+raw `x_mm`/`z_mm` are sensor-frame; `to_points()` reports gantry frame by
+default. To go one step further, into experiment coordinates, see
+[Placing a Gocator profile](frames.md#placing-a-gocator-profile).
 
 ---
 

@@ -31,9 +31,10 @@ import numpy as np
 import pytest
 
 from laguna.scanner import gosdk as g
-from laguna.scanner.gocator import GocatorScanner, UniformSpacingRequiredError
+from laguna.scanner.gocator import GocatorScanner, ScanNotPossibleError, UniformSpacingRequiredError
 from laguna.scanner.mounting import SensorMounting
 from laguna.scanner.pointcloud import SurfaceScan
+from laguna.scanner.profile import GocatorProfile
 
 # ---------------------------------------------------------------------------
 # Fake GoSdk
@@ -463,6 +464,64 @@ class FakeGo:
         self._owner._buffers.append(buf)
         return ctypes.cast(buf, ctypes.POINTER(ctypes.c_int16))
 
+    # -- resampled profile (GO_DATA_MESSAGE_TYPE_UNIFORM_PROFILE) --------
+    # Real GoSdk names confirmed against the vendor SDK source
+    # (Gocator/GoSdk/GoSdk/Messages/GoDataTypes.c) 2026-08-13 —
+    # GoUniformProfileMsg/GoProfilePointCloudMsg, not the deprecated
+    # GoResampledProfileMsg/GoProfileMsg aliases first guessed here.
+
+    def GoUniformProfileMsg_Width(self, msg):
+        return self._owner._msg(msg)["width"]
+
+    def GoUniformProfileMsg_Count(self, msg):
+        return self._owner._msg(msg).get("count", 1)
+
+    def GoUniformProfileMsg_XResolution(self, msg):
+        return self._owner._msg(msg)["x_res"]
+
+    def GoUniformProfileMsg_ZResolution(self, msg):
+        return self._owner._msg(msg)["z_res"]
+
+    def GoUniformProfileMsg_XOffset(self, msg):
+        return self._owner._msg(msg)["x_off"]
+
+    def GoUniformProfileMsg_ZOffset(self, msg):
+        return self._owner._msg(msg)["z_off"]
+
+    def GoUniformProfileMsg_At(self, msg, row):
+        data = self._owner._msg(msg)["data"]
+        buf = (ctypes.c_int16 * len(data))(*data.tolist())
+        self._owner._buffers.append(buf)
+        return ctypes.cast(buf, ctypes.POINTER(ctypes.c_int16))
+
+    # -- raw profile point cloud (GO_DATA_MESSAGE_TYPE_PROFILE_POINT_CLOUD)
+
+    def GoProfilePointCloudMsg_Width(self, msg):
+        return self._owner._msg(msg)["width"]
+
+    def GoProfilePointCloudMsg_Count(self, msg):
+        return self._owner._msg(msg).get("count", 1)
+
+    def GoProfilePointCloudMsg_XResolution(self, msg):
+        return self._owner._msg(msg)["x_res"]
+
+    def GoProfilePointCloudMsg_ZResolution(self, msg):
+        return self._owner._msg(msg)["z_res"]
+
+    def GoProfilePointCloudMsg_XOffset(self, msg):
+        return self._owner._msg(msg)["x_off"]
+
+    def GoProfilePointCloudMsg_ZOffset(self, msg):
+        return self._owner._msg(msg)["z_off"]
+
+    def GoProfilePointCloudMsg_At(self, msg, row):
+        # kPoint16s{x, y} pairs, flattened: [x0, y0, x1, y1, ...].
+        points = self._owner._msg(msg)["points"]
+        flat = points.reshape(-1)
+        buf = (ctypes.c_int16 * len(flat))(*flat.tolist())
+        self._owner._buffers.append(buf)
+        return ctypes.cast(buf, ctypes.POINTER(ctypes.c_int16))
+
 
 class FakeLib:
     """Stand-in for laguna.scanner.gosdk.GoSdkLib."""
@@ -528,6 +587,44 @@ def make_surface_msg(rows=3, cols=4, z_res=1000, z_off=0, y_res=50_000, x_res=12
 
 def make_stamp_msg():
     return {"type": g.GO_DATA_MESSAGE_TYPE_STAMP}
+
+
+def make_uniform_profile_msg(width=6, z_res=1000, z_off=0, x_res=125_000):
+    """Build a synthetic UNIFORM_PROFILE message dict.
+
+    Raw counts ascend 0,1,2,... so scaled values are trivially predictable.
+    """
+    data = np.arange(width, dtype=np.int16)
+    return {
+        "type": g.GO_DATA_MESSAGE_TYPE_UNIFORM_PROFILE,
+        "width": width,
+        "x_res": x_res,
+        "z_res": z_res,
+        "x_off": 0,
+        "z_off": z_off,
+        "data": data,
+    }
+
+
+def make_profile_point_cloud_msg(n=6, z_res=1000, z_off=0, x_res=125_000):
+    """Build a synthetic PROFILE_POINT_CLOUD message dict.
+
+    Each point is a raw (x, y) pair — x ascends 0,1,2,..., y (height)
+    ascends 10,11,12,... so the two axes are distinguishable in assertions.
+    """
+    points = np.stack(
+        [np.arange(n, dtype=np.int16), np.arange(10, 10 + n, dtype=np.int16)],
+        axis=1,
+    )
+    return {
+        "type": g.GO_DATA_MESSAGE_TYPE_PROFILE_POINT_CLOUD,
+        "width": n,
+        "x_res": x_res,
+        "z_res": z_res,
+        "x_off": 0,
+        "z_off": z_off,
+        "points": points,
+    }
 
 
 @pytest.fixture
@@ -1927,3 +2024,230 @@ class TestErrorTypes:
         with pytest.raises(g.GoSdkError):
             lib.check("GoSensor_Connect", g.kERROR)
         assert lib.check("GoSensor_Connect", g.kOK) == g.kOK
+
+
+# ---------------------------------------------------------------------------
+# Profile mode (GO_MODE_PROFILE) — single stationary instantaneous exposure
+# ---------------------------------------------------------------------------
+
+
+def make_profile(**meta) -> GocatorProfile:
+    z = np.array([1.0, 2.0, np.nan, 4.0])
+    return GocatorProfile(
+        z_mm=z, x_mm=np.array([0.0, 1.0, 2.0, 3.0]), metadata=meta, is_uniform=True
+    )
+
+
+class TestProfileMode:
+    def test_default_mode_is_surface(self, scanner):
+        assert scanner.get_status()["mode"] == "surface"
+
+    def test_invalid_mode_rejected_at_construction(self):
+        with pytest.raises(ValueError, match="mode"):
+            GocatorScanner({"ip": "1.2.3.4", "mode": "video"})
+
+    def test_configure_rejects_unknown_mode(self, scanner):
+        with pytest.raises(ValueError, match="mode"):
+            scanner.configure(mode="video")
+
+    def test_configure_profile_sets_scan_mode_and_software_trigger(self, scanner):
+        applied = scanner.configure(mode="profile")
+        assert scanner._fake.go.scan_mode == g.GO_MODE_PROFILE
+        assert scanner._fake.go.trigger_source == g.GO_TRIGGER_SOFTWARE
+        assert applied["mode"] == "profile"
+        assert applied["trigger_source"] == "software"
+        assert scanner.get_status()["mode"] == "profile"
+
+    def test_configure_profile_skips_surface_generation_and_travel_speed(self, scanner):
+        scanner.configure(mode="profile")
+        names = scanner._fake.call_names()
+        for surface_only in (
+            "GoSetup_SurfaceGeneration",
+            "GoSurfaceGeneration_SetGenerationType",
+            "GoSurfaceGenerationFixedLength_SetStartTrigger",
+            "GoTransform_SetSpeed",
+        ):
+            assert surface_only not in names, surface_only
+
+    def test_configure_profile_rejects_fixed_length_mm(self, scanner):
+        with pytest.raises(ValueError, match="fixed_length_mm"):
+            scanner.configure(mode="profile", fixed_length_mm=100.0)
+
+    def test_configure_profile_rejects_travel_speed(self, scanner):
+        with pytest.raises(ValueError, match="travel_speed_mm_s"):
+            scanner.configure(mode="profile", travel_speed_mm_s=10.0)
+
+    def test_configure_surface_mode_unaffected(self, scanner):
+        """Regression: mode=None (default) must still run the full surface
+        recipe — the mode branch must not have swallowed the existing path."""
+        scanner.configure()
+        names = scanner._fake.call_names()
+        assert "GoSurfaceGeneration_SetGenerationType" in names
+        assert scanner._fake.go.scan_mode == g.GO_MODE_SURFACE
+        assert scanner._fake.go.trigger_source == g.GO_TRIGGER_TIME
+
+    def test_receive_profile_requires_start(self, scanner):
+        with pytest.raises(RuntimeError, match=r"call start\(\) before receive_profile"):
+            scanner.receive_profile()
+
+    def test_receive_profile_times_out_with_actionable_message(self, scanner):
+        scanner._fake.go.datasets = []
+        scanner.configure(mode="profile")
+        scanner.start()
+        with pytest.raises(TimeoutError, match="profile"):
+            scanner.receive_profile(timeout_s=0.2)
+
+    def test_scan_profile_uniform_flavor(self, scanner):
+        scanner._fake.go.datasets = [[make_uniform_profile_msg(width=6)]]
+        profile = scanner.scan_profile(timeout_s=1.0)
+        assert isinstance(profile, GocatorProfile)
+        assert profile.is_uniform is True
+        assert profile.z_mm.shape == (6,)
+        assert profile.x_mm.shape == (6,)
+        names = scanner._fake.call_names()
+        assert "GoSensor_Trigger" in names
+        assert "GoSurfaceGeneration_SetGenerationType" not in names
+        assert scanner.get_status()["is_running"] is False
+
+    def test_scan_profile_raw_point_cloud_flavor(self, scanner):
+        scanner._fake.go.datasets = [[make_profile_point_cloud_msg(n=5)]]
+        profile = scanner.scan_profile(timeout_s=1.0)
+        assert isinstance(profile, GocatorProfile)
+        assert profile.is_uniform is False
+        assert profile.z_mm.shape == (5,)
+        assert profile.x_mm.shape == (5,)
+
+    def test_scan_profile_carries_scanner_mounting(self, monkeypatch):
+        """A profile from a rotated-mount sensor must carry that mounting —
+        without it, orient_gocator_profile() (laguna.frames) has no way to
+        know sensor X/Z land in different gantry axes."""
+        fake = FakeLib()
+        monkeypatch.setattr(
+            "laguna.scanner.gocator.GoSdkLib", lambda lib_dir=None: fake
+        )
+        s = GocatorScanner(
+            {
+                "ip": "192.168.1.10",
+                "mounting": {"scan_x": "-Y", "scan_y": "+X", "scan_z": "+Z"},
+            }
+        )
+        assert s.connect() is True
+        fake.go.datasets = [[make_uniform_profile_msg(width=4)]]
+        profile = s.scan_profile(timeout_s=1.0)
+        assert profile.mounting.gantry_axis_of("scan_x") == "-Y"
+        np.testing.assert_array_equal(profile.mounting.matrix, s.mounting.matrix)
+
+    def test_scan_profile_uniform_scaling(self, scanner):
+        """value_mm = offset_um/1000 + resolution_nm/1e6 * raw_count."""
+        msg = make_uniform_profile_msg(width=4, z_res=1000, z_off=500, x_res=125_000)
+        scanner._fake.go.datasets = [[msg]]
+        profile = scanner.scan_profile(timeout_s=1.0)
+        expected_z = 500 / 1000 + 1000 / 1e6 * np.arange(4)
+        np.testing.assert_allclose(profile.z_mm, expected_z)
+        expected_x = 125_000 / 1e6 * np.arange(4)
+        np.testing.assert_allclose(profile.x_mm, expected_x)
+
+    def test_scan_profile_uniform_nan_at_invalid_sentinel(self, scanner):
+        msg = make_uniform_profile_msg(width=4)
+        msg["data"] = np.array([0, 1, -32768, 3], dtype=np.int16)
+        scanner._fake.go.datasets = [[msg]]
+        profile = scanner.scan_profile(timeout_s=1.0)
+        assert np.isnan(profile.z_mm).tolist() == [False, False, True, False]
+
+    def test_scan_profile_point_cloud_scaling(self, scanner):
+        msg = make_profile_point_cloud_msg(n=3, z_res=2000, z_off=100, x_res=125_000)
+        scanner._fake.go.datasets = [[msg]]
+        profile = scanner.scan_profile(timeout_s=1.0)
+        # x raw counts are 0,1,2 (offset 0); y (height) raw counts are 10,11,12
+        expected_x = 125_000 / 1e6 * np.array([0, 1, 2])
+        expected_z = 100 / 1000 + 2000 / 1e6 * np.array([10, 11, 12])
+        np.testing.assert_allclose(profile.x_mm, expected_x)
+        np.testing.assert_allclose(profile.z_mm, expected_z)
+
+    def test_scan_profile_stamp_metadata_attached(self, scanner):
+        scanner._fake.go.datasets = [[make_stamp_msg(), make_uniform_profile_msg()]]
+        profile = scanner.scan_profile(timeout_s=1.0)
+        assert profile.metadata["frame_index"] == 7
+        assert profile.metadata["timestamp_us"] == pytest.approx(1000.0)
+
+
+class TestSaveProfile:
+    """GocatorScanner.save_profile() format dispatch."""
+
+    def _scanner(self, tmp_path, monkeypatch):
+        fake = FakeLib()
+        monkeypatch.setattr(
+            "laguna.scanner.gocator.GoSdkLib", lambda lib_dir=None: fake
+        )
+        return GocatorScanner({"ip": "192.168.1.10", "output_dir": str(tmp_path)})
+
+    def test_default_formats_are_npz_and_csv(self, tmp_path, monkeypatch):
+        written = self._scanner(tmp_path, monkeypatch).save_profile(make_profile())
+        assert set(written) == {"npz", "csv"}
+        assert all(p.exists() for p in written.values())
+
+    def test_unknown_format_rejected(self, tmp_path, monkeypatch):
+        scanner = self._scanner(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="Unknown profile format"):
+            scanner.save_profile(make_profile(), formats=("npz", "nope"))
+        assert list(tmp_path.glob("*")) == []
+
+    def test_no_las_or_ply_support(self, tmp_path, monkeypatch):
+        """A single X-Z line has no meaningful 3-D point-cloud
+        representation — LAS/PLY are deliberately not offered."""
+        scanner = self._scanner(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="Unknown profile format"):
+            scanner.save_profile(make_profile(), formats=("ply",))
+
+    def test_npz_round_trip(self, tmp_path, monkeypatch):
+        scanner = self._scanner(tmp_path, monkeypatch)
+        profile = make_profile(exposure_us=200)
+        written = scanner.save_profile(profile, formats=("npz",))
+        loaded = GocatorProfile.from_npz(written["npz"])
+        np.testing.assert_array_equal(loaded.z_mm, profile.z_mm)
+        np.testing.assert_array_equal(loaded.x_mm, profile.x_mm)
+        assert loaded.is_uniform == profile.is_uniform
+        assert loaded.metadata == profile.metadata
+
+
+class TestAcquireDispatch:
+    """acquire() dispatches on self.mode — see GocatorScanner.acquire()."""
+
+    def _connected(self, tmp_path, monkeypatch, **config):
+        fake = FakeLib()
+        monkeypatch.setattr(
+            "laguna.scanner.gocator.GoSdkLib", lambda lib_dir=None: fake
+        )
+        s = GocatorScanner(
+            {"ip": "192.168.1.10", "output_dir": str(tmp_path), **config}
+        )
+        assert s.connect() is True
+        s._fake = fake
+        return s
+
+    def test_profile_mode_dispatches_without_a_gantry(self, tmp_path, monkeypatch):
+        s = self._connected(tmp_path, monkeypatch, mode="profile")
+        s._fake.go.datasets = [[make_uniform_profile_msg(width=4)]]
+        result = s.acquire()  # no gantry passed — must not raise
+        assert isinstance(result, GocatorProfile)
+
+    def test_profile_mode_saves_when_formats_given(self, tmp_path, monkeypatch):
+        s = self._connected(
+            tmp_path, monkeypatch, mode="profile", scan={"formats": "npz"}
+        )
+        s._fake.go.datasets = [[make_uniform_profile_msg(width=4)]]
+        s.acquire()
+        assert list(tmp_path.glob("*.npz"))
+
+    def test_profile_mode_raises_if_not_connected(self, tmp_path):
+        s = GocatorScanner(
+            {"ip": "192.168.1.10", "mode": "profile", "output_dir": str(tmp_path)}
+        )
+        with pytest.raises(ScanNotPossibleError, match="not connected"):
+            s.acquire()
+
+    def test_surface_mode_still_requires_a_scan_spec(self, scanner):
+        """Regression: splitting acquire() into _acquire_surface() must not
+        change surface mode's existing no-spec/no-gantry behavior."""
+        with pytest.raises(ScanNotPossibleError, match="scan:"):
+            scanner.acquire()

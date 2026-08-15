@@ -1325,6 +1325,14 @@ class AxisHandle:
         """Read encoder position (ENP), in real mm."""
         return self._cmd.get_encoder_position(self._axis)
 
+    def get_negative_limit(self) -> float:
+        """Read software negative travel limit (NLT), in real mm."""
+        return self._cmd.get_negative_limit(self._axis)
+
+    def get_positive_limit(self) -> float:
+        """Read software positive travel limit (PLT), in real mm."""
+        return self._cmd.get_positive_limit(self._axis)
+
     # -- motor -------------------------------------------------------------
     # No enable/disable-drive (ENA) counterpart: addressing ENA on a
     # responder-node axis crashes the controller — see _ENA_BANNED. MTR is

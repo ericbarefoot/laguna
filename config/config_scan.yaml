@@ -59,7 +59,7 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
   remote_serial_device: /dev/serial/by-id/usb-FTDI_USB-RS232_Cable_AV0K9L0C-if00-port0
   remote_baud: 9600
   group_index: 1
-  safe_mode: false              # client-side query-only allowlist enforced — do not disable
+  safe_mode: true              # client-side query-only allowlist enforced — do not disable
                                 # without explicit authorization to command motion
   axes:                        # 8 axis slots are physically present, split across two PLC nodes:
                                 # commander (1-4: X, Y, encoder, encoder) and responder (5-8: Z,
@@ -87,6 +87,7 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
   mm_per_acp_unit: 15.0
   # Real-mm translation from the gantry's raw zero to a real-world origin.
   coordinate_offset: {X: 0.0, Y: 0.0, Z: 0.0, Theta: 0.0}
+  position_checkpoint_file: ./tmp/positions.tmp
 
 # OD2000 / WTT12L PowerProx rangefinders, via an ifm AL1342 IO-Link master.
 # Add one block per sensor in use — od2000 and wtt12l use the same shape,

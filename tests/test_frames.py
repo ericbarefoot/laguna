@@ -8,9 +8,16 @@ gantry commands that land their measurement points on the same physical spot.
 import numpy as np
 import pytest
 
-from laguna.frames import AffineTransform, FrameRegistry, InstrumentFrame, orient_scan
+from laguna.frames import (
+    AffineTransform,
+    FrameRegistry,
+    InstrumentFrame,
+    orient_gocator_profile,
+    orient_scan,
+)
 from laguna.scanner.mounting import SensorMounting
 from laguna.scanner.pointcloud import SurfaceScan
+from laguna.scanner.profile import GocatorProfile
 
 #: Representative rig: sensors offset on the carriage, origin at a corner.
 RIG = {
@@ -437,3 +444,109 @@ class TestOrientScan:
         scan = make_scan(gantry_axis="X", gantry_start_mm=700.0)
         with pytest.raises(ValueError, match="unknown output format"):
             orient_scan(scan, frames=registry, output=tmp_path / "oriented.txt")
+
+
+def make_profile(mounting=None, x_mm=None, z_mm=None, **meta):
+    x_mm = np.array([0.0, 10.0]) if x_mm is None else x_mm
+    z_mm = np.array([1.0, 2.0]) if z_mm is None else z_mm
+    return GocatorProfile(
+        z_mm=z_mm, x_mm=x_mm, metadata=meta, mounting=mounting or SensorMounting()
+    )
+
+
+class TestOrientGocatorProfile:
+    """Stationary sibling of TestOrientScan: no travel axis, so orienting a
+    profile only needs the gantry position it was captured at — no
+    start/end/direction bookkeeping."""
+
+    def test_places_a_profile_using_metadata_position(self):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(gantry_position={"X": 700.0, "Y": 450.0, "Z": 20.0})
+        pts = orient_gocator_profile(profile, frames=registry)
+        # identity mounting: sensor x -> gantry X, sensor z -> gantry Z.
+        # gantry = [700+x, 450, 20+z]; experiment = +RIG's [500,300,0].
+        np.testing.assert_allclose(pts[0], [700.0 + 500.0, 450.0 + 300.0, 20.0 + 1.0 - 325.0])
+        np.testing.assert_allclose(pts[1], [710.0 + 500.0, 450.0 + 300.0, 22.0 - 325.0])
+
+    def test_gantry_position_accepts_a_plain_sequence(self):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile()
+        pts = orient_gocator_profile(profile, frames=registry, gantry_position=[700.0, 450.0, 20.0])
+        np.testing.assert_allclose(pts[0], [700.0 + 500.0, 450.0 + 300.0, 20.0 + 1.0 - 325.0])
+
+    def test_explicit_gantry_position_overrides_metadata(self):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(gantry_position={"X": 999.0, "Y": 999.0, "Z": 999.0})
+        pts = orient_gocator_profile(profile, frames=registry, gantry_position=[0.0, 0.0, 0.0])
+        np.testing.assert_allclose(pts[0], [500.0, 300.0, 1.0 - 325.0])
+
+    def test_missing_position_raises(self):
+        with pytest.raises(ValueError, match="needs the gantry position"):
+            orient_gocator_profile(make_profile(), frames=FrameRegistry.from_config(RIG))
+
+    def test_rotated_mounting_lands_in_the_expected_gantry_axis(self):
+        """This rig's actual mount: sensor X (across laser) -> gantry -Y."""
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(
+            mounting=SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z"),
+            x_mm=np.array([10.0]),
+            z_mm=np.array([1.0]),
+            gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0},
+        )
+        pts = orient_gocator_profile(profile, frames=registry)
+        # sensor x=10 -> gantry Y=-10, then +RIG's Y=300 -> 290
+        np.testing.assert_allclose(pts[0], [0.0 + 500.0, -10.0 + 300.0, 1.0 - 325.0])
+
+    def test_double_rotation_is_refused(self):
+        """The profile already rotates itself into gantry orientation; a
+        rotation in the instrument frame too would turn it twice."""
+        registry = FrameRegistry.from_config(
+            {"instruments": {"gocator": {"axes": {"scan_x": "-Y", "scan_y": "+X", "scan_z": "+Z"}}}}
+        )
+        profile = make_profile(
+            mounting=SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z"),
+            gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0},
+        )
+        with pytest.raises(ValueError, match="would turn the data twice"):
+            orient_gocator_profile(profile, frames=registry)
+
+    def test_translation_only_frame_is_fine_with_a_rotated_profile(self):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(
+            mounting=SensorMounting(scan_x="-Y", scan_y="+X", scan_z="+Z"),
+            gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0},
+        )
+        assert orient_gocator_profile(profile, frames=registry).shape == (2, 3)
+
+    def test_invalid_points_dropped(self):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(
+            x_mm=np.array([0.0, 10.0, 20.0]),
+            z_mm=np.array([1.0, np.nan, 3.0]),
+            gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0},
+        )
+        pts = orient_gocator_profile(profile, frames=registry)
+        assert pts.shape == (2, 3)
+
+    def test_output_writes_a_csv_inferred_from_suffix(self, tmp_path):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0})
+        out = tmp_path / "oriented_profile.csv"
+        orient_gocator_profile(profile, frames=registry, output=out)
+        assert out.exists()
+        assert "x_mm,y_mm,z_mm" in out.read_text()
+
+    def test_output_writes_npz_inferred_from_suffix(self, tmp_path):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0})
+        out = tmp_path / "oriented_profile.npz"
+        orient_gocator_profile(profile, frames=registry, output=out)
+        assert out.exists()
+        with np.load(out, allow_pickle=True) as data:
+            assert data["points"].shape == (2, 3)
+
+    def test_output_unknown_suffix_raises(self, tmp_path):
+        registry = FrameRegistry.from_config(RIG)
+        profile = make_profile(gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0})
+        with pytest.raises(ValueError, match="unknown output format"):
+            orient_gocator_profile(profile, frames=registry, output=tmp_path / "oriented.txt")

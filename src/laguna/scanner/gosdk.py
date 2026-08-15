@@ -76,6 +76,7 @@ GO_SPACING_INTERVAL_TYPE_MAX_SPEED = 2
 GO_SPACING_INTERVAL_TYPE_CUSTOM = 3
 
 # GoMode
+GO_MODE_PROFILE = 2  # GoSdkDef.h:281 — matches gocator.py's _SCAN_MODES label
 GO_MODE_SURFACE = 3  # GoSdkDef.h:281
 
 # GoTrigger — GoSdkDef.h:297-303
@@ -160,6 +161,17 @@ class kPoint3d16s(Structure):
     """Platform/kApi/kApi/kApiDef.h:1370-1375."""
 
     _fields_ = [("x", k16s), ("y", k16s), ("z", k16s)]
+
+
+class kPoint16s(Structure):
+    """A raw profile point: {x, y} int16 (Platform/kApi/kApi/kApiDef.h).
+
+    Distinct from ``kPoint3d16s`` — profiles have no travel axis, so the
+    SDK's 'y' field here is height (what surface messages call Z), not a
+    second position axis. See ``GoProfileMsg_At`` below.
+    """
+
+    _fields_ = [("x", k16s), ("y", k16s)]
 
 
 # ----------------------------------------------------------------------
@@ -418,6 +430,30 @@ class GoSdkLib:
 
         sig(go, "GoUniformSurfaceMsg_RowAt", POINTER(k16s), kObject, kSize)
         sig(go, "GoSurfacePointCloudMsg_RowAt", POINTER(kPoint3d16s), kObject, kSize)
+
+        # Profile messages (GO_MODE_PROFILE) — confirmed against the real
+        # SDK headers/source (Gocator/GoSdk/GoSdk/Messages/GoDataTypes.c,
+        # GoDataTypes.h) in ~/Downloads/14400-6.5.2.5_SOFTWARE_GO_SDK,
+        # 2026-08-13, after GoProfileMsg/GoResampledProfileMsg (this file's
+        # first guess, by analogy to the Surface names) turned out to be
+        # *deprecated aliases* that don't export a full symbol set — the
+        # real, current types are GoProfilePointCloudMsg (raw/sparse) and
+        # GoUniformProfileMsg (resampled), naming-symmetric with
+        # GoSurfacePointCloudMsg/GoUniformSurfaceMsg above. Like the surface
+        # messages, content is a 2-D array: Count = rows (profiles batched
+        # in one message — 1 for the 2690), Width = points per profile;
+        # _At(msg, row) returns that row's pointer, not a single point.
+        for prefix in ("GoUniformProfileMsg", "GoProfilePointCloudMsg"):
+            sig(go, f"{prefix}_Count", kSize, kObject)       # rows (profiles/message)
+            sig(go, f"{prefix}_Width", kSize, kObject)       # cols (points/profile)
+            sig(go, f"{prefix}_XResolution", k32u, kObject)  # nm
+            sig(go, f"{prefix}_ZResolution", k32u, kObject)  # nm
+            sig(go, f"{prefix}_XOffset", k32s, kObject)      # µm
+            sig(go, f"{prefix}_ZOffset", k32s, kObject)      # µm
+            sig(go, f"{prefix}_Exposure", k32u, kObject)     # ns
+
+        sig(go, "GoUniformProfileMsg_At", POINTER(k16s), kObject, kSize)
+        sig(go, "GoProfilePointCloudMsg_At", POINTER(kPoint16s), kObject, kSize)
 
     # ------------------------------------------------------------------
     # Call helpers

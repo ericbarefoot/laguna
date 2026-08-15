@@ -824,6 +824,7 @@ class GocatorSettingsMixin:
 
     def configure(
         self,
+        mode: Optional[str] = None,
         travel_speed_mm_s: Optional[float] = None,
         frame_rate_hz: Optional[float] = None,
         frame_rate_max: Optional[bool] = None,
@@ -845,6 +846,16 @@ class GocatorSettingsMixin:
         (guarding against needless flash wear across repeated scans).
 
         Args:
+            mode: "surface" (default) or "profile". Surface mode is the
+                encoderless recipe this method is named for: fixed-length
+                surface generation plus a travel-speed write to scale Y.
+                Profile mode is a single instantaneous exposure with no
+                travel — it sets GO_MODE_PROFILE and GO_TRIGGER_SOFTWARE
+                (see GocatorScanner.scan_profile()) and skips the
+                surface-generation/travel-speed blocks entirely, since
+                neither concept applies to one line. None falls back to
+                whatever mode the scanner was constructed or last
+                configured with.
             travel_speed_mm_s: Assumed constant velocity along travel, mm/s.
             frame_rate_hz: Profile rate. Pass 0 or None with no configured
                 value to leave whatever frame-rate mode/rate the sensor
@@ -892,7 +903,10 @@ class GocatorSettingsMixin:
 
         Raises:
             RuntimeError: If not connected.
-            ValueError: If both frame_rate_hz and frame_rate_max are given.
+            ValueError: If both frame_rate_hz and frame_rate_max are given,
+                if mode is neither "surface" nor "profile", or if
+                fixed_length_mm/travel_speed_mm_s is given together with
+                mode="profile".
             GoSdkError: If any SDK call fails.
         """
         if frame_rate_hz is not None and frame_rate_max:
@@ -902,6 +916,29 @@ class GocatorSettingsMixin:
                 "frame_rate_max=True to use the sensor's current maximum, "
                 "not both."
             )
+
+        effective_mode = mode if mode is not None else self._mode
+        if effective_mode not in ("surface", "profile"):
+            raise ValueError(
+                f"configure() got mode={effective_mode!r} — must be "
+                "'surface' or 'profile'."
+            )
+        if effective_mode == "profile":
+            surface_only = [
+                label
+                for label, value in (
+                    ("fixed_length_mm", fixed_length_mm),
+                    ("travel_speed_mm_s", travel_speed_mm_s),
+                )
+                if value is not None
+            ]
+            if surface_only:
+                raise ValueError(
+                    f"configure() got {' and '.join(surface_only)} together "
+                    "with mode='profile' — these are surface-generation-only "
+                    "settings and don't apply to a single profile exposure. "
+                    "Drop them, or use mode='surface'."
+                )
 
         # Catch uniform-spacing-only settings against the value this call is
         # about to apply, before writing anything. Checking the live sensor
@@ -953,11 +990,23 @@ class GocatorSettingsMixin:
         if self._active_area:
             self.set_active_area(flush=False, **self._active_area)
 
-        # Surface mode — a 3D scan, not individual profiles.
-        lib.call("GoSetup_SetScanMode", setup, _g.k32s(_g.GO_MODE_SURFACE))
+        lib.call(
+            "GoSetup_SetScanMode",
+            setup,
+            _g.k32s(_g.GO_MODE_SURFACE if effective_mode == "surface" else _g.GO_MODE_PROFILE),
+        )
 
-        # Time trigger: the encoderless path. Y spacing comes from travel speed.
-        lib.call("GoSetup_SetTriggerSource", setup, _g.k32s(_g.GO_TRIGGER_TIME))
+        if effective_mode == "surface":
+            # Time trigger: the encoderless path. Y spacing comes from travel speed.
+            lib.call("GoSetup_SetTriggerSource", setup, _g.k32s(_g.GO_TRIGGER_TIME))
+        else:
+            # Software trigger: one GoSensor_Trigger() call = one profile
+            # exposure (GoSensor_Trigger's doc comment: "will trigger
+            # individual frames in Profile ... mode" — see
+            # docs/archive/gocator/GOCATOR_SDK_NOTES.md §2). There's no
+            # travel to space triggers against, so TIME's free-run has
+            # nothing to offer here.
+            lib.call("GoSetup_SetTriggerSource", setup, _g.k32s(_g.GO_TRIGGER_SOFTWARE))
 
         if use_max:
             # Explicitly requested, regardless of whether a previous
@@ -1026,46 +1075,50 @@ class GocatorSettingsMixin:
         if self._filters:
             self.set_filters(flush=False, **self._filters)
 
-        # Fixed-length surface, started by our software trigger.
-        surface = lib.handle("GoSetup_SurfaceGeneration", setup)
-        lib.call(
-            "GoSurfaceGeneration_SetGenerationType",
-            surface,
-            _g.k32s(_g.GO_SURFACE_GENERATION_TYPE_FIXED_LENGTH),
-        )
-        lib.call(
-            "GoSurfaceGenerationFixedLength_SetStartTrigger",
-            surface,
-            _g.k32s(_g.GO_SURFACE_GENERATION_START_TRIGGER_SOFTWARE),
-        )
-        if length:
-            lo = float(lib.go.GoSurfaceGenerationFixedLength_LengthLimitMin(surface))
-            hi = float(lib.go.GoSurfaceGenerationFixedLength_LengthLimitMax(surface))
-            if hi > 0 and not (lo <= float(length) <= hi):
-                raise ValueError(
-                    f"fixed_length_mm={length} outside the sensor's supported "
-                    f"range [{lo}, {hi}] mm"
-                )
+        if effective_mode == "surface":
+            # Fixed-length surface, started by our software trigger. Neither
+            # this state machine nor the travel-speed write below has any
+            # profile-mode meaning — a profile is one instantaneous exposure,
+            # not a sequence stitched together over travel.
+            surface = lib.handle("GoSetup_SurfaceGeneration", setup)
             lib.call(
-                "GoSurfaceGenerationFixedLength_SetLength",
+                "GoSurfaceGeneration_SetGenerationType",
                 surface,
-                _g.k64f(float(length)),
+                _g.k32s(_g.GO_SURFACE_GENERATION_TYPE_FIXED_LENGTH),
             )
-            self._fixed_length_mm = float(length)
-
-        # Travel speed lives on GoTransform and writes to flash — only touch
-        # it when it actually changes.
-        if speed:
-            transform = lib.handle("GoSensor_Transform", self._sensor)
-            current = float(lib.go.GoTransform_Speed(transform))
-            if abs(current - float(speed)) > 1e-6:
-                logger.info(
-                    "Updating Gocator travel speed %.4f -> %.4f mm/s (writes flash)",
-                    current,
-                    float(speed),
+            lib.call(
+                "GoSurfaceGenerationFixedLength_SetStartTrigger",
+                surface,
+                _g.k32s(_g.GO_SURFACE_GENERATION_START_TRIGGER_SOFTWARE),
+            )
+            if length:
+                lo = float(lib.go.GoSurfaceGenerationFixedLength_LengthLimitMin(surface))
+                hi = float(lib.go.GoSurfaceGenerationFixedLength_LengthLimitMax(surface))
+                if hi > 0 and not (lo <= float(length) <= hi):
+                    raise ValueError(
+                        f"fixed_length_mm={length} outside the sensor's supported "
+                        f"range [{lo}, {hi}] mm"
+                    )
+                lib.call(
+                    "GoSurfaceGenerationFixedLength_SetLength",
+                    surface,
+                    _g.k64f(float(length)),
                 )
-                lib.call("GoTransform_SetSpeed", transform, _g.k64f(float(speed)))
-            self._travel_speed_mm_s = float(speed)
+                self._fixed_length_mm = float(length)
+
+            # Travel speed lives on GoTransform and writes to flash — only
+            # touch it when it actually changes.
+            if speed:
+                transform = lib.handle("GoSensor_Transform", self._sensor)
+                current = float(lib.go.GoTransform_Speed(transform))
+                if abs(current - float(speed)) > 1e-6:
+                    logger.info(
+                        "Updating Gocator travel speed %.4f -> %.4f mm/s (writes flash)",
+                        current,
+                        float(speed),
+                    )
+                    lib.call("GoTransform_SetSpeed", transform, _g.k64f(float(speed)))
+                self._travel_speed_mm_s = float(speed)
 
         lib.call("GoSensor_Flush", self._sensor)
 
@@ -1114,7 +1167,10 @@ class GocatorSettingsMixin:
                 )
                 self._frame_rate_hz = achieved
 
+        self._mode = effective_mode
+
         applied = {
+            "mode": effective_mode,
             "travel_speed_mm_s": self._travel_speed_mm_s,
             "frame_rate_hz": self._frame_rate_hz,
             "frame_rate_max": use_max,
@@ -1125,9 +1181,9 @@ class GocatorSettingsMixin:
             "spacing_interval": self._spacing_interval,
             "filters": self._filters,
             "exposure_us": self._exposure_us,
-            "trigger_source": "time",
-            "surface_generation": "fixed_length",
-            "start_trigger": "software",
+            "trigger_source": "time" if effective_mode == "surface" else "software",
+            "surface_generation": "fixed_length" if effective_mode == "surface" else None,
+            "start_trigger": "software" if effective_mode == "surface" else None,
         }
         logger.info("Gocator configured: %s", applied)
         return applied

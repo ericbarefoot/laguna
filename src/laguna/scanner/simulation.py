@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 SIM_ROWS = 200
 SIM_COLS = 400
 
+#: Width of the synthetic profile — same order of magnitude as one row of
+#: the synthetic surface, for the same "small but realistic" reason.
+SIM_PROFILE_WIDTH = 400
+
 
 class _SimGo:
     """Stands in for the libGoSdk CDLL object."""
@@ -52,6 +56,7 @@ class _SimGo:
             "width": 2000.0, "length": 200.0, "height": 300.0,
         }
         self._grid = self._make_surface()
+        self._profile = self._make_profile()
 
     @staticmethod
     def _make_surface() -> np.ndarray:
@@ -62,6 +67,14 @@ class _SimGo:
         # A patch of no-return, so NaN handling is genuinely exercised.
         grid[10:20, 10:30] = -32768
         return grid
+
+    @staticmethod
+    def _make_profile() -> np.ndarray:
+        """A smooth ramp with a few invalid samples, as raw 16-bit counts."""
+        cols = np.linspace(-1000, 1000, SIM_PROFILE_WIDTH, dtype=np.float64)
+        profile = (cols * 0.05).astype(np.int16)
+        profile[10:20] = -32768
+        return profile
 
     # -- everything else answers plausibly ------------------------------
 
@@ -167,6 +180,14 @@ class _SimGo:
         return _g.kFALSE
 
     # setters that matter for readback
+    def GoSetup_SetScanMode(self, s, mode):
+        self.scan_mode = int(getattr(mode, "value", mode))
+        return _g.kOK
+
+    def GoSetup_SetTriggerSource(self, s, source):
+        self.trigger_source = int(getattr(source, "value", source))
+        return _g.kOK
+
     def GoSetup_SetFrameRate(self, s, rate):
         self.frame_rate = float(getattr(rate, "value", rate))
         return _g.kOK
@@ -235,7 +256,73 @@ class _SimGo:
         return 1
 
     def GoDataMsg_Type(self, msg):
+        if self.scan_mode == _g.GO_MODE_PROFILE:
+            return (
+                _g.GO_DATA_MESSAGE_TYPE_UNIFORM_PROFILE
+                if self.uniform_spacing
+                else _g.GO_DATA_MESSAGE_TYPE_PROFILE_POINT_CLOUD
+            )
         return _g.GO_DATA_MESSAGE_TYPE_UNIFORM_SURFACE
+
+    # -- profile (GO_MODE_PROFILE) ---------------------------------------
+    # Real GoSdk names (GoUniformProfileMsg/GoProfilePointCloudMsg) —
+    # confirmed against the vendor SDK source 2026-08-13, see gosdk.py.
+
+    def GoUniformProfileMsg_Width(self, msg):
+        return SIM_PROFILE_WIDTH
+
+    def GoUniformProfileMsg_Count(self, msg):
+        return 1
+
+    def GoUniformProfileMsg_XResolution(self, msg):
+        return 124000
+
+    def GoUniformProfileMsg_ZResolution(self, msg):
+        return 24300
+
+    def GoUniformProfileMsg_XOffset(self, msg):
+        return -1000000
+
+    def GoUniformProfileMsg_ZOffset(self, msg):
+        return 0
+
+    def GoUniformProfileMsg_At(self, msg, row):
+        data = object.__getattribute__(self, "_profile")
+        return ctypes.cast(
+            (ctypes.c_int16 * len(data))(*data.tolist()),
+            ctypes.POINTER(ctypes.c_int16),
+        )
+
+    def GoProfilePointCloudMsg_Width(self, msg):
+        return SIM_PROFILE_WIDTH
+
+    def GoProfilePointCloudMsg_Count(self, msg):
+        return 1
+
+    def GoProfilePointCloudMsg_XResolution(self, msg):
+        return 124000
+
+    def GoProfilePointCloudMsg_ZResolution(self, msg):
+        return 24300
+
+    def GoProfilePointCloudMsg_XOffset(self, msg):
+        return -1000000
+
+    def GoProfilePointCloudMsg_ZOffset(self, msg):
+        return 0
+
+    def GoProfilePointCloudMsg_At(self, msg, row):
+        # kPoint16s{x, y} pairs — x is a synthetic index-derived lateral
+        # count, y reuses the same synthetic Z ramp as the resampled path.
+        z = object.__getattribute__(self, "_profile")
+        n = len(z)
+        flat = np.empty(n * 2, dtype=np.int16)
+        flat[0::2] = np.arange(n, dtype=np.int16)
+        flat[1::2] = z
+        return ctypes.cast(
+            (ctypes.c_int16 * len(flat))(*flat.tolist()),
+            ctypes.POINTER(ctypes.c_int16),
+        )
 
     def GoUniformSurfaceMsg_Length(self, msg):
         return SIM_ROWS

@@ -56,6 +56,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from .scanner.pointcloud import SurfaceScan
+    from .scanner.profile import GocatorProfile
 
 logger = logging.getLogger(__name__)
 
@@ -814,9 +815,112 @@ def orient_scan(
     return oriented
 
 
+def orient_gocator_profile(
+    profile: "GocatorProfile",
+    *,
+    instrument: str = "gocator",
+    frames: FrameRegistry,
+    gantry_position: Optional[Sequence[float]] = None,
+    dtype: Any = np.float64,
+    output: Optional[Union[str, Path]] = None,
+) -> np.ndarray:
+    """Return `profile`'s points in experiment coordinates, (N, 3) XYZ mm.
+
+    A stationary single-exposure sibling of :func:`orient_scan`: a profile
+    has no travel axis to reconstruct — the sensor never moved during the
+    exposure, so there's no start/end/direction bookkeeping like
+    ``scan_with_gantry()``'s. All this needs is the gantry position the
+    profile was captured *at*, the sensor's own mounting rotation
+    (``profile.mounting`` — already applied by
+    :meth:`~laguna.scanner.profile.GocatorProfile.to_points`), the
+    instrument's frame translation, and the experiment frame.
+
+    Args:
+        profile: The GocatorProfile to orient.
+        instrument: Which instrument frame to use (``frames.instruments.<name>``).
+        frames: The lab's FrameRegistry.
+        gantry_position: ``[x, y, z]`` gantry position when the profile was
+            captured. Falls back to ``profile.metadata["gantry_position"]``
+            (an ``{"X": .., "Y": .., "Z": ..}``-style dict, as
+            ``scan_profile(metadata={"gantry_position": ...})`` can stamp in
+            at capture time) when omitted.
+        dtype: Output dtype.
+        output: Optional path to also write the oriented points to
+            (``.csv`` or ``.npz``).
+
+    Returns:
+        (N, 3) array of [x, y, z] in experiment-frame mm.
+
+    Raises:
+        ValueError: If no gantry position is available (neither passed nor
+            in metadata), the instrument frame and the profile's own
+            mounting both carry a rotation (would double-rotate — same
+            guard as :func:`orient_scan`), or `output`'s suffix isn't
+            recognized.
+    """
+    if gantry_position is None:
+        stamped = profile.metadata.get("gantry_position")
+        if stamped is None:
+            raise ValueError(
+                "orient_gocator_profile() needs the gantry position the "
+                "profile was captured at. Pass gantry_position=[x, y, z], "
+                "or stamp it into metadata at capture time — "
+                "scan_profile(metadata={'gantry_position': gantry.get_status()"
+                "['positions']})."
+            )
+        gantry_position = (
+            [stamped[a] for a in ("X", "Y", "Z")]
+            if isinstance(stamped, dict)
+            else list(stamped)
+        )
+
+    frame = frames.frame_for(instrument)
+    profile_rotated = not profile.mounting.is_identity
+    frame_rotates = not np.allclose(frame.mount.matrix[:3, :3], np.eye(3), atol=_RIGID_TOL)
+    if profile_rotated and frame_rotates:
+        raise ValueError(
+            f"the profile is already rotated into gantry orientation by its "
+            f"own mounting, and frames.instruments.{instrument} also "
+            "specifies a rotation — applying both would turn the data "
+            f"twice. Keep the axis map in gocator.mounting only, and give "
+            f"frames.instruments.{instrument} just a translation."
+        )
+
+    gantry_points = profile.to_points(drop_invalid=True, dtype=np.float64, frame="gantry")
+    offset = frame.offset + np.asarray(gantry_position, dtype=float)
+    experiment_points = frames.experiment_from_gantry.apply(gantry_points + offset)
+    experiment_points = experiment_points.astype(dtype, copy=False)
+
+    if output is not None:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = output_path.suffix.lower()
+        if suffix == ".csv":
+            import csv
+
+            with open(output_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["x_mm", "y_mm", "z_mm"])
+                writer.writerows(experiment_points)
+        elif suffix == ".npz":
+            np.savez_compressed(
+                output_path,
+                points=experiment_points,
+                metadata=np.array([repr(profile.metadata)], dtype=object),
+            )
+        else:
+            raise ValueError(
+                f"orient_gocator_profile(): unknown output format {suffix!r} "
+                "(expected .csv or .npz)"
+            )
+
+    return experiment_points
+
+
 __all__ = [
     "AffineTransform",
     "InstrumentFrame",
     "FrameRegistry",
     "orient_scan",
+    "orient_gocator_profile",
 ]

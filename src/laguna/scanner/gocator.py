@@ -47,6 +47,11 @@ from .pointcloud import (
     surface_point_cloud_to_scan,
     uniform_surface_to_scan,
 )
+from .profile import (
+    GocatorProfile,
+    profile_point_cloud_to_scan,
+    uniform_profile_to_scan,
+)
 # The configuration half of this subsystem lives in settings.py; it is mixed
 # in below so the public API is unchanged. FILTER_NAMES and
 # UniformSpacingRequiredError are re-exported here because callers and tests
@@ -98,6 +103,10 @@ class GocatorScanner(GocatorSettingsMixin):
 
     Args:
         config: Dict with keys:
+            mode: "surface" (default) or "profile". Surface mode is the
+                encoderless gantry-pass recipe described below. Profile
+                mode captures a single stationary instantaneous exposure
+                (see scan_profile()) — no gantry motion, no travel scaling.
             ip: Sensor IP address (e.g. "192.168.1.10").
             travel_speed_mm_s: Assumed constant gantry velocity, mm/s. This
                 is what scales the Y axis — it must match the actual feed
@@ -138,6 +147,12 @@ class GocatorScanner(GocatorSettingsMixin):
 
     def __init__(self, config: Dict[str, Any]):
         """Initialize the Gocator scanner from a config dict."""
+        self._mode = config.get("mode", "surface")
+        if self._mode not in ("surface", "profile"):
+            raise ValueError(
+                f"gocator config mode={self._mode!r} — must be 'surface' or "
+                "'profile'."
+            )
         self._ip = config.get("ip", "192.168.1.10")
         self._travel_speed_mm_s = config.get("travel_speed_mm_s")
         self._frame_rate_hz = config.get("frame_rate_hz")
@@ -286,6 +301,7 @@ class GocatorScanner(GocatorSettingsMixin):
         status: Dict[str, Any] = {
             "is_connected": self._is_connected,
             "is_running": self._is_running,
+            "mode": self._mode,
             "ip": self._ip,
             "scan_count": self._scan_count,
             "travel_speed_mm_s": self._travel_speed_mm_s,
@@ -599,6 +615,111 @@ class GocatorScanner(GocatorSettingsMixin):
             logger.debug("Could not read stamp: %s", e)
             return {}
 
+    def receive_profile(
+        self,
+        timeout_s: float = DEFAULT_RECEIVE_TIMEOUT_S,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> GocatorProfile:
+        """Poll the data channel until a profile message arrives.
+
+        Mirrors :meth:`receive_surface`, but for a single instantaneous
+        exposure instead of a gantry-timed pass — see :meth:`scan_profile`.
+
+        Args:
+            timeout_s: Total wall-clock budget for receiving a profile.
+            metadata: Extra context merged into the result's metadata.
+
+        Returns:
+            The converted :class:`GocatorProfile`.
+
+        Raises:
+            RuntimeError: If not started.
+            TimeoutError: If no profile message arrives within `timeout_s`.
+            GoSdkError: On a non-timeout SDK failure.
+        """
+        lib = self._require_connected()
+        if not self._is_running:
+            raise RuntimeError("call start() before receive_profile()")
+
+        deadline = time.monotonic() + timeout_s
+        stamps: Dict[str, Any] = {}
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"No Gocator profile message within {timeout_s:.1f} s. "
+                    "Check that mode='profile' was configured and that "
+                    "trigger() was called."
+                )
+
+            dataset = _g.kObject()
+            try:
+                lib.call(
+                    "GoSystem_ReceiveData",
+                    self._system,
+                    byref(dataset),
+                    _g.k64u(int(remaining * 1_000_000)),  # SDK wants µs
+                )
+            except GoSdkTimeout:
+                continue
+
+            try:
+                profile = self._extract_profile(dataset, stamps, metadata)
+            finally:
+                lib.go.GoDestroy(dataset)
+
+            if profile is not None:
+                self._scan_count += 1
+                self._last_scan_meta = dict(profile.metadata)
+                return profile
+
+    def _extract_profile(
+        self,
+        dataset,
+        stamps: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[GocatorProfile]:
+        """Scan one GoDataSet for a profile message, harvesting stamps too.
+
+        Returns None when the dataset holds no profile (stamps only),
+        signalling the caller to keep polling. Mirrors :meth:`_extract_surface`.
+        """
+        lib = self._lib
+        assert lib is not None
+        go = lib.go
+
+        count = int(go.GoDataSet_Count(dataset))
+        for i in range(count):
+            msg = go.GoDataSet_At(dataset, _g.kSize(i))
+            if not msg:
+                continue
+            msg = ctypes.c_void_p(msg)
+            msg_type = int(go.GoDataMsg_Type(msg))
+
+            if msg_type == _g.GO_DATA_MESSAGE_TYPE_STAMP:
+                stamps.update(self._read_first_stamp(msg))
+                continue
+
+            if msg_type in (
+                _g.GO_DATA_MESSAGE_TYPE_UNIFORM_PROFILE,
+                _g.GO_DATA_MESSAGE_TYPE_PROFILE_POINT_CLOUD,
+            ):
+                meta: Dict[str, Any] = {
+                    "ip": self._ip,
+                    "exposure_us": self._exposure_us,
+                    "received_wall_time": time.time(),
+                }
+                meta.update(stamps)
+                if metadata:
+                    meta.update(metadata)
+
+                if msg_type == _g.GO_DATA_MESSAGE_TYPE_UNIFORM_PROFILE:
+                    return uniform_profile_to_scan(lib, msg, meta, self._mounting)
+                return profile_point_cloud_to_scan(lib, msg, meta, self._mounting)
+
+        return None
+
     # ------------------------------------------------------------------
     # High-level scan
     # ------------------------------------------------------------------
@@ -652,6 +773,48 @@ class GocatorScanner(GocatorSettingsMixin):
             travel_s = float(self._fixed_length_mm) / float(self._travel_speed_mm_s)
             return max(5.0, travel_s * 1.5)
         return DEFAULT_RECEIVE_TIMEOUT_S
+
+    def scan_profile(
+        self,
+        timeout_s: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        configure: bool = True,
+    ) -> GocatorProfile:
+        """Capture one stationary profile: configure, start, trigger, receive.
+
+        Unlike :meth:`scan`/:meth:`scan_with_gantry`, this commands no
+        gantry motion at all — a profile is a single instantaneous exposure,
+        so there is no travel to coordinate.
+
+        Args:
+            timeout_s: Receive budget. Defaults to
+                :data:`DEFAULT_RECEIVE_TIMEOUT_S` — there is no travel
+                distance/speed to derive a tighter budget from.
+            metadata: Extra context merged into the result metadata.
+            configure: Apply :meth:`configure` (with ``mode="profile"``)
+                first. Pass False if you've already configured and want to
+                avoid re-touching settings.
+
+        Returns:
+            The captured :class:`GocatorProfile`.
+        """
+        if configure:
+            self.configure(mode="profile")
+
+        started_here = not self._is_running
+        if started_here:
+            self.start()
+        try:
+            self.trigger()
+            return self.receive_profile(
+                timeout_s=timeout_s or DEFAULT_RECEIVE_TIMEOUT_S, metadata=metadata
+            )
+        finally:
+            if started_here and self._is_running:
+                try:
+                    self._end_acquisition()
+                except GoSdkError as e:
+                    logger.warning("Error stopping after profile scan: %s", e)
 
     def scan_with_gantry(
         self,
@@ -849,8 +1012,62 @@ class GocatorScanner(GocatorSettingsMixin):
 
     def acquire(
         self, gantry: Optional["GantryController"] = None, **overrides: Any
-    ) -> Optional[SurfaceScan]:
-        """Run one configured scan — a zero-argument entry point for schedulers.
+    ) -> Optional[Any]:
+        """Run one configured acquisition — a zero-argument scheduler entry point.
+
+        Dispatches on ``self.mode``: surface mode runs the gantry-coordinated
+        pass this method has always run (see :meth:`_acquire_surface`);
+        profile mode runs a stationary single-exposure capture (see
+        :meth:`_acquire_profile`), which needs no gantry at all.
+
+        Args:
+            gantry: A connected GantryController. Required in surface mode
+                (a coordinated pass needs one); ignored in profile mode,
+                which commands no motion.
+            **overrides: Per-call overrides of the configured scan spec.
+
+        Returns:
+            The captured :class:`SurfaceScan` (surface mode) or
+            :class:`GocatorProfile` (profile mode).
+
+        Raises:
+            ScanNotPossibleError: If the acquisition cannot run at all — see
+                :meth:`_acquire_surface`/:meth:`_acquire_profile` for the
+                mode-specific reasons. The runner escalates this to a
+                lab-wide pause rather than skipping the acquisition, because
+                an experiment that quietly stops collecting data leaves a
+                hole nobody can reconstruct.
+        """
+        if self._mode == "profile":
+            return self._acquire_profile(**overrides)
+        return self._acquire_surface(gantry, **overrides)
+
+    def _acquire_profile(self, **overrides: Any) -> GocatorProfile:
+        """Body of ``acquire()`` for profile mode — stationary, no gantry.
+
+        The spec comes from the ``gocator.scan:`` config block, but only
+        ``formats`` is meaningful here (profile capture needs no
+        axis/end_mm/feed_rate_mm_s — there's no travel to coordinate).
+        """
+        spec = dict(self._scan_spec or {})
+        spec.update(overrides)
+        formats = spec.get("formats")
+
+        if not self._is_connected:
+            raise ScanNotPossibleError(
+                f"scanner at {self._ip} is not connected, so this profile "
+                "capture would collect nothing"
+            )
+
+        profile = self.scan_profile()
+        if formats:
+            self.save_profile(profile, formats=formats)
+        return profile
+
+    def _acquire_surface(
+        self, gantry: Optional["GantryController"] = None, **overrides: Any
+    ) -> SurfaceScan:
+        """Body of ``acquire()`` for surface mode — the gantry-coordinated pass.
 
         ``scan_with_gantry()`` needs four arguments including a gantry handle,
         so it cannot be handed to ``Scheduler.repeat(action=...)`` or to
@@ -1028,6 +1245,64 @@ class GocatorScanner(GocatorSettingsMixin):
         # happened. See experiment.runner and COSCRIPTING_ROADMAP workstream 2.
         self._last_saved_path = str(next(iter(written.values()))) if written else None
         logger.info("Saved scan: %s", {k: str(v) for k, v in written.items()})
+        return written
+
+    def save_profile(
+        self,
+        profile: GocatorProfile,
+        name: Optional[str] = None,
+        formats: tuple = ("npz", "csv"),
+    ) -> Dict[str, Path]:
+        """Save a profile under ``output_dir`` in the requested formats.
+
+        Slim sibling of :meth:`save_scan` for :class:`GocatorProfile` — no
+        LAS/PLY (those are 3-D point-cloud formats; a single X-Z line has no
+        meaningful 3-D representation) and no shared point-precompute step
+        (a profile is a handful of KB, not hundreds of MB).
+
+        Args:
+            profile: The profile to save.
+            name: Base filename without extension. Defaults to a UTC
+                timestamp, ``profile_YYYYmmdd_HHMMSS``.
+            formats: Any of "npz" (full array incl. NaNs, best for
+                reprocessing), "csv" (x_mm,z_mm text).
+
+        Returns:
+            Dict mapping format name to the written path.
+
+        Raises:
+            ValueError: On an unknown format name.
+        """
+        import datetime as _dt
+
+        if isinstance(formats, str):
+            formats = (formats,)
+
+        if name is None:
+            name = "profile_" + _dt.datetime.now(_dt.timezone.utc).strftime(
+                "%Y%m%d_%H%M%S_%f"
+            )[:-3]
+            if self._run_stamp:
+                name = f"{name}_{self._run_stamp.get('run_id', '')}".rstrip("_")
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        base = self._output_dir / name
+
+        unknown = [f for f in formats if f not in ("npz", "csv")]
+        if unknown:
+            raise ValueError(f"Unknown profile format: {unknown[0]!r}")
+
+        if self._run_stamp:
+            profile.metadata.setdefault("run_id", self._run_stamp.get("run_id"))
+            profile.metadata.setdefault("runtime_s", self._run_stamp.get("runtime_s"))
+
+        written: Dict[str, Path] = {}
+        for fmt in formats:
+            if fmt == "npz":
+                written["npz"] = profile.save_npz(base.with_suffix(".npz"))
+            elif fmt == "csv":
+                written["csv"] = profile.save_csv(base.with_suffix(".csv"))
+        self._last_saved_path = str(next(iter(written.values()))) if written else None
+        logger.info("Saved profile: %s", {k: str(v) for k, v in written.items()})
         return written
 
     @classmethod
