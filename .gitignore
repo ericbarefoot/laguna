@@ -62,6 +62,7 @@ env/
 *.swo
 *~
 .DS_Store
+._*
 
 # Project specific
 config/local_config.yaml
