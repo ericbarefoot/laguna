@@ -152,7 +152,7 @@ real, commandable axes.
 | `MTR`/`ENA` *(with an argument)* | enable/disable the motor drive or axis |
 | `SPD`/`ACL`/`DCL`/`NLT`/`PLT` *(with an argument)* | change motion parameters or soft limits |
 | `ACP`/`ENP` *(with an argument)* | zero/offset the position registers |
-| `SCS`/`SCT`/`AIC` | configure and arm the hardware capture-latch (homing) |
+| `SCS`/`SCT`/`AIC` | configure and arm the hardware capture-latch (not currently used by homing — see `homing.py`) |
 
 `MMCCommands` (`src/laguna/robot/macron/commands.py`) wraps almost all of
 these in typed Python methods (`get_actual_position()`, `begin_move_to()`,

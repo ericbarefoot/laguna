@@ -450,7 +450,19 @@ class MMCCommands:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_axis(axis: "Axis | AxisHandle") -> Axis:
+        """Unwrap an AxisHandle (e.g. lab.gantry.x) to its underlying Axis.
+
+        Lets every method below accept either form interchangeably — an
+        Axis singleton (X_AXIS) or the AxisHandle a caller already has in
+        hand (lab.gantry.x) — without callers needing to know which one
+        they're holding. Passes a bare Axis through unchanged.
+        """
+        return getattr(axis, "_axis", axis)
+
     def _ax(self, axis: Axis) -> str:
+        axis = self._resolve_axis(axis)
         return axis.token()
 
     def _gx(self) -> str:
@@ -476,28 +488,33 @@ class MMCCommands:
 
     def _unit_for(self, axis: Axis) -> float:
         """This axis's mm_per_unit — the override if one's configured, else the shared default."""
+        axis = self._resolve_axis(axis)
         return self._axis_mm_per_unit.get(axis.name, self._mm_per_unit)
 
     def _pos_to_raw(self, axis: Axis, value_mm: float) -> float:
         """Real mm -> raw units for an absolute position (applies offset)."""
+        axis = self._resolve_axis(axis)
         if not self._is_linear(axis):
             return value_mm
         return (value_mm - self._offset.get(axis.name, 0.0)) / self._unit_for(axis)
 
     def _pos_to_mm(self, axis: Axis, value_raw: float) -> float:
         """Raw units -> real mm for an absolute position (applies offset)."""
+        axis = self._resolve_axis(axis)
         if not self._is_linear(axis):
             return value_raw
         return value_raw * self._unit_for(axis) + self._offset.get(axis.name, 0.0)
 
     def _delta_to_raw(self, axis: Axis, value_mm: float) -> float:
         """Real mm(/s) -> raw units for a relative delta/velocity/accel (no offset)."""
+        axis = self._resolve_axis(axis)
         if not self._is_linear(axis):
             return value_mm
         return value_mm / self._unit_for(axis)
 
     def _delta_to_mm(self, axis: Axis, value_raw: float) -> float:
         """Raw units -> real mm(/s) for a relative delta/velocity/accel (no offset)."""
+        axis = self._resolve_axis(axis)
         if not self._is_linear(axis):
             return value_raw
         return value_raw * self._unit_for(axis)
@@ -512,7 +529,7 @@ class MMCCommands:
     # Motor & enable
     # ------------------------------------------------------------------
 
-    def set_motor(self, axis: Axis, on: bool) -> bool:
+    def set_motor(self, axis: "Axis | AxisHandle", on: bool) -> bool:
         """Enable or disable a single-axis motor drive.
 
         Args:
@@ -522,10 +539,11 @@ class MMCCommands:
         Returns:
             Current motor state (True = on).
         """
+        axis = self._resolve_axis(axis)
         val = 1 if on else 0
         return bool(self._send(f"{self._ax(axis)} MTR {val}"))
 
-    def get_motor(self, axis: Axis) -> bool:
+    def get_motor(self, axis: "Axis | AxisHandle") -> bool:
         """Read single-axis motor drive state.
 
         Args:
@@ -534,6 +552,7 @@ class MMCCommands:
         Returns:
             True if motor is on, False if off.
         """
+        axis = self._resolve_axis(axis)
         return bool(self._send(f"{self._ax(axis)} MTR"))
 
     def set_motor_group(self, on: bool) -> bool:
@@ -548,19 +567,21 @@ class MMCCommands:
         val = 1 if on else 0
         return bool(self._send(f"{self._gx()} MTR {val}"))
 
-    def set_enable(self, axis: Axis, enabled: bool) -> bool:
+    def set_enable(self, axis: "Axis | AxisHandle", enabled: bool) -> bool:
         """Banned — see _ENA_BANNED."""
+        axis = self._resolve_axis(axis)
         raise RuntimeError(_ENA_BANNED.format(call="set_enable"))
 
-    def get_enable(self, axis: Axis) -> bool:
+    def get_enable(self, axis: "Axis | AxisHandle") -> bool:
         """Banned — see _ENA_BANNED."""
+        axis = self._resolve_axis(axis)
         raise RuntimeError(_ENA_BANNED.format(call="get_enable"))
 
     # ------------------------------------------------------------------
     # Position & kinematics — single axis
     # ------------------------------------------------------------------
 
-    def get_actual_position(self, axis: Axis) -> float:
+    def get_actual_position(self, axis: "Axis | AxisHandle") -> float:
         """Read the axis stepper position tracker (ACP), in real mm.
 
         Args:
@@ -569,9 +590,10 @@ class MMCCommands:
         Returns:
             Current position in real mm.
         """
+        axis = self._resolve_axis(axis)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ACP"))
 
-    def set_actual_position(self, axis: Axis, value: float) -> float:
+    def set_actual_position(self, axis: "Axis | AxisHandle", value: float) -> float:
         """Set/zero the actual position register (ACP), given real mm.
 
         Args:
@@ -581,10 +603,11 @@ class MMCCommands:
         Returns:
             New position value in real mm.
         """
+        axis = self._resolve_axis(axis)
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ACP {raw:.6g}"))
 
-    def get_encoder_position(self, axis: Axis) -> float:
+    def get_encoder_position(self, axis: "Axis | AxisHandle") -> float:
         """Read raw encoder position (ENP) in real mm.
 
         Distinct from ACP (stepper position) — use to detect lost steps.
@@ -595,9 +618,10 @@ class MMCCommands:
         Returns:
             Current encoder position in real mm.
         """
+        axis = self._resolve_axis(axis)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ENP"))
 
-    def set_encoder_position(self, axis: Axis, value: float) -> float:
+    def set_encoder_position(self, axis: "Axis | AxisHandle", value: float) -> float:
         """Zero or offset the encoder position register, given real mm.
 
         Args:
@@ -607,10 +631,11 @@ class MMCCommands:
         Returns:
             New encoder position in real mm.
         """
+        axis = self._resolve_axis(axis)
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} ENP {raw:.6g}"))
 
-    def get_commanded_position(self, axis: Axis) -> float:
+    def get_commanded_position(self, axis: "Axis | AxisHandle") -> float:
         """Read the last commanded position (COP), in real mm.
 
         Args:
@@ -619,9 +644,10 @@ class MMCCommands:
         Returns:
             Last commanded position in real mm.
         """
+        axis = self._resolve_axis(axis)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} COP"))
 
-    def get_destination_position(self, axis: Axis) -> float:
+    def get_destination_position(self, axis: "Axis | AxisHandle") -> float:
         """Read the target position of the current or most recent move (DEP), in real mm.
 
         Args:
@@ -630,9 +656,10 @@ class MMCCommands:
         Returns:
             Move destination in real mm.
         """
+        axis = self._resolve_axis(axis)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} DEP"))
 
-    def set_speed(self, axis: Axis, value: float) -> float:
+    def set_speed(self, axis: "Axis | AxisHandle", value: float) -> float:
         """Set axis motion speed (SPD), given real mm/s.
 
         Args:
@@ -642,10 +669,11 @@ class MMCCommands:
         Returns:
             Speed after command in real mm/s.
         """
+        axis = self._resolve_axis(axis)
         raw = self._delta_to_raw(axis, value)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} SPD {raw:.6g}"))
 
-    def get_speed(self, axis: Axis) -> float:
+    def get_speed(self, axis: "Axis | AxisHandle") -> float:
         """Read axis motion speed (SPD), in real mm/s.
 
         Args:
@@ -654,9 +682,10 @@ class MMCCommands:
         Returns:
             Current speed in real mm/s.
         """
+        axis = self._resolve_axis(axis)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} SPD"))
 
-    def set_accel(self, axis: Axis, value: float) -> float:
+    def set_accel(self, axis: "Axis | AxisHandle", value: float) -> float:
         """Set axis acceleration (ACL), given real mm/s².
 
         Args:
@@ -666,10 +695,11 @@ class MMCCommands:
         Returns:
             Acceleration after command in real mm/s².
         """
+        axis = self._resolve_axis(axis)
         raw = self._delta_to_raw(axis, value)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} ACL {raw:.6g}"))
 
-    def get_accel(self, axis: Axis) -> float:
+    def get_accel(self, axis: "Axis | AxisHandle") -> float:
         """Read axis acceleration (ACL), in real mm/s².
 
         Args:
@@ -678,9 +708,10 @@ class MMCCommands:
         Returns:
             Current acceleration in real mm/s².
         """
+        axis = self._resolve_axis(axis)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} ACL"))
 
-    def set_decel(self, axis: Axis, value: float) -> float:
+    def set_decel(self, axis: "Axis | AxisHandle", value: float) -> float:
         """Set axis deceleration (DCL), given real mm/s².
 
         Args:
@@ -690,10 +721,11 @@ class MMCCommands:
         Returns:
             Deceleration after command in real mm/s².
         """
+        axis = self._resolve_axis(axis)
         raw = self._delta_to_raw(axis, value)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} DCL {raw:.6g}"))
 
-    def get_decel(self, axis: Axis) -> float:
+    def get_decel(self, axis: "Axis | AxisHandle") -> float:
         """Read axis deceleration (DCL), in real mm/s².
 
         Args:
@@ -702,9 +734,10 @@ class MMCCommands:
         Returns:
             Current deceleration in real mm/s².
         """
+        axis = self._resolve_axis(axis)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} DCL"))
 
-    def set_negative_limit(self, axis: Axis, value: float) -> float:
+    def set_negative_limit(self, axis: "Axis | AxisHandle", value: float) -> float:
         """Set software negative travel limit (NLT), given real mm.
 
         Motion beyond this limit will raise an error.
@@ -716,10 +749,11 @@ class MMCCommands:
         Returns:
             Limit position after command in real mm.
         """
+        axis = self._resolve_axis(axis)
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} NLT {raw:.6g}"))
 
-    def get_negative_limit(self, axis: Axis) -> float:
+    def get_negative_limit(self, axis: "Axis | AxisHandle") -> float:
         """Read software negative travel limit (NLT), in real mm.
 
         Args:
@@ -728,9 +762,10 @@ class MMCCommands:
         Returns:
             Negative limit in real mm.
         """
+        axis = self._resolve_axis(axis)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} NLT"))
 
-    def set_positive_limit(self, axis: Axis, value: float) -> float:
+    def set_positive_limit(self, axis: "Axis | AxisHandle", value: float) -> float:
         """Set software positive travel limit (PLT), given real mm.
 
         Args:
@@ -740,10 +775,11 @@ class MMCCommands:
         Returns:
             Limit position after command in real mm.
         """
+        axis = self._resolve_axis(axis)
         raw = self._pos_to_raw(axis, value)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} PLT {raw:.6g}"))
 
-    def get_positive_limit(self, axis: Axis) -> float:
+    def get_positive_limit(self, axis: "Axis | AxisHandle") -> float:
         """Read software positive travel limit (PLT), in real mm.
 
         Args:
@@ -752,6 +788,7 @@ class MMCCommands:
         Returns:
             Positive limit in real mm.
         """
+        axis = self._resolve_axis(axis)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} PLT"))
 
     def validate_soft_limits(
@@ -788,46 +825,55 @@ class MMCCommands:
     # Single-axis motion
     # ------------------------------------------------------------------
 
-    def begin_move_to(self, axis: Axis, position: float) -> None:
+    def begin_move_to(self, axis: "Axis | AxisHandle", position: float) -> None:
         """Non-blocking absolute move (BMT), given real mm. Returns immediately; poll MIF to wait."""
+        axis = self._resolve_axis(axis)
         raw = self._pos_to_raw(axis, position)
         self._send(f"{self._ax(axis)} BMT {raw:.6g}")
 
-    def begin_move_by(self, axis: Axis, delta: float) -> None:
+    def begin_move_by(self, axis: "Axis | AxisHandle", delta: float) -> None:
         """Non-blocking relative move (BMB), given real mm."""
+        axis = self._resolve_axis(axis)
         raw = self._delta_to_raw(axis, delta)
         self._send(f"{self._ax(axis)} BMB {raw:.6g}")
 
-    def move_to(self, axis: Axis, position: float) -> None:
+    def move_to(self, axis: "Axis | AxisHandle", position: float) -> None:
         """Banned — see _BLOCKING_MOTION_BANNED."""
+        axis = self._resolve_axis(axis)
         raise RuntimeError(_BLOCKING_MOTION_BANNED.format(blocking="move_to", nonblocking="begin_move_to"))
 
-    def move_by(self, axis: Axis, delta: float) -> None:
+    def move_by(self, axis: "Axis | AxisHandle", delta: float) -> None:
         """Banned — see _BLOCKING_MOTION_BANNED."""
+        axis = self._resolve_axis(axis)
         raise RuntimeError(_BLOCKING_MOTION_BANNED.format(blocking="move_by", nonblocking="begin_move_by"))
 
-    def jog(self, axis: Axis, speed: float) -> float:
+    def jog(self, axis: "Axis | AxisHandle", speed: float) -> float:
         """Start continuous velocity motion at speed (mm/s) (JOG). Pass 0 to stop.
 
         Speed sign determines direction. Returns the axis speed (mm/s) after command.
         """
+        axis = self._resolve_axis(axis)
         raw = self._delta_to_raw(axis, speed)
         return self._delta_to_mm(axis, self._send(f"{self._ax(axis)} JOG {raw:.6g}"))
 
-    def begin_stop(self, axis: Axis) -> None:
+    def begin_stop(self, axis: "Axis | AxisHandle") -> None:
         """Controlled deceleration stop (BST)."""
+        axis = self._resolve_axis(axis)
         self._send(f"{self._ax(axis)} BST")
 
-    def abort(self, axis: Axis) -> None:
+    def abort(self, axis: "Axis | AxisHandle") -> None:
         """Immediate stop with no decel ramp (ABT). Use for emergencies."""
+        axis = self._resolve_axis(axis)
         self._send(f"{self._ax(axis)} ABT")
 
-    def stop(self, axis: Axis) -> None:
+    def stop(self, axis: "Axis | AxisHandle") -> None:
         """Immediate stop (STP)."""
+        axis = self._resolve_axis(axis)
         self._send(f"{self._ax(axis)} STP")
 
-    def move_is_finished(self, axis: Axis) -> bool:
+    def move_is_finished(self, axis: "Axis | AxisHandle") -> bool:
         """Poll whether the axis move has completed (MIF)."""
+        axis = self._resolve_axis(axis)
         return bool(self._send(f"{self._ax(axis)} MIF"))
 
     # ------------------------------------------------------------------
@@ -985,47 +1031,53 @@ class MMCCommands:
     # Capture mechanism — precise limit-switch / event position latching
     # ------------------------------------------------------------------
 
-    def set_capture_source(self, axis: Axis, source_index: int) -> None:
+    def set_capture_source(self, axis: "Axis | AxisHandle", source_index: int) -> None:
         """Configure which digital input index triggers capture for this axis (SCS).
 
         source_index corresponds to the INB index of the limit switch.
         Must be called before arm_capture.
         """
+        axis = self._resolve_axis(axis)
         self._send(f"{self._ax(axis)} SCS {source_index}")
 
-    def set_capture_trip(self, axis: Axis, trip_on_high: bool) -> None:
+    def set_capture_trip(self, axis: "Axis | AxisHandle", trip_on_high: bool) -> None:
         """Set capture trip polarity (SCT).
 
         Args:
             axis: Target axis.
             trip_on_high: True = trip on input HIGH, False = trip on LOW.
         """
+        axis = self._resolve_axis(axis)
         val = 1 if trip_on_high else 0
         self._send(f"{self._ax(axis)} SCT {val}")
 
-    def arm_capture(self, axis: Axis) -> None:
+    def arm_capture(self, axis: "Axis | AxisHandle") -> None:
         """Arm the hardware capture latch (AIC).
 
         Once armed, the next input event on the configured source latches the
         current axis position into the capture register (read with get_capture_position).
         capture_has_tripped() returns True after the event; arm again to re-use.
         """
+        axis = self._resolve_axis(axis)
         self._send(f"{self._ax(axis)} AIC")
 
-    def get_capture_bit(self, axis: Axis) -> bool:
+    def get_capture_bit(self, axis: "Axis | AxisHandle") -> bool:
         """Read the live state of the capture input (CAB). Not latched."""
+        axis = self._resolve_axis(axis)
         return bool(self._send(f"{self._ax(axis)} CAB"))
 
-    def get_capture_position(self, axis: Axis) -> float:
+    def get_capture_position(self, axis: "Axis | AxisHandle") -> float:
         """Read the hardware-latched position at the moment of the capture event (CAP), in real mm.
 
         This is more precise than polling actual_position because it is
         timestamped at the interrupt level rather than at the poll interval.
         """
+        axis = self._resolve_axis(axis)
         return self._pos_to_mm(axis, self._send(f"{self._ax(axis)} CAP"))
 
-    def capture_has_tripped(self, axis: Axis) -> bool:
+    def capture_has_tripped(self, axis: "Axis | AxisHandle") -> bool:
         """Return True if a capture event has occurred since last arm_capture (CAT)."""
+        axis = self._resolve_axis(axis)
         return bool(self._send(f"{self._ax(axis)} CAT"))
 
     # ------------------------------------------------------------------
@@ -1048,7 +1100,7 @@ class MMCCommands:
         """
         return bool(self._send(f"INB {index}"))
 
-    def read_home_switch(self, axis: Axis, io_map: IOMap) -> bool:
+    def read_home_switch(self, axis: "Axis | AxisHandle", io_map: IOMap) -> bool:
         """Read the home switch state for X, Y, or Z (INB, via IOMap).
 
         Args:
@@ -1061,6 +1113,7 @@ class MMCCommands:
         Raises:
             ValueError: If the relevant IOMap channel hasn't been set yet.
         """
+        axis = self._resolve_axis(axis)
         if axis == X_AXIS:
             index = io_map.x_home_input
         elif axis == Y_AXIS:
@@ -1075,7 +1128,7 @@ class MMCCommands:
             )
         return self.read_input_bit(index)
 
-    def read_limit_switch(self, axis: Axis, io_map: IOMap) -> bool:
+    def read_limit_switch(self, axis: "Axis | AxisHandle", io_map: IOMap) -> bool:
         """Read the limit switch state for X, Y, Z, or Theta (INB, via IOMap).
 
         Args:
@@ -1091,6 +1144,7 @@ class MMCCommands:
                 responder node's own input bank and is architecturally
                 unreachable via the plain ASCII INB command; see IOMap.
         """
+        axis = self._resolve_axis(axis)
         if axis == X_AXIS:
             index = io_map.x_limit_input
         elif axis == Y_AXIS:
@@ -1153,13 +1207,14 @@ class MMCCommands:
     # Brake control helpers (uses IOMap indices)
     # ------------------------------------------------------------------
 
-    def disengage_brake(self, axis: Axis, io_map: IOMap) -> None:
+    def disengage_brake(self, axis: "Axis | AxisHandle", io_map: IOMap) -> None:
         """Disengage the electromagnetic brake on Y or Z axis.
 
         Brake output ON = brake disengaged (spring-return design: power
         releases brake). Raises ValueError if the relevant IOMap channel
         hasn't been set yet (physical probing required — see IOMap).
         """
+        axis = self._resolve_axis(axis)
         if axis == Y_AXIS:
             if io_map.y_brake_output is None:
                 raise ValueError("io_map.y_brake_output is not set — probe the native SOB channel first")
@@ -1169,11 +1224,12 @@ class MMCCommands:
                 raise ValueError("io_map.z_brake_output is not set — probe the native SOB channel first")
             self.set_output_bit(io_map.z_brake_output, True)
 
-    def engage_brake(self, axis: Axis, io_map: IOMap) -> None:
+    def engage_brake(self, axis: "Axis | AxisHandle", io_map: IOMap) -> None:
         """Engage the electromagnetic brake on Y or Z axis.
 
         Raises ValueError if the relevant IOMap channel hasn't been set yet.
         """
+        axis = self._resolve_axis(axis)
         if axis == Y_AXIS:
             if io_map.y_brake_output is None:
                 raise ValueError("io_map.y_brake_output is not set — probe the native SOB channel first")
@@ -1183,13 +1239,14 @@ class MMCCommands:
                 raise ValueError("io_map.z_brake_output is not set — probe the native SOB channel first")
             self.set_output_bit(io_map.z_brake_output, False)
 
-    def brake_is_disengaged(self, axis: Axis, io_map: IOMap) -> bool:
+    def brake_is_disengaged(self, axis: "Axis | AxisHandle", io_map: IOMap) -> bool:
         """Read brake feedback status. True = brake is currently disengaged (released).
 
         Raises ValueError if the relevant IOMap channel hasn't been set yet
         (this is currently the case for Y — only Z's status input is
         confirmed on this hardware).
         """
+        axis = self._resolve_axis(axis)
         if axis == Y_AXIS:
             if io_map.y_brake_status_input is None:
                 raise ValueError(
@@ -1214,7 +1271,7 @@ class MMCCommands:
     # Full axis state snapshot
     # ------------------------------------------------------------------
 
-    def read_axis_state(self, axis: Axis) -> AxisState:
+    def read_axis_state(self, axis: "Axis | AxisHandle") -> AxisState:
         """Read all readable axis properties in one batch of queries.
 
         Each query is issued and caught independently — a single failing
@@ -1230,6 +1287,7 @@ class MMCCommands:
         axis crashes the controller (see _ENA_BANNED), so that field always
         keeps its default here.
         """
+        axis = self._resolve_axis(axis)
         state = AxisState()
         queries: Dict[str, Callable[[], Any]] = {
             "actual_position": lambda: self.get_actual_position(axis),
@@ -1578,3 +1636,23 @@ class AxisHandle:
         """
         self._require_brake()
         return self._cmd.brake_is_disengaged(self._axis, self._io_map)
+
+    # -- home / limit switches ---------------------------------------------
+
+    def read_home_switch(self) -> bool:
+        """Read this axis's home switch state (INB, via IOMap).
+
+        X/Y/Z only. Raises ValueError if the underlying IOMap channel
+        hasn't been configured yet — see MMCCommands.read_home_switch.
+        """
+        return self._cmd.read_home_switch(self._axis, self._io_map)
+
+    def read_limit_switch(self) -> bool:
+        """Read this axis's limit switch state (INB, via IOMap).
+
+        Raises ValueError if the underlying IOMap channel hasn't been
+        configured yet, or NotImplementedError for Theta — its limit
+        switch is architecturally unreachable via ASCII on this hardware.
+        See MMCCommands.read_limit_switch.
+        """
+        return self._cmd.read_limit_switch(self._axis, self._io_map)

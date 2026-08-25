@@ -10,6 +10,7 @@ import pytest
 from laguna.robot.macron import commands as macron_commands
 from laguna.robot.macron.commands import (
     ALL_AXES,
+    AxisHandle,
     IOMap,
     MMCCommands,
     THETA_AXIS,
@@ -439,3 +440,23 @@ class TestReadAxisStateResilience:
         conn = FakeSnapConnection(self.ALL_OK)
         MMCCommands(conn).read_axis_state(X_AXIS)
         assert not any("ENA" in c for c in conn.sent)
+
+
+class TestAcceptsAxisHandle:
+    """Methods taking `axis` should accept lab.gantry.x (an AxisHandle) as
+    interchangeably as the bare Axis singleton it wraps — see
+    MMCCommands._resolve_axis."""
+
+    def test_get_actual_position_accepts_axis_handle(self):
+        conn = FakeSnapConnection({"A1 ACP": "12.000"})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: True)
+        assert cmd.get_actual_position(handle) == 12.0
+        assert conn.sent == ["A1 ACP"]
+
+    def test_read_home_switch_dispatches_correctly_by_wrapped_axis(self):
+        conn = FakeSnapConnection({"INB 3": "1"})
+        cmd = MMCCommands(conn)
+        handle = AxisHandle(cmd, Y_AXIS, is_safe_mode=lambda: True)
+        io_map = IOMap(y_home_input=3)
+        assert cmd.read_home_switch(handle, io_map) is True

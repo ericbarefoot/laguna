@@ -26,11 +26,13 @@ toggle the INB channels IOMap expects, and you're physically present at
 the gantry able to hit Ctrl-C.
 
 1. Requires the pi_agent transport, same as example_07/08.
-2. Homing direction, capture source (home vs. limit switch), and trip
+2. Homing direction, which switch to poll (home vs. limit), and trip
    polarity all come from config/example_config.yaml's gantry.axes
    entries (home_switch / home_trip_on_high) — see
    GantryController._build_homing_config. Confirm those match what
    example_08 showed on your hardware before trusting this script.
+   Homing is software-polled (jog + poll INB), not hardware capture-latch
+   — see homing.py's module docstring for why.
 3. AXES_TO_HOME defaults to Z, X, Y (Z first) to avoid the instrument
    crashing into the bed during a lateral search — see homing.py's module
    docstring for why. Don't reorder this without a reason.
@@ -98,7 +100,10 @@ def main():
                 continue
 
             print(f"Homing {name}... (Ctrl-C stops motion immediately)")
-            final_pos = lab.gantry.homing.home_axis(axis)
+            # lab.gantry.home_axis(), not lab.gantry.homing.home_axis() —
+            # the wrapper also resyncs GCodeExecutor's cached position
+            # afterward, which move_to() needs to plan correctly next.
+            final_pos = lab.gantry.home_axis(axis)
             print(f"  {name} homed. Standoff position: {final_pos:.3f} mm")
     except KeyboardInterrupt:
         print()

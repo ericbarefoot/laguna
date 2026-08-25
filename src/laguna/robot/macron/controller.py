@@ -297,6 +297,26 @@ class GantryController:
         """
         return self._resolve_axis_handle(axis).brake_is_disengaged()
 
+    def read_home_switch(self, axis: "Axis | AxisHandle | str") -> bool:
+        """Read the given axis's home switch state.
+
+        X/Y/Z only — raises ValueError for Theta (no home switch) or if
+        the underlying IOMap channel hasn't been configured yet. See
+        engage_brake() above for accepted `axis` forms.
+        """
+        return self._resolve_axis_handle(axis).read_home_switch()
+
+    def read_limit_switch(self, axis: "Axis | AxisHandle | str") -> bool:
+        """Read the given axis's limit switch state.
+
+        Raises ValueError if the underlying IOMap channel hasn't been
+        configured yet, or NotImplementedError for Theta — its limit
+        switch is architecturally unreachable via ASCII on this hardware
+        (see IOMap in commands.py). See engage_brake() above for accepted
+        `axis` forms.
+        """
+        return self._resolve_axis_handle(axis).read_limit_switch()
+
     @classmethod
     def from_config(cls, config: "Config") -> "GantryController":
         """Build a GantryController from the lab's Config (its 'gantry:' section)."""
@@ -831,13 +851,7 @@ class GantryController:
 
         for name, value in target_by_name.items():
             self.cmd.set_actual_position(axes_by_name[name], value)
-        # gcode's _current_pos/_current_theta cache doesn't know this
-        # register recalibration happened — without this, the next
-        # move_to() would still plan/classify legs against the pre-
-        # recalibration position. See sync_position_from_hardware's
-        # docstring.
-        self.gcode.sync_position_from_hardware()
-        self._persist_position()
+        self._sync_position_after_direct_motion("set_position()")
         return True
 
     def soft_stop(self) -> None:
@@ -857,18 +871,43 @@ class GantryController:
                 self.cmd.begin_stop(axis)
             except Exception as exc:
                 logger.error("Error soft-stopping %s: %s", axis.name, exc)
-        # gcode's _current_pos/_current_theta cache would otherwise still
-        # believe wherever this interrupted move started from — the next
-        # move_to() could then silently no-op if its target happens to
-        # match that stale starting position. Best-effort: BST isn't
-        # blocking, so this reads position while still decelerating, not
-        # at final rest (same caveat as _persist_position() below), but
-        # that's still far closer to reality than the stale pre-move
-        # cache. See sync_position_from_hardware's docstring.
+        # Best-effort: BST isn't blocking, so this reads position while
+        # still decelerating, not at final rest (same caveat noted in
+        # _persist_position()'s docstring), but that's still far closer to
+        # reality than the stale pre-move state.
+        self._sync_position_after_direct_motion("soft_stop()")
+
+    def _sync_position_after_direct_motion(self, source: str) -> None:
+        """Resync gcode's cached position and the on-disk checkpoint after direct motion.
+
+        home()/home_axis()/locate_limit_switch()/soft_stop()/estop()/
+        set_position() all move hardware (or redefine position registers)
+        directly through HomingProcedure/MMCCommands rather than through
+        GCodeExecutor.plan()/execute(), which normally keeps two things in
+        sync on its own: gcode's in-memory `_current_pos`/`_current_theta`
+        cache, and (via _persist_position(), also called here) the
+        on-disk position checkpoint file used by restore_last_position()
+        after a power cycle. Skipping either leaves it believing wherever
+        it was before this call:
+          - A stale gcode cache makes the next move_to() plan a leg
+            against the wrong starting position. A wrong-enough leg
+            distance from that mismatch can scale ACL/DCL down to 0 raw
+            units (ASCII escape 16/17, "0 Or Negative") — see
+            GCodeExecutor._sync_position_from_hardware's docstring for
+            the full mechanism.
+          - A stale checkpoint file means restore_last_position() would
+            recalibrate to the wrong place after a power cycle.
+        Never raises: called from a `finally`/cleanup path, so a resync
+        failure is logged, not propagated. _persist_position() itself
+        never raises either — see its own docstring.
+
+        Args:
+            source: Caller name, for the log message if the resync fails.
+        """
         try:
             self.gcode.sync_position_from_hardware()
         except Exception as exc:
-            logger.error("Error resyncing gcode position after soft-stop: %s", exc)
+            logger.error("Error resyncing gcode position after %s: %s", source, exc)
         self._persist_position()
 
     # ------------------------------------------------------------------
@@ -904,12 +943,7 @@ class GantryController:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry emergency stop: %s", exc)
-        # See soft_stop()'s matching resync for why this can't be skipped.
-        try:
-            self.gcode.sync_position_from_hardware()
-        except Exception as exc:
-            logger.error("Error resyncing gcode position after estop: %s", exc)
-        self._persist_position()
+        self._sync_position_after_direct_motion("estop()")
         return None
 
     def set_safe_mode(self, enabled: bool) -> bool:
@@ -974,8 +1008,44 @@ class GantryController:
         except Exception:
             logger.exception("home() — failed")
             raise
+        finally:
+            self._sync_position_after_direct_motion("home()")
         logger.info("home() — %s", "completed" if result.success else "did not find home")
         return result.success
+
+    def home_axis(self, axis: "Axis | AxisHandle | str") -> float:
+        """Home a single axis. Returns the standoff position after homing.
+
+        Prefer this over calling self.homing.home_axis() directly — homing
+        moves hardware through HomingProcedure/MMCCommands, bypassing
+        GCodeExecutor entirely, so its cached position and the on-disk
+        checkpoint must both be resynced afterward or the next move_to()
+        will plan against a stale cache (see
+        _sync_position_after_direct_motion). See engage_brake() above for
+        accepted `axis` forms.
+        """
+        handle = self._resolve_axis_handle(axis)
+        try:
+            return self.homing.home_axis(handle._axis)
+        finally:
+            self._sync_position_after_direct_motion("home_axis()")
+
+    def locate_limit_switch(self, axis: "Axis | AxisHandle | str") -> float:
+        """Jog toward and record the given axis's limit switch position.
+
+        Unlike home(), this does not redefine the origin — it reports the
+        limit switch's position in the current (already-homed) coordinate
+        frame, then backs off to standoff_distance so the axis isn't left
+        resting against the hard stop. See
+        HomingProcedure.locate_limit_switch for the direction/polarity
+        assumptions this reuses from the axis's homing config. See
+        engage_brake() above for accepted `axis` forms.
+        """
+        handle = self._resolve_axis_handle(axis)
+        try:
+            return self.homing.locate_limit_switch(handle._axis)
+        finally:
+            self._sync_position_after_direct_motion("locate_limit_switch()")
 
     def enable(self) -> None:
         """Turn motor drive on for all configured axes (MTR only).
@@ -1133,7 +1203,7 @@ def _build_homing_config(
     for entry in axes_cfg:
         axis = _lookup_axis(axes_cfg, entry.get("name", ""))
         if axis is None or axis not in config.home_order or axis not in home_channels:
-            continue  # Theta has no capture-latch homing support on this hardware
+            continue  # Theta has no home/limit switch homing support on this hardware
 
         switch = entry.get("home_switch", "home")
         if switch == "home":
@@ -1152,12 +1222,12 @@ def _build_homing_config(
             )
 
         axis_configs[axis] = AxisHomingConfig(
-            capture_source_index=index,
+            input_index=index,
             # Confirmed on hardware 2026-08-25: home switches read LOW when
             # triggered (normally-closed wiring) — default matches that,
             # override per axis with "home_trip_on_high" if a given switch
             # differs.
-            capture_trip_on_high=entry.get("home_trip_on_high", False),
+            trip_on_high=entry.get("home_trip_on_high", False),
             homing_direction=entry.get("home_direction", -1.0),
         )
     config.axis_configs = axis_configs

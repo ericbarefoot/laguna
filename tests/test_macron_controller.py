@@ -158,13 +158,13 @@ class TestFromConfigHomingAndFences:
     def test_axis_configs_default_to_home_switch_and_default_direction(self):
         controller = GantryController.from_config(_cfg(BASE_CONFIG))
         x_cfg = controller.homing._config.axis_config(X_AXIS)
-        assert x_cfg.capture_source_index == 1  # io_map.x_home_input
-        assert x_cfg.capture_trip_on_high is False  # default matches confirmed hardware
+        assert x_cfg.input_index == 1  # io_map.x_home_input
+        assert x_cfg.trip_on_high is False  # default matches confirmed hardware
         assert x_cfg.homing_direction == -1.0
 
     def test_axis_configs_only_built_for_axes_in_home_order(self):
         # BASE_CONFIG's home_order is [Z, X, Y] — Theta never gets an
-        # AxisHomingConfig (no capture-latch homing support for it here).
+        # AxisHomingConfig (no home/limit switch homing support for it here).
         controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert controller.homing._config.axis_config(THETA_AXIS) is None
 
@@ -178,7 +178,7 @@ class TestFromConfigHomingAndFences:
         ]
         controller = GantryController.from_config(_cfg(cfg))
         x_cfg = controller.homing._config.axis_config(X_AXIS)
-        assert x_cfg.capture_source_index == 2  # io_map.x_limit_input
+        assert x_cfg.input_index == 2  # io_map.x_limit_input
 
     def test_home_trip_on_high_overridable_per_axis(self):
         cfg = dict(BASE_CONFIG)
@@ -189,7 +189,7 @@ class TestFromConfigHomingAndFences:
             {"name": "Theta", "index": 6},
         ]
         controller = GantryController.from_config(_cfg(cfg))
-        assert controller.homing._config.axis_config(X_AXIS).capture_trip_on_high is True
+        assert controller.homing._config.axis_config(X_AXIS).trip_on_high is True
 
     def test_unknown_home_switch_value_raises(self):
         cfg = dict(BASE_CONFIG)
@@ -459,6 +459,66 @@ class TestHomeEnableDisableWaitForMove:
         )
         assert controller.home() is False
 
+    def test_locate_limit_switch_delegates_to_homing_and_accepts_axis_forms(self, monkeypatch):
+        controller, _conn = self._make_controller({})
+        seen = []
+        monkeypatch.setattr(
+            controller.homing, "locate_limit_switch",
+            lambda axis: seen.append(axis) or 42.0,
+        )
+        monkeypatch.setattr(controller.gcode, "sync_position_from_hardware", lambda: None)
+        assert controller.locate_limit_switch("X") == 42.0
+        assert controller.locate_limit_switch(controller.x) == 42.0
+        assert seen == [X_AXIS, X_AXIS]  # resolved to the underlying Axis both times
+
+    def test_home_axis_delegates_and_accepts_axis_forms(self, monkeypatch):
+        controller, _conn = self._make_controller({})
+        seen = []
+        monkeypatch.setattr(
+            controller.homing, "home_axis",
+            lambda axis: seen.append(axis) or 5.0,
+        )
+        monkeypatch.setattr(controller.gcode, "sync_position_from_hardware", lambda: None)
+        assert controller.home_axis("Y") == 5.0
+        assert controller.home_axis(Y_AXIS) == 5.0
+        assert seen == [Y_AXIS, Y_AXIS]
+
+    def test_home_axis_resyncs_gcode_position_even_on_failure(self, monkeypatch):
+        # home_axis()/home()/locate_limit_switch() all move hardware
+        # directly, bypassing GCodeExecutor — without resyncing its
+        # cached position afterward, the next move_to() plans against a
+        # stale position and can send a near-zero leg that scales ACL/DCL
+        # to 0 (escape 16/17). Must resync even when homing raises.
+        from laguna.robot.macron.connection import SnapMotionError
+
+        controller, _conn = self._make_controller({})
+
+        def _raise(axis):
+            raise SnapMotionError(0, "switch not reached")
+
+        monkeypatch.setattr(controller.homing, "home_axis", _raise)
+        resynced = []
+        monkeypatch.setattr(
+            controller.gcode, "sync_position_from_hardware", lambda: resynced.append(True)
+        )
+        with pytest.raises(SnapMotionError):
+            controller.home_axis(X_AXIS)
+        assert resynced == [True]
+
+    def test_home_resyncs_gcode_position(self, monkeypatch):
+        controller, _conn = self._make_controller({})
+        from laguna.robot.macron.homing import HomingResult
+
+        monkeypatch.setattr(
+            controller.homing, "home_all", lambda: HomingResult(success=True, axis_results={})
+        )
+        resynced = []
+        monkeypatch.setattr(
+            controller.gcode, "sync_position_from_hardware", lambda: resynced.append(True)
+        )
+        controller.home()
+        assert resynced == [True]
+
     def test_enable_turns_on_every_motor_and_never_sends_ena(self):
         # ENA on a responder-node axis crashes the controller — confirmed on
         # hardware 2026-08-02 and reproduced from a bare tio terminal. The
@@ -547,6 +607,17 @@ class TestAxisHandles:
         with pytest.raises(ValueError, match="no brake"):
             controller.x.engage_brake()
 
+    def test_reads_home_and_limit_switches_using_default_io_map(self):
+        controller, conn = self._make_controller({"INB 1": "1", "INB 2": "0"})
+        assert controller.x.read_home_switch() is True
+        assert controller.x.read_limit_switch() is False
+        assert conn.sent == ["INB 1", "INB 2"]
+
+    def test_theta_limit_switch_raises_not_implemented(self):
+        controller, _ = self._make_controller()
+        with pytest.raises(NotImplementedError):
+            controller.theta.read_limit_switch()
+
 
 class TestBrakeVerbs:
     """GantryController.engage_brake/disengage_brake accept a name, an Axis,
@@ -571,6 +642,26 @@ class TestBrakeVerbs:
         controller, _ = self._make_controller()
         with pytest.raises(TypeError):
             controller.engage_brake(42)
+
+
+class TestHomeAndLimitSwitchVerbs:
+    """GantryController.read_home_switch/read_limit_switch accept a name,
+    an Axis, or a handle — same effect as the handle method."""
+
+    def _make_controller(self, responses=None):
+        conn = FakeSnapConnection(responses or {})
+        return GantryController(connection=conn), conn
+
+    @pytest.mark.parametrize("axis_ref", ["X", X_AXIS])
+    def test_read_home_switch_accepts_name_or_axis_object(self, axis_ref):
+        controller, conn = self._make_controller({"INB 1": "1"})
+        assert controller.read_home_switch(axis_ref) is True
+        assert conn.sent == ["INB 1"]
+
+    def test_read_limit_switch_accepts_a_handle(self):
+        controller, conn = self._make_controller({"INB 4": "0"})
+        assert controller.read_limit_switch(controller.y) is False
+        assert conn.sent == ["INB 4"]
 
 
 class TestSetPosition:
@@ -664,13 +755,12 @@ class TestSoftStop:
 
 
 class TestPositionPersistence:
-    """position_checkpoint_file (issue #23): last-known axis positions are
-    written at the end of move_to()/set_position()/stop()/soft_stop(), so a
-    power cycle (which wipes the PLC's ACP registers) can be recovered from
-    via restore_last_position() instead of requiring homing — currently
-    disabled while its limit switches are obstructed, see
-    HomingProcedure.home_all(). Off by default (position_checkpoint_file is
-    None), and every other test class in this file constructs its
+    """position_checkpoint_file: last-known axis positions are written at
+    the end of move_to()/set_position()/stop()/soft_stop()/home()/
+    home_axis()/locate_limit_switch(), so a power cycle (which wipes the
+    PLC's ACP registers) can be recovered from via restore_last_position()
+    without a fresh home() run. Off by default (position_checkpoint_file
+    is None), and every other test class in this file constructs its
     controller(s) without it — see the passing exact conn.sent== assertions
     elsewhere, which would break if persistence sent wire commands
     unconditionally."""
@@ -732,6 +822,54 @@ class TestPositionPersistence:
 
         data = GantryPositionStore(path).load()
         assert data["positions"] == {"X": 10.0, "Y": 0.0, "Z": 0.0, "Theta": 0.0}
+
+    _CONNECT_ACP_RESPONSES = {"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"}
+
+    def test_home_axis_persists_the_live_position(self, tmp_path, monkeypatch):
+        controller, _conn, path = self._make_controller(tmp_path, dict(self._CONNECT_ACP_RESPONSES))
+        monkeypatch.setattr(controller.homing, "home_axis", lambda axis: 5.0)
+        monkeypatch.setattr(controller.gcode, "sync_position_from_hardware", lambda: None)
+        monkeypatch.setattr(
+            controller, "cmd",
+            type("_C", (), {"get_actual_position": staticmethod(lambda axis: 7.0)})(),
+        )
+        controller.home_axis(X_AXIS)
+
+        data = GantryPositionStore(path).load()
+        assert data is not None
+        assert data["positions"] == {"X": 7.0, "Y": 7.0, "Z": 7.0, "Theta": 7.0}
+
+    def test_home_persists_the_live_position(self, tmp_path, monkeypatch):
+        from laguna.robot.macron.homing import HomingResult
+
+        controller, _conn, path = self._make_controller(tmp_path, dict(self._CONNECT_ACP_RESPONSES))
+        monkeypatch.setattr(
+            controller.homing, "home_all", lambda: HomingResult(success=True, axis_results={})
+        )
+        monkeypatch.setattr(controller.gcode, "sync_position_from_hardware", lambda: None)
+        monkeypatch.setattr(
+            controller, "cmd",
+            type("_C", (), {"get_actual_position": staticmethod(lambda axis: 9.0)})(),
+        )
+        controller.home()
+
+        data = GantryPositionStore(path).load()
+        assert data is not None
+        assert data["positions"] == {"X": 9.0, "Y": 9.0, "Z": 9.0, "Theta": 9.0}
+
+    def test_locate_limit_switch_persists_the_live_position(self, tmp_path, monkeypatch):
+        controller, _conn, path = self._make_controller(tmp_path, dict(self._CONNECT_ACP_RESPONSES))
+        monkeypatch.setattr(controller.homing, "locate_limit_switch", lambda axis: 42.0)
+        monkeypatch.setattr(controller.gcode, "sync_position_from_hardware", lambda: None)
+        monkeypatch.setattr(
+            controller, "cmd",
+            type("_C", (), {"get_actual_position": staticmethod(lambda axis: 3.0)})(),
+        )
+        controller.locate_limit_switch(X_AXIS)
+
+        data = GantryPositionStore(path).load()
+        assert data is not None
+        assert data["positions"] == {"X": 3.0, "Y": 3.0, "Z": 3.0, "Theta": 3.0}
 
     def test_not_persisted_when_disconnected(self, tmp_path):
         controller, _conn, path = self._make_controller(tmp_path, responses={}, connect=False)

@@ -91,8 +91,14 @@ real controller. Both agree exactly.
   position of `700.0` would be misidentified as an error).
 - **Get/set duality**: most 3-letter mnemonics read with no argument,
   write+echo with one.
-- **No firmware homing** (`HMX` is a stub) — built in the driver via the
-  hardware capture-latch mechanism (`SCS`/`SCT`/`AIC`/`CAB`/`CAP`/`CAT`).
+- **No firmware homing** (`HMX` is a stub) — built in the driver by jogging
+  and software-polling the home/limit switch (`INB`). Originally attempted
+  via the hardware capture-latch mechanism (`SCS`/`SCT`/`AIC`/`CAB`/`CAP`/
+  `CAT`), abandoned 2026-08-25 — see `homing.py`'s module docstring for why
+  (the vendor's own `SCS` parameter table only supports encoder channels or
+  an expansion-card "Option N Index," never a native `INB` bit, and axis A2
+  rejects `SCS` outright with an undocumented escape code). Pending word
+  from the vendor.
 
 Full command table, error codes, and grammar details are in
 `src/laguna/robot/macron/commands.py`'s docstrings — not duplicated here to
@@ -224,11 +230,11 @@ garbage-value failure mode if it recurs.
 4. **`confirm_cb`** on `GCodeExecutor` — per-motion-segment human
    confirmation hook for real-motion testing.
 
-**No motion has ever been sent to the hardware.** Every verification so
-far has been read-only queries, or, where even those failed, connectivity
-checks. Real motion (Stage 3 testing) is still gated on explicit
-authorization in a future session — nothing in this repo commands it by
-default (`safe_mode=True` everywhere).
+**Real motion has been run on hardware** (homing and `move_to()`, session
+2026-08-25) — nothing in this repo commands it by default
+(`safe_mode=True` everywhere), but it is no longer purely theoretical. See
+[Motion control layers & guards](MOTION_CONTROL_LAYERS.md) for which
+guards apply to which call path before running more.
 
 ## Files
 
@@ -236,7 +242,7 @@ default (`safe_mode=True` everywhere).
 |---|---|
 | `connection.py` | `SnapConnection` ABC, `EthernetConnection`, `RS232Connection`, envelope parsing, port discovery |
 | `commands.py` | `MMCCommands` (typed ASCII command wrapper), `Axis`/`AxisState`/`IOMap`, `validate_soft_limits()` |
-| `homing.py` | `HomingProcedure` — capture-latch homing |
+| `homing.py` | `HomingProcedure` — software-polled homing |
 | `fences.py` | `BoxFence`/`CylinderFence`/`TrajectoryChecker`/`CheckedTrajectory` — exclusion-zone safety |
 | `gcode.py` | `GCodeParser`/`GCodeExecutor` — G0/G1/G2/G3/G28/G90/G91/G21/G4/M0/M1/M114 |
 | `pi_bridge.py` | `PiGantryConnection`, `SafeModeConnection`, `SAFE_COMMANDS`, `check_safe_mode` |

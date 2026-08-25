@@ -19,7 +19,7 @@ from laguna.robot.macron.gcode import (
     GCodeParser,
 )
 from laguna.robot.macron.commands import IOMap
-from laguna.robot.macron.homing import HomingConfig, HomingProcedure
+from laguna.robot.macron.homing import AxisHomingConfig, HomingConfig, HomingProcedure
 from tests.macron_fixtures import FakeSnapConnection
 
 
@@ -190,13 +190,24 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None, with_
     for fence in fences or []:
         registry.add(fence)
     checker = TrajectoryChecker(registry)
-    homing_config = HomingConfig(poll_interval_s=0.001, timeout_s=1.0, backoff_timeout_s=1.0)
+    homing_config = HomingConfig(
+        poll_interval_s=0.001, timeout_s=1.0, backoff_timeout_s=1.0,
+        # Default IOMap home inputs (X=INB1, Y=INB3, Z=INB5) — see IOMap in
+        # commands.py. Only exercised by G28 tests; harmless for the rest.
+        axis_configs={
+            X_AXIS: AxisHomingConfig(input_index=1),
+            Y_AXIS: AxisHomingConfig(input_index=3),
+            Z_AXIS: AxisHomingConfig(input_index=5),
+        },
+    )
     # z_brake_status_input defaults to None (unreachable via ASCII on real
     # hardware — it lives on the responder's own input bank). Stand in a
-    # test-only channel here so homing tests can exercise the full
-    # brake-confirm flow; this is not a claim about real reachability.
+    # test-only channel here (7 — the spare/unused INB per IOMap's default
+    # commander decode, so it can't collide with any real home/limit
+    # channel) so homing tests can exercise the full brake-confirm flow;
+    # this is not a claim about real reachability.
     io_map = IOMap(
-        y_brake_output=4, z_brake_output=5, y_brake_status_input=8, z_brake_status_input=1
+        y_brake_output=4, z_brake_output=5, y_brake_status_input=8, z_brake_status_input=7
     )
     homing = HomingProcedure(cmd, homing_config, io_map=io_map)
     executor = GCodeExecutor(
@@ -964,24 +975,33 @@ class TestExecutorLinearMoves:
 
 class TestExecutorHomeDwellPause:
     def test_g28_homes_all_configured_axes(self):
-        """G28 delegates to HomingProcedure.home_all(), which by default
-        (no axis_configs) homes Z, X, Y in that order with the default
-        negative-direction jog — see homing.py's HomingConfig."""
+        """G28 delegates to HomingProcedure.home_all(), which homes Z, X, Y
+        in that order (default home_order) by jogging and polling each
+        axis's home switch (INB) — see homing.py's HomingConfig."""
+
+        def _untripped_then_tripped():
+            # 1st read is the not-already-tripped backoff check; 2nd is the
+            # first poll inside the jog-and-wait loop, where it trips.
+            state = {"calls": 0}
+
+            def _resp(cmd):
+                state["calls"] += 1
+                return "0" if state["calls"] == 1 else "1"
+
+            return _resp
+
         responses = {
-            # Z (index 5) — brake release + status confirm
-            "SOB 5 1": "0", "INB 1": "1",
-            "A5 AIC": "0", "A5 CAB": "0", "A5 JOG -10": "-10", "A5 CAT": "1",
-            "A5 BST": "0", "A5 MIF": "1", "A5 CAP": "0", "A5 ACP": "0",
-            "A5 ACP 0": "0", "A5 BMT 5": "0",
-            # X (index 1) — no brake
-            "A1 AIC": "0", "A1 CAB": "0", "A1 JOG -10": "-10", "A1 CAT": "1",
-            "A1 BST": "0", "A1 MIF": "1", "A1 CAP": "0", "A1 ACP": "0",
-            "A1 ACP 0": "0", "A1 BMT 5": "0",
-            # Y (index 2) — brake release + status confirm
+            # Z (index 5) — brake release + status confirm, home switch INB 5
+            "SOB 5 1": "0", "INB 7": "1",
+            "INB 5": _untripped_then_tripped(), "A5 JOG -10": "-10",
+            "A5 BST": "0", "A5 MIF": "1", "A5 ACP": "0", "A5 ACP 0": "0", "A5 BMT 5": "0",
+            # X (index 1) — no brake, home switch INB 1
+            "INB 1": _untripped_then_tripped(), "A1 JOG -10": "-10",
+            "A1 BST": "0", "A1 MIF": "1", "A1 ACP": "0", "A1 ACP 0": "0", "A1 BMT 5": "0",
+            # Y (index 2) — brake release + status confirm, home switch INB 3
             "SOB 4 1": "0", "INB 8": "1",
-            "A2 AIC": "0", "A2 CAB": "0", "A2 JOG -10": "-10", "A2 CAT": "1",
-            "A2 BST": "0", "A2 MIF": "1", "A2 CAP": "0", "A2 ACP": "0",
-            "A2 ACP 0": "0", "A2 BMT 5": "0",
+            "INB 3": _untripped_then_tripped(), "A2 JOG -10": "-10",
+            "A2 BST": "0", "A2 MIF": "1", "A2 ACP": "0", "A2 ACP 0": "0", "A2 BMT 5": "0",
         }
         executor, conn = _make_executor(responses)
         trajectory = executor.plan("G28")
