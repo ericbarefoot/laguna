@@ -22,9 +22,13 @@ naming it, rather than silently skipping potentially-motion-relevant
 instructions.
 
 Arc handling note: the vendor's native ARC command (radius/theta/phi
-parameters, see MMCCommands.append_arc) has never been confirmed against
-real hardware — the exact parameter semantics are ambiguous in the
-extracted documentation. Rather than guess at an unverified wire format,
+parameters, see MMCCommands.append_arc) is CONFIRMED NON-FUNCTIONAL on
+this hardware — curve-buffer motion (LNK/ARC/AMT/AMB/BMC/CLR) is an
+optional firmware feature this controller doesn't have; link_curve_buffer()
+fails with SnapMotion error 33 ("Option Not Present") before an ARC
+segment is ever reached (see the note above MMCCommands.append_move_to()
+and sandbox/probe_arc.py for the full record). Rather than guess at an
+unusable wire format,
 G2/G3 arcs are tessellated here into a sequence of short straight-line
 moves, each individually fence-checked and executed as an ordinary
 coordinated group move. This fully supports arc G-code without sending any

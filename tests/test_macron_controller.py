@@ -99,6 +99,23 @@ class TestFromConfigAxesAndIOMap:
         controller = GantryController.from_config(_cfg(cfg))
         assert controller._axes == (X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS)
 
+    def test_soft_limits_resolved_from_axes_config(self):
+        cfg = dict(BASE_CONFIG)
+        cfg["axes"] = [
+            {"name": "X", "index": 1, "soft_negative_limit_mm": -5, "soft_positive_limit_mm": 495},
+            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Z", "index": 5},
+            {"name": "Theta", "index": 6},
+        ]
+        controller = GantryController.from_config(_cfg(cfg))
+        assert controller._soft_limits == {"X": (-5, 495)}
+
+    def test_axis_with_no_soft_limits_configured_is_absent(self):
+        # Y has no soft_*_limit_mm keys at all in BASE_CONFIG — must not
+        # appear in _soft_limits, not appear as (None, None).
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
+        assert controller._soft_limits == {}
+
     def test_gcode_group_is_xy_only_with_z_held_separately(self):
         """Z cannot join the commander-node coordinated group on this
         hardware, so the executor takes the two commander axes as its
@@ -982,6 +999,93 @@ class TestConnectBrakeRelease:
         assert controller.connect() is True             # must not raise
         assert "SOB 4 1" not in conn.sent               # Y's brake stayed engaged...
         assert "SOB 5 1" in conn.sent                   # ...but Z still got released
+
+
+class TestConnectSoftLimits:
+    """connect() writes configured NLT/PLT once motion is permitted — see
+    GantryController._apply_soft_limits(). NLT/PLT writes are blocked by
+    the safe_mode allowlist exactly like any other motion-adjacent write,
+    so this only fires once safe_mode=False, alongside the existing
+    brake-release step."""
+
+    BRAKE_RESPONSES = {
+        "A2 MTR 1": "1", "SOB 4 1": "0", "A5 MTR 1": "1", "SOB 5 1": "0",
+        "A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
+    }
+
+    def _make_controller(self, safe_mode, soft_limits, responses=None):
+        merged = dict(self.BRAKE_RESPONSES)
+        merged.update(responses or {})
+        conn = FakeSnapConnection(merged)
+        return (
+            GantryController(connection=conn, safe_mode=safe_mode, soft_limits=soft_limits),
+            conn,
+        )
+
+    def test_writes_and_validates_configured_limits(self):
+        controller, conn = self._make_controller(
+            False, {"X": (-5, 495)},
+            {"A1 NLT -5": "-5", "A1 PLT 495": "495", "A1 NLT": "-5", "A1 PLT": "495"},
+        )
+        assert controller.connect() is True
+        assert "A1 NLT -5" in conn.sent
+        assert "A1 PLT 495" in conn.sent
+        # validate_soft_limits() read-back happens after the writes
+        assert conn.sent.index("A1 PLT 495") < conn.sent.index("A1 NLT")
+
+    def test_only_configured_axes_are_touched(self):
+        controller, conn = self._make_controller(
+            False, {"X": (-5, 495)},
+            {"A1 NLT -5": "-5", "A1 PLT 495": "495", "A1 NLT": "-5", "A1 PLT": "495"},
+        )
+        controller.connect()
+        assert not any(
+            c.startswith(("A2 NLT", "A2 PLT", "A5 NLT", "A5 PLT", "A6 NLT", "A6 PLT"))
+            for c in conn.sent
+        )
+
+    def test_a_single_bound_can_be_set_alone(self):
+        controller, conn = self._make_controller(
+            False, {"X": (-5, None)}, {"A1 NLT -5": "-5", "A1 NLT": "-5", "A1 PLT": "0"},
+        )
+        controller.connect()
+        assert "A1 NLT -5" in conn.sent
+        assert not any(c.startswith("A1 PLT ") for c in conn.sent)  # no PLT write, only its read-back
+
+    def test_does_nothing_while_safe_mode_is_on(self):
+        controller, conn = self._make_controller(True, {"X": (-5, 495)})
+        assert controller.connect() is True
+        assert not any("NLT" in c or "PLT" in c for c in conn.sent)
+
+    def test_no_configured_limits_is_a_no_op(self):
+        controller, conn = self._make_controller(False, None)
+        assert controller.connect() is True
+        assert not any("NLT" in c or "PLT" in c for c in conn.sent)
+
+    def test_a_failing_axis_does_not_block_connect_or_the_other_axis(self):
+        from laguna.robot.macron.connection import SnapMotionError
+
+        controller, conn = self._make_controller(
+            False, {"X": (-5, None), "Y": (-1, 400)},
+            {
+                "A1 NLT -5": SnapMotionError(0, "boom"),
+                "A2 NLT -1": "-1", "A2 PLT 400": "400", "A2 NLT": "-1", "A2 PLT": "400",
+            },
+        )
+        assert controller.connect() is True  # must not raise
+        assert "A2 NLT -1" in conn.sent  # Y still got its limits despite X failing
+
+    def test_validation_failure_does_not_raise(self):
+        # A garbage read-back makes validate_soft_limits() raise internally
+        # — _apply_soft_limits() must swallow that, not let it fail connect().
+        controller, conn = self._make_controller(
+            False, {"X": (-5, 495)},
+            {
+                "A1 NLT -5": "-5", "A1 PLT 495": "495",
+                "A1 NLT": "-822536056", "A1 PLT": "495",
+            },
+        )
+        assert controller.connect() is True
 
 
 class TestSetSafeMode:

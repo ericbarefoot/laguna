@@ -122,6 +122,7 @@ class GantryController:
         coordinate_offset_mm: Optional[Dict[str, float]] = None,
         position_checkpoint_file: Optional[str] = None,
         arbiter: Optional[Any] = None,
+        soft_limits: Optional[Dict[str, Tuple[Optional[float], Optional[float]]]] = None,
     ):
         """Initialize the gantry controller.
 
@@ -144,6 +145,10 @@ class GantryController:
             coordinate_offset_mm: Per-axis position offsets in mm.
             position_checkpoint_file: Path to position persistence file.
             arbiter: Motion arbiter for serializing operations.
+            soft_limits: Per-axis (negative_limit_mm, positive_limit_mm)
+                overrides, either value optional. Written to the
+                controller's NLT/PLT registers by connect() — see
+                _apply_soft_limits().
         """
         self._connection = connection
         #: Shared gantry lock — see laguna.robot.motion_arbiter.
@@ -153,6 +158,7 @@ class GantryController:
         self._io_map = io_map or IOMap()
         self._safe_mode = safe_mode
         self._is_connected = False
+        self._soft_limits = soft_limits or {}
         # See position_store.py / restore_last_position() — off (None) unless
         # a path is configured. Useful any time a power cycle wipes the
         # PLC's ACP registers and a fresh home() isn't wanted right away.
@@ -339,6 +345,7 @@ class GantryController:
         axis_mm_per_unit = {
             a["name"]: a["mm_per_unit"] for a in axes_cfg if "mm_per_unit" in a
         }
+        soft_limits = _build_soft_limits(axes_cfg)
 
         return cls(
             connection=connection,
@@ -359,6 +366,7 @@ class GantryController:
             axis_mm_per_unit=axis_mm_per_unit,
             coordinate_offset_mm=config.get("coordinate_offset"),
             position_checkpoint_file=config.get("position_checkpoint_file"),
+            soft_limits=soft_limits,
         )
 
     # ------------------------------------------------------------------
@@ -408,7 +416,50 @@ class GantryController:
 
         if self._is_connected and not self._safe_mode:
             self._enable_and_release_brakes()
+            self._apply_soft_limits()
         return self._is_connected
+
+    def _apply_soft_limits(self) -> None:
+        """Write configured software travel limits (NLT/PLT) to the controller.
+
+        NLT/PLT writes are on the safe_mode allowlist as bare reads only
+        (see SAFE_COMMANDS in pi_bridge.py) — actually setting a limit is
+        blocked exactly like any other motion-adjacent write while
+        safe_mode is True. Called by connect() only after that check
+        already passed. Not called by set_safe_mode(False) — a later
+        transition to motion-permitted while already connected does not
+        currently reapply configured limits.
+
+        After writing, reads them back via validate_soft_limits() to
+        confirm the values actually took, catching a wiring/unit mistake
+        in config before anything can move. Never raises: like
+        _enable_and_release_brakes(), a failure here is logged, not
+        propagated — connect() itself must still succeed.
+        """
+        if not self._soft_limits:
+            return
+        applied: List[Axis] = []
+        for axis in self._axes:
+            bounds = self._soft_limits.get(axis.name)
+            if bounds is None:
+                continue
+            neg, pos = bounds
+            try:
+                if neg is not None:
+                    self.cmd.set_negative_limit(axis, neg)
+                if pos is not None:
+                    self.cmd.set_positive_limit(axis, pos)
+            except Exception as exc:
+                logger.warning("Could not set %s's soft limits: %s", axis.name, exc)
+                continue
+            applied.append(axis)
+            logger.info("%s: soft limits set to (%s, %s) mm", axis.name, neg, pos)
+        if not applied:
+            return
+        try:
+            self.cmd.validate_soft_limits(axes=tuple(applied))
+        except Exception as exc:
+            logger.warning("Soft limits did not validate after being set: %s", exc)
 
     def _enable_and_release_brakes(self) -> None:
         """Turn each brake-equipped axis's motor on, then release its brake.
@@ -1178,6 +1229,23 @@ def _build_io_map(axes_cfg: List[Dict[str, Any]]) -> IOMap:
             if entry.get("limit_input") is not None:
                 kwargs["theta_limit_input"] = entry["limit_input"]
     return IOMap(**kwargs)
+
+
+def _build_soft_limits(
+    axes_cfg: List[Dict[str, Any]],
+) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    """Resolve per-axis (negative_limit_mm, positive_limit_mm) from config.
+
+    Only axes with at least one bound set in config appear in the result
+    — see GantryController._apply_soft_limits(), the only consumer.
+    """
+    limits: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    for entry in axes_cfg:
+        neg = entry.get("soft_negative_limit_mm")
+        pos = entry.get("soft_positive_limit_mm")
+        if neg is not None or pos is not None:
+            limits[entry["name"]] = (neg, pos)
+    return limits
 
 
 def _build_homing_config(

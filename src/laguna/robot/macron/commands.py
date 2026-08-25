@@ -914,28 +914,81 @@ class MMCCommands:
             _BLOCKING_MOTION_BANNED.format(blocking="group_move_by", nonblocking="group_begin_move_by")
         )
 
+    # -- Curve buffer (AMT/AMB/ARC/CLR/LNK/BMC) — CONFIRMED NON-FUNCTIONAL --
+    # ------------------------------------------------------------------
+    # Do not build on any of the six methods below. Curve-buffer motion is
+    # an optional vendor firmware feature this controller does not have
+    # installed — link_curve_buffer() (LNK) fails with SnapMotion error 33
+    # ("Option Not Present") on real hardware every time, before an ARC
+    # segment is ever reached. Confirmed via sandbox/probe_arc.py on
+    # 2026-08-25: `C1 LNK` refused outright, no motion occurred.
+    #
+    # This also explains why none of these mnemonics appear anywhere in
+    # the vendor's OEM package (AsciiHelp.chm/BlockHelp.chm/TextHelp.chm,
+    # nor any example .DSM) — they were never omitted from documentation,
+    # they're gated behind an option this hardware variant doesn't have.
+    # The method bodies below were reverse-engineered from the ASCII
+    # interpreter's own Pascal source (bk_ar/bk_ln/bk_bm in e.g. "MMC
+    # RS232 Ascii Command Interpreter 003.DSM") purely to run that probe;
+    # kept here, unused, as a record so a future session doesn't redo this
+    # investigation. G2/G3 arcs stay tessellated into ordinary fence-checked
+    # line segments in gcode.py — see that module's docstring — which is
+    # the only arc-motion path that actually works on this controller.
+
     def append_move_to(self, *positions: float) -> None:
         """Queue an absolute waypoint into the curve buffer (AMT), given real mm.
 
-        Must be called after group_begin_move_to to chain waypoints for
-        smooth blended trajectory. The controller executes them in sequence.
+        See the "CONFIRMED NON-FUNCTIONAL" note above this method group —
+        the curve buffer this appends into cannot be linked on this
+        hardware, so nothing queued here can ever run.
         """
         self._send(f"{self._gx()} AMT {self._fmt_params(*self._group_pos_to_raw(*positions))}")
 
     def append_move_by(self, *deltas: float) -> None:
-        """Queue a relative waypoint into the curve buffer (AMB), given real mm."""
+        """Queue a relative waypoint into the curve buffer (AMB), given real mm.
+
+        See the "CONFIRMED NON-FUNCTIONAL" note above this method group.
+        """
         self._send(f"{self._gx()} AMB {self._fmt_params(*self._group_delta_to_raw(*deltas))}")
 
     def append_arc(self, radius: float, theta: float, phi: float, extra: Optional[float] = None) -> None:
-        """Queue an arc segment (ARC). 3D arc takes radius, theta, phi, plus one extra param."""
+        """Queue an arc segment (ARC). 3D arc takes radius, theta, phi, plus one extra param.
+
+        See the "CONFIRMED NON-FUNCTIONAL" note above this method group —
+        never reached on real hardware; link_curve_buffer() fails first.
+        radius/theta/phi's geometric meaning was never determined.
+        """
         if extra is not None:
             self._send(f"{self._gx()} ARC {radius:.6g} {theta:.6g} {phi:.6g} {extra:.6g}")
         else:
             self._send(f"{self._gx()} ARC {radius:.6g} {theta:.6g} {phi:.6g}")
 
     def clear_curve_buffer(self) -> None:
-        """Clear the group's queued waypoints (CLR)."""
+        """Clear the group's queued waypoints (CLR).
+
+        See the "CONFIRMED NON-FUNCTIONAL" note above this method group.
+        """
         self._send(f"{self._gx()} CLR")
+
+    def link_curve_buffer(self) -> None:
+        """Attach the group to a curve buffer (LNK), required before begin_move_along_curve().
+
+        CONFIRMED NON-FUNCTIONAL on this hardware — see the note above this
+        method group. This is the exact call that fails: SnapMotion error
+        33 ("Option Not Present"), confirmed on real hardware via
+        sandbox/probe_arc.py on 2026-08-25. The curve-buffer feature is
+        gated behind an optional firmware/hardware configuration this
+        controller was not purchased/configured with.
+        """
+        self._send(f"{self._gx()} LNK")
+
+    def begin_move_along_curve(self) -> None:
+        """Start the group's queued curve-buffer moves, non-blocking (BMC).
+
+        See the "CONFIRMED NON-FUNCTIONAL" note above this method group —
+        never reachable, since link_curve_buffer() always fails first.
+        """
+        self._send(f"{self._gx()} BMC")
 
     def group_begin_stop(self) -> None:
         """Start controlled deceleration of coordinated group (BST)."""

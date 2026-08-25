@@ -110,9 +110,24 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
                                 # triggered; confirmed LOW-on-trigger (normally-closed wiring) on
                                 # this hardware 2026-08-25, hence false below. See
                                 # docs/MACRON_GANTRY.md.
-    - {name: X, index: 1, home_switch: home, home_trip_on_high: false}
-    - {name: Y, index: 2, brake_output: 4, brake_status_input: 8,   # SOB 4 / INB 8 confirmed (commander)
-       home_switch: home, home_trip_on_high: false}
+                                #
+                                # soft_negative_limit_mm / soft_positive_limit_mm (optional, either
+                                # bound independently): written to the controller's NLT/PLT once
+                                # connected with safe_mode=False — see
+                                # GantryController._apply_soft_limits(). Not set below — measure the
+                                # real travel envelope on your hardware before filling these in,
+                                # e.g.:
+                                #   - {name: X, index: 1, soft_negative_limit_mm: -5, soft_positive_limit_mm: 495}
+    - {
+      name: X, index: 1, 
+      home_switch: home, home_trip_on_high: false,
+      soft_negative_limit_mm: -5, soft_positive_limit_mm: 2130
+      }
+    - {name: Y, index: 2, 
+      brake_output: 4, brake_status_input: 8,   # SOB 4 / INB 8 confirmed (commander)
+      home_switch: home, home_trip_on_high: false,
+      soft_negative_limit_mm: -5, soft_positive_limit_mm: 1200
+      }
     - {name: Z, index: 5, brake_output: 5, mm_per_unit: 13.5,        # SOB 5 confirmed (commander);
                                                                      # brake_status_input lives on the
                                                                      # responder's own input bank and has
@@ -122,7 +137,9 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
                                                                      # 13.5, not the shared 15.0 default,
                                                                      # on hardware 2026-08-10 — see
                                                                      # docs/archive/GANTRY_UNIT_CALIBRATION.md
-       home_switch: home, home_trip_on_high: false}
+       home_switch: home, home_trip_on_high: false,
+       soft_negative_limit_mm: 0, soft_positive_limit_mm: 520
+       }
     - {name: Theta, index: 6}   # limit switch lives on the responder — same caveat as Z's brake status;
                                 # no capture-latch homing support for Theta on this hardware
   homing:
@@ -143,6 +160,7 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
   mm_per_acp_unit: 15.0
   # Real-mm translation from the gantry's raw zero to a real-world origin.
   coordinate_offset: {X: 0.0, Y: 0.0, Z: 0.0, Theta: 0.0}
+  position_checkpoint_file: "./gantry_position.json"
 
 # OD2000 / WTT12L PowerProx rangefinders, via an ifm AL1342 IO-Link master.
 # Add one block per sensor in use — od2000 and wtt12l use the same shape,

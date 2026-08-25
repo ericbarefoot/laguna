@@ -211,6 +211,16 @@ for the actual travel envelope — treat them as "present" not "verified
 correct." `MMCCommands.validate_soft_limits()` exists to catch the old
 garbage-value failure mode if it recurs.
 
+Config can specify per-axis overrides (`soft_negative_limit_mm`/
+`soft_positive_limit_mm` in an `axes:` entry — see
+`config/example_config.yaml`) that `GantryController.connect()` writes to
+`NLT`/`PLT` once connected with `safe_mode=False` and immediately
+validates via `validate_soft_limits()`. Like `NLT`/`PLT` reads,
+*writing* them is gated by the `safe_mode` allowlist — see [Motion
+control layers & guards](MOTION_CONTROL_LAYERS.md). Not applied by
+`set_safe_mode(False)` on an already-connected controller — only by
+`connect()` itself.
+
 ## Safety model (defense in depth, multiple independent layers)
 
 1. **`SAFE_COMMANDS` allowlist** (`pi_bridge.py`) — mnemonic → max arg count
