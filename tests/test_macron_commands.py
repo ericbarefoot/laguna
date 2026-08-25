@@ -167,6 +167,61 @@ class TestIOMapGatedBrakeHelpers:
         assert conn.sent == []
 
 
+class TestIOMapGatedHomeAndLimitSwitches:
+    def test_read_home_switch_uses_confirmed_default_channels(self):
+        conn = FakeSnapConnection({"INB 1": "1", "INB 3": "0", "INB 5": "1"})
+        cmd = MMCCommands(conn)
+        io_map = IOMap()
+        assert cmd.read_home_switch(X_AXIS, io_map) is True
+        assert cmd.read_home_switch(Y_AXIS, io_map) is False
+        assert cmd.read_home_switch(Z_AXIS, io_map) is True
+        assert conn.sent == ["INB 1", "INB 3", "INB 5"]
+
+    def test_read_home_switch_raises_when_channel_unset(self):
+        conn = FakeSnapConnection({})
+        cmd = MMCCommands(conn)
+        io_map = IOMap(x_home_input=None)
+        with pytest.raises(ValueError):
+            cmd.read_home_switch(X_AXIS, io_map)
+        assert conn.sent == []
+
+    def test_read_home_switch_rejects_theta(self):
+        conn = FakeSnapConnection({})
+        cmd = MMCCommands(conn)
+        with pytest.raises(ValueError):
+            cmd.read_home_switch(THETA_AXIS, IOMap())
+        assert conn.sent == []
+
+    def test_read_limit_switch_uses_confirmed_default_channels(self):
+        conn = FakeSnapConnection({"INB 2": "1", "INB 4": "0", "INB 6": "1"})
+        cmd = MMCCommands(conn)
+        io_map = IOMap()
+        assert cmd.read_limit_switch(X_AXIS, io_map) is True
+        assert cmd.read_limit_switch(Y_AXIS, io_map) is False
+        assert cmd.read_limit_switch(Z_AXIS, io_map) is True
+        assert conn.sent == ["INB 2", "INB 4", "INB 6"]
+
+    def test_read_limit_switch_raises_when_channel_unset(self):
+        conn = FakeSnapConnection({})
+        cmd = MMCCommands(conn)
+        io_map = IOMap(y_limit_input=None)
+        with pytest.raises(ValueError):
+            cmd.read_limit_switch(Y_AXIS, io_map)
+        assert conn.sent == []
+
+    def test_read_limit_switch_raises_not_implemented_for_theta(self):
+        # theta_limit_input lives on the responder's own input bank
+        # (TNamedIO ModuleNumber=1) and has no ASCII addressing path from
+        # here — architectural gap, not "not yet probed", so
+        # NotImplementedError rather than ValueError.
+        conn = FakeSnapConnection({})
+        cmd = MMCCommands(conn)
+        io_map = IOMap()  # theta_limit_input defaults to None
+        with pytest.raises(NotImplementedError):
+            cmd.read_limit_switch(THETA_AXIS, io_map)
+        assert conn.sent == []
+
+
 class TestPredictedMoveS:
     """predicted_move_s feeds the sparse move-completion polling — see
     commands.py's "Move-completion polling" note."""

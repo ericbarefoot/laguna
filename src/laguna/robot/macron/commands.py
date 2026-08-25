@@ -1049,6 +1049,75 @@ class MMCCommands:
         """
         return bool(self._send(f"INB {index}"))
 
+    def read_home_switch(self, axis: Axis, io_map: IOMap) -> bool:
+        """Read the home switch state for X, Y, or Z (INB, via IOMap).
+
+        Args:
+            axis: Target axis. Theta has no home switch.
+            io_map: IOMap with the confirmed home-input channel for this axis.
+
+        Returns:
+            Input state (True = HIGH, False = LOW).
+
+        Raises:
+            ValueError: If the relevant IOMap channel hasn't been set yet.
+        """
+        if axis == X_AXIS:
+            index = io_map.x_home_input
+        elif axis == Y_AXIS:
+            index = io_map.y_home_input
+        elif axis == Z_AXIS:
+            index = io_map.z_home_input
+        else:
+            raise ValueError(f"Axis {axis.name} has no home switch")
+        if index is None:
+            raise ValueError(
+                f"io_map.{axis.name.lower()}_home_input is not set — probe the native INB channel first"
+            )
+        return self.read_input_bit(index)
+
+    def read_limit_switch(self, axis: Axis, io_map: IOMap) -> bool:
+        """Read the limit switch state for X, Y, Z, or Theta (INB, via IOMap).
+
+        Args:
+            axis: Target axis.
+            io_map: IOMap with the confirmed limit-input channel for this axis.
+
+        Returns:
+            Input state (True = HIGH, False = LOW).
+
+        Raises:
+            ValueError: If the relevant IOMap channel hasn't been set yet.
+            NotImplementedError: For Theta — its limit switch lives on the
+                responder node's own input bank and is architecturally
+                unreachable via the plain ASCII INB command; see IOMap.
+        """
+        if axis == X_AXIS:
+            index = io_map.x_limit_input
+        elif axis == Y_AXIS:
+            index = io_map.y_limit_input
+        elif axis == Z_AXIS:
+            index = io_map.z_limit_input
+        elif axis == THETA_AXIS:
+            if io_map.theta_limit_input is None:
+                raise NotImplementedError(
+                    "Theta's limit switch lives on the responder node's own input bank "
+                    "(TNamedIO ModuleNumber=1, index 2 in eab-2026-07-16/17.dsm) and "
+                    "is not reachable via the plain ASCII INB command from the "
+                    "commander — there is no node-scoped addressing in this "
+                    "firmware's ASCII grammar. Needs Named IO GUI config or the "
+                    "Binary Commands node protocol to expose this value; see "
+                    "docs/MACRON_GANTRY.md."
+                )
+            index = io_map.theta_limit_input
+        else:
+            raise ValueError(f"Unknown axis {axis.name}")
+        if index is None:
+            raise ValueError(
+                f"io_map.{axis.name.lower()}_limit_input is not set — probe the native INB channel first"
+            )
+        return self.read_input_bit(index)
+
     def set_output_bit(self, index: int, state: bool) -> None:
         """Set native digital output by index (SOB).
 
