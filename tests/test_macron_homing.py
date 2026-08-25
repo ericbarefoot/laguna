@@ -1,9 +1,6 @@
 """Tests for the hardware capture-latch homing procedure.
 
-All scripted against FakeSnapConnection — no hardware. Homing is currently
-deprioritized for real-hardware use (limit switch INB channels haven't been
-physically probed on this machine), but the state machine itself is fully
-unit-testable and should stay correct for whenever it is revisited.
+All scripted against FakeSnapConnection — no hardware.
 """
 
 import pytest
@@ -176,23 +173,56 @@ class TestHomeAxisBrakeHandling:
 
 
 class TestHomeAll:
-    """home_all() is disabled while physical obstructions block several of
-    the limit switches it depends on (plan step 2, from 5c170d3). It must
-    refuse before commanding any motion — a partial home into a blocked
-    switch is exactly what this guards against. home_axis() itself is left
-    callable and is still covered by the tests above, so the state machine
-    stays verified for whenever homing is re-enabled."""
+    def test_homes_all_axes_in_configured_order(self):
+        responses = {
+            # X
+            "A1 SCS 1": "1", "A1 SCT 1": "1", "A1 AIC": "0", "A1 CAB": "0",
+            "A1 JOG -10": "-10", "A1 CAT": _trip_after(0), "A1 BST": "0",
+            "A1 MIF": _trip_after(0), "A1 CAP": "0", "A1 ACP": "0",
+            "A1 ACP 0": "0", "A1 BMT 5": "0",
+            # Y (brake release + home)
+            "SOB 4 1": "0", "INB 8": "1",
+            "A2 SCS 3": "1", "A2 SCT 1": "1", "A2 AIC": "0", "A2 CAB": "0",
+            "A2 JOG -10": "-10", "A2 CAT": _trip_after(0), "A2 BST": "0",
+            "A2 MIF": _trip_after(0), "A2 CAP": "0", "A2 ACP": "0",
+            "A2 ACP 0": "0", "A2 BMT 5": "0",
+        }
+        conn = FakeSnapConnection(responses)
+        cmd = MMCCommands(conn)
+        io_map = IOMap(y_brake_output=4, y_brake_status_input=8)
+        config = HomingConfig(
+            homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
+            timeout_s=1.0, backoff_timeout_s=1.0,
+            home_order=(X_AXIS, Y_AXIS),
+            axis_configs={
+                X_AXIS: AxisHomingConfig(capture_source_index=1),
+                Y_AXIS: AxisHomingConfig(capture_source_index=3),
+            },
+        )
+        proc = HomingProcedure(cmd, config, io_map=io_map)
+        result = proc.home_all()
+        assert result.success is True
+        assert result.axis_results == {"X": 0.0, "Y": 0.0}
+        # order matters: X homes before Y, as configured
+        assert conn.sent.index("A1 JOG -10") < conn.sent.index("A2 JOG -10")
 
-    def test_home_all_refuses_and_sends_nothing(self):
-        conn = FakeSnapConnection({})
-        proc = HomingProcedure(MMCCommands(conn), HomingConfig())
-        with pytest.raises(NotImplementedError, match="Homing is temporarily disabled"):
-            proc.home_all()
-        assert conn.sent == []
-
-    def test_error_names_the_supported_alternative(self):
-        """Callers need to know what to do instead: set_position() declares
-        where the gantry already is, without commanding motion."""
-        proc = HomingProcedure(MMCCommands(FakeSnapConnection({})), HomingConfig())
-        with pytest.raises(NotImplementedError, match="set_position"):
-            proc.home_all()
+    def test_stops_and_reports_failure_on_first_axis_that_fails(self):
+        responses = {
+            "A1 SCS 1": "1", "A1 SCT 1": "1", "A1 AIC": "0", "A1 CAB": "0",
+            "A1 JOG -10": "-10", "A1 CAT": "0",  # never trips -> timeout
+            "A1 ABT": "0",
+        }
+        conn = FakeSnapConnection(responses)
+        cmd = MMCCommands(conn)
+        config = HomingConfig(
+            homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
+            timeout_s=0.02, backoff_timeout_s=1.0,
+            home_order=(X_AXIS, Y_AXIS),
+            axis_configs={X_AXIS: AxisHomingConfig(capture_source_index=1)},
+        )
+        proc = HomingProcedure(cmd, config)
+        result = proc.home_all()
+        assert result.success is False
+        assert "X" not in result.axis_results
+        assert "Y" not in result.axis_results  # never reached — X failed first
+        assert not any(cmd.startswith("A2") for cmd in conn.sent)

@@ -33,7 +33,7 @@ from .commands import (
 from .connection import EthernetConnection, RS232Connection, SnapConnection, SnapMotionError
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
 from .gcode import GCodeExecutor
-from .homing import HomingConfig, HomingProcedure
+from .homing import AxisHomingConfig, HomingConfig, HomingProcedure
 from ..motion_arbiter import DEFAULT_ARBITER
 from .pi_bridge import PiGantryConnection
 from .position_store import GantryPositionStore
@@ -154,8 +154,8 @@ class GantryController:
         self._safe_mode = safe_mode
         self._is_connected = False
         # See position_store.py / restore_last_position() — off (None) unless
-        # a path is configured, since it's a stopgap for the obstructed-
-        # limit-switch homing situation, not something every gantry needs.
+        # a path is configured. Useful any time a power cycle wipes the
+        # PLC's ACP registers and a fresh home() isn't wanted right away.
         self._position_store = (
             GantryPositionStore(position_checkpoint_file)
             if position_checkpoint_file
@@ -311,7 +311,7 @@ class GantryController:
         )
 
         io_map = _build_io_map(axes_cfg)
-        homing_config = _build_homing_config(config.get("homing") or {}, axes_cfg)
+        homing_config = _build_homing_config(config.get("homing") or {}, axes_cfg, io_map)
         fences = _build_fences(config.get("fences") or [])
         gcode_axes = _resolve_gcode_axes(axes_cfg)
         gcode_z_axis = _lookup_axis(axes_cfg, "Z") or Z_AXIS
@@ -558,11 +558,9 @@ class GantryController:
         Applies whatever _persist_position() (called at the end of
         move_to(), set_position(), stop(), and soft_stop()) most recently
         wrote, via set_position() — the same non-motion register
-        recalibration described in its docstring. This is the recovery path
-        for issue #23: a power cycle wipes the PLC's ACP registers entirely,
-        and physical homing is currently disabled (obstructed limit
-        switches — see HomingProcedure.home_all()), so without this there is
-        no way to re-reference position at all short of measuring by hand.
+        recalibration described in its docstring. Useful after a power
+        cycle, which wipes the PLC's ACP registers entirely: this restores
+        the last known position instantly without running home() again.
 
         Deliberately NOT called automatically by connect() — unlike a fresh
         physical home, a checkpoint file only proves "this was the position
@@ -781,9 +779,8 @@ class GantryController:
         recalibrates each given axis's position register (ACP) to the given
         real-mm value without commanding any motion. Use it to re-reference
         the gantry after it has been repositioned by other means (e.g.
-        manually). This is currently the only way to (re-)establish a
-        position reference, since home() is temporarily disabled — see
-        HomingProcedure.home_all(). To actually move, use move_to().
+        manually), as an alternative to running home() again. To actually
+        move, use move_to().
 
         Both forms mirror move_to()'s shape — a full vector (one value per
         configured axis, in self._axes order) or per-axis keywords — except
@@ -1113,7 +1110,9 @@ def _build_io_map(axes_cfg: List[Dict[str, Any]]) -> IOMap:
     return IOMap(**kwargs)
 
 
-def _build_homing_config(homing_cfg: Dict[str, Any], axes_cfg: List[Dict[str, Any]]) -> HomingConfig:
+def _build_homing_config(
+    homing_cfg: Dict[str, Any], axes_cfg: List[Dict[str, Any]], io_map: IOMap
+) -> HomingConfig:
     config = HomingConfig(
         homing_speed=homing_cfg.get("speed_mm_s", 10.0),
         standoff_distance=homing_cfg.get("standoff_mm", 5.0),
@@ -1127,6 +1126,41 @@ def _build_homing_config(homing_cfg: Dict[str, Any], axes_cfg: List[Dict[str, An
                 raise KeyError(f"homing.order references unknown axis {name!r}")
             resolved.append(axis)
         config.home_order = tuple(resolved)
+
+    axis_configs: Dict[Axis, AxisHomingConfig] = {}
+    home_channels = {X_AXIS: io_map.x_home_input, Y_AXIS: io_map.y_home_input, Z_AXIS: io_map.z_home_input}
+    limit_channels = {X_AXIS: io_map.x_limit_input, Y_AXIS: io_map.y_limit_input, Z_AXIS: io_map.z_limit_input}
+    for entry in axes_cfg:
+        axis = _lookup_axis(axes_cfg, entry.get("name", ""))
+        if axis is None or axis not in config.home_order or axis not in home_channels:
+            continue  # Theta has no capture-latch homing support on this hardware
+
+        switch = entry.get("home_switch", "home")
+        if switch == "home":
+            index = home_channels[axis]
+        elif switch == "limit":
+            index = limit_channels[axis]
+        else:
+            raise ValueError(
+                f"axes[name={entry.get('name')!r}].home_switch must be 'home' or 'limit', got {switch!r}"
+            )
+        if index is None:
+            raise ValueError(
+                f"axes[name={entry.get('name')!r}].home_switch={switch!r} but IOMap has no "
+                f"{switch}_input channel configured for this axis — set it in the axes config "
+                f"(brake/limit fields) or pass a fully-populated io_map"
+            )
+
+        axis_configs[axis] = AxisHomingConfig(
+            capture_source_index=index,
+            # Confirmed on hardware 2026-08-25: home switches read LOW when
+            # triggered (normally-closed wiring) — default matches that,
+            # override per axis with "home_trip_on_high" if a given switch
+            # differs.
+            capture_trip_on_high=entry.get("home_trip_on_high", False),
+            homing_direction=entry.get("home_direction", -1.0),
+        )
+    config.axis_configs = axis_configs
     return config
 
 

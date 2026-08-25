@@ -1,10 +1,8 @@
 """Persists the gantry's last-known axis positions across power cycles.
 
 The OEM-2T's position registers (ACP) live only in the PLC's volatile state —
-a power cycle wipes them, and physical homing is currently disabled while its
-limit switches are obstructed (see HomingProcedure.home_all()). Without a
-saved last-known position there is no way to re-reference the controller
-after a power cycle short of measuring by hand — see issue #23.
+a power cycle wipes them. This gives a faster path back to a known position
+than re-running home() every time.
 
 This is a last-known-value cache, not a substitute for homing: it is exactly
 as accurate as "nothing moved an axis between the last write and the power

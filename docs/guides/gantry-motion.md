@@ -103,10 +103,10 @@ vectors, not just the scanned axis's value.
 
 ## Things this guide deliberately does not cover
 
-- **Homing** — currently disabled on the lab's hardware (physical
-  obstructions block several limit switches); see `docs/MACRON_GANTRY.md`.
-  Scripts that assume a homed reference frame should declare position with
-  `lab.gantry.set_position([...])` instead, which commands no motion.
+- **Homing** — see `docs/MACRON_GANTRY.md` and `HomingProcedure`/
+  `lab.gantry.home()`. Scripts that don't want to run a physical homing
+  pass can declare position instead with `lab.gantry.set_position([...])`,
+  which commands no motion.
 - **Recovering from a power cycle or interrupted session** — see
   "Resuming after a Pi reboot or session gap" in `docs/MACRON_GANTRY.md`.
 - **The full safety-verb vocabulary** (`pause`/`resume`/`stop`/`estop`) —

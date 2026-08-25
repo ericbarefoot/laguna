@@ -963,18 +963,32 @@ class TestExecutorLinearMoves:
 
 
 class TestExecutorHomeDwellPause:
-    def test_g28_raises_while_homing_is_disabled(self):
-        """HomingProcedure.home_all() raises unconditionally while physical
-        obstructions block several of the limit switches it depends on
-        (plan step 2, from 5c170d3). G28 therefore cannot run, and must
-        fail before touching the wire rather than jogging into a blocked
-        switch.
-        """
-        executor, conn = _make_executor({})
+    def test_g28_homes_all_configured_axes(self):
+        """G28 delegates to HomingProcedure.home_all(), which by default
+        (no axis_configs) homes Z, X, Y in that order with the default
+        negative-direction jog — see homing.py's HomingConfig."""
+        responses = {
+            # Z (index 5) — brake release + status confirm
+            "SOB 5 1": "0", "INB 1": "1",
+            "A5 AIC": "0", "A5 CAB": "0", "A5 JOG -10": "-10", "A5 CAT": "1",
+            "A5 BST": "0", "A5 MIF": "1", "A5 CAP": "0", "A5 ACP": "0",
+            "A5 ACP 0": "0", "A5 BMT 5": "0",
+            # X (index 1) — no brake
+            "A1 AIC": "0", "A1 CAB": "0", "A1 JOG -10": "-10", "A1 CAT": "1",
+            "A1 BST": "0", "A1 MIF": "1", "A1 CAP": "0", "A1 ACP": "0",
+            "A1 ACP 0": "0", "A1 BMT 5": "0",
+            # Y (index 2) — brake release + status confirm
+            "SOB 4 1": "0", "INB 8": "1",
+            "A2 AIC": "0", "A2 CAB": "0", "A2 JOG -10": "-10", "A2 CAT": "1",
+            "A2 BST": "0", "A2 MIF": "1", "A2 CAP": "0", "A2 ACP": "0",
+            "A2 ACP 0": "0", "A2 BMT 5": "0",
+        }
+        executor, conn = _make_executor(responses)
         trajectory = executor.plan("G28")
-        with pytest.raises(NotImplementedError, match="Homing is temporarily disabled"):
-            executor.execute(trajectory)
-        assert conn.sent == []  # nothing reached the controller
+        executor.execute(trajectory)
+        # order matters: Z homes first (default home_order), then X, then Y
+        assert conn.sent.index("A5 JOG -10") < conn.sent.index("A1 JOG -10")
+        assert conn.sent.index("A1 JOG -10") < conn.sent.index("A2 JOG -10")
 
     def test_g4_dwell_sleeps(self, monkeypatch):
         slept = []

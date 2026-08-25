@@ -155,6 +155,49 @@ class TestFromConfigHomingAndFences:
         with pytest.raises(KeyError):
             GantryController.from_config(_cfg(cfg))
 
+    def test_axis_configs_default_to_home_switch_and_default_direction(self):
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
+        x_cfg = controller.homing._config.axis_config(X_AXIS)
+        assert x_cfg.capture_source_index == 1  # io_map.x_home_input
+        assert x_cfg.capture_trip_on_high is False  # default matches confirmed hardware
+        assert x_cfg.homing_direction == -1.0
+
+    def test_axis_configs_only_built_for_axes_in_home_order(self):
+        # BASE_CONFIG's home_order is [Z, X, Y] — Theta never gets an
+        # AxisHomingConfig (no capture-latch homing support for it here).
+        controller = GantryController.from_config(_cfg(BASE_CONFIG))
+        assert controller.homing._config.axis_config(THETA_AXIS) is None
+
+    def test_home_switch_can_be_set_to_limit(self):
+        cfg = dict(BASE_CONFIG)
+        cfg["axes"] = [
+            {"name": "X", "index": 1, "home_switch": "limit"},
+            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Z", "index": 5},
+            {"name": "Theta", "index": 6},
+        ]
+        controller = GantryController.from_config(_cfg(cfg))
+        x_cfg = controller.homing._config.axis_config(X_AXIS)
+        assert x_cfg.capture_source_index == 2  # io_map.x_limit_input
+
+    def test_home_trip_on_high_overridable_per_axis(self):
+        cfg = dict(BASE_CONFIG)
+        cfg["axes"] = [
+            {"name": "X", "index": 1, "home_trip_on_high": True},
+            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Z", "index": 5},
+            {"name": "Theta", "index": 6},
+        ]
+        controller = GantryController.from_config(_cfg(cfg))
+        assert controller.homing._config.axis_config(X_AXIS).capture_trip_on_high is True
+
+    def test_unknown_home_switch_value_raises(self):
+        cfg = dict(BASE_CONFIG)
+        cfg["axes"] = [{"name": "X", "index": 1, "home_switch": "banana"}]
+        cfg["homing"] = {"order": ["X"]}
+        with pytest.raises(ValueError):
+            GantryController.from_config(_cfg(cfg))
+
     def test_fences_built_from_config(self):
         controller = GantryController.from_config(_cfg(BASE_CONFIG))
         assert len(controller.fence_registry) == 1

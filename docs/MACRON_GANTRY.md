@@ -139,8 +139,10 @@ treats `ModuleNumber=16` as the **local/commander native** input bus, not an
 IsoIO designation. These are commander-native `INB`/`SOB` channels,
 decoded directly from the `.dsm`'s Named-IO block declarations and
 cross-checked against a live `INB 1-8` read (values `1,1,1,0,1,1,0,0` —
-consistent with the table below). Not yet physically toggle-tested
-switch-by-switch.
+consistent with the table below). Trip polarity confirmed on hardware
+2026-08-25: home switches read LOW when triggered (normally-closed
+wiring). Switch-by-switch INB-index confirmation uses
+`examples/example_08_gantry_io_verify.py`.
 
 **Commander native IO** (all `ModuleNumber=16` in the `.dsm`):
 
@@ -188,8 +190,12 @@ though a live `INB 1-8` read is a strong cross-check. Brake-control methods
 yet probed/configured" case, distinct from the responder's structural
 unreachability.
 
-**Homing is not currently run in practice**, though `HomingProcedure`'s
-architecture is sound and fully unit-tested.
+**Homing** (`HomingProcedure.home_all()` / `GantryController.home()`) jogs
+each configured axis toward its home switch by default (`INB 1/3/5`),
+configurable per axis to the limit switch instead (`home_switch: limit` in
+config) — see `GantryController._build_homing_config`. See
+`examples/example_09_gantry_home_axis_test.py` for a per-axis test script
+with a Ctrl-C safety stop.
 
 **Soft limits**: X/Y/Z soft-limit registers (`PLT`/`NLT`) currently return
 real, sane values (`A1 PLT=122`, `A2 PLT=80`, `A5 PLT=24`), not uninitialized

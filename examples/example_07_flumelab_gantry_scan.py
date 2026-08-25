@@ -185,18 +185,11 @@ def main():
     # ------------------------------------------------------------------
 
     print()
-    # Homing is temporarily disabled: physical obstructions currently block
-    # several of the limit switches the routine depends on, so
-    # lab.gantry.home() raises NotImplementedError rather than jogging into
-    # them (see HomingProcedure.home_all). Until that is cleared, declare
-    # the reference frame instead — set_position() tells the controller
-    # where the gantry already is, and commands no motion:
-    #
-    #     lab.gantry.set_position([0.0, 0.0, 0.0, 0.0])
-    #
-    # This example assumes the gantry is already referenced and just moves
-    # from wherever it is.
-    print("Skipping homing (temporarily disabled — see comment above).")
+    # This example assumes the gantry is already referenced (homed, or its
+    # position declared via lab.gantry.set_position([...])) and just moves
+    # from wherever it is. See examples/example_09_gantry_home_axis_test.py
+    # for a real homing run.
+    print("Skipping homing (assuming the gantry is already referenced).")
 
     print("Moving to (100, 50, 10, 0) mm...")
     lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0)

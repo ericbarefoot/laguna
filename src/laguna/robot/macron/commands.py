@@ -259,8 +259,13 @@ class IOMap:
     commander-native INB/SOB reads, decoded directly from the .dsm's
     Named-IO block declarations (eab-2026-07-16.dsm and eab-2026-07-17.dsm
     agree exactly) and cross-checked against a live INB 1-8 read on
-    2026-07-17 (values 1,1,1,0,1,1,0,0 — consistent with this table). Not
-    yet physically toggle-tested switch-by-switch.
+    2026-07-17 (values 1,1,1,0,1,1,0,0 — consistent with this table).
+    Trip polarity confirmed on hardware 2026-08-25: home switches read LOW
+    when triggered (normally-closed wiring) — see
+    GantryController._build_homing_config's default for
+    home_trip_on_high. Switch-by-switch INB-index confirmation (which
+    physical switch maps to which INB number) uses
+    examples/example_08_gantry_io_verify.py.
 
     Commander native IO decode (ModuleNumber=16 in both .dsm files):
       - x_home_input         = INB 1  (XXHome)
@@ -304,12 +309,6 @@ class IOMap:
     z_home_input: Optional[int] = 5      # INB 5 — confirmed (eab-2026-07-16/17.dsm)
     z_limit_input: Optional[int] = 6     # INB 6 — confirmed (eab-2026-07-16/17.dsm)
     theta_limit_input: Optional[int] = None  # on responder — unreachable via ASCII, see above
-
-    # Capture sources for the hardware capture-latch homing mechanism (SCS).
-    # Homing is currently deprioritized — left unset until needed.
-    x_limit_capture_source: Optional[int] = None
-    y_limit_capture_source: Optional[int] = None
-    z_limit_capture_source: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
