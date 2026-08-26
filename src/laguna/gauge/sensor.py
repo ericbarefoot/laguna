@@ -109,9 +109,16 @@ class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
 
     @classmethod
     def from_config(cls, config: "Config") -> "SaflWaterLevelSensor":
-        """Build from the lab's Config (its 'gauge:' section and shared 'mqtt:' section)."""
-        section = config.get("gauge")
-        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
+        """Build from the lab's Config (its 'gauge:' section and shared 'mqtt:' section).
+
+        Derives the default topic from mqtt.node_name — the gauge section
+        itself only needs a "topic" key to override that default.
+        """
+        mqtt_config = config.get("mqtt")
+        node_name = mqtt_config.get("node_name", "SAFL Confluence Node 1")
+        section = dict(config.get("gauge"))
+        section.setdefault("topic", f"{node_name}/Massa_Ultrasonic")
+        mqtt_subscriber = MqttSubscriber(mqtt_config)
         return cls(section, mqtt_subscriber)
 
     def connect(self) -> bool:

@@ -206,9 +206,18 @@ class SaflWeirController(WeirController, SubsystemLogging):
 
     @classmethod
     def from_config(cls, config: "Config") -> "SaflWeirController":
-        """Build from the lab's Config (its 'weir:' section and shared 'mqtt:' section)."""
-        section = config.get("weir")
-        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
+        """Build from the lab's Config (its 'weir:' section and shared 'mqtt:' section).
+
+        Derives default topics from mqtt.node_name — the weir section
+        itself only needs topic_* keys to override those defaults.
+        """
+        mqtt_config = config.get("mqtt")
+        node_name = mqtt_config.get("node_name", "SAFL Confluence Node 1")
+        section = dict(config.get("weir"))
+        section.setdefault("topic_status", f"{node_name}/weir")
+        section.setdefault("topic_commands", f"{node_name}/weir/commands")
+        section.setdefault("topic_replies", f"{node_name}/weir/replies")
+        mqtt_subscriber = MqttSubscriber(mqtt_config)
         return cls(section, mqtt_subscriber)
 
     def connect(self) -> bool:

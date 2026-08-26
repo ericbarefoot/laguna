@@ -65,20 +65,19 @@ class Config:
                 "capture_format": "BGR",
             },
             # weir/gauge/flow are now MQTT clients of the confluence node on
-            # red.lab rather than direct USB serial — see
-            # docs/CONFLUENCE_INTEGRATION.md. Topic names below match
-            # confluence's `{Node Name}/{interface}` convention (default
-            # node name "SAFL Confluence Node 1", see
-            # confluence/confluence_config.json on red.lab).
+            # red.lab rather than direct USB serial. Their topics are
+            # derived from mqtt.node_name below (`{node_name}/{interface}`,
+            # matching confluence's own convention — see
+            # confluence/confluence_config.json's "Node Name" on red.lab)
+            # in each subsystem's from_config(), not hardcoded per-section —
+            # change the node name in one place, not three. A subsystem
+            # section can still set its own topic_* key explicitly to
+            # override the derived default (e.g. for a second node).
             "weir": {
-                "topic_status": "SAFL Confluence Node 1/weir",
-                "topic_commands": "SAFL Confluence Node 1/weir/commands",
-                "topic_replies": "SAFL Confluence Node 1/weir/replies",
                 "command_timeout_s": 5.0,
                 "home_offset_mm": 0.0,
             },
             "gauge": {
-                "topic": "SAFL Confluence Node 1/Massa_Ultrasonic",
                 # Index into the Massa interface's per-device arrays
                 # (device names/dist_mm/signal_strength/...) — confluence
                 # polls all configured Massa IDs in one message, so this
@@ -87,15 +86,6 @@ class Config:
                 "offset_mm": 0.0,
             },
             "flow": {
-                "vfd_topic_status": "SAFL Confluence Node 1/Fuji_Frenic_VFD",
-                "vfd_topic_commands": "SAFL Confluence Node 1/Fuji_Frenic_VFD/commands",
-                "vfd_topic_replies": "SAFL Confluence Node 1/Fuji_Frenic_VFD/replies",
-                # Valve axis lives on the same physical ClearCore as the weir
-                # gate axis (one controller, two axes) but is published/
-                # commanded as its own confluence interface/topic set.
-                "valve_topic_status": "SAFL Confluence Node 1/flow_valve",
-                "valve_topic_commands": "SAFL Confluence Node 1/flow_valve/commands",
-                "valve_topic_replies": "SAFL Confluence Node 1/flow_valve/replies",
                 "command_timeout_s": 5.0,
                 "C0": 4.902,
                 "C1": 58.49,
@@ -195,6 +185,10 @@ class Config:
                 "keepalive": 60,
                 "topics": [],
                 "qos": 0,
+                # Must match confluence_config.json's "Node Name" on red.lab —
+                # weir/gauge/flow derive their MQTT topics from this in their
+                # own from_config() (see the comment above the "weir" section).
+                "node_name": "UCRS Confluence Node 1",
             },
             "rangefinder": {
                 "topic": "laguna/od2000",

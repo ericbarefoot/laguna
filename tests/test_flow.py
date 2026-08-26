@@ -8,6 +8,7 @@ place of a real broker.
 
 import math
 
+from laguna.config import Config
 from laguna.flow import SaflFlowController
 
 from mqtt_fixtures import FakeMqttSubscriber
@@ -228,3 +229,16 @@ class TestSaflFlowControllerSimulated:
         controller.connect()
         controller.qin = True
         assert controller.qin is True
+
+
+class TestSaflFlowControllerFromConfig:
+    """from_config() derives topics from mqtt.node_name — see
+    config.py's comment above the "weir" section."""
+
+    def test_topics_derived_from_node_name(self):
+        config = Config(defaults={"flow": {}, "mqtt": {"node_name": "UCRS Confluence Node 1"}})
+        controller = SaflFlowController.from_config(config)
+        assert controller._vfd_status_topic == "UCRS Confluence Node 1/Fuji_Frenic_VFD"
+        assert controller._vfd_commands_topic == "UCRS Confluence Node 1/Fuji_Frenic_VFD/commands"
+        assert controller._valve_status_topic == "UCRS Confluence Node 1/flow_valve"
+        assert controller._valve_commands_topic == "UCRS Confluence Node 1/flow_valve/commands"

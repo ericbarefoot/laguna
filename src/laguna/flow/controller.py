@@ -209,9 +209,21 @@ class SaflFlowController(FlowController, SubsystemLogging):
 
     @classmethod
     def from_config(cls, config: "Config") -> "SaflFlowController":
-        """Build from the lab's Config (its 'flow:' section and shared 'mqtt:' section)."""
-        section = config.get("flow")
-        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
+        """Build from the lab's Config (its 'flow:' section and shared 'mqtt:' section).
+
+        Derives default topics from mqtt.node_name — the flow section
+        itself only needs topic_* keys to override those defaults.
+        """
+        mqtt_config = config.get("mqtt")
+        node_name = mqtt_config.get("node_name", "SAFL Confluence Node 1")
+        section = dict(config.get("flow"))
+        section.setdefault("vfd_topic_status", f"{node_name}/Fuji_Frenic_VFD")
+        section.setdefault("vfd_topic_commands", f"{node_name}/Fuji_Frenic_VFD/commands")
+        section.setdefault("vfd_topic_replies", f"{node_name}/Fuji_Frenic_VFD/replies")
+        section.setdefault("valve_topic_status", f"{node_name}/flow_valve")
+        section.setdefault("valve_topic_commands", f"{node_name}/flow_valve/commands")
+        section.setdefault("valve_topic_replies", f"{node_name}/flow_valve/replies")
+        mqtt_subscriber = MqttSubscriber(mqtt_config)
         return cls(section, mqtt_subscriber)
 
     def connect(self) -> bool:

@@ -10,6 +10,7 @@ double used here in place of a real broker.
 
 import math
 
+from laguna.config import Config
 from laguna.weir import SaflWeirController
 
 from mqtt_fixtures import FakeMqttSubscriber
@@ -197,3 +198,26 @@ class TestSaflWeirControllerSimulated:
         assert controller.pause() is None
         assert controller.stop() is None
         assert controller.estop() is None
+
+
+class TestSaflWeirControllerFromConfig:
+    """from_config() derives topics from mqtt.node_name — see
+    config.py's comment above the "weir" section."""
+
+    def test_topics_derived_from_node_name(self):
+        config = Config(defaults={"weir": {}, "mqtt": {"node_name": "UCRS Confluence Node 1"}})
+        controller = SaflWeirController.from_config(config)
+        assert controller._status_topic == "UCRS Confluence Node 1/weir"
+        assert controller._commands_topic == "UCRS Confluence Node 1/weir/commands"
+        assert controller._replies_topic == "UCRS Confluence Node 1/weir/replies"
+
+    def test_explicit_topic_overrides_derived_default(self):
+        config = Config(
+            defaults={
+                "weir": {"topic_status": "custom/status"},
+                "mqtt": {"node_name": "UCRS Confluence Node 1"},
+            }
+        )
+        controller = SaflWeirController.from_config(config)
+        assert controller._status_topic == "custom/status"
+        assert controller._commands_topic == "UCRS Confluence Node 1/weir/commands"

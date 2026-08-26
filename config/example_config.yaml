@@ -12,15 +12,21 @@ timing:
                                # Omit to leave every subsystem writing exactly where
                                # its own output_dir says — see laguna.run_context.
 
+# weir/gauge/flow are MQTT clients of the confluence node on red.lab, not
+# direct USB serial — their topics default to `{mqtt.node_name}/...`
+# (see config.py's comment above its "weir" default section), so the one
+# thing you actually need to set here is mqtt.node_name matching red.lab's
+# confluence_config.json "Node Name". A topic_* key below overrides the
+# derived default for a single subsystem if ever needed.
+# mqtt:
+#   node_name: "UCRS Confluence Node 1"
+
 # gauge:
-#   port: /dev/ttyUSB2          # Massa M-5000 ultrasonic sensor
-#   sensor_ids: [0]
+#   sensor_index: 0             # which Massa device ID this gauge reads, by array position
 #   offset_mm: 0.0
 #   interval_s: 5               # read every 5 s
 
 # weir:
-#   port: /dev/ttyUSB1          # Teknic ClearCore motor controller
-#   baudrate: 9600
 #   home_offset_mm: 0.0
 #   # Scheduling (choose one):
 #   interval_s: 20              # poll status every 20 s (read-only, no motor motion)
@@ -28,10 +34,6 @@ timing:
 
 # Flow controller (Fuji VFD pump + solenoid valves). Omit section to disable.
 # flow:
-#   vfd_port: /dev/ttyUSB3
-#   vfd_slave_id: 1
-#   motor_port: /dev/ttyUSB1  # shared serial port with weir
-#   motor_baudrate: 9600
 #   C0: 4.902                 # flowrate-to-frequency calibration: Hz = C2*Q^2 + C1*Q + C0
 #   C1: 58.49
 #   C2: 0.08956

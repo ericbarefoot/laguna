@@ -11,6 +11,7 @@ for the double used here in place of a real broker.
 import logging
 import math
 
+from laguna.config import Config
 from laguna.gauge import SaflWaterLevelSensor
 
 from mqtt_fixtures import FakeMqttSubscriber
@@ -200,3 +201,24 @@ class TestSaflWaterLevelSensorSimulated:
         status = sensor.get_status()
         assert status["is_connected"] is True
         assert math.isnan(status["elevation_mm"])
+
+
+class TestSaflWaterLevelSensorFromConfig:
+    """from_config() derives the topic from mqtt.node_name — changing the
+    node name should be a one-line edit, not a hunt through three
+    subsystem sections (see config.py's comment above the "weir" section)."""
+
+    def test_topic_derived_from_node_name(self):
+        config = Config(defaults={"gauge": {}, "mqtt": {"node_name": "UCRS Confluence Node 1"}})
+        sensor = SaflWaterLevelSensor.from_config(config)
+        assert sensor._topic == "UCRS Confluence Node 1/Massa_Ultrasonic"
+
+    def test_explicit_topic_overrides_derived_default(self):
+        config = Config(
+            defaults={
+                "gauge": {"topic": "custom/topic"},
+                "mqtt": {"node_name": "UCRS Confluence Node 1"},
+            }
+        )
+        sensor = SaflWaterLevelSensor.from_config(config)
+        assert sensor._topic == "custom/topic"
