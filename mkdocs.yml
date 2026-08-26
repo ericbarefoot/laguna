@@ -83,6 +83,7 @@ nav:
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
+      - Config parameter reference: GANTRY_CONFIG_REFERENCE.md
       - Motion layers & guards: MOTION_CONTROL_LAYERS.md
       - Rangefinder profiling: RANGEFINDER_PROFILING.md
       - MQTT & AL1342 setup: MQTT_AL1342_SETUP.md

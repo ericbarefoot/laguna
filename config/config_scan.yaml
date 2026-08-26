@@ -110,6 +110,7 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
     order: [Z, X, Y]
   fences:                   # populate once the work envelope / exclusion zones are known
     # - {type: box, name: hvac, x: [650, 1400], y: [115, 900], z: [360, 1000]}
+    - {type: box, name: sirius, x: [1080, 1430], y: [430, 850], z: [295, 500]}
   # TEMPORARY: 1 raw controller (ACP) unit = this many real mm on X/Y/Z —
   # confirmed 15.0 on hardware 2026-07-28, see docs/GANTRY_UNIT_CALIBRATION.md.
   # The single toggle: change to 1.0 (and gantry_agent.py's matching
