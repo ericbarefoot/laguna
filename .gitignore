@@ -65,6 +65,7 @@ env/
 ._*
 
 # Project specific
+tmp/
 config/local_config.yaml
 config/config_line_scan.yaml
 data/raw/
