@@ -115,8 +115,26 @@ class Config:
                 "group_index": 1,
                 "safe_mode": True,
                 "axes": [
-                    {"name": "X", "index": 1},
-                    {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+                    # home_switch: "home" (default, INB1/3/5) or "limit"
+                    # (INB2/4/6) — which switch HomingProcedure jogs toward
+                    # and latches on. home_trip_on_high: whether that switch
+                    # reads HIGH when triggered; confirmed LOW-on-trigger
+                    # (normally-closed wiring) on this hardware 2026-08-25,
+                    # so the default is False. See docs/MACRON_GANTRY.md.
+                    #
+                    # soft_negative_limit_mm / soft_positive_limit_mm:
+                    # optional NLT/PLT overrides, written to the controller
+                    # by connect() once safe_mode=False — see
+                    # GantryController._apply_soft_limits(). Either bound
+                    # can be omitted; an axis with neither is left at
+                    # whatever the controller's own program has. No
+                    # defaults are guessed here — set both once the real
+                    # travel envelope is measured.
+                    {"name": "X", "index": 1, "home_switch": "home", "home_trip_on_high": False},
+                    {
+                        "name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8,
+                        "home_switch": "home", "home_trip_on_high": False,
+                    },
                     # mm_per_unit override: confirmed 13.5 mm/unit on hardware
                     # 2026-08-10 (measured 90mm actual travel for a
                     # 100mm-commanded move), not the shared 15.0 default —
@@ -124,7 +142,10 @@ class Config:
                     # MMCCommands.__init__'s axis_mm_per_unit docstring. X/Y
                     # were not re-measured this session and still use the
                     # shared default.
-                    {"name": "Z", "index": 5, "brake_output": 5, "mm_per_unit": 13.5},
+                    {
+                        "name": "Z", "index": 5, "brake_output": 5, "mm_per_unit": 13.5,
+                        "home_switch": "home", "home_trip_on_high": False,
+                    },
                     {"name": "Theta", "index": 6},
                 ],
                 "homing": {

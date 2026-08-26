@@ -22,9 +22,13 @@ naming it, rather than silently skipping potentially-motion-relevant
 instructions.
 
 Arc handling note: the vendor's native ARC command (radius/theta/phi
-parameters, see MMCCommands.append_arc) has never been confirmed against
-real hardware — the exact parameter semantics are ambiguous in the
-extracted documentation. Rather than guess at an unverified wire format,
+parameters, see MMCCommands.append_arc) is CONFIRMED NON-FUNCTIONAL on
+this hardware — curve-buffer motion (LNK/ARC/AMT/AMB/BMC/CLR) is an
+optional firmware feature this controller doesn't have; link_curve_buffer()
+fails with SnapMotion error 33 ("Option Not Present") before an ARC
+segment is ever reached (see the note above MMCCommands.append_move_to()
+and sandbox/probe_arc.py for the full record). Rather than guess at an
+unusable wire format,
 G2/G3 arcs are tessellated here into a sequence of short straight-line
 moves, each individually fence-checked and executed as an ordinary
 coordinated group move. This fully supports arc G-code without sending any
@@ -979,14 +983,56 @@ class GCodeExecutor:
 
         self._sync_position_from_hardware(touches_xy, responder)
 
+    def _apply_scaled_ramp(
+        self,
+        set_accel: Callable[[float], None],
+        set_decel: Callable[[float], None],
+        accel: float,
+        decel: float,
+        leg: str,
+    ) -> None:
+        """Apply a duration-matching-scaled (accel, decel) to one leg, tolerating rounding to zero.
+
+        _execute_concurrent_pair scales the shorter leg's ramp down so both
+        legs take the same time (see that method's docstring). When the
+        shorter leg's real distance is small relative to the longer leg's,
+        the scaled value can round to 0 raw units once converted through
+        mm_per_unit — the controller refuses that outright (SnapMotion
+        escape 16/17, "User Accel/Decel 0 Or Negative"), even though the
+        *unscaled* ramp already sitting on that axis/group is perfectly
+        valid. This was reproduced on real hardware: a small residual XY
+        drift (sub-mm quantization noise left over from the previous
+        move's live position resync — see _sync_position_from_hardware's
+        docstring) was enough to cross _moved()'s epsilon and force this
+        move through the concurrent-pair path, but was negligible next to
+        a 170mm Z leg — k came out small enough that k * ref_accel
+        vanished in raw units. Rather than abort the whole move over a
+        duration-matching nicety, fall back to leaving this leg's ramp
+        exactly as it already was.
+        """
+        try:
+            set_accel(accel)
+            set_decel(decel)
+        except SnapMotionError as exc:
+            if exc.code not in (16, 17):
+                raise
+            logger.warning(
+                "%s leg: scaled ramp (accel=%.6g, decel=%.6g) rejected as 0-or-negative "
+                "(SnapMotion error %d) — leaving this leg's ramp unscaled",
+                leg, accel, decel, exc.code,
+            )
+
     def _begin_z_leg(
         self, move: GCodeMove, speed: Optional[float] = None, ramp: Optional[Tuple[float, float]] = None
     ) -> None:
         speed = move.feed_mm_s if speed is None else speed
         if ramp is not None:
             accel, decel = ramp
-            self._cmd.set_accel(self._z_axis, accel)
-            self._cmd.set_decel(self._z_axis, decel)
+            self._apply_scaled_ramp(
+                lambda v: self._cmd.set_accel(self._z_axis, v),
+                lambda v: self._cmd.set_decel(self._z_axis, v),
+                accel, decel, "Z",
+            )
         if speed is not None:
             self._cmd.set_speed(self._z_axis, speed)
         self._cmd.begin_move_to(self._z_axis, move.target[2])
@@ -1022,8 +1068,11 @@ class GCodeExecutor:
         speed = move.feed_mm_s if speed is None else speed
         if ramp is not None:
             accel, decel = ramp
-            self._cmd.set_accel(self._theta_axis, accel)
-            self._cmd.set_decel(self._theta_axis, decel)
+            self._apply_scaled_ramp(
+                lambda v: self._cmd.set_accel(self._theta_axis, v),
+                lambda v: self._cmd.set_decel(self._theta_axis, v),
+                accel, decel, "Theta",
+            )
         if speed is not None:
             self._cmd.set_speed(self._theta_axis, speed)
         self._cmd.begin_move_to(self._theta_axis, move.theta)
@@ -1056,8 +1105,11 @@ class GCodeExecutor:
         speed = move.feed_mm_s if speed is None else speed
         if ramp is not None:
             accel, decel = ramp
-            self._theta_cmd.group_set_accel(accel)
-            self._theta_cmd.group_set_decel(decel)
+            self._apply_scaled_ramp(
+                self._theta_cmd.group_set_accel,
+                self._theta_cmd.group_set_decel,
+                accel, decel, "Z/Theta",
+            )
         if speed is not None:
             self._theta_cmd.group_set_speed(speed)
         self._theta_cmd.group_begin_move_to(move.target[2], move.theta)
@@ -1097,8 +1149,11 @@ class GCodeExecutor:
         speed = move.feed_mm_s if speed is None else speed
         if ramp is not None:
             accel, decel = ramp
-            self._cmd.group_set_accel(accel)
-            self._cmd.group_set_decel(decel)
+            self._apply_scaled_ramp(
+                self._cmd.group_set_accel,
+                self._cmd.group_set_decel,
+                accel, decel, "X/Y",
+            )
         if speed is not None:
             self._cmd.group_set_speed(speed)
         self._cmd.group_begin_move_to(move.target[0], move.target[1])
@@ -1238,13 +1293,26 @@ class GCodeExecutor:
         value just read, so leaving it alone is correct, not an oversight.
 
         Skipped entirely (both legs left untouched, running at whatever
-        SPD/ACL/DCL each already has) only if the reference leg's
-        currently-configured ACL/DCL reads back as 0 or negative (e.g.
-        right after group INI, before this session has ever set a ramp on
-        it — querying ACL/DCL immediately after INI is untested): scaling
-        a 0-or-negative reference produces a 0-or-negative ACL/DCL for the
+        SPD/ACL/DCL each already has) if the reference leg's currently-
+        configured ACL/DCL reads back as 0 or negative (e.g. right after
+        group INI, before this session has ever set a ramp on it —
+        querying ACL/DCL immediately after INI is untested): scaling a
+        0-or-negative reference produces a 0-or-negative ACL/DCL for the
         other leg, which the controller rejects outright (ASCII escape
         codes 16/17, "User Accels/Decels 0 Or Negative").
+
+        The same escape can also happen with a perfectly valid positive
+        reference: if the *other* leg's real distance is tiny relative to
+        the reference leg's (a small residual XY drift next to a large Z
+        move, say), k comes out small enough that k * ref_accel/ref_decel
+        rounds to 0 once converted to raw controller units — the
+        controller rejects that leg's scaled ramp specifically, even
+        though the reference leg's own ramp was fine. See
+        _apply_scaled_ramp's docstring: each leg falls back to its own
+        pre-scaling ramp (not a whole-move abort) when that happens, so
+        this method's own duration-matching intent can silently degrade
+        to "both legs run, just not duration-matched" rather than
+        failing the move outright.
         """
         current_pos = self._current_pos
         current_theta = self._current_theta

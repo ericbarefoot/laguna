@@ -91,8 +91,14 @@ real controller. Both agree exactly.
   position of `700.0` would be misidentified as an error).
 - **Get/set duality**: most 3-letter mnemonics read with no argument,
   write+echo with one.
-- **No firmware homing** (`HMX` is a stub) — built in the driver via the
-  hardware capture-latch mechanism (`SCS`/`SCT`/`AIC`/`CAB`/`CAP`/`CAT`).
+- **No firmware homing** (`HMX` is a stub) — built in the driver by jogging
+  and software-polling the home/limit switch (`INB`). Originally attempted
+  via the hardware capture-latch mechanism (`SCS`/`SCT`/`AIC`/`CAB`/`CAP`/
+  `CAT`), abandoned 2026-08-25 — see `homing.py`'s module docstring for why
+  (the vendor's own `SCS` parameter table only supports encoder channels or
+  an expansion-card "Option N Index," never a native `INB` bit, and axis A2
+  rejects `SCS` outright with an undocumented escape code). Pending word
+  from the vendor.
 
 Full command table, error codes, and grammar details are in
 `src/laguna/robot/macron/commands.py`'s docstrings — not duplicated here to
@@ -139,8 +145,10 @@ treats `ModuleNumber=16` as the **local/commander native** input bus, not an
 IsoIO designation. These are commander-native `INB`/`SOB` channels,
 decoded directly from the `.dsm`'s Named-IO block declarations and
 cross-checked against a live `INB 1-8` read (values `1,1,1,0,1,1,0,0` —
-consistent with the table below). Not yet physically toggle-tested
-switch-by-switch.
+consistent with the table below). Trip polarity confirmed on hardware
+2026-08-25: home switches read LOW when triggered (normally-closed
+wiring). Switch-by-switch INB-index confirmation uses
+`examples/example_08_gantry_io_verify.py`.
 
 **Commander native IO** (all `ModuleNumber=16` in the `.dsm`):
 
@@ -188,8 +196,12 @@ though a live `INB 1-8` read is a strong cross-check. Brake-control methods
 yet probed/configured" case, distinct from the responder's structural
 unreachability.
 
-**Homing is not currently run in practice**, though `HomingProcedure`'s
-architecture is sound and fully unit-tested.
+**Homing** (`HomingProcedure.home_all()` / `GantryController.home()`) jogs
+each configured axis toward its home switch by default (`INB 1/3/5`),
+configurable per axis to the limit switch instead (`home_switch: limit` in
+config) — see `GantryController._build_homing_config`. See
+`examples/example_09_gantry_home_axis_test.py` for a per-axis test script
+with a Ctrl-C safety stop.
 
 **Soft limits**: X/Y/Z soft-limit registers (`PLT`/`NLT`) currently return
 real, sane values (`A1 PLT=122`, `A2 PLT=80`, `A5 PLT=24`), not uninitialized
@@ -198,6 +210,16 @@ from an unhomed position, though, and have not been validated as correct
 for the actual travel envelope — treat them as "present" not "verified
 correct." `MMCCommands.validate_soft_limits()` exists to catch the old
 garbage-value failure mode if it recurs.
+
+Config can specify per-axis overrides (`soft_negative_limit_mm`/
+`soft_positive_limit_mm` in an `axes:` entry — see
+`config/example_config.yaml`) that `GantryController.connect()` writes to
+`NLT`/`PLT` once connected with `safe_mode=False` and immediately
+validates via `validate_soft_limits()`. Like `NLT`/`PLT` reads,
+*writing* them is gated by the `safe_mode` allowlist — see [Motion
+control layers & guards](MOTION_CONTROL_LAYERS.md). Not applied by
+`set_safe_mode(False)` on an already-connected controller — only by
+`connect()` itself.
 
 ## Safety model (defense in depth, multiple independent layers)
 
@@ -218,11 +240,11 @@ garbage-value failure mode if it recurs.
 4. **`confirm_cb`** on `GCodeExecutor` — per-motion-segment human
    confirmation hook for real-motion testing.
 
-**No motion has ever been sent to the hardware.** Every verification so
-far has been read-only queries, or, where even those failed, connectivity
-checks. Real motion (Stage 3 testing) is still gated on explicit
-authorization in a future session — nothing in this repo commands it by
-default (`safe_mode=True` everywhere).
+**Real motion has been run on hardware** (homing and `move_to()`, session
+2026-08-25) — nothing in this repo commands it by default
+(`safe_mode=True` everywhere), but it is no longer purely theoretical. See
+[Motion control layers & guards](MOTION_CONTROL_LAYERS.md) for which
+guards apply to which call path before running more.
 
 ## Files
 
@@ -230,7 +252,7 @@ default (`safe_mode=True` everywhere).
 |---|---|
 | `connection.py` | `SnapConnection` ABC, `EthernetConnection`, `RS232Connection`, envelope parsing, port discovery |
 | `commands.py` | `MMCCommands` (typed ASCII command wrapper), `Axis`/`AxisState`/`IOMap`, `validate_soft_limits()` |
-| `homing.py` | `HomingProcedure` — capture-latch homing |
+| `homing.py` | `HomingProcedure` — software-polled homing |
 | `fences.py` | `BoxFence`/`CylinderFence`/`TrajectoryChecker`/`CheckedTrajectory` — exclusion-zone safety |
 | `gcode.py` | `GCodeParser`/`GCodeExecutor` — G0/G1/G2/G3/G28/G90/G91/G21/G4/M0/M1/M114 |
 | `pi_bridge.py` | `PiGantryConnection`, `SafeModeConnection`, `SAFE_COMMANDS`, `check_safe_mode` |

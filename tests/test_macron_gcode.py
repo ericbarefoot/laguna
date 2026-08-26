@@ -19,7 +19,7 @@ from laguna.robot.macron.gcode import (
     GCodeParser,
 )
 from laguna.robot.macron.commands import IOMap
-from laguna.robot.macron.homing import HomingConfig, HomingProcedure
+from laguna.robot.macron.homing import AxisHomingConfig, HomingConfig, HomingProcedure
 from tests.macron_fixtures import FakeSnapConnection
 
 
@@ -190,13 +190,24 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None, with_
     for fence in fences or []:
         registry.add(fence)
     checker = TrajectoryChecker(registry)
-    homing_config = HomingConfig(poll_interval_s=0.001, timeout_s=1.0, backoff_timeout_s=1.0)
+    homing_config = HomingConfig(
+        poll_interval_s=0.001, timeout_s=1.0, backoff_timeout_s=1.0,
+        # Default IOMap home inputs (X=INB1, Y=INB3, Z=INB5) — see IOMap in
+        # commands.py. Only exercised by G28 tests; harmless for the rest.
+        axis_configs={
+            X_AXIS: AxisHomingConfig(input_index=1),
+            Y_AXIS: AxisHomingConfig(input_index=3),
+            Z_AXIS: AxisHomingConfig(input_index=5),
+        },
+    )
     # z_brake_status_input defaults to None (unreachable via ASCII on real
     # hardware — it lives on the responder's own input bank). Stand in a
-    # test-only channel here so homing tests can exercise the full
-    # brake-confirm flow; this is not a claim about real reachability.
+    # test-only channel here (7 — the spare/unused INB per IOMap's default
+    # commander decode, so it can't collide with any real home/limit
+    # channel) so homing tests can exercise the full brake-confirm flow;
+    # this is not a claim about real reachability.
     io_map = IOMap(
-        y_brake_output=4, z_brake_output=5, y_brake_status_input=8, z_brake_status_input=1
+        y_brake_output=4, z_brake_output=5, y_brake_status_input=8, z_brake_status_input=7
     )
     homing = HomingProcedure(cmd, homing_config, io_map=io_map)
     executor = GCodeExecutor(
@@ -430,6 +441,83 @@ class TestExecutorLinearMoves:
         ]
         assert "A5 ACL" not in conn.sent
         assert "A5 DCL" not in conn.sent
+
+    def test_falls_back_to_unscaled_ramp_when_scaled_value_rounds_to_zero(self):
+        """Even with a perfectly valid positive reference ramp, a small
+        enough short-leg distance (a sub-mm residual XY drift next to a
+        much larger Z move, say — reproduced on real hardware from
+        _sync_position_from_hardware's live-read quantization noise
+        crossing _moved()'s epsilon) can make k * ref_accel/ref_decel
+        round to 0 raw units once the controller receives it, even though
+        the unscaled math (dist_xy=10, dist_responder=3, k=0.3) here is
+        the same as test_moves_z_concurrently_with_the_xy_group_scaled_to_
+        match_duration. This scripts the controller rejecting the scaled
+        A5 ACL specifically (escape 16) to simulate that rounding, and
+        confirms the executor falls back to Z's own pre-scaling ramp
+        (never touched, so no A5 DCL write and no restore needed) instead
+        of letting the exception abort the whole move. Z's own pre-scaling
+        ramp/speed are still read up front, and restored at the end,
+        exactly as in the successful-scaling case (test_moves_z_
+        concurrently_with_the_xy_group_scaled_to_match_duration) — the
+        restore is unconditional (it doesn't know or care whether the
+        scaled write actually landed), so it re-sends the same ACL/DCL
+        the axis already had. Only the scaled A5 ACL write is skipped.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "A5 ACL": "25",  # Z's own ramp before this move — restored after
+            "A5 DCL": "20",
+            "A5 SPD": "8",  # Z's own speed before this move — restored after
+            "A5 ACL 15": SnapMotionError(16, "User Accel 0 Or Negative"),
+            "A5 SPD 3": "3",
+            "A5 BMT 3": "0",
+            "A5 MIF": "1",
+            "C1 SPD 10": "10",
+            "C1 BMT 10 0": "0",
+            "C1 MIF": "1",
+            "A5 ACL 25": "25",  # restore — unconditional, re-sends what Z already had
+            "A5 DCL 20": "20",
+            "A5 SPD 8": "8",  # restore
+            "A1 ACP": "10",  # post-move resync of X/Y/Z from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "3",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        executor.execute(trajectory)  # must not raise
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
+            "A5 ACL", "A5 DCL", "A5 SPD",  # read Z's own ramp/speed (to restore later)
+            "A5 ACL 15",  # rejected — no A5 DCL write attempted after
+            "A5 SPD 3", "A5 BMT 3",  # Z still moves, at the scaled speed, unscaled ramp
+            "C1 SPD 10", "C1 BMT 10 0",  # X/Y, unscaled
+            "A5 MIF", "C1 MIF",
+            "A5 ACL 25", "A5 DCL 20", "A5 SPD 8",  # Z's ramp/speed restored (no-op — never changed)
+            "A1 ACP", "A2 ACP", "A5 ACP",  # resync _current_pos from hardware
+        ]
+        assert conn.sent.count("A5 ACL 15") == 1  # never retried
+
+    def test_reraises_non_ramp_snap_motion_errors(self):
+        """_apply_scaled_ramp only swallows escape 16/17 (0-or-negative
+        accel/decel) — any other SnapMotionError from setting a scaled
+        ramp is a real fault and must propagate, not be silently eaten.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "A5 ACL": "25",
+            "A5 DCL": "20",
+            "A5 SPD": "8",
+            "A5 ACL 15": SnapMotionError(70, "inter-node timeout"),
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        with pytest.raises(SnapMotionError) as exc_info:
+            executor.execute(trajectory)
+        assert exc_info.value.code == 70
 
     def test_scales_the_short_leg_even_with_no_f_word(self):
         """A move with no F word at all used to skip scaling entirely,
@@ -963,18 +1051,41 @@ class TestExecutorLinearMoves:
 
 
 class TestExecutorHomeDwellPause:
-    def test_g28_raises_while_homing_is_disabled(self):
-        """HomingProcedure.home_all() raises unconditionally while physical
-        obstructions block several of the limit switches it depends on
-        (plan step 2, from 5c170d3). G28 therefore cannot run, and must
-        fail before touching the wire rather than jogging into a blocked
-        switch.
-        """
-        executor, conn = _make_executor({})
+    def test_g28_homes_all_configured_axes(self):
+        """G28 delegates to HomingProcedure.home_all(), which homes Z, X, Y
+        in that order (default home_order) by jogging and polling each
+        axis's home switch (INB) — see homing.py's HomingConfig."""
+
+        def _untripped_then_tripped():
+            # 1st read is the not-already-tripped backoff check; 2nd is the
+            # first poll inside the jog-and-wait loop, where it trips.
+            state = {"calls": 0}
+
+            def _resp(cmd):
+                state["calls"] += 1
+                return "0" if state["calls"] == 1 else "1"
+
+            return _resp
+
+        responses = {
+            # Z (index 5) — brake release + status confirm, home switch INB 5
+            "SOB 5 1": "0", "INB 7": "1",
+            "INB 5": _untripped_then_tripped(), "A5 JOG -10": "-10",
+            "A5 BST": "0", "A5 MIF": "1", "A5 ACP": "0", "A5 ACP 0": "0", "A5 BMT 5": "0",
+            # X (index 1) — no brake, home switch INB 1
+            "INB 1": _untripped_then_tripped(), "A1 JOG -10": "-10",
+            "A1 BST": "0", "A1 MIF": "1", "A1 ACP": "0", "A1 ACP 0": "0", "A1 BMT 5": "0",
+            # Y (index 2) — brake release + status confirm, home switch INB 3
+            "SOB 4 1": "0", "INB 8": "1",
+            "INB 3": _untripped_then_tripped(), "A2 JOG -10": "-10",
+            "A2 BST": "0", "A2 MIF": "1", "A2 ACP": "0", "A2 ACP 0": "0", "A2 BMT 5": "0",
+        }
+        executor, conn = _make_executor(responses)
         trajectory = executor.plan("G28")
-        with pytest.raises(NotImplementedError, match="Homing is temporarily disabled"):
-            executor.execute(trajectory)
-        assert conn.sent == []  # nothing reached the controller
+        executor.execute(trajectory)
+        # order matters: Z homes first (default home_order), then X, then Y
+        assert conn.sent.index("A5 JOG -10") < conn.sent.index("A1 JOG -10")
+        assert conn.sent.index("A1 JOG -10") < conn.sent.index("A2 JOG -10")
 
     def test_g4_dwell_sleeps(self, monkeypatch):
         slept = []

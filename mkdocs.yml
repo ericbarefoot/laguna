@@ -40,7 +40,11 @@ markdown_extensions:
       permalink: true
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight
   - pymdownx.inlinehilite
 
@@ -79,6 +83,7 @@ nav:
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
       - Technical reference: MACRON_GANTRY.md
+      - Motion layers & guards: MOTION_CONTROL_LAYERS.md
       - Rangefinder profiling: RANGEFINDER_PROFILING.md
       - MQTT & AL1342 setup: MQTT_AL1342_SETUP.md
       - WTT12L PowerProx setup: WTT12L_POWERPROX_SETUP.md
