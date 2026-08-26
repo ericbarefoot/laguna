@@ -103,10 +103,12 @@ class TestSaflWaterLevelSensorConnected:
         sensor, mqtt = _make_gauge(offset_mm=100.0)
         sensor.connect()
         mqtt.push("node/Massa_Ultrasonic", _massa_message(dist_mm=5.0))
-        # dist_mm here is confluence's field name but is really in mm despite
-        # its Massa_funcs.py "dist_mm" label (see poll_status()) — 5.0 mm.
+        # dist_mm is already millimeters (Massa_funcs.py computes it as
+        # dist * 25.4, inches -> mm) — confirmed against a live red.lab
+        # reading, no *10 scaling despite the old serial driver's
+        # distance_cm convention.
         elevation_mm = sensor.read_mm()
-        assert elevation_mm == 100.0 - 5.0 * 10.0
+        assert elevation_mm == 100.0 - 5.0
 
     def test_sensor_index_selects_correct_array_element(self):
         sensor, mqtt = _make_gauge(sensor_index=1, offset_mm=0.0)
@@ -116,7 +118,7 @@ class TestSaflWaterLevelSensorConnected:
             _massa_message(dist_mm=7.0, index=1, count=2),
         )
         elevation_mm = sensor.read_mm()
-        assert elevation_mm == -70.0
+        assert elevation_mm == -7.0
 
     def test_get_status_reflects_latest_message(self):
         sensor, mqtt = _make_gauge(offset_mm=0.0)
@@ -127,7 +129,7 @@ class TestSaflWaterLevelSensorConnected:
         )
         status = sensor.get_status()
         assert status["is_connected"] is True
-        assert status["elevation_mm"] == -30.0
+        assert status["elevation_mm"] == -3.0
         assert status["temperature_c"] == 22.5
         assert status["signal_strength"] == "75%"
 
@@ -147,7 +149,7 @@ class TestSaflWaterLevelSensorConnected:
         mqtt.push("node/Massa_Ultrasonic", _massa_message(dist_mm=5.0))
         with caplog.at_level(logging.INFO, logger="laguna.gauge.sensor"):
             sensor.read_mm()
-        assert "elevation_mm=50.00" in caplog.text
+        assert "elevation_mm=95.00" in caplog.text
 
     def test_read_mm_never_writes_to_the_archival_event_log(self):
         """A reading measures the experiment's state without changing it —

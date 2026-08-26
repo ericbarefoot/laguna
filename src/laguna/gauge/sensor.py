@@ -174,7 +174,7 @@ class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
             raise RuntimeError(
                 f"{self.__class__.__name__}: no reading received yet on {self._topic!r}"
             )
-        elevation_mm = float(self._offset_mm) - float(self._last_read["dist_mm"]) * 10.0
+        elevation_mm = float(self._offset_mm) - float(self._last_read["dist_mm"])
         # Operational log only, not the archival event log — a reading
         # measures the experiment's state without changing it, so it's
         # data, not a "step taken." A caller polling this on a schedule
@@ -219,7 +219,7 @@ class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
         temperature_c = None
         signal_strength = None
         if self._last_read is not None:
-            elevation_mm = float(self._offset_mm) - float(self._last_read["dist_mm"]) * 10.0
+            elevation_mm = float(self._offset_mm) - float(self._last_read["dist_mm"])
             temperature_c = self._last_read.get("temperature_c")
             signal_strength = self._last_read.get("signal_strength")
         return {
