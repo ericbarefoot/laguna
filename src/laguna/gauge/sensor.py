@@ -1,20 +1,18 @@
 """Water level measurement subsystem."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 import logging
 
+from ..mqtt import MqttSubscriber
 from ..subsystem_logging import SubsystemLogging
 
 if TYPE_CHECKING:
     from ..config import Config
 
 logger = logging.getLogger(__name__)
-
-try:
-    from safl_ocean_hardware.massa import MassaSensor as _MassaSensor
-except ImportError:
-    _MassaSensor = None
 
 
 class WaterLevelSensor(ABC):
@@ -58,100 +56,118 @@ class WaterLevelSensor(ABC):
 
 
 class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
-    """Water level sensor backed by a Massa ultrasonic distance sensor.
+    """Water level sensor backed by a Massa ultrasonic sensor, via MQTT.
 
-    The Massa sensor measures a downward-looking distance to the water
-    surface; this class converts that into an elevation by subtracting it
-    from a fixed reference offset (`offset_mm`), so elevation increases as
-    the water rises and the measured distance shrinks.
+    The Massa sensor is wired to the confluence node on red.lab, which
+    polls it over USB serial and publishes readings to MQTT — this class
+    no longer talks to serial itself, it subscribes to that topic (see
+    laguna.mqtt.MqttSubscriber). Massa measures a downward-looking distance
+    to the water surface; this class converts that into an elevation by
+    subtracting it from a fixed reference offset (`offset_mm`), so
+    elevation increases as the water rises and the measured distance
+    shrinks.
+
+    Because readings now arrive asynchronously (at whatever interval
+    confluence's job schedule publishes on) rather than on-demand, read_mm()
+    no longer triggers a fresh hardware read — it returns the most recently
+    published sample, raising if none has arrived yet.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], mqtt_subscriber: MqttSubscriber):
         """Build the sensor from a config dict; does not open a connection.
 
         Args:
             config: Subsystem configuration dictionary (see
                 Config._get_defaults()'s 'gauge' section for the expected
                 shape). Recognized keys:
-                - port: Serial device for the Massa sensor
-                  (default '/dev/ttyUSB2').
-                - sensor_ids: Massa device IDs to poll on the shared serial
-                  bus (default [0]). Only the first ID's reading is used by
-                  read_mm()/get_status() below.
-                - offsets: Per-sensor-ID offsets (cm) forwarded to the
-                  underlying MassaSensor driver; not used by this class's
-                  own mm-based elevation calculation (default None).
+                - topic: MQTT topic the confluence Massa_Ultrasonic
+                  interface publishes readings on (default
+                  'SAFL Confluence Node 1/Massa_Ultrasonic').
+                - sensor_index: Index into the Massa interface's per-device
+                  arrays (dist_mm, signal_strength, ...) — confluence polls
+                  every configured Massa ID in one message, so this picks
+                  out which array element is this gauge's sensor
+                  (default 0).
                 - offset_mm: Elevation (mm) that corresponds to a Massa
                   reading of zero distance; used as `offset_mm -
-                  distance_mm` for every reading in this class
-                  (default 0.0).
+                  dist_mm` for every reading (default 0.0).
                 - log_level / event_log_verbosity: see laguna.subsystem_logging
                   (both default 'INFO').
-                - simulated: build a SimulatedMassaSensor instead of the
-                  real driver — see laguna.simulation (default False).
+                - simulated: skip MQTT entirely and return NaN readings
+                  (default False).
+            mqtt_subscriber: MqttSubscriber for MQTT operations.
         """
-        self._port = config.get("port", "/dev/ttyUSB2")
-        self._sensor_ids = config.get("sensor_ids", [0])
-        self._offsets = config.get("offsets", None)
+        self._topic = config.get("topic", "SAFL Confluence Node 1/Massa_Ultrasonic")
+        self._sensor_index = int(config.get("sensor_index", 0))
         self._offset_mm = config.get("offset_mm", 0.0)
         self.log_level = config.get("log_level", "INFO")
         self.event_log_verbosity = config.get("event_log_verbosity", "INFO")
         self._simulated = config.get("simulated", False)
-        self._sensor = None
+        self._mqtt = mqtt_subscriber
         self._is_connected = False
-        self._last_read: Optional[dict] = None
+        self._last_read: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_config(cls, config: "Config") -> "SaflWaterLevelSensor":
-        """Build from the lab's Config (its 'gauge:' section)."""
-        return cls(config.get("gauge"))
+        """Build from the lab's Config (its 'gauge:' section and shared 'mqtt:' section)."""
+        section = config.get("gauge")
+        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
+        return cls(section, mqtt_subscriber)
 
     def connect(self) -> bool:
-        """Open the serial connection to the Massa sensor(s).
+        """Connect the underlying MQTT subscriber and subscribe to the Massa topic.
 
         Returns:
-            True if connected. False if safl_ocean_hardware isn't installed,
-            or if the connection attempt raised an exception (the exception
-            is logged, not propagated).
+            True if connected successfully (or if simulated).
         """
         if self._simulated:
-            from ..simulation import SimulatedMassaSensor
-
-            self._sensor = SimulatedMassaSensor()
-            self._is_connected = self._sensor.connect()
-            return self._is_connected
-        if _MassaSensor is None:
-            logger.warning(
-                "safl_ocean_hardware is not installed; SaflWaterLevelSensor cannot connect"
-            )
-            return False
-        try:
-            self._sensor = _MassaSensor(self._port, self._sensor_ids, self._offsets)
-            self._is_connected = self._sensor.connect()
-            return self._is_connected
-        except Exception as e:
-            logger.error(f"Failed to connect water level sensor: {e}")
-            return False
+            self._is_connected = True
+            return True
+        if not self._mqtt._is_connected:
+            ok = self._mqtt.connect()
+            if not ok:
+                return False
+        self._mqtt.subscribe(self._topic)
+        self._is_connected = True
+        return True
 
     def disconnect(self) -> None:
-        """Close the serial connection, if open. Safe to call when already disconnected."""
-        if self._sensor and self._is_connected:
-            self._sensor.disconnect()
+        """Disconnect the underlying MQTT subscriber. Safe to call when already disconnected."""
+        if self._simulated:
+            self._is_connected = False
+            return
+        self._mqtt.disconnect()
         self._is_connected = False
 
+    def _poll(self) -> None:
+        """Drain the Massa topic and cache the latest message for our sensor_index."""
+        for msg in self._mqtt.drain(self._topic):
+            try:
+                self._last_read = {
+                    "dist_mm": msg["dist_mm"][self._sensor_index],
+                    "temperature_c": msg["massa temperature"][self._sensor_index],
+                    "signal_strength": msg["signal_strength"][self._sensor_index],
+                }
+            except (KeyError, IndexError, TypeError):
+                logger.warning("Malformed Massa_Ultrasonic message on %s: %r", self._topic, msg)
+
     def read_mm(self) -> float:
-        """Read and return instantaneous water surface elevation in mm.
+        """Return the most recently published water surface elevation in mm.
 
-        Performs a synchronous serial read from the Massa sensor and updates
-        the internal cache used by get_status().
+        Unlike the old serial version, this does not trigger a fresh
+        hardware read — it drains and returns from the MQTT topic.
 
-        Returns:
-            Water surface elevation in mm.
+        Raises:
+            RuntimeError: If no reading has arrived yet.
         """
-        result = self._sensor.read()
-        self._last_read = result
-        # Distance decreases as water rises: elevation = offset - distance_cm * 10
-        elevation_mm = self._offset_mm - result["distance_cm"] * 10.0
+        if self._simulated:
+            return float("nan")
+        self._poll()
+        if self._last_read is None:
+            raise RuntimeError(
+                f"{self.__class__.__name__}: no reading received yet on {self._topic!r}"
+            )
+        elevation_mm = float(self._offset_mm) - float(self._last_read["dist_mm"]) * 10.0
         # Operational log only, not the archival event log — a reading
         # measures the experiment's state without changing it, so it's
         # data, not a "step taken." A caller polling this on a schedule
@@ -162,41 +178,42 @@ class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
         return elevation_mm
 
     def read_mm_smoothed(self) -> float:
-        """Read and return elevation using the sensor's built-in FIFO moving average.
+        """Return a smoothed elevation reading.
 
-        Like read_mm(), this triggers a fresh sensor read, but returns the
-        elevation computed from the Massa driver's rolling average of
-        recent distance samples rather than the single latest reading —
-        useful for reducing noise from surface ripples.
-
-        Returns:
-            Smoothed elevation in mm, or NaN if the driver has no moving
-            average available yet (e.g. immediately after connecting).
+        The confluence Massa interface does not currently publish a
+        rolling average (see Interfaces/Massa_Ultrasonic/Massa_funcs.py on
+        the confluence side), so there is no MQTT equivalent of the old
+        driver's FIFO moving average yet. Returns NaN until confluence
+        publishes one.
         """
-        self._last_read = self._sensor.read()
-        avg_list = getattr(self._sensor, "dist_cm_array_moving_avg", [])
-        if avg_list:
-            return self._offset_mm - avg_list[0] * 10.0
         return float("nan")
 
     def get_status(self) -> Dict[str, Any]:
         """Return connection state and the most recent reading, without polling hardware.
 
-        Unlike read_mm(), this does not talk to the sensor — it reports
-        values derived from whatever the last read_mm()/read_mm_smoothed()
-        call cached.
+        Drains any buffered MQTT messages (non-blocking) but does not wait
+        for a new one.
 
         Returns:
             Dict with `is_connected`, `elevation_mm`, `temperature_c`, and
             `signal_strength`. All reading-derived fields are None until a
-            read has been performed at least once.
+            message has arrived at least once.
         """
+        if self._simulated:
+            return {
+                "is_connected": self._is_connected,
+                "elevation_mm": float("nan") if self._is_connected else None,
+                "temperature_c": None,
+                "signal_strength": None,
+            }
+        if self._is_connected:
+            self._poll()
         elevation_mm = None
         temperature_c = None
         signal_strength = None
         if self._last_read is not None:
-            elevation_mm = self._offset_mm - self._last_read["distance_cm"] * 10.0
-            temperature_c = self._last_read.get("temperature")
+            elevation_mm = float(self._offset_mm) - float(self._last_read["dist_mm"]) * 10.0
+            temperature_c = self._last_read.get("temperature_c")
             signal_strength = self._last_read.get("signal_strength")
         return {
             "is_connected": self._is_connected,

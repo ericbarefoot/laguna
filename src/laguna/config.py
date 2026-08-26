@@ -64,22 +64,39 @@ class Config:
                 "resolution": (1920, 1080),
                 "capture_format": "BGR",
             },
+            # weir/gauge/flow are now MQTT clients of the confluence node on
+            # red.lab rather than direct USB serial — see
+            # docs/CONFLUENCE_INTEGRATION.md. Topic names below match
+            # confluence's `{Node Name}/{interface}` convention (default
+            # node name "SAFL Confluence Node 1", see
+            # confluence/confluence_config.json on red.lab).
             "weir": {
-                "port": "/dev/ttyUSB0",
-                "baudrate": 9600,
-                "steps_per_mm": 1000.0,
+                "topic_status": "SAFL Confluence Node 1/weir",
+                "topic_commands": "SAFL Confluence Node 1/weir/commands",
+                "topic_replies": "SAFL Confluence Node 1/weir/replies",
+                "command_timeout_s": 5.0,
                 "home_offset_mm": 0.0,
             },
             "gauge": {
-                "port": "/dev/ttyUSB2",
-                "sensor_ids": [0],
+                "topic": "SAFL Confluence Node 1/Massa_Ultrasonic",
+                # Index into the Massa interface's per-device arrays
+                # (device names/dist_mm/signal_strength/...) — confluence
+                # polls all configured Massa IDs in one message, so this
+                # picks out which array element is this gauge's sensor.
+                "sensor_index": 0,
                 "offset_mm": 0.0,
             },
             "flow": {
-                "vfd_port": "/dev/ttyUSB1",
-                "vfd_slave_id": 1,
-                "motor_port": "/dev/ttyUSB0",
-                "motor_baudrate": 9600,
+                "vfd_topic_status": "SAFL Confluence Node 1/Fuji_Frenic_VFD",
+                "vfd_topic_commands": "SAFL Confluence Node 1/Fuji_Frenic_VFD/commands",
+                "vfd_topic_replies": "SAFL Confluence Node 1/Fuji_Frenic_VFD/replies",
+                # Valve axis lives on the same physical ClearCore as the weir
+                # gate axis (one controller, two axes) but is published/
+                # commanded as its own confluence interface/topic set.
+                "valve_topic_status": "SAFL Confluence Node 1/flow_valve",
+                "valve_topic_commands": "SAFL Confluence Node 1/flow_valve/commands",
+                "valve_topic_replies": "SAFL Confluence Node 1/flow_valve/replies",
+                "command_timeout_s": 5.0,
                 "C0": 4.902,
                 "C1": 58.49,
                 "C2": 0.08956,

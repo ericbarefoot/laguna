@@ -1,25 +1,18 @@
 """Pump flow control subsystem."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional
 import logging
 
+from ..mqtt import MqttSubscriber, RequestTimeout, request
 from ..subsystem_logging import SubsystemLogging
 
 if TYPE_CHECKING:
     from ..config import Config
 
 logger = logging.getLogger(__name__)
-
-try:
-    from safl_ocean_hardware.vfd import VFD as _VFD
-except ImportError:
-    _VFD = None
-
-try:
-    from safl_ocean_hardware.motor import TeknicMotor as _TeknicMotor
-except ImportError:
-    _TeknicMotor = None
 
 
 class FlowController(ABC):
@@ -140,49 +133,67 @@ class FlowController(ABC):
 
 
 class SaflFlowController(FlowController, SubsystemLogging):
-    """Flow controller backed by a Fuji VFD pump and Teknic motor for solenoid IO.
+    """Flow controller backed by a Fuji VFD pump and a shared ClearCore valve axis, via MQTT.
 
-    NOTE: In production, the TeknicMotor instance should be shared with
-    SaflWeirController rather than creating a separate connection to the same
-    physical motor. This implementation creates its own instance for
-    self-contained first-draft purposes.
+    Both the VFD and the ClearCore that drives the qin/qaux solenoid
+    digital outputs are wired to the confluence node on red.lab, which
+    exposes each over its own MQTT interface — this class no longer talks
+    to serial itself. The valve axis is the same physical ClearCore
+    controller the weir gate axis lives on (one controller, two axes), but
+    published/commanded as its own confluence interface/topic set
+    ("flow_valve"). A single MqttSubscriber is shared across both channels
+    to avoid the duplicate-client-ID reconnect fight documented in
+    laguna.mqtt.subscriber.MqttSubscriber.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], mqtt_subscriber: MqttSubscriber):
         """Build the controller from a config dict; does not open a connection.
 
         Args:
             config: Subsystem configuration dictionary (see
                 Config._get_defaults()'s 'flow' section for the expected
                 shape). Recognized keys:
-                - vfd_port: Serial device for the Fuji VFD (Modbus RTU)
-                  (default '/dev/ttyUSB1').
-                - vfd_slave_id: Modbus slave address of the VFD (default 1).
-                - motor_port: Serial device for the Teknic ClearCore that
-                  drives the qin/qaux solenoid digital outputs
-                  (default '/dev/ttyUSB0').
-                - motor_baudrate: Baud rate for the ClearCore connection
-                  (default 9600).
+                - vfd_topic_status / vfd_topic_commands / vfd_topic_replies:
+                  MQTT topics for the confluence Fuji_Frenic_VFD interface.
+                - valve_topic_status / valve_topic_commands /
+                  valve_topic_replies: MQTT topics for the confluence
+                  Teknic_ClearCore interface's flow-valve axis.
+                - command_timeout_s: Seconds to wait for a command reply
+                  before treating it as failed (default 5.0).
                 - C0, C1, C2: Coefficients of the quadratic pump calibration
                   curve `freq_hz = C2*Q^2 + C1*Q + C0` (Q in L/min) used by
                   set_flowrate() to convert a requested flow rate into a VFD
-                  drive frequency. These are empirically fit per pump/
-                  plumbing configuration — they are not physical constants,
-                  just curve-fit coefficients for this specific installed
-                  pump. Defaults (4.902, 58.49, 0.08956) match the values in
-                  Config._get_defaults(); override per-installation as
-                  needed. The resulting frequency is clamped to [0, 60] Hz
-                  by the underlying VFD driver.
+                  drive frequency, computed locally and sent to the VFD as
+                  a target frequency. These are empirically fit per pump/
+                  plumbing configuration — not physical constants. The
+                  resulting frequency is clamped to [0, 60] Hz here before
+                  sending, matching the old driver's clamp.
                 - log_level / event_log_verbosity: see laguna.subsystem_logging
                   (both default 'INFO').
-                - simulated: build a SimulatedVFD + SimulatedTeknicMotor
-                  instead of the real drivers — see laguna.simulation
-                  (default False).
+                - simulated: skip MQTT entirely — every command "succeeds"
+                  immediately (default False).
+            mqtt_subscriber: MqttSubscriber shared across the VFD and valve
+                channels.
         """
-        self._vfd_port = config.get("vfd_port", "/dev/ttyUSB1")
-        self._vfd_slave_id = config.get("vfd_slave_id", 1)
-        self._motor_port = config.get("motor_port", "/dev/ttyUSB0")
-        self._motor_baudrate = config.get("motor_baudrate", 9600)
+        self._vfd_status_topic = config.get(
+            "vfd_topic_status", "SAFL Confluence Node 1/Fuji_Frenic_VFD"
+        )
+        self._vfd_commands_topic = config.get(
+            "vfd_topic_commands", "SAFL Confluence Node 1/Fuji_Frenic_VFD/commands"
+        )
+        self._vfd_replies_topic = config.get(
+            "vfd_topic_replies", "SAFL Confluence Node 1/Fuji_Frenic_VFD/replies"
+        )
+        self._valve_status_topic = config.get(
+            "valve_topic_status", "SAFL Confluence Node 1/flow_valve"
+        )
+        self._valve_commands_topic = config.get(
+            "valve_topic_commands", "SAFL Confluence Node 1/flow_valve/commands"
+        )
+        self._valve_replies_topic = config.get(
+            "valve_topic_replies", "SAFL Confluence Node 1/flow_valve/replies"
+        )
+        self._command_timeout_s = config.get("command_timeout_s", 5.0)
         self.C0 = config.get("C0", 4.902)
         self.C1 = config.get("C1", 58.49)
         self.C2 = config.get("C2", 0.08956)
@@ -190,8 +201,7 @@ class SaflFlowController(FlowController, SubsystemLogging):
         self.event_log_verbosity = config.get("event_log_verbosity", "INFO")
         self._simulated = config.get("simulated", False)
 
-        self._vfd = None
-        self._motor = None
+        self._mqtt = mqtt_subscriber
         self._is_connected = False
         self._current_flowrate = 0.0
         self._qin_state = False
@@ -199,53 +209,37 @@ class SaflFlowController(FlowController, SubsystemLogging):
 
     @classmethod
     def from_config(cls, config: "Config") -> "SaflFlowController":
-        """Build from the lab's Config (its 'flow:' section)."""
-        return cls(config.get("flow"))
+        """Build from the lab's Config (its 'flow:' section and shared 'mqtt:' section)."""
+        section = config.get("flow")
+        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
+        return cls(section, mqtt_subscriber)
 
     def connect(self) -> bool:
-        """Open connections to both the VFD (Modbus) and the ClearCore (serial).
-
-        Both connections must succeed for this to report success; if either
-        safl_ocean_hardware is missing or either device fails to connect,
-        `is_connected` is left False.
+        """Connect the underlying MQTT subscriber and subscribe to VFD + valve topics.
 
         Returns:
-            True only if both the VFD and motor connections succeeded.
+            True if connected successfully (or if simulated).
         """
         if self._simulated:
-            from ..simulation import SimulatedTeknicMotor, SimulatedVFD
-
-            self._vfd = SimulatedVFD()
-            self._motor = SimulatedTeknicMotor()
-            self._is_connected = self._vfd.connect() and self._motor.connect()
-            return self._is_connected
-        if _VFD is None or _TeknicMotor is None:
-            logger.warning(
-                "safl_ocean_hardware is not installed; SaflFlowController cannot connect"
-            )
-            return False
-        try:
-            self._vfd = _VFD(self._vfd_port, self._vfd_slave_id)
-            self._motor = _TeknicMotor(self._motor_port, self._motor_baudrate)
-            vfd_ok = self._vfd.connect()
-            motor_ok = self._motor.connect()
-            self._is_connected = vfd_ok and motor_ok
-            return self._is_connected
-        except Exception as e:
-            logger.error(f"Failed to connect flow controller: {e}")
-            return False
+            self._is_connected = True
+            return True
+        if not self._mqtt._is_connected:
+            ok = self._mqtt.connect()
+            if not ok:
+                return False
+        self._mqtt.subscribe(self._vfd_status_topic)
+        self._mqtt.subscribe(self._vfd_replies_topic)
+        self._mqtt.subscribe(self._valve_status_topic)
+        self._mqtt.subscribe(self._valve_replies_topic)
+        self._is_connected = True
+        return True
 
     def disconnect(self) -> None:
-        """Close both the VFD and motor connections, if open.
-
-        Safe to call when already disconnected.
-        """
-        if self._vfd is not None:
-            self._vfd.disconnect()
-        if self._motor is not None:
-            self._motor.disconnect()
-        self._vfd = None
-        self._motor = None
+        """Disconnect the underlying MQTT subscriber. Safe to call when already disconnected."""
+        if self._simulated:
+            self._is_connected = False
+            return
+        self._mqtt.disconnect()
         self._is_connected = False
 
     def _require_connected(self) -> None:
@@ -253,34 +247,67 @@ class SaflFlowController(FlowController, SubsystemLogging):
         if not self._is_connected:
             raise RuntimeError(f"{self.__class__.__name__} is not connected")
 
+    def _command_vfd(self, command: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Send a command to the confluence Fuji_Frenic_VFD interface and block for its reply."""
+        if self._simulated:
+            return {"ok": True}
+        return request(
+            self._mqtt,
+            self._vfd_commands_topic,
+            self._vfd_replies_topic,
+            command,
+            args,
+            timeout=self._command_timeout_s,
+        )
+
+    def _command_valve(self, command: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Send a command to the confluence Teknic_ClearCore valve axis and block for its reply."""
+        if self._simulated:
+            return {"ok": True}
+        return request(
+            self._mqtt,
+            self._valve_commands_topic,
+            self._valve_replies_topic,
+            command,
+            args,
+            timeout=self._command_timeout_s,
+        )
+
     def set_flowrate(self, lpm: float) -> bool:
         """Set the pump's target flow rate.
 
         Converts `lpm` to a VFD drive frequency using the quadratic
-        calibration curve `C2*Q^2 + C1*Q + C0` (see __init__ for details on
-        C0/C1/C2), clamps it to the VFD's [0, 60] Hz range, and writes it as
-        the new setpoint. This does not itself start the pump — call
-        start() to begin running at the new setpoint.
+        calibration curve `C2*Q^2 + C1*Q + C0` (see __init__), clamps it to
+        the VFD's [0, 60] Hz range, and sends it as the new setpoint. This
+        does not itself start the pump — call start() to begin running at
+        the new setpoint.
 
         Returns:
-            True (the underlying driver does not report setpoint-write
-            failure separately from a communication exception).
+            True if the confluence node acknowledged the new setpoint;
+            False on timeout (the cached setpoint is left unchanged).
 
         Raises:
             RuntimeError: If not connected.
         """
         self._require_connected()
-        self._vfd.set_freq_from_flowrate(lpm, self.C0, self.C1, self.C2)
-        self._current_flowrate = lpm
+        freq_hz = max(0.0, min(60.0, self.C2 * lpm**2 + self.C1 * lpm + self.C0))
+        try:
+            reply = self._command_vfd("set_setpoint_hz", {"freq_hz": freq_hz})
+        except RequestTimeout:
+            logger.error("set_flowrate(%.2f): no reply from confluence node", lpm)
+            return False
+        ok = bool(reply.get("ok", True))
+        if ok:
+            self._current_flowrate = lpm
         self.log_event("set_flowrate", flowrate_lpm=f"{lpm:.2f}")
-        return True
+        return ok
 
     def get_flowrate(self) -> float:
         """Return the most recently commanded flow rate in L/min.
 
         This is a locally cached setpoint, not a live sensor measurement —
         it is available even when disconnected, reflecting whatever was
-        last passed to set_flowrate().
+        last successfully passed to set_flowrate().
         """
         return self._current_flowrate
 
@@ -291,14 +318,23 @@ class SaflFlowController(FlowController, SubsystemLogging):
             RuntimeError: If not connected.
         """
         self._require_connected()
-        started = self._vfd.start()
+        try:
+            reply = self._command_vfd("start_motor")
+        except RequestTimeout:
+            logger.error("start(): no reply from confluence node")
+            return False
         self.log_event("start")
-        return started
+        return bool(reply.get("ok", True))
 
     def _vfd_stop(self) -> bool:
         """Stop the pump drive itself. See stop() for the safety verb."""
         self._require_connected()
-        return self._vfd.stop()
+        try:
+            reply = self._command_vfd("stop_motor")
+        except RequestTimeout:
+            logger.error("_vfd_stop(): no reply from confluence node")
+            return False
+        return bool(reply.get("ok", True))
 
     # ------------------------------------------------------------------
     # Safety verbs (see laguna.safety)
@@ -371,14 +407,19 @@ class SaflFlowController(FlowController, SubsystemLogging):
             RuntimeError: If not connected.
         """
         self._require_connected()
-        return self._vfd.clear_faults()
+        try:
+            reply = self._command_vfd("clear_faults")
+        except RequestTimeout:
+            logger.error("clear_faults(): no reply from confluence node")
+            return False
+        return bool(reply.get("ok", True))
 
     @property
     def qin(self) -> bool:
         """Whether the inlet solenoid valve is currently commanded open.
 
-        This reflects the last value written via the setter, not a live
-        hardware readback.
+        This reflects the last value successfully written via the setter,
+        not a live hardware readback.
         """
         return self._qin_state
 
@@ -386,13 +427,18 @@ class SaflFlowController(FlowController, SubsystemLogging):
     def qin(self, state: bool) -> None:
         """Open (True) or close (False) the inlet solenoid valve.
 
-        Drives digital output channel 0 on the shared ClearCore controller.
+        Sends a set_io command to the shared ClearCore's valve axis
+        (channel 0) and blocks for acknowledgement.
 
         Raises:
-            RuntimeError: If not connected.
+            RuntimeError: If not connected, or if the confluence node
+                doesn't acknowledge the command in time.
         """
         self._require_connected()
-        self._motor.set_io(0, state)
+        try:
+            self._command_valve("set_io", {"channel": 0, "state": state})
+        except RequestTimeout as exc:
+            raise RuntimeError(f"qin={state}: no reply from confluence node") from exc
         self._qin_state = state
         self.log_event("qin", state=state)
 
@@ -400,8 +446,8 @@ class SaflFlowController(FlowController, SubsystemLogging):
     def qaux(self) -> bool:
         """Whether the auxiliary solenoid valve is currently commanded open.
 
-        This reflects the last value written via the setter, not a live
-        hardware readback.
+        This reflects the last value successfully written via the setter,
+        not a live hardware readback.
         """
         return self._qaux_state
 
@@ -409,22 +455,26 @@ class SaflFlowController(FlowController, SubsystemLogging):
     def qaux(self, state: bool) -> None:
         """Open (True) or close (False) the auxiliary solenoid valve.
 
-        Drives digital output channel 1 on the shared ClearCore controller.
+        Sends a set_io command to the shared ClearCore's valve axis
+        (channel 1) and blocks for acknowledgement.
 
         Raises:
-            RuntimeError: If not connected.
+            RuntimeError: If not connected, or if the confluence node
+                doesn't acknowledge the command in time.
         """
         self._require_connected()
-        self._motor.set_io(1, state)
+        try:
+            self._command_valve("set_io", {"channel": 1, "state": state})
+        except RequestTimeout as exc:
+            raise RuntimeError(f"qaux={state}: no reply from confluence node") from exc
         self._qaux_state = state
         self.log_event("qaux", state=state)
 
     def get_status(self) -> Dict[str, Any]:
-        """Return connection state, flow setpoint, valve states, and raw VFD status.
+        """Return connection state, flow setpoint, valve states, and raw VFD/valve status.
 
-        When connected, this also polls the VFD over Modbus for its current
-        state message, e-stop flag, and drive frequency setpoint — so this
-        call is not free of hardware I/O like the qin/qaux property getters.
+        Reads the latest cached messages on the VFD and valve status
+        topics (non-blocking) rather than polling hardware synchronously.
 
         Returns:
             Dict with `is_connected`, `flowrate_lpm`, `qin_open`, and
@@ -437,10 +487,14 @@ class SaflFlowController(FlowController, SubsystemLogging):
             "qin_open": self._qin_state,
             "qaux_open": self._qaux_state,
         }
-        if self._is_connected and self._vfd is not None:
-            vfd_state = self._vfd.poll_state()
-            status["vfd_state"] = vfd_state.get("state_message")
-            status["vfd_estop"] = vfd_state.get("e_stop")
-            self._vfd.poll_setpoint()
-            status["vfd_setpoint_hz"] = getattr(self._vfd, "setpoint", None)
+        if self._is_connected:
+            if self._simulated:
+                status["vfd_state"] = None
+                status["vfd_estop"] = None
+                status["vfd_setpoint_hz"] = float("nan")
+            else:
+                vfd_status = self._mqtt.get_latest(self._vfd_status_topic) or {}
+                status["vfd_state"] = vfd_status.get("state_message")
+                status["vfd_estop"] = vfd_status.get("e_stop")
+                status["vfd_setpoint_hz"] = vfd_status.get("setpoint")
         return status

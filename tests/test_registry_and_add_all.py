@@ -89,11 +89,11 @@ class TestRegistry:
 class TestAddByName:
     def test_looks_up_registry_and_builds_from_config(self, tmp_path):
         path = tmp_path / "cfg.yaml"
-        path.write_text("weir:\n  port: /dev/ttyUSB0\n")
+        path.write_text("weir:\n  topic_status: node/weir\n")
         lab = FlumeLab(str(path))
         lab.add("weir")
         assert "weir" in lab._subsystems
-        assert lab.weir._port == "/dev/ttyUSB0"
+        assert lab.weir._status_topic == "node/weir"
 
     def test_unknown_name_raises(self):
         lab = FlumeLab()

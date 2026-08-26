@@ -151,6 +151,23 @@ class MqttSubscriber:
         if self._is_connected and self._client is not None:
             self._client.subscribe(topic, qos=self._qos)
 
+    def publish(self, topic: str, payload: Any, qos: Optional[int] = None) -> None:
+        """Publish a message to the broker.
+
+        Args:
+            topic: Topic to publish on.
+            payload: JSON-serialized if not already a str/bytes (dicts are
+                the common case — command/reply envelopes).
+            qos: Overrides the subscriber's default qos for this publish only.
+
+        Raises:
+            RuntimeError: If not connected.
+        """
+        if self._client is None or not self._is_connected:
+            raise RuntimeError("MqttSubscriber is not connected")
+        body = payload if isinstance(payload, (str, bytes)) else json.dumps(payload)
+        self._client.publish(topic, body, qos=self._qos if qos is None else qos)
+
     def get_latest(self, topic: str) -> Optional[Dict[str, Any]]:
         """Return the most recent message for a topic, or None if queue is empty.
 

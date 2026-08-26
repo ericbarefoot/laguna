@@ -196,191 +196,6 @@ class SimulatedSnapConnection:
         return "0"
 
 
-class SimulatedTeknicMotor:
-    """Stand-in for safl_ocean_hardware's TeknicMotor.
-
-    Every command succeeds instantly; every reading returns NaN (or None for
-    non-numeric fields) rather than a fabricated state. Commanding proves the
-    schedule sends the right command at the right time, not physical position.
-    """
-
-    def connect(self) -> bool:
-        """Connect the simulated motor.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def disconnect(self) -> None:
-        """Disconnect the simulated motor."""
-        pass
-
-    def set_absolute_position(self, mm: float) -> None:
-        """Set absolute position (no-op in simulation)."""
-        pass
-
-    def move_to_position(self, mm: float) -> bool:
-        """Move to position.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def get_position(self) -> float:
-        """Get current position.
-
-        Returns:
-            NaN (no physical model).
-        """
-        return float("nan")
-
-    def set_velocity(self, mm_per_sec: float) -> None:
-        """Set velocity (no-op in simulation)."""
-        pass
-
-    def poll_status(self) -> Dict[str, Any]:
-        """Poll motor status.
-
-        Returns:
-            Dict with NaN positions and None status fields.
-        """
-        return {
-            "position": float("nan"), "VelSetPoint": float("nan"),
-            "Enabled": None, "MotorInFault": None, "StepsActive": None,
-        }
-
-    def enable(self) -> None:
-        """Enable the motor (no-op in simulation)."""
-        pass
-
-    def disable(self) -> None:
-        """Disable the motor (no-op in simulation)."""
-        pass
-
-    def wait_for_HLFB(self, timeout: float) -> None:
-        """Wait for high-level feedback (no-op in simulation)."""
-        pass
-
-    def clear_faults(self) -> None:
-        """Clear faults (no-op in simulation)."""
-        pass
-
-    def find_home(self, home_position_mm: float = 0.0) -> bool:
-        """Find home position.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def stop(self) -> None:
-        """Stop the motor (no-op in simulation)."""
-        pass
-
-    def set_io(self, channel: int, state: bool) -> None:
-        """Set digital IO (no-op in simulation)."""
-        pass
-
-
-class SimulatedVFD:
-    """Stand-in for safl_ocean_hardware's VFD (Fuji pump drive).
-
-    Commands succeed instantly; readings are NaN or None. See
-    SimulatedTeknicMotor's docstring for the reasoning.
-    """
-
-    def __init__(self) -> None:
-        """Initialize the simulated VFD."""
-        self.setpoint = float("nan")
-
-    def connect(self) -> bool:
-        """Connect the simulated VFD.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def disconnect(self) -> None:
-        """Disconnect the simulated VFD."""
-        pass
-
-    def set_freq_from_flowrate(self, lpm: float, c0: float, c1: float, c2: float) -> None:
-        """Set frequency from flowrate (no-op in simulation)."""
-        pass
-
-    def start(self) -> bool:
-        """Start the VFD.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def stop(self) -> bool:
-        """Stop the VFD.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def clear_faults(self) -> bool:
-        """Clear VFD faults.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def poll_state(self) -> Dict[str, Any]:
-        """Poll VFD state.
-
-        Returns:
-            Dict with None status fields.
-        """
-        return {"state_message": None, "e_stop": None}
-
-    def poll_setpoint(self) -> None:
-        """Poll setpoint (no-op in simulation)."""
-        pass
-
-
-class SimulatedMassaSensor:
-    """Stand-in for safl_ocean_hardware's MassaSensor.
-
-    Readings are NaN rather than fabricated water levels. See
-    SimulatedTeknicMotor's docstring for the reasoning. Deliberately omits
-    dist_cm_array_moving_avg; SaflWaterLevelSensor.read_mm_smoothed()
-    treats its absence as "no moving average yet" and returns NaN anyway.
-    """
-
-    def connect(self) -> bool:
-        """Connect the simulated sensor.
-
-        Returns:
-            True (always succeeds).
-        """
-        return True
-
-    def disconnect(self) -> None:
-        """Disconnect the simulated sensor."""
-        pass
-
-    def read(self) -> Dict[str, Any]:
-        """Read sensor data.
-
-        Returns:
-            Dict with NaN distance, temperature, and signal strength.
-        """
-        return {
-            "distance_cm": float("nan"), "temperature": float("nan"),
-            "signal_strength": float("nan"),
-        }
-
-
 def simulated_gocator_lib() -> Any:
     """A fake GoSdk that returns synthetic surfaces.
 
@@ -393,11 +208,13 @@ def simulated_gocator_lib() -> Any:
 
 
 #: Config sections with a simulated backend (see SimulatedSnapConnection,
-#: SimulatedGoSdkLib, SimulatedTeknicMotor/SimulatedVFD/SimulatedMassaSensor,
-#: and the pi_cameras/dslr_cameras/od2000/wtt12l "simulated" flag each
-#: subsystem's own connect()/action methods check directly). This is now
-#: every entry in laguna.registry.SUBSYSTEM_REGISTRY — simulate=True
-#: rehearses the whole opt-in rig, not a subset of it.
+#: SimulatedGoSdkLib, and the weir/flow/gauge/pi_cameras/dslr_cameras/
+#: od2000/wtt12l "simulated" flag each subsystem's own connect()/action
+#: methods check directly — weir/flow/gauge are MQTT clients now, so their
+#: "simulated" path just skips MQTT entirely rather than swapping in a
+#: fake serial driver). This is now every entry in
+#: laguna.registry.SUBSYSTEM_REGISTRY — simulate=True rehearses the whole
+#: opt-in rig, not a subset of it.
 _SIMULATED_SECTIONS = ("gantry", "gocator", "weir", "flow", "gauge",
                         "pi_cameras", "dslr_cameras", "od2000", "wtt12l")
 
@@ -458,9 +275,6 @@ def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 __all__ = [
     "SimulatedSnapConnection",
-    "SimulatedTeknicMotor",
-    "SimulatedVFD",
-    "SimulatedMassaSensor",
     "simulated_gocator_lib",
     "simulate_config",
 ]
