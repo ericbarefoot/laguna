@@ -19,6 +19,7 @@ class FakeMqttSubscriber:
         self._is_connected = False
         self._queues: Dict[str, list] = {}
         self._topics: List[str] = []
+        self._last_seen: Dict[str, dict] = {}
         self.connected_called = 0
         self.disconnect_called = 0
         self.published: List[tuple] = []  # (topic, payload)
@@ -27,6 +28,9 @@ class FakeMqttSubscriber:
         self._is_connected = True
         self.connected_called += 1
         return True
+
+    def wait_until_connected(self, timeout: float = 5.0, poll_interval: float = 0.05) -> bool:
+        return self._is_connected
 
     def disconnect(self) -> None:
         self._is_connected = False
@@ -42,15 +46,17 @@ class FakeMqttSubscriber:
         self._queues.setdefault(topic, []).append(payload)
 
     def drain(self, topic: str) -> list:
+        self._last_seen.pop(topic, None)
         items = list(self._queues.get(topic, []))
         self._queues[topic] = []
         return items
 
     def get_latest(self, topic: str) -> Optional[dict]:
         items = self._queues.get(topic, [])
-        last = items[-1] if items else None
-        self._queues[topic] = []
-        return last
+        if items:
+            self._last_seen[topic] = items[-1]
+            self._queues[topic] = []
+        return self._last_seen.get(topic)
 
     def get_status(self) -> dict:
         return {"is_connected": self._is_connected}

@@ -77,6 +77,13 @@ class TestSaflWaterLevelSensorConnected:
         assert mqtt.connected_called == 1
         assert "node/Massa_Ultrasonic" in mqtt._topics
 
+    def test_connect_fails_if_broker_handshake_never_completes(self):
+        """Regression: connect() used to return True as soon as the async
+        MQTT handshake was *started*, not once it actually completed."""
+        sensor, mqtt = _make_gauge()
+        mqtt.wait_until_connected = lambda timeout=5.0, poll_interval=0.05: False
+        assert sensor.connect() is False
+
     def test_connect_does_not_double_connect(self):
         sensor, mqtt = _make_gauge()
         mqtt._is_connected = True

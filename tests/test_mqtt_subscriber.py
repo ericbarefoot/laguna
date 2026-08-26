@@ -8,6 +8,7 @@ AL1342 or broker violated.
 
 import json
 import sys
+import time
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
@@ -158,6 +159,28 @@ class TestMqttSubscriberConnect:
         sub.connect()
         sub._client.fire_connect(rc=5)
         assert sub._is_connected is False
+
+    def test_wait_until_connected_returns_true_once_handshake_completes(self, paho_stub):
+        """connect() only starts the async handshake; wait_until_connected()
+        is what a caller needing to publish() right after connecting (e.g.
+        weir/flow's command path) should block on instead."""
+        import threading
+
+        sub = _sub()
+        sub.connect()
+
+        def fire_soon():
+            time.sleep(0.05)
+            sub._client.fire_connect(rc=0)
+
+        threading.Thread(target=fire_soon).start()
+        assert sub.wait_until_connected(timeout=2.0) is True
+
+    def test_wait_until_connected_times_out_if_handshake_never_completes(self, paho_stub):
+        sub = _sub()
+        sub.connect()
+        # on_connect never fires
+        assert sub.wait_until_connected(timeout=0.2) is False
 
     def test_disconnect_stops_loop(self, paho_stub):
         sub = _connected_sub(paho_stub)
