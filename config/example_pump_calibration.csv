@@ -1,0 +1,14 @@
+# laguna pump calibration
+device,example flume pump - main inlet
+coeffs,"[0.0009999999999999968, 0.1000000000000002, -3.263375893225244e-15]"
+hz_max,60.0
+r_squared,1.0
+created_at,2026-08-26T14:18:16
+
+freq_hz,discharge_lpm
+10.0,1.1
+20.0,2.4
+30.0,3.9
+40.0,5.6
+50.0,7.5
+60.0,9.6

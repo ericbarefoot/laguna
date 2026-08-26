@@ -59,35 +59,56 @@ the same serial port, that means two separate connections to the same
 physical device — the source comment flags this explicitly as a
 "self-contained first-draft" shortcut, not a deliberate design.
 
-## The `C0`/`C1`/`C2` calibration coefficients
+## Flow-rate calibration: `calibration_file` vs. `C0`/`C1`/`C2`
 
-`Config._get_defaults()`'s `flow:` section defines three floats:
+`set_flowrate(lpm)` converts a requested flow rate (L/min) into the VFD
+drive frequency (Hz) that actually produces it — the pump has no native
+notion of L/min, only a frequency setpoint. That conversion needs a
+per-pump/plumbing calibration; there are two ways to provide one.
+
+**`calibration_file` (preferred)** — a CSV written by
+`laguna.flow.calibration.PumpCalibration.to_csv()`, fitting a quadratic
+curve `discharge_lpm = f(freq_hz)` against real measured points (command
+a known frequency, measure the actual discharge — bucket and stopwatch, a
+flow meter, whatever's available), then inverting that fit numerically to
+answer "what Hz gives me this many L/min." See
+[the API reference](../reference/flow.md#calibration) for
+`PumpCalibrationPoint`/`PumpCalibration.fit()`/`hz_for_lpm()`, and
+`config/example_pump_calibration.csv` for a worked example file (fit from
+made-up but plausible data — replace with real measurements from your own
+pump before trusting it).
 
 ```python
-"C0": 4.902,
-"C1": 58.49,
-"C2": 0.08956,
+from laguna.flow.calibration import PumpCalibration, PumpCalibrationPoint
+
+points = [
+    PumpCalibrationPoint(freq_hz=10.0, discharge_lpm=1.1),
+    PumpCalibrationPoint(freq_hz=20.0, discharge_lpm=2.4),
+    PumpCalibrationPoint(freq_hz=30.0, discharge_lpm=3.9),
+    # ... at least 3 points; more, spread across the range you'll
+    # actually use, gives a more trustworthy fit.
+]
+cal = PumpCalibration.fit("my pump - main inlet", points, hz_max=60.0)
+print(f"r_squared: {cal.r_squared:.4f}")   # check the fit quality
+cal.to_csv("config/my_pump_calibration.csv")
 ```
 
-These are the coefficients of a quadratic pump curve that converts a
-requested flow rate (L/min) into the VFD drive frequency (Hz) that
-actually produces it:
-
-```
-Hz = C2 * Q^2 + C1 * Q + C0        # Q in L/min
+```yaml
+flow:
+  calibration_file: config/my_pump_calibration.csv
 ```
 
-`set_flowrate(lpm)` doesn't do this arithmetic itself — it hands `lpm` and
-all three coefficients straight to
-`safl_ocean_hardware`'s `vfd.set_freq_from_flowrate(lpm, C0, C1, C2)`,
-which applies the formula and writes the resulting frequency to the drive.
-The three constants are a **per-pump calibration**, not a physical
-universal — they come from fitting a quadratic to that specific pump's
-measured flow-vs-frequency curve, so a different pump (or the same pump
-after maintenance/re-calibration) would need different values. The
-defaults above and in `config/example_config.yaml` are this lab's current
-calibration; don't reuse them for a different installation without
-re-deriving the fit.
+**`C0`/`C1`/`C2` (legacy)** — only used when `calibration_file` is unset.
+Three floats plugged directly into `Hz = C2*Q^2 + C1*Q + C0` inside
+`set_flowrate()` itself, with no separate fit-and-save step. **The
+defaults shipped in `Config._get_defaults()`/`config/example_config.yaml`
+(`C0=4.902, C1=58.49, C2=0.08956`) were found to be wrong on first live
+hardware test** — they compute a 1 L/min request to 63.48 Hz, clamped to
+the VFD's 60 Hz max, i.e. essentially full speed for what was meant to be
+a low test rate. Don't rely on these numbers for any real pump without
+re-deriving them (or, better, switching to a `calibration_file`) — a
+single triple of coefficients also can't represent a curve that isn't a
+clean quadratic the way a real fit-from-data calibration can.
 
 ## Config
 
@@ -97,7 +118,8 @@ flow:
   vfd_slave_id: 1
   motor_port: /dev/ttyUSB1   # shared serial port with weir (see limitation above)
   motor_baudrate: 9600
-  C0: 4.902                  # flowrate-to-frequency calibration: Hz = C2*Q^2 + C1*Q + C0
+  calibration_file: config/my_pump_calibration.csv  # preferred — see "Flow-rate calibration" above
+  C0: 4.902                  # legacy fallback, only used without calibration_file — see above
   C1: 58.49
   C2: 0.08956
   # Scheduling (choose one):
