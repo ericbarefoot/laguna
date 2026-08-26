@@ -442,6 +442,83 @@ class TestExecutorLinearMoves:
         assert "A5 ACL" not in conn.sent
         assert "A5 DCL" not in conn.sent
 
+    def test_falls_back_to_unscaled_ramp_when_scaled_value_rounds_to_zero(self):
+        """Even with a perfectly valid positive reference ramp, a small
+        enough short-leg distance (a sub-mm residual XY drift next to a
+        much larger Z move, say — reproduced on real hardware from
+        _sync_position_from_hardware's live-read quantization noise
+        crossing _moved()'s epsilon) can make k * ref_accel/ref_decel
+        round to 0 raw units once the controller receives it, even though
+        the unscaled math (dist_xy=10, dist_responder=3, k=0.3) here is
+        the same as test_moves_z_concurrently_with_the_xy_group_scaled_to_
+        match_duration. This scripts the controller rejecting the scaled
+        A5 ACL specifically (escape 16) to simulate that rounding, and
+        confirms the executor falls back to Z's own pre-scaling ramp
+        (never touched, so no A5 DCL write and no restore needed) instead
+        of letting the exception abort the whole move. Z's own pre-scaling
+        ramp/speed are still read up front, and restored at the end,
+        exactly as in the successful-scaling case (test_moves_z_
+        concurrently_with_the_xy_group_scaled_to_match_duration) — the
+        restore is unconditional (it doesn't know or care whether the
+        scaled write actually landed), so it re-sends the same ACL/DCL
+        the axis already had. Only the scaled A5 ACL write is skipped.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "A5 ACL": "25",  # Z's own ramp before this move — restored after
+            "A5 DCL": "20",
+            "A5 SPD": "8",  # Z's own speed before this move — restored after
+            "A5 ACL 15": SnapMotionError(16, "User Accel 0 Or Negative"),
+            "A5 SPD 3": "3",
+            "A5 BMT 3": "0",
+            "A5 MIF": "1",
+            "C1 SPD 10": "10",
+            "C1 BMT 10 0": "0",
+            "C1 MIF": "1",
+            "A5 ACL 25": "25",  # restore — unconditional, re-sends what Z already had
+            "A5 DCL 20": "20",
+            "A5 SPD 8": "8",  # restore
+            "A1 ACP": "10",  # post-move resync of X/Y/Z from hardware
+            "A2 ACP": "0",
+            "A5 ACP": "3",
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        executor.execute(trajectory)  # must not raise
+        assert conn.sent == [
+            "C1 INI 1 2", "C1 ACL", "C1 DCL",  # read X/Y's ramp (scaling reference)
+            "A5 ACL", "A5 DCL", "A5 SPD",  # read Z's own ramp/speed (to restore later)
+            "A5 ACL 15",  # rejected — no A5 DCL write attempted after
+            "A5 SPD 3", "A5 BMT 3",  # Z still moves, at the scaled speed, unscaled ramp
+            "C1 SPD 10", "C1 BMT 10 0",  # X/Y, unscaled
+            "A5 MIF", "C1 MIF",
+            "A5 ACL 25", "A5 DCL 20", "A5 SPD 8",  # Z's ramp/speed restored (no-op — never changed)
+            "A1 ACP", "A2 ACP", "A5 ACP",  # resync _current_pos from hardware
+        ]
+        assert conn.sent.count("A5 ACL 15") == 1  # never retried
+
+    def test_reraises_non_ramp_snap_motion_errors(self):
+        """_apply_scaled_ramp only swallows escape 16/17 (0-or-negative
+        accel/decel) — any other SnapMotionError from setting a scaled
+        ramp is a real fault and must propagate, not be silently eaten.
+        """
+        responses = {
+            "C1 INI 1 2": "0",
+            "C1 ACL": "50",
+            "C1 DCL": "40",
+            "A5 ACL": "25",
+            "A5 DCL": "20",
+            "A5 SPD": "8",
+            "A5 ACL 15": SnapMotionError(70, "inter-node timeout"),
+        }
+        executor, conn = _make_executor(responses)
+        trajectory = executor.plan("G1 X10 Z3 F600")
+        with pytest.raises(SnapMotionError) as exc_info:
+            executor.execute(trajectory)
+        assert exc_info.value.code == 70
+
     def test_scales_the_short_leg_even_with_no_f_word(self):
         """A move with no F word at all used to skip scaling entirely,
         leaving each leg at whatever SPD it already independently had —
