@@ -1,9 +1,11 @@
 # Flow
 
 Pump flow-rate control plus the two inflow solenoid valves. Lives at
-`src/laguna/flow/`, wrapping a Fuji VFD (variable-frequency drive) pump
-controller and a Teknic ClearCore's digital IO — both via
-`safl_ocean_hardware`, not implemented in this repo.
+`src/laguna/flow/`. Both the Fuji VFD pump drive and the Teknic ClearCore
+that switches the qin/qaux solenoids are wired to the confluence node on
+red.lab, which exposes each over its own MQTT interface — this subsystem
+is an MQTT client, not a direct-serial driver; see
+`src/laguna/flow/controller.py`.
 
 ## Why it exists
 
@@ -13,8 +15,10 @@ the same shape as `weir`/`gauge`: `subsystem_name = "flow"`,
 → `lab.flow`.
 
 `FlowController` (`src/laguna/flow/controller.py`) is an ABC; the only
-concrete implementation is `SaflFlowController`. If `safl_ocean_hardware`
-isn't installed, `connect()` logs a warning and returns `False`.
+concrete implementation is `SaflFlowController`. Build it via
+`SaflFlowController.from_config()`, which derives its MQTT topics from
+the shared `mqtt.node_name` — `connect()` fails (returns `False`) rather
+than raising if the confluence node can't be reached.
 
 ## Quick start
 
@@ -23,7 +27,7 @@ from laguna.config import Config
 from laguna.flow import SaflFlowController
 
 config = Config(config_file="config/example_config.yaml")
-flow = SaflFlowController(config.get("flow"))
+flow = SaflFlowController.from_config(config)
 
 flow.connect()
 flow.qin = True             # open the main inflow solenoid
@@ -39,25 +43,22 @@ flow.disconnect()
 
 ## Two physically separate things under one subsystem
 
-`SaflFlowController` owns two independent hardware connections:
+`SaflFlowController` talks to two independent confluence interfaces over
+one shared `MqttSubscriber` (a single MQTT client avoids the
+duplicate-client-ID reconnect fight documented in
+`laguna.mqtt.subscriber.MqttSubscriber`):
 
-- **A Fuji VFD** (`self._vfd`, on `vfd_port`/`vfd_slave_id`) — sets pump
-  speed by frequency and starts/stops it.
-- **A Teknic ClearCore** (`self._motor`, on `motor_port`/`motor_baudrate`)
-  — used here purely for its digital IO pins to drive the `qin`/`qaux`
-  solenoid valves (`motor.set_io(0, state)` / `motor.set_io(1, state)`),
-  *not* for any motion. It happens to be the same model of controller the
-  weir subsystem uses for its stepper.
-
-**Known limitation, called out directly in the source docstring**: in
-production, this `TeknicMotor` instance should be the *same* one
-`SaflWeirController` uses (the example config even comments
-`motor_port: /dev/ttyUSB1  # shared serial port with weir`), but
-`SaflFlowController` currently opens its own independent connection
-instead of sharing one. If `weir` and `flow` are both configured against
-the same serial port, that means two separate connections to the same
-physical device — the source comment flags this explicitly as a
-"self-contained first-draft" shortcut, not a deliberate design.
+- **The Fuji VFD** — confluence's `Fuji_Frenic_VFD` interface
+  (`vfd_topic_status`/`vfd_topic_commands`/`vfd_topic_replies`) — sets
+  pump speed by frequency and starts/stops it via request/reply commands
+  (`set_setpoint_hz`, `start_motor`, `stop_motor`, `clear_faults`).
+- **The shared ClearCore's `flow_valve` axis** — confluence's
+  `Teknic_ClearCore` interface (`valve_topic_status`/
+  `valve_topic_commands`/`valve_topic_replies`) — drives the `qin`/`qaux`
+  solenoid digital outputs (`set_io` on channels 0/1), *not* any motion.
+  It is the same physical ClearCore the weir gate axis lives on (one
+  controller, two axes), published/commanded as its own confluence
+  interface/topic set so the two subsystems don't step on each other.
 
 ## Flow-rate calibration: `calibration_file` vs. `C0`/`C1`/`C2`
 
@@ -113,15 +114,27 @@ clean quadratic the way a real fit-from-data calibration can.
 ## Config
 
 ```yaml
+# weir/gauge/flow are MQTT clients of the confluence node on red.lab, not
+# direct USB serial — their topics default to `{mqtt.node_name}/...`,
+# so the one thing you actually need to set is mqtt.node_name matching
+# red.lab's confluence_config.json "Node Name".
+# mqtt:
+#   node_name: "UCRS Confluence Node 1"
+
 flow:
-  vfd_port: /dev/ttyUSB3
-  vfd_slave_id: 1
-  motor_port: /dev/ttyUSB1   # shared serial port with weir (see limitation above)
-  motor_baudrate: 9600
   calibration_file: config/my_pump_calibration.csv  # preferred — see "Flow-rate calibration" above
   C0: 4.902                  # legacy fallback, only used without calibration_file — see above
   C1: 58.49
   C2: 0.08956
+  # command_timeout_s: 5.0    # seconds to wait for a confluence reply before failing
+  # A topic_* key overrides the mqtt.node_name-derived default for a single
+  # subsystem if ever needed, e.g.:
+  # vfd_topic_status: "SAFL Confluence Node 1/Fuji_Frenic_VFD"
+  # vfd_topic_commands: "SAFL Confluence Node 1/Fuji_Frenic_VFD/commands"
+  # vfd_topic_replies: "SAFL Confluence Node 1/Fuji_Frenic_VFD/replies"
+  # valve_topic_status: "SAFL Confluence Node 1/flow_valve"
+  # valve_topic_commands: "SAFL Confluence Node 1/flow_valve/commands"
+  # valve_topic_replies: "SAFL Confluence Node 1/flow_valve/replies"
   # Scheduling (choose one):
   # interval_s: 20            # poll status every 20 s (read-only)
   # use_schedule: true        # follow schedule CSV (pump_flow_lpm, qin_open, qaux_open columns)
@@ -129,7 +142,9 @@ flow:
 
 The `flow:` section is commented out by default in
 `config/example_config.yaml` — omit it entirely to disable the subsystem
-if you don't have a pump/VFD attached.
+if you don't have a pump/VFD attached. Build with
+`SaflFlowController.from_config(config)`, not the constructor directly, so
+the topic defaults get derived from `mqtt.node_name`.
 
 ## Scheduling it via `setup_run()`
 
