@@ -79,7 +79,7 @@ Because the gauge has nothing to set — only to read — `setup_run()` only
 ever wires it up as a periodic status poll: `interval_s` (or `trigger_at`)
 fires `gauge.read_mm()` and logs `elevation_mm=<value>` to the event log.
 `use_schedule: true` is structurally accepted by the same generic
-`_register_action()` helper used for every subsystem, but there's no
+`schedule_action()` helper used for every subsystem, but there's no
 schedule-CSV column that maps to a gauge setpoint, so in practice you'd
 only reach for `interval_s`.
 

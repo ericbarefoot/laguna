@@ -42,7 +42,7 @@ script) calls into rather than hand-wiring subsystems itself.
 
 ## Actuators vs. sensors under `use_schedule`
 
-The scheduling logic in `_register_action()` treats "does this action need
+The scheduling logic in `schedule_action()` treats "does this action need
 a *value* from the schedule, or just a *timestamp*?" as the key branch:
 
 - **Actuators** (`weir`, `flow`) pass an `action_factory(t_s) -> Callable`
@@ -83,6 +83,98 @@ thread = lab.start(duration=1800)
 thread.join()
 lab.disconnect_all()
 ```
+
+## User-defined scheduled actions
+
+`setup_run()` only wires up the built-in per-subsystem actions (gauge
+polling, weir/flow setpoints, camera captures, one fixed Gocator
+transect). Anything more involved — a tiled survey, a repeated WTT12L
+transect, a custom action spanning several subsystems — isn't something
+you add to the codebase; you register it yourself, in your own run
+script, using the same `schedule_action()` building block every built-in
+action already goes through:
+
+```python
+from laguna.experiment import schedule_action, setup_run, run_blocking
+from laguna.survey import Tile, SurveyRunner
+
+lab = setup_run("config/my_experiment.yaml")
+
+def tiled_scan():
+    active_area = lab.gocator.get_active_area()
+    tile = Tile(
+        origin=[0, 0, 0], length_mm=1000, width_mm=600,
+        swath_mm=active_area["width_mm"], instrument="gocator", speed=20.0,
+    )
+    SurveyRunner(lab, tile).run()
+
+schedule_action(
+    lab, lab.config.get("tiled_scan"), subsystem="gocator", name="tiled_scan",
+    action=tiled_scan,
+)
+
+run_blocking(lab, duration=3600)
+```
+
+with a matching config section — any of `interval_s`/`trigger_at`/
+`use_schedule` works, same as a built-in subsystem:
+
+```yaml
+tiled_scan:
+  interval_s: 900   # a full tile pass every 15 minutes
+```
+
+`schedule_action()` validates that section the same way it validates
+`gauge:`/`weir:`/etc. — set more than one of those three keys and it
+raises `ValueError`, whether the section belongs to a real subsystem or
+not. The action itself is a plain zero-arg closure: it can read
+`lab.gocator`/`lab.gantry`/any other connected subsystem, run a whole
+`SurveyRunner` pass, and take as long as it needs — the scheduler doesn't
+care what's inside, only when to fire it.
+
+**Overlap is handled for you, and it's a pause, not a skip.**
+`Scheduler._fire()` spawns a fresh daemon thread on every due firing with
+no awareness of whether the previous firing is still running — so a
+tiled scan that takes longer than its own `interval_s` would otherwise
+run concurrently with itself. `schedule_action()` guards against this
+automatically: if a new firing starts before the previous one for the
+same action finished, it calls `lab.escalate(...)` (pausing the whole
+lab) instead of running it, skipping it, or letting them race. This is
+deliberate, not a conservative default to override — per this project's
+priority ordering, missed/duplicated data is worse than a pause, and an
+interval dense enough to trigger this means the *schedule* doesn't match
+how long the action actually takes, which is worth fixing at the
+experiment-design level (widen the interval, or speed up the action),
+not working around at runtime.
+
+**That guard is self-only by default — two *different* actions never
+block each other unless you opt them in.** A weir setpoint and a camera
+capture run fully concurrently with no coordination at all out of the
+box, since each `schedule_action()` call gets its own private lock. Pass
+the same `exclusive_with` tag to two (or more) calls to widen that into a
+shared exclusion group — e.g. a tiled Gocator scan and a camera capture
+that must not fire while the gantry is mid-scan:
+
+```python
+schedule_action(lab, lab.config.get("tiled_scan"), "gocator", "tiled_scan",
+                 action=tiled_scan, exclusive_with="gantry_busy")
+schedule_action(lab, lab.config.get("pi_cameras"), "pi_cameras", "capture",
+                 action=capture, exclusive_with="gantry_busy")
+```
+
+Both still can't overlap *themselves* either way — `exclusive_with` only
+adds cross-action exclusion, it never removes the self-exclusion above.
+A capture that fires while the tagged scan is mid-flight escalates
+exactly like a self-overlap would, naming the tag in the pause reason.
+
+One more thing worth building into a real hook like this, following the
+pattern `runner.py`'s own `_scan_gocator()` closure uses internally: pass
+a `CheckpointStore` to `SurveyRunner` so an interrupted tile resumes
+instead of restarting — see `laguna.timing.checkpoint.CheckpointStore`
+and `SurveyRunner`'s own docstring. (A failed *pass* inside a survey is a
+separate concern from an *overlapping firing* — `SurveyRunner.run()`
+re-raises on a pass failure, which propagates out of the closure and
+still needs handling; see `example_14` for one way to do that.)
 
 ## `run_blocking()` — pause/resume without dropping hardware connections
 

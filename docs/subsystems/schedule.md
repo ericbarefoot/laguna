@@ -103,5 +103,5 @@ time_s,weir_elevation_mm,pump_flow_lpm,qin_open,qaux_open
 ## Further reading
 
 - [API reference](../reference/schedule.md) — generated from docstrings.
-- [Experiment runner](experiment.md) — how a loaded `ExperimentSchedule` drives `weir`/`flow`/camera scheduling via `_register_action()`.
+- [Experiment runner](experiment.md) — how a loaded `ExperimentSchedule` drives `weir`/`flow`/camera scheduling via `schedule_action()`.
 - [Weir](weir.md), [Flow](flow.md) — the subsystems that consume `weir_elevation_mm`/`pump_flow_lpm`/`qin_open`/`qaux_open`.

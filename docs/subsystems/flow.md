@@ -133,7 +133,7 @@ if you don't have a pump/VFD attached.
 
 ## Scheduling it via `setup_run()`
 
-Same three-way choice as every other subsystem, via `_register_action()`
+Same three-way choice as every other subsystem, via `schedule_action()`
 in `src/laguna/experiment/runner.py`:
 
 - **`interval_s: N`** — read-only `flow.get_status()` poll, logged to the
