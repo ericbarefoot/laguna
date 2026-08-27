@@ -84,10 +84,11 @@ class TestSimulateConfig:
 
     def test_every_registry_subsystem_is_marked_simulated_not_dropped(self):
         """Every laguna.registry.SUBSYSTEM_REGISTRY entry has a simulated
-        backend now (SimulatedTeknicMotor/VFD/MassaSensor, and a
-        `simulated` flag pi_cameras/dslr_cameras/od2000/wtt12l check
-        directly) — a rehearsal must exercise all of them, or it proves
-        nothing about their schedules."""
+        backend now (weir/flow/gauge just skip MQTT via their own
+        `simulated` flag rather than swapping in a fake serial driver,
+        same as pi_cameras/dslr_cameras/od2000/wtt12l check directly) — a
+        rehearsal must exercise all of them, or it proves nothing about
+        their schedules."""
         cfg = {
             "gantry": {}, "gocator": {}, "weir": {}, "flow": {}, "gauge": {},
             "pi_cameras": {}, "dslr_cameras": {}, "od2000": {}, "wtt12l": {},
@@ -138,10 +139,10 @@ class TestSetupRunSimulation:
     def test_weir_and_flow_are_now_constructed_and_connect_under_simulate(
         self, tmp_path
     ):
-        """weir/flow have simulated backends now (SimulatedTeknicMotor/VFD) —
-        constructed and successfully connected under simulate=True even
-        though safl_ocean_hardware isn't installed in this environment,
-        which is exactly the point: no real driver is needed to rehearse."""
+        """weir/flow are MQTT clients now — their `simulated` flag skips
+        MQTT entirely, so they construct and connect successfully under
+        simulate=True with no broker anywhere, which is exactly the point:
+        no real hardware or network is needed to rehearse."""
         from laguna.experiment.runner import setup_run
 
         lab = setup_run(self._config_path(tmp_path), simulate=True)

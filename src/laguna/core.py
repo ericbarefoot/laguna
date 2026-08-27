@@ -190,6 +190,18 @@ class FlumeLab:
             )
         self.scheduler = Scheduler(clock=self.clock, event_log=self.event_log)
 
+        # Locks shared across schedule_action() registrations that opt into
+        # the same exclusive_with tag, so two differently-named scheduled
+        # actions (e.g. a gocator scan and a camera capture) can be made
+        # mutually exclusive without introducing their own coordination —
+        # see laguna.experiment.runner.schedule_action(). Keyed by tag,
+        # created lazily; a plain dict is fine here despite the scheduler's
+        # own actions running in separate threads, since CPython dict
+        # get/setdefault is already atomic under the GIL for this access
+        # pattern (no read-modify-write race: setdefault either finds an
+        # existing Lock or atomically inserts the new one).
+        self._exclusion_locks: Dict[str, threading.Lock] = {}
+
         # Registry for opt-in hardware subsystems
         self._subsystems: Dict[str, Any] = {}
 

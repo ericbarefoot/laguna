@@ -1071,7 +1071,7 @@ class GocatorScanner(GocatorSettingsMixin):
 
         ``scan_with_gantry()`` needs four arguments including a gantry handle,
         so it cannot be handed to ``Scheduler.repeat(action=...)`` or to
-        ``experiment.runner._register_action``. This closes over a scan spec
+        ``experiment.schedule_action``. This closes over a scan spec
         from config instead, so a Gocator pass can be scheduled exactly like a
         camera capture.
 

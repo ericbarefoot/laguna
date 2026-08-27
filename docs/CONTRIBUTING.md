@@ -112,7 +112,7 @@ into `core.py`. Every existing subsystem (`weir`, `gauge`, `flow`,
    experiment config file. If it needs scheduling (`interval_s` /
    `trigger_at` / `use_schedule`), add that to `setup_run()` following the
    pattern of the existing closures (`_log_gauge`, `_make_update_weir`,
-   etc.) and the shared `_register_action()` helper.
+   etc.) and the shared `schedule_action()` helper.
 4. Logging follows a two-tier model — see `laguna.subsystem_logging`'s
    module docstring for the full reasoning:
    - **Archival event log** (`lab.event_log`, ships alongside published

@@ -1,0 +1,6 @@
+mqtt:
+  broker_host: red.lab
+  node_name: "UCRS Confluence Node 1"
+
+gauge:
+  offset_mm: 625.0  # measured reference — see confluence_config.json on red.lab

@@ -245,6 +245,7 @@ class FakeMqttSubscriber:
         self._is_connected = False
         self._queues: dict = {}
         self._topics: list = []
+        self._last_seen: dict = {}
         self.connected_called = 0
         self.disconnect_called = 0
 
@@ -252,6 +253,9 @@ class FakeMqttSubscriber:
         self._is_connected = True
         self.connected_called += 1
         return True
+
+    def wait_until_connected(self, timeout: float = 5.0, poll_interval: float = 0.05) -> bool:
+        return self._is_connected
 
     def disconnect(self) -> None:
         self._is_connected = False
@@ -267,15 +271,17 @@ class FakeMqttSubscriber:
         self._queues.setdefault(topic, []).append(payload)
 
     def drain(self, topic: str) -> list:
+        self._last_seen.pop(topic, None)
         items = list(self._queues.get(topic, []))
         self._queues[topic] = []
         return items
 
     def get_latest(self, topic: str) -> dict:
         items = self._queues.get(topic, [])
-        last = items[-1] if items else None
-        self._queues[topic] = []
-        return last
+        if items:
+            self._last_seen[topic] = items[-1]
+            self._queues[topic] = []
+        return self._last_seen.get(topic)
 
     def get_status(self) -> dict:
         return {"is_connected": self._is_connected}
@@ -300,6 +306,13 @@ class TestRangefinderSubsystem:
         mqtt._is_connected = True  # already connected
         rf.connect()
         assert mqtt.connected_called == 0  # skipped
+
+    def test_connect_fails_if_broker_handshake_never_completes(self):
+        """Regression: connect() used to return True as soon as the async
+        MQTT handshake was *started*, not once it actually completed."""
+        rf, mqtt = _make_rangefinder()
+        mqtt.wait_until_connected = lambda timeout=5.0, poll_interval=0.05: False
+        assert rf.connect() is False
 
     def test_disconnect_delegates(self):
         rf, mqtt = _make_rangefinder()

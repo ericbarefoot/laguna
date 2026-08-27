@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import time
 import uuid
 from collections import deque
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -69,6 +70,9 @@ class MqttSubscriber:
         # Per-topic inbound queue (filled in paho thread, drained by caller)
         self._queues: Dict[str, queue.Queue] = {}
         self._topics: List[str] = []
+        # Most recent message seen per topic via get_latest() — see that
+        # method's docstring for why this exists separately from the queue.
+        self._last_seen: Dict[str, Dict[str, Any]] = {}
 
         for topic in self._initial_topics:
             self._queues[topic] = queue.Queue()
@@ -112,6 +116,29 @@ class MqttSubscriber:
         logger.info("MQTT subscriber connecting to %s:%d", self._host, self._port)
         return True
 
+    def wait_until_connected(self, timeout: float = 5.0, poll_interval: float = 0.05) -> bool:
+        """Block until the broker handshake actually completes, or timeout.
+
+        connect() only starts paho's background connect/loop — the real
+        handshake completes asynchronously via the on_connect callback,
+        which is what actually flips _is_connected. A caller that publishes
+        (or expects subscriptions to be live) immediately after connect()
+        can lose this race: publish() raises "MqttSubscriber is not
+        connected" if called before the handshake finishes, and
+        subscribe() silently defers rather than failing, so neither one
+        surfaces the gap on its own. Call this after connect() before
+        relying on either.
+
+        Returns:
+            True once connected; False if `timeout` elapses first.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._is_connected:
+                return True
+            time.sleep(poll_interval)
+        return self._is_connected
+
     def disconnect(self) -> None:
         """Stop the background loop and disconnect from the broker."""
         client = self._client
@@ -150,25 +177,62 @@ class MqttSubscriber:
             self._topics.append(topic)
         if self._is_connected and self._client is not None:
             self._client.subscribe(topic, qos=self._qos)
+            logger.info("MQTT subscribed to %s", topic)
+
+    def publish(self, topic: str, payload: Any, qos: Optional[int] = None) -> None:
+        """Publish a message to the broker.
+
+        Args:
+            topic: Topic to publish on.
+            payload: JSON-serialized if not already a str/bytes (dicts are
+                the common case — command/reply envelopes).
+            qos: Overrides the subscriber's default qos for this publish only.
+
+        Raises:
+            RuntimeError: If not connected.
+        """
+        if self._client is None or not self._is_connected:
+            raise RuntimeError("MqttSubscriber is not connected")
+        body = payload if isinstance(payload, (str, bytes)) else json.dumps(payload)
+        self._client.publish(topic, body, qos=self._qos if qos is None else qos)
 
     def get_latest(self, topic: str) -> Optional[Dict[str, Any]]:
-        """Return the most recent message for a topic, or None if queue is empty.
+        """Return the most recently published message for a topic, or None.
 
-        Drains the entire queue and discards all but the last item.
+        Coalesces any backlog into a per-topic "last seen" slot (discarding
+        older duplicates) and returns that slot, rather than handing the one
+        buffered message to whichever caller happens to ask first and
+        leaving every other caller reading None until the next publish.
+        This matters because several read-only accessors on one subsystem
+        (e.g. get_elevation()/get_velocity()/get_status() on the weir) can
+        all call get_latest() on the same status topic close together — with
+        pure drain-and-discard semantics, only the first of those calls
+        would see the message and the rest would get None/stale fallbacks,
+        which is exactly the get_velocity()-vs-get_status() mismatch this
+        was built to fix. Only drain() actually forgets a topic's last-seen
+        message (see its docstring) — that is the deliberate way to say "I
+        don't trust anything buffered before this point," e.g.
+        go_to_elevation() using it to discard a pre-move status reading.
         """
         if topic not in self._queues:
             return None
         q = self._queues[topic]
-        last = None
         while True:
             try:
-                last = q.get_nowait()
+                self._last_seen[topic] = q.get_nowait()
             except queue.Empty:
                 break
-        return last
+        return self._last_seen.get(topic)
 
     def drain(self, topic: str) -> List[Dict[str, Any]]:
-        """Return and remove all buffered messages for a topic."""
+        """Return and remove all buffered messages for a topic.
+
+        Also forgets that topic's get_latest() "last seen" message, so a
+        subsequent get_latest() call returns None until a message arrives
+        after this call — the explicit way to discard backlog a caller
+        knows is stale (see get_latest()'s docstring).
+        """
+        self._last_seen.pop(topic, None)
         if topic not in self._queues:
             return []
         q = self._queues[topic]
@@ -188,9 +252,15 @@ class MqttSubscriber:
         """Handle broker connection completion (paho callback)."""
         if rc == 0:
             self._is_connected = True
+            logger.info("MQTT connected to %s:%d", self._host, self._port)
+            # Re-subscribe to topics registered before this connection (or
+            # left over from before a drop, on a reconnect) — a fresh
+            # first-time connect has none yet, since subscribe() calls
+            # from FlumeLab/subsystem connect() happen just after this
+            # callback returns, not before.
             for topic in self._topics:
                 client.subscribe(topic, qos=self._qos)
-            logger.info("MQTT connected to %s:%d; subscribed to %s", self._host, self._port, self._topics)
+                logger.info("MQTT subscribed to %s", topic)
         else:
             logger.error("MQTT connection refused (rc=%d)", rc)
 

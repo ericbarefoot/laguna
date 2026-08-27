@@ -39,7 +39,7 @@ def _validate_trigger_config(section_name: str, cfg: dict) -> None:
         raise ValueError(f"[{section_name}]: 'interval_s' and 'trigger_at' are mutually exclusive")
 
 
-def _register_action(
+def schedule_action(
     lab: FlumeLab,
     cfg: dict,
     subsystem: str,
@@ -48,23 +48,112 @@ def _register_action(
     action_factory: Optional[Callable] = None,
     exp_schedule: Optional[ExperimentSchedule] = None,
     schedule_col: Optional[str] = None,
+    exclusive_with: Optional[str] = None,
 ) -> None:
-    """Register a scheduled action via interval_s, trigger_at, or use_schedule.
+    """Register any action on the experiment scheduler via interval_s, trigger_at, or use_schedule.
+
+    This is the same building block every built-in subsystem's scheduled
+    action (gauge polling, weir/flow setpoints, camera captures, gocator
+    scans) goes through in setup_run() below — promoted to a public
+    function so a user-defined action spanning multiple subsystems (e.g.
+    a tiled Gocator survey, or a repeated WTT12L transect) gets the exact
+    same scheduling-mode choice and config validation as a built-in one,
+    instead of hand-rolling interval/trigger_at/use_schedule dispatch. See
+    docs/subsystems/experiment.md#user-defined-scheduled-actions for a
+    worked example.
+
+    `cfg` doesn't have to come from a subsystem's own config section — a
+    user-defined action can use any dict-shaped section under its own
+    name (e.g. a `tiled_scan:` block) as long as it has at most one of
+    `use_schedule`/`interval_s`/`trigger_at`.
+
+    Every action registered here is guarded against overlapping itself:
+    Scheduler._fire() spawns a fresh daemon thread on every due firing
+    with no awareness of whether the previous firing is still running
+    (see laguna.timing.scheduler) — if an action's real duration can
+    exceed its own interval/schedule spacing, a naive registration lets
+    two copies run concurrently. Per this project's own priority ordering
+    (missed/corrupted data is worse than pausing — see safety.py's module
+    docstring), the guard here escalates to a lab-wide pause rather than
+    silently skipping or letting them race: a schedule dense enough to
+    make an action still be running when it's due again is an experiment
+    *design* problem (the interval/schedule doesn't match how long the
+    action actually takes), not something to paper over at runtime.
+
+    By default that's the *only* exclusion — two differently-named actions
+    (e.g. a weir setpoint and a camera capture) can always run
+    concurrently, since each gets its own private lock. Pass the same
+    `exclusive_with` tag to two (or more) schedule_action() calls to make
+    them mutually exclusive with each other too — e.g. a Gocator scan and
+    a camera capture that must not fire while the gantry is mid-scan:
+
+        schedule_action(lab, scan_cfg, "gocator", "tiled_scan",
+                         action=tiled_scan, exclusive_with="gantry_busy")
+        schedule_action(lab, cam_cfg, "pi_cameras", "capture",
+                         action=capture, exclusive_with="gantry_busy")
+
+    Both still can't overlap *themselves* either way — `exclusive_with`
+    only widens the group, it never narrows self-exclusion.
 
     Args:
         lab: FlumeLab instance to register actions with.
-        cfg: Config dict with scheduling options (mutually exclusive).
-        subsystem: Subsystem name for the scheduler.
+        cfg: Config dict with scheduling options (mutually exclusive) —
+            just needs `interval_s`, `trigger_at`, or `use_schedule`.
+        subsystem: Name shown in the event log / scheduler for this action
+            — an existing subsystem name, or any label for a user-defined
+            multi-subsystem action.
         name: Action name for the scheduler.
-        action: Optional fixed action callable. Ignored if action_factory is set.
-        action_factory: Optional factory(t_s) -> Callable for schedule-dependent actions.
+        action: Optional fixed action callable (zero-arg). Ignored if
+            action_factory is set.
+        action_factory: Optional factory(t_s) -> Callable for
+            schedule-dependent actions (use_schedule mode only — lets the
+            action see which schedule row triggered it).
         exp_schedule: ExperimentSchedule for use_schedule mode.
-        schedule_col: Optional schedule column to filter by (for fixed actions).
+        schedule_col: Optional schedule column to filter by (for fixed
+            actions) — only rows where this column is truthy fire.
+        exclusive_with: Optional tag naming a shared exclusion group.
+            Any other schedule_action() calls using this same tag on this
+            `lab` become mutually exclusive with this one, in addition to
+            each still being self-exclusive. Omit for the default of
+            "only exclusive with itself."
 
     Raises:
-        ValueError: If scheduling config is invalid (caught by _validate_trigger_config).
+        ValueError: If more than one of use_schedule/interval_s/trigger_at
+            is set in `cfg`.
     """
+    _validate_trigger_config(subsystem, cfg)
     use_sched = cfg.get("use_schedule", False)
+
+    # Self-exclusion needs a lock shared only across this call's own
+    # firings (all rows of a use_schedule run, or every repeat()/
+    # trigger_at() firing) — a plain local Lock is enough, no lab-level
+    # state needed. exclusive_with widens that to a lock shared across
+    # separate schedule_action() calls that opt into the same tag, so it
+    # has to live on the lab, not as a local here — see FlumeLab.__init__'s
+    # _exclusion_locks.
+    if exclusive_with is not None:
+        busy = lab._exclusion_locks.setdefault(exclusive_with, threading.Lock())
+    else:
+        busy = threading.Lock()
+
+    def _guarded(inner_action: Callable) -> Callable:
+        def _run():
+            if not busy.acquire(blocking=False):
+                group = f" (exclusive_with={exclusive_with!r})" if exclusive_with else ""
+                lab.escalate(
+                    f"[{subsystem}/{name}] fired again before its previous run "
+                    f"(or an exclusive_with peer's{group}) finished — the "
+                    "schedule's interval/spacing doesn't match how long these "
+                    "actions actually take. Fix the experiment design (widen "
+                    "the interval, or shorten the action) rather than "
+                    "re-running this."
+                )
+                return
+            try:
+                inner_action()
+            finally:
+                busy.release()
+        return _run
 
     if use_sched:
         if exp_schedule is None:
@@ -77,16 +166,16 @@ def _register_action(
             times = df["time_s"].tolist()
         make = action_factory or (lambda t: action)
         for t in times:
-            lab.scheduler.at(float(t), make(float(t)), subsystem=subsystem, name=name)
+            lab.scheduler.at(float(t), _guarded(make(float(t))), subsystem=subsystem, name=name)
 
     elif "interval_s" in cfg:
         lab.scheduler.repeat(
-            every=cfg["interval_s"], action=action, subsystem=subsystem, name=name
+            every=cfg["interval_s"], action=_guarded(action), subsystem=subsystem, name=name
         )
 
     elif "trigger_at" in cfg:
         for t in cfg["trigger_at"]:
-            lab.scheduler.at(float(t), action, subsystem=subsystem, name=name)
+            lab.scheduler.at(float(t), _guarded(action), subsystem=subsystem, name=name)
 
 
 # ------------------------------------------------------------------ #
@@ -328,7 +417,7 @@ def setup_run(
     # ------------------------------------------------------------------ #
 
     if "gauge" in lab._subsystems:
-        _register_action(lab, lab.config.get("gauge"), "gauge", "read_mm", action=_log_gauge)
+        schedule_action(lab, lab.config.get("gauge"), "gauge", "read_mm", action=_log_gauge)
 
     if "weir" in lab._subsystems:
         weir_cfg = lab.config.get("weir")
@@ -337,12 +426,12 @@ def setup_run(
         if weir_cfg.get("use_schedule"):
             if not schedule_has_weir:
                 logger.warning("weir.use_schedule=true but CSV has no weir_elevation_mm — read-only")
-                _register_action(lab, weir_cfg, "weir", "get_status", action=_log_weir_status)
+                schedule_action(lab, weir_cfg, "weir", "get_status", action=_log_weir_status)
             else:
-                _register_action(lab, weir_cfg, "weir", "update_elevation",
+                schedule_action(lab, weir_cfg, "weir", "update_elevation",
                                  action_factory=_make_update_weir, exp_schedule=exp_schedule)
         else:
-            _register_action(lab, weir_cfg, "weir", "get_status", action=_log_weir_status)
+            schedule_action(lab, weir_cfg, "weir", "get_status", action=_log_weir_status)
 
     if "flow" in lab._subsystems:
         flow_cfg = lab.config.get("flow")
@@ -352,19 +441,19 @@ def setup_run(
         if flow_cfg.get("use_schedule"):
             if not schedule_has_flow:
                 logger.warning("flow.use_schedule=true but CSV has no flow columns — read-only")
-                _register_action(lab, flow_cfg, "flow", "get_status", action=_log_flow_status)
+                schedule_action(lab, flow_cfg, "flow", "get_status", action=_log_flow_status)
             else:
-                _register_action(lab, flow_cfg, "flow", "update_flow",
+                schedule_action(lab, flow_cfg, "flow", "update_flow",
                                  action_factory=_make_update_flow, exp_schedule=exp_schedule)
         else:
-            _register_action(lab, flow_cfg, "flow", "get_status", action=_log_flow_status)
+            schedule_action(lab, flow_cfg, "flow", "get_status", action=_log_flow_status)
 
     if "pi_cameras" in lab._subsystems:
-        _register_action(lab, lab.config.get("pi_cameras"), "pi_cameras", "capture",
+        schedule_action(lab, lab.config.get("pi_cameras"), "pi_cameras", "capture",
                          action=_capture_pi, exp_schedule=exp_schedule, schedule_col="pi_cameras")
 
     if "dslr_cameras" in lab._subsystems:
-        _register_action(lab, lab.config.get("dslr_cameras"), "dslr_cameras", "capture",
+        schedule_action(lab, lab.config.get("dslr_cameras"), "dslr_cameras", "capture",
                          action=_capture_dslr, exp_schedule=exp_schedule, schedule_col="dslr_cameras")
 
     def _scan_gocator():
@@ -414,7 +503,7 @@ def setup_run(
         )
 
     if "gocator" in lab._subsystems:
-        _register_action(lab, lab.config.get("gocator"), "gocator", "scan",
+        schedule_action(lab, lab.config.get("gocator"), "gocator", "scan",
                          action=_scan_gocator, exp_schedule=exp_schedule,
                          schedule_col="gocator")
 

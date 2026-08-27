@@ -5,6 +5,7 @@ and a thread-safe per-topic message buffer so callers can drain samples at any
 rate without missing messages.
 """
 
+from .request_reply import RequestTimeout, request
 from .subscriber import MqttSubscriber
 
-__all__ = ["MqttSubscriber"]
+__all__ = ["MqttSubscriber", "request", "RequestTimeout"]

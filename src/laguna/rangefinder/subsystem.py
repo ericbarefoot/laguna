@@ -81,15 +81,20 @@ class RangefinderSubsystem:
     def connect(self) -> bool:
         """Connect the underlying MQTT subscriber and subscribe to OD2000 topic.
 
+        Blocks (up to a few seconds) for the broker handshake to actually
+        complete before returning — connect() alone only starts it
+        asynchronously (see MqttSubscriber.wait_until_connected()).
+
         Returns:
-            True if connected successfully.
+            True if connected successfully; False if the broker handshake
+            didn't complete in time.
         """
         if self._simulated:
             self._is_connected = True
             return True
         if not self._mqtt._is_connected:
             ok = self._mqtt.connect()
-            if not ok:
+            if not ok or not self._mqtt.wait_until_connected():
                 return False
         self._mqtt.subscribe(self._topic)
         self._is_connected = True

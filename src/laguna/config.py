@@ -64,22 +64,29 @@ class Config:
                 "resolution": (1920, 1080),
                 "capture_format": "BGR",
             },
+            # weir/gauge/flow are now MQTT clients of the confluence node on
+            # red.lab rather than direct USB serial. Their topics are
+            # derived from mqtt.node_name below (`{node_name}/{interface}`,
+            # matching confluence's own convention — see
+            # confluence/confluence_config.json's "Node Name" on red.lab)
+            # in each subsystem's from_config(), not hardcoded per-section —
+            # change the node name in one place, not three. A subsystem
+            # section can still set its own topic_* key explicitly to
+            # override the derived default (e.g. for a second node).
             "weir": {
-                "port": "/dev/ttyUSB0",
-                "baudrate": 9600,
-                "steps_per_mm": 1000.0,
+                "command_timeout_s": 5.0,
                 "home_offset_mm": 0.0,
             },
             "gauge": {
-                "port": "/dev/ttyUSB2",
-                "sensor_ids": [0],
+                # Index into the Massa interface's per-device arrays
+                # (device names/dist_mm/signal_strength/...) — confluence
+                # polls all configured Massa IDs in one message, so this
+                # picks out which array element is this gauge's sensor.
+                "sensor_index": 0,
                 "offset_mm": 0.0,
             },
             "flow": {
-                "vfd_port": "/dev/ttyUSB1",
-                "vfd_slave_id": 1,
-                "motor_port": "/dev/ttyUSB0",
-                "motor_baudrate": 9600,
+                "command_timeout_s": 5.0,
                 "C0": 4.902,
                 "C1": 58.49,
                 "C2": 0.08956,
@@ -178,6 +185,10 @@ class Config:
                 "keepalive": 60,
                 "topics": [],
                 "qos": 0,
+                # Must match confluence_config.json's "Node Name" on red.lab —
+                # weir/gauge/flow derive their MQTT topics from this in their
+                # own from_config() (see the comment above the "weir" section).
+                "node_name": "UCRS Confluence Node 1",
             },
             "rangefinder": {
                 "topic": "laguna/od2000",
