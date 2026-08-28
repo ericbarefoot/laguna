@@ -44,6 +44,8 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .robot.macron.commands import ramp_distance_mm, ramp_time_s
+
 logger = logging.getLogger(__name__)
 
 #: Cartesian axis name -> index into a 3-component [x, y, z] vector. Shared
@@ -53,13 +55,26 @@ _AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
 
 @dataclass
 class Pass:
-    """One traverse: measure from `start` to `end`, both experiment-frame mm.
+    """One traverse: measure from `measure_start` to `end`, experiment-frame mm.
+
+    The gantry may be commanded from further back than the measuring
+    starts (`start` vs. `cruise_start`) — see those attributes below.
 
     Attributes:
         index: Position in the plan, 0-based. Used as the checkpoint id, so
             an interrupted survey resumes at the right pass.
-        start: [x, y, z] where the measuring point should begin.
+        start: [x, y, z] where the gantry is *commanded* to begin moving —
+            the ramp start. Ordinarily identical to `cruise_start`; a
+            :class:`Tile` with `accel_mm_s2` set moves this back along the
+            travel axis so the axis is already at `scan_speed` by the time
+            it reaches `cruise_start`, instead of a step change.
         end: [x, y, z] where it should finish.
+        cruise_start: [x, y, z] where the measuring point should actually
+            begin — the swath boundary a plan asked for. None means it's
+            identical to `start` (the common case: no ramp lead-in was
+            computed). This, not `start`, is what a scan's dead-reckoned
+            surface must be anchored to; see `SurveyRunner._run_pass()`
+            and `GocatorScanner`'s `cruise_start_mm` parameter.
         instrument: Which instrument measures this pass.
         axis: Gantry axis the traverse runs along, resolved from the
             geometry.
@@ -81,6 +96,7 @@ class Pass:
     index: int
     start: Tuple[float, float, float]
     end: Tuple[float, float, float]
+    cruise_start: Optional[Tuple[float, float, float]] = None
     instrument: str = "gocator"
     axis: str = "X"
     scan_speed: Optional[float] = None
@@ -90,13 +106,24 @@ class Pass:
     step_axis: Optional[str] = None
 
     @property
-    def length_mm(self) -> float:
-        """Get the traverse distance in mm.
+    def measure_start(self) -> Tuple[float, float, float]:
+        """`cruise_start` if set, else `start` — where measuring truly begins.
 
         Returns:
-            Distance from start to end.
+            The swath boundary a plan asked for, regardless of whether a
+            ramp lead-in moved `start` behind it.
         """
-        return math.dist(self.start, self.end)
+        return self.cruise_start if self.cruise_start is not None else self.start
+
+    @property
+    def length_mm(self) -> float:
+        """Get the measuring traverse distance in mm.
+
+        Returns:
+            Distance from `measure_start` to `end` — the swath itself, not
+            including any ramp lead-in before `measure_start`.
+        """
+        return math.dist(self.measure_start, self.end)
 
     def duration_s(self, scan_speed: Optional[float] = None) -> Optional[float]:
         """Get the traverse duration at a given scan speed.
@@ -123,6 +150,7 @@ class Pass:
             "index": self.index,
             "start": list(self.start),
             "end": list(self.end),
+            "cruise_start": list(self.cruise_start) if self.cruise_start is not None else None,
             "instrument": self.instrument,
             "axis": self.axis,
             "scan_speed": self.scan_speed,
@@ -182,11 +210,16 @@ class Survey:
         """
         rows = [f"{len(self)} passes"]
         for p in self.passes():
+            ramp_note = (
+                f" (ramp from {tuple(round(v, 1) for v in p.start)})"
+                if p.cruise_start is not None and p.cruise_start != p.start
+                else ""
+            )
             rows.append(
                 f"  [{p.index}] {p.label or p.instrument}: "
-                f"{tuple(round(v, 1) for v in p.start)} -> "
+                f"{tuple(round(v, 1) for v in p.measure_start)} -> "
                 f"{tuple(round(v, 1) for v in p.end)} "
-                f"along {p.axis} ({p.length_mm:.0f} mm)"
+                f"along {p.axis} ({p.length_mm:.0f} mm){ramp_note}"
             )
         return "\n".join(rows)
 
@@ -222,6 +255,20 @@ class Tile(Survey):
             differ from scan_speed — see Pass.travel_speed.
         speed: Convenience for setting scan_speed and travel_speed to the
             same value. Ignored for whichever of the two is set explicitly.
+        accel_mm_s2: The travel axis's configured acceleration, mm/s^2. When
+            set, each pass's commanded start (``Pass.start``) is moved back
+            along the travel axis by the accel-ramp distance
+            (``v^2 / 2a`` at ``scan_speed``), on whichever side matches that
+            pass's serpentine direction, so the axis is already at
+            ``scan_speed`` — not still accelerating — by the time it
+            reaches the swath boundary (``Pass.cruise_start``). Left unset
+            (the default), passes are commanded exactly at the swath
+            boundary as before: no ramp adjustment, and the classic
+            travel-direction seam between swaths (see issue #58) can
+            reappear. ``SurveyRunner.run()`` fills this in automatically
+            from the live axis's ``get_accel()`` when a ``Tile`` leaves it
+            unset — set it explicitly only for planning/dry-run use before
+            a gantry is connected.
 
     Each pass's ``step_axis`` coordinate names the swath's **near edge**,
     not its centerline — ``SurveyRunner`` reads the instrument's live
@@ -243,6 +290,7 @@ class Tile(Survey):
     scan_speed: Optional[float] = None
     travel_speed: Optional[float] = None
     speed: Optional[float] = None
+    accel_mm_s2: Optional[float] = None
 
     def __post_init__(self) -> None:
         """Validate tile survey parameters."""
@@ -301,6 +349,8 @@ class Tile(Survey):
         else:
             count = math.ceil((self.width_mm - self.swath_mm) / self.pitch_mm) + 1
 
+        ramp_mm = ramp_distance_mm(self.scan_speed, self.accel_mm_s2)
+
         out: List[Pass] = []
         for i in range(count):
             offset = min(i * self.pitch_mm, max(0.0, self.width_mm - self.swath_mm))
@@ -313,11 +363,21 @@ class Tile(Survey):
                 end[travel_i] += self.length_mm
             else:
                 start[travel_i] += self.length_mm
+            cruise_start = tuple(float(v) for v in start)
+            if ramp_mm > 0:
+                # Extend the commanded start opposite the travel direction,
+                # so the axis is already at scan_speed — not still
+                # ramping — when it reaches the true swath boundary
+                # (cruise_start). Direction alternates with serpentine
+                # travel direction, same as the `forward` branch above.
+                direction = 1.0 if forward else -1.0
+                start[travel_i] -= direction * ramp_mm
             out.append(
                 Pass(
                     index=i,
                     start=tuple(float(v) for v in start),
                     end=tuple(float(v) for v in end),
+                    cruise_start=cruise_start if ramp_mm > 0 else None,
                     instrument=self.instrument,
                     axis=self.axis,
                     scan_speed=self.scan_speed,
@@ -563,6 +623,7 @@ class SurveyRunner:
         Returns:
             The passes that were executed.
         """
+        self._fill_tile_accel()
         done: List[Pass] = []
         for p in self.pending():
             reference_point = self._resolve_reference_point(p)
@@ -572,12 +633,16 @@ class SurveyRunner:
             gantry_end = self.lab.frames.gantry_target_for(
                 p.instrument, list(p.end), reference_point=reference_point
             )
+            ramp_note = ""
+            if p.cruise_start is not None and p.cruise_start != p.start:
+                ramp_note = f" (ramp start {tuple(round(v, 1) for v in p.start)})"
             logger.info(
-                "Survey pass %d/%d — %s | experiment %s -> %s | gantry %s -> %s",
+                "Survey pass %d/%d — %s | experiment %s -> %s | gantry %s -> %s%s",
                 p.index + 1, len(self.survey), p.label or p.instrument,
-                tuple(round(v, 1) for v in p.start), tuple(round(v, 1) for v in p.end),
+                tuple(round(v, 1) for v in p.measure_start), tuple(round(v, 1) for v in p.end),
                 tuple(round(float(v), 1) for v in gantry_start),
                 tuple(round(float(v), 1) for v in gantry_end),
+                ramp_note,
             )
             if dry_run:
                 done.append(p)
@@ -593,6 +658,36 @@ class SurveyRunner:
                     wall_time=self.lab.clock.wall_time(), name=p.label,
                 )
         return done
+
+    def _fill_tile_accel(self) -> None:
+        """Read the travel axis's accel into a Tile survey that didn't set one.
+
+        Lets ``Tile`` stay hardware-free for planning/dry-run use
+        (``describe()``, ``coverage_mm()``) while ``run()`` — which already
+        needs a connected gantry — supplies the real number so passes get
+        a ramp-derived lead-in without every caller reading
+        ``get_accel()`` itself. Mutating ``self.survey`` here is safe:
+        ``Tile.passes()`` isn't cached, so `run()`'s subsequent calls pick
+        up the filled-in value immediately.
+
+        A tile with an explicit ``accel_mm_s2`` is left untouched. Any
+        other survey type (e.g. ``Traverse``, which has no such attribute)
+        or a lab with no ``gantry`` is a no-op.
+        """
+        if not isinstance(self.survey, Tile) or self.survey.accel_mm_s2 is not None:
+            return
+        gantry = getattr(self.lab, "gantry", None)
+        if gantry is None:
+            return
+        try:
+            self.survey.accel_mm_s2 = gantry.axis(self.survey.axis).get_accel()
+        except Exception as e:
+            logger.warning(
+                "Could not read %s accel for tile-scan ramp lead-in — "
+                "passes will run without one, and the travel-direction "
+                "seam between swaths (issue #58) may reappear: %s",
+                self.survey.axis, e,
+            )
 
     def _run_pass(self, p: Pass, reference_point: Optional[List[float]] = None) -> Any:
         """Position and measure one pass.
@@ -630,11 +725,28 @@ class SurveyRunner:
                 gantry = getattr(self.lab, "gantry", None)
                 end_gantry = self.lab.frames.gantry_target_for(p.instrument, list(p.end))
                 axis_index = _AXIS_INDEX[p.axis]
+                overrides: Dict[str, Any] = {}
+                if p.scan_speed:
+                    overrides["feed_rate_mm_s"] = p.scan_speed
+                if p.cruise_start is not None:
+                    # A ramp lead-in was planned: tell the scanner where the
+                    # true swath boundary is (for gantry_start_mm/dead
+                    # reckoning) rather than letting it anchor to wherever
+                    # p.start's live pre-motion read happens to be, and give
+                    # it the matching kinematic settle time — same accel and
+                    # scan_speed the lead-in distance was computed from — so
+                    # the trigger fires once the axis has actually covered
+                    # that lead-in, not after an unrelated guess.
+                    cruise_gantry = self.lab.frames.gantry_target_for(
+                        p.instrument, list(p.cruise_start)
+                    )
+                    overrides["cruise_start_mm"] = float(cruise_gantry[axis_index])
+                    overrides["settle_s"] = ramp_time_s(p.scan_speed, self.survey.accel_mm_s2)
                 scan = scanner.acquire(
                     gantry=gantry,
                     axis=p.axis,
                     end_mm=float(end_gantry[axis_index]),
-                    **({"feed_rate_mm_s": p.scan_speed} if p.scan_speed else {}),
+                    **overrides,
                 )
                 result_note = f"points={scan.valid_count}" if scan is not None else "no data"
             else:
