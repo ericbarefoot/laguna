@@ -101,7 +101,8 @@ class TestAcquireIsSchedulable:
         gantry = FakeGantry()
         scanner.acquire(gantry=gantry)
         assert scanner.scans == [
-            {"axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0, "settle_s": 0.5}
+            {"axis": "X", "end_mm": 200.0, "feed_rate_mm_s": 20.0, "settle_s": 0.5,
+             "cruise_start_mm": None}
         ]
 
     def test_an_unconfigured_scanner_is_a_run_stopping_problem(self):

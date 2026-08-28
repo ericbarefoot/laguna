@@ -826,6 +826,7 @@ class GocatorScanner(GocatorSettingsMixin):
         fixed_length_mm: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
         timeout_s: Optional[float] = None,
+        cruise_start_mm: Optional[float] = None,
     ) -> SurfaceScan:
         """Coordinate a gantry pass and a triggered surface capture.
 
@@ -847,6 +848,18 @@ class GocatorScanner(GocatorSettingsMixin):
         ``move_to()`` does, so the caller is responsible for the destination
         being inside the work envelope.
 
+        A caller that commanded this move from further back than where it
+        actually wants the surface anchored — a ramp lead-in, so the axis is
+        already at `feed_rate_mm_s` rather than still accelerating when it
+        crosses the region it cares about — should pass `cruise_start_mm`
+        for that true starting point. Without one, `settle_s` is a blind
+        guess uncorrelated with the axis's actual ramp kinematics, and the
+        recorded surface ends up anchored to wherever the axis happened to
+        be *before* motion was even commanded — the mechanism behind the
+        travel-direction seam described in issue #58. ``Tile``/
+        ``SurveyRunner`` (see `laguna.survey`) already do this; prefer that
+        path over calling this method directly when the seam matters.
+
         Args:
             gantry: A connected GantryController.
             axis: Configured axis *name*, e.g. "X" or "Y".
@@ -855,7 +868,11 @@ class GocatorScanner(GocatorSettingsMixin):
                 sensor as travel speed.
             settle_s: Delay between commanding motion and triggering, to skip
                 the acceleration ramp. Increase if the leading edge of scans
-                looks compressed along Y.
+                looks compressed along Y. When `cruise_start_mm` is also
+                given, this should be the time to cover the lead-in at
+                `feed_rate_mm_s` (``laguna.robot.macron.commands.ramp_time_s``
+                computed from the same accel/feed-rate pair as the lead-in
+                distance) rather than an independent guess.
             fixed_length_mm: Surface length to configure on the sensor, mm.
                 Defaults to None, meaning: derive it from the axis's actual
                 position right now and `end_mm` (``abs(end_mm - current)``),
@@ -870,6 +887,14 @@ class GocatorScanner(GocatorSettingsMixin):
             metadata: Extra context merged into the result's metadata.
             timeout_s: Receive budget in seconds. Defaults to computed value
                 based on configured fixed length and travel speed.
+            cruise_start_mm: The true starting position to record as
+                ``scan.metadata["gantry_start_mm"]`` — the point dead
+                reckoning should anchor to — when it differs from wherever
+                the axis physically is right now (e.g. because motion was
+                commanded from a ramp lead-in behind it). None (the default)
+                keeps today's behavior: the live pre-motion position is
+                used, under both ``gantry_start_mm`` and
+                ``ramp_start_measured_mm``.
 
         Returns:
             The captured :class:`SurfaceScan`, with gantry context in
@@ -910,7 +935,7 @@ class GocatorScanner(GocatorSettingsMixin):
         with arbiter.hold(f"gocator scan {axis} -> {end_mm:.1f}mm"):
             return self._scan_with_gantry(
                 gantry, axis, end_mm, feed_rate_mm_s, settle_s,
-                fixed_length_mm, metadata, timeout_s,
+                fixed_length_mm, metadata, timeout_s, cruise_start_mm,
             )
 
     def _scan_with_gantry(
@@ -923,6 +948,7 @@ class GocatorScanner(GocatorSettingsMixin):
         fixed_length_mm: Optional[float],
         metadata: Optional[Dict[str, Any]],
         timeout_s: Optional[float],
+        cruise_start_mm: Optional[float] = None,
     ) -> SurfaceScan:
         """Body of scan_with_gantry(), with the gantry already held."""
         handle = gantry.axis(axis)
@@ -968,7 +994,13 @@ class GocatorScanner(GocatorSettingsMixin):
 
         meta: Dict[str, Any] = {
             "gantry_axis": axis,
-            "gantry_start_mm": start_mm,
+            # The true anchor for dead reckoning: the caller's cruise_start_mm
+            # when given (the swath boundary a ramp lead-in was planned
+            # around), else the live pre-motion read — today's behavior.
+            # The live read is always preserved separately below, never
+            # discarded, even when overridden.
+            "gantry_start_mm": start_mm if cruise_start_mm is None else cruise_start_mm,
+            "ramp_start_measured_mm": start_mm,
             "gantry_end_mm": end_mm,
             "gantry_feed_rate_mm_s": feed_rate_mm_s,
             "trigger_settle_s": settle_s,
@@ -982,6 +1014,11 @@ class GocatorScanner(GocatorSettingsMixin):
         try:
             axis_names = [a.name for a in gantry._axes]
             positions = {n: gantry.axis(n).get_position() for n in axis_names}
+            if cruise_start_mm is not None:
+                # Only the travel axis is wrong pre-substitution — the two
+                # static axes didn't move, so their live read is already
+                # accurate.
+                positions[axis] = cruise_start_mm
             meta["gantry_start"] = [
                 float(positions[n]) for n in ("X", "Y", "Z") if n in axis_names
             ]
@@ -1139,12 +1176,14 @@ class GocatorScanner(GocatorSettingsMixin):
         # the return move starts.
         arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
         with arbiter.hold(f"gocator acquire {spec['axis']} -> {spec['end_mm']}"):
+            cruise_start_mm = spec.get("cruise_start_mm")
             scan = self.scan_with_gantry(
                 gantry,
                 axis=spec["axis"],
                 end_mm=float(spec["end_mm"]),
                 feed_rate_mm_s=float(spec["feed_rate_mm_s"]),
                 settle_s=float(spec.get("settle_s", 0.5)),
+                cruise_start_mm=float(cruise_start_mm) if cruise_start_mm is not None else None,
             )
             if formats:
                 self.save_scan(scan, formats=formats)

@@ -1139,6 +1139,42 @@ class TestScanWithGantry:
         )
         assert scan.metadata["gantry_start"] == [100.0, 250.0]
 
+    def test_cruise_start_mm_becomes_gantry_start_mm_not_the_live_read(self, scanner):
+        """Issue #58 fix: cruise_start_mm, not a live read, anchors the scan.
+
+        A caller with a ramp lead-in tells the scanner where the true
+        swath boundary is (cruise_start_mm) — that value, not the live
+        pre-motion position, becomes gantry_start_mm, the anchor
+        orient_scan() uses for dead reckoning. The live read is preserved
+        separately, not discarded.
+        """
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0, "Y": 250.0})  # ramp start
+        scan = scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0,
+            cruise_start_mm=42.0,  # the true swath boundary, ahead of the ramp start
+        )
+        assert scan.metadata["gantry_start_mm"] == pytest.approx(42.0)
+        assert scan.metadata["ramp_start_measured_mm"] == pytest.approx(40.0)
+        # Only the travel axis substitutes — the static Y axis's live read
+        # is unaffected, since it never moved.
+        assert scan.metadata["gantry_start"] == [42.0, 250.0]
+
+    def test_without_cruise_start_mm_behavior_is_unchanged(self, scanner):
+        """Omitting cruise_start_mm reproduces pre-#58 behavior exactly.
+
+        Every non-Tile caller today omits it — gantry_start_mm stays the
+        live pre-motion read, same as ramp_start_measured_mm.
+        """
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0, "Y": 250.0})
+        scan = scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+        )
+        assert scan.metadata["gantry_start_mm"] == pytest.approx(40.0)
+        assert scan.metadata["ramp_start_measured_mm"] == pytest.approx(40.0)
+        assert scan.metadata["gantry_start"] == [40.0, 250.0]
+
     def test_feed_rate_becomes_sensor_travel_speed(self, scanner):
         """The whole scheme depends on these two matching."""
         scanner._fake.go.datasets = [[make_surface_msg()]]

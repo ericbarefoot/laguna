@@ -57,6 +57,22 @@ gantry **X** — see "Sensor axes are not gantry axes".) So:
 - If you later measure the true velocity, `SurfaceScan.rescale_y()` fixes
   the travel axis without re-scanning.
 
+**`gantry_start_mm` is the dead-reckoning anchor, and it must be the point
+the trigger actually fired at — not wherever the axis was *before* motion
+was commanded.** A `settle_s` that's just a guess (rather than derived from
+the axis's real accel/feed-rate kinematics) and a `gantry_start_mm` read
+before `begin_move_to()` combine into a travel-direction seam between
+overlapping tile-scan swaths — see issue #58. `Tile`/`SurveyRunner` (see
+`laguna.survey`) fix this by commanding motion from a **ramp start** —
+computed from the axis's configured accel and `scan_speed`
+(`laguna.robot.macron.commands.ramp_distance_mm`/`ramp_time_s`) — set back
+from the true swath boundary (the **cruise start**), so the axis is already
+at speed when it crosses the boundary. `scan_with_gantry()`'s
+`cruise_start_mm` parameter is what makes this possible: pass it and
+`gantry_start_mm` records the true boundary, not a live read (kept
+separately as `ramp_start_measured_mm`). Prefer `Tile`/`SurveyRunner` over
+calling `scan_with_gantry()` directly when the seam matters.
+
 `travel_speed` maps to `GoTransform_SetSpeed()` in the SDK, and to
 **Manage > Motion and Alignment > Speed** in the web UI. It writes to sensor
 **flash**, so `configure()` only pushes it when the value actually changes.

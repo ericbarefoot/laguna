@@ -8,9 +8,33 @@ the data is being stitched.
 import numpy as np
 import pytest
 
-from laguna.robot.macron.commands import Axis
+from laguna.robot.macron.commands import Axis, ramp_distance_mm, ramp_time_s
 from laguna.scanner.mounting import SensorMounting
 from laguna.survey import Pass, Tile, Traverse, SurveyRunner
+
+
+class TestRampKinematics:
+    """Tests for ramp_distance_mm / ramp_time_s.
+
+    The accel-ramp math the tile-scan lead-in (issue #58) is built on.
+    """
+
+    @pytest.mark.parametrize("feed_rate,accel,expected_distance,expected_time", [
+        (20.0, 100.0, 2.0, 0.2),      # v^2/2a = 400/200, v/a = 0.2
+        (100.0, 50.0, 100.0, 2.0),    # v^2/2a = 10000/100, v/a = 2.0
+        (10.0, 10.0, 5.0, 1.0),
+    ])
+    def test_matches_kinematics_formula(self, feed_rate, accel, expected_distance, expected_time):
+        assert ramp_distance_mm(feed_rate, accel) == pytest.approx(expected_distance)
+        assert ramp_time_s(feed_rate, accel) == pytest.approx(expected_time)
+
+    @pytest.mark.parametrize("feed_rate,accel", [
+        (0.0, 100.0), (-5.0, 100.0), (None, 100.0),
+        (20.0, 0.0), (20.0, -1.0), (20.0, None),
+    ])
+    def test_non_positive_or_unknown_input_gives_zero(self, feed_rate, accel):
+        assert ramp_distance_mm(feed_rate, accel) == 0.0
+        assert ramp_time_s(feed_rate, accel) == 0.0
 
 
 class TestTileGeometry:
@@ -102,6 +126,62 @@ class TestTileGeometry:
     def test_serpentine_can_be_disabled(self):
         passes = self._tile(serpentine=False, width_mm=3000.0, swath_mm=1000.0).passes()
         assert all(p.end[0] > p.start[0] for p in passes)
+
+    def test_no_accel_leaves_start_and_cruise_start_identical(self):
+        """Default (no ramp lead-in): backward-compatible with pre-#58
+        behavior — start IS the swath boundary, cruise_start is unset."""
+        passes = self._tile(width_mm=3000.0, swath_mm=1000.0, scan_speed=20.0).passes()
+        for p in passes:
+            assert p.cruise_start is None
+            assert p.measure_start == p.start
+
+    def test_accel_shifts_start_behind_the_true_boundary(self):
+        """With accel_mm_s2 set, Pass.start (the commanded/ramp start) moves
+        back along the travel axis by the accel-ramp distance, while
+        cruise_start keeps the true swath boundary the plan asked for —
+        this is the fix for issue #58's travel-direction seam."""
+        survey = self._tile(
+            axis="X", width_mm=3000.0, swath_mm=1000.0,
+            scan_speed=20.0, accel_mm_s2=100.0,
+        )
+        expected_ramp = ramp_distance_mm(20.0, 100.0)
+        assert expected_ramp == pytest.approx(2.0)  # v^2/2a = 400/200
+        passes = survey.passes()
+        for p in passes:
+            assert p.cruise_start is not None
+            # length_mm/measure_start reflect the true swath, unaffected by
+            # the ramp lead-in.
+            assert p.measure_start == p.cruise_start
+            assert p.length_mm == pytest.approx(survey.length_mm)
+
+    def test_ramp_lead_in_lands_on_the_correct_side_per_serpentine_leg(self):
+        """Forward passes ramp in from behind (smaller travel coordinate);
+        reversed serpentine passes ramp in from the far side (larger
+        coordinate) — either way the axis is already at scan_speed when it
+        crosses cruise_start, from whichever direction it's travelling."""
+        survey = self._tile(
+            axis="X", serpentine=True, width_mm=3000.0, swath_mm=1000.0,
+            scan_speed=20.0, accel_mm_s2=100.0,
+        )
+        ramp = ramp_distance_mm(20.0, 100.0)
+        passes = survey.passes()
+        # pass 0: forward (start=origin -> end=+length): ramp start is
+        # BEHIND cruise_start (smaller travel-axis coordinate).
+        assert passes[0].end[0] > passes[0].cruise_start[0]
+        assert passes[0].start[0] == pytest.approx(passes[0].cruise_start[0] - ramp)
+        # pass 1: reversed (cruise_start=+length -> end=origin): ramp start
+        # is further along than cruise_start (larger travel-axis coordinate).
+        assert passes[1].end[0] < passes[1].cruise_start[0]
+        assert passes[1].start[0] == pytest.approx(passes[1].cruise_start[0] + ramp)
+
+    def test_zero_scan_speed_means_no_lead_in_even_with_accel_set(self):
+        """ramp_distance_mm's own guard (feed_rate <= 0 -> 0.0) must reach
+        through Tile.passes() as "no lead-in needed", not a crash."""
+        passes = self._tile(
+            width_mm=1000.0, swath_mm=1000.0, accel_mm_s2=100.0,
+        ).passes()  # scan_speed left unset
+        assert passes[0].cruise_start is None
+        assert passes[0].start == passes[0].measure_start
 
     def test_indices_are_sequential_from_zero(self):
         assert [p.index for p in self._tile(width_mm=3000.0, swath_mm=1000.0)] == [0, 1, 2]
@@ -633,3 +713,120 @@ class TestSurveyRunner:
         assert seen["end"] == [100.0, 0.0, 0.0, 42.0]  # X, Y, Z, then Theta backfilled
         assert seen["axis"] == "X"
         assert runner.results[0].path == "fake.csv"  # ProfileResult, not the Gocator SurfaceScan branch
+
+
+class TestRampLeadInIntegration:
+    """SurveyRunner wiring for the issue #58 fix.
+
+    A Tile with accel_mm_s2 (explicit, or auto-filled from the live axis)
+    commands the gantry from the ramp start while telling the scanner the
+    true swath boundary.
+    """
+
+    class FakeAxisHandle:
+        """Reports a fixed accel, nothing else — that's all `_fill_tile_accel()` reads."""
+
+        def __init__(self, accel_mm_s2):
+            """Store the accel this handle reports."""
+            self._accel = accel_mm_s2
+
+        def get_accel(self):
+            """Return the configured accel, mm/s^2."""
+            return self._accel
+
+    class FakeGantryWithAccel:
+        """A gantry whose axes report a fixed configured accel."""
+
+        def __init__(self, accel_mm_s2=100.0):
+            """Store the accel every axis handle will report."""
+            self._accel = accel_mm_s2
+
+        def axis(self, name):
+            """Return a FakeAxisHandle reporting this gantry's accel."""
+            return TestRampLeadInIntegration.FakeAxisHandle(self._accel)
+
+    def _survey(self, **kw):
+        base = dict(
+            origin=(0.0, 0.0, 0.0), length_mm=100.0, width_mm=1000.0,
+            swath_mm=1000.0, overlap=0.0, scan_speed=20.0, axis="X",
+        )
+        base.update(kw)
+        return Tile(**base)
+
+    def test_explicit_accel_shifts_the_placed_point_not_the_scan_anchor(self):
+        """lab.place() gets the ramp start; the scanner gets the boundary.
+
+        `Pass.start` (ramp start) is what's placed; `Pass.cruise_start`
+        (the true boundary) reaches the scanner via `cruise_start_mm`.
+        """
+        survey = self._survey(accel_mm_s2=100.0)
+        lab = FakeLab()
+        SurveyRunner(lab, survey).run()
+
+        expected_ramp = ramp_distance_mm(20.0, 100.0)
+        placed_point = lab.placed[0][1]
+        cruise_start = survey.passes()[0].cruise_start
+        assert placed_point[0] == pytest.approx(cruise_start[0] - expected_ramp)
+        assert lab.gocator.acquired[0]["cruise_start_mm"] == pytest.approx(cruise_start[0])
+        assert lab.gocator.acquired[0]["settle_s"] == pytest.approx(
+            ramp_time_s(20.0, 100.0)
+        )
+
+    def test_no_accel_places_directly_at_the_boundary_as_before(self):
+        """Backward compatible: no accel_mm_s2 means no behavior change.
+
+        Without it, placement and the scanner call are identical to
+        pre-#58 behavior.
+        """
+        survey = self._survey()  # accel_mm_s2 left unset
+        lab = FakeLab()
+        SurveyRunner(lab, survey).run()
+        assert lab.placed[0][1][0] == pytest.approx(0.0)  # tile origin, no shift
+        assert "cruise_start_mm" not in lab.gocator.acquired[0]
+
+    def test_run_auto_fills_accel_from_the_live_axis(self):
+        """A Tile left with accel_mm_s2=None gets it from the live axis.
+
+        `gantry.axis(...).get_accel()` is read before any pass runs, so
+        callers don't have to read it themselves.
+        """
+        survey = self._survey()  # accel_mm_s2 left unset
+        lab = FakeLab()
+        lab.gantry = self.FakeGantryWithAccel(accel_mm_s2=50.0)
+        SurveyRunner(lab, survey).run()
+        assert survey.accel_mm_s2 == 50.0
+        assert "cruise_start_mm" in lab.gocator.acquired[0]
+
+    def test_explicit_accel_is_not_overwritten_by_auto_fill(self):
+        """An explicit accel_mm_s2 wins over whatever the live axis reports."""
+        survey = self._survey(accel_mm_s2=25.0)
+        lab = FakeLab()
+        lab.gantry = self.FakeGantryWithAccel(accel_mm_s2=999.0)
+        SurveyRunner(lab, survey).run()
+        assert survey.accel_mm_s2 == 25.0
+
+    def test_unreadable_accel_logs_a_warning_and_runs_without_a_lead_in(self, caplog):
+        """An accel read failure degrades gracefully, with a clear reason.
+
+        A gantry that can't report accel (unconnected axis, older
+        firmware) must not fail the survey — it just loses the seam fix,
+        with a warning explaining why, per CLAUDE.md's requirement that a
+        pause/degraded-mode's cause be legible in the log.
+        """
+        import logging
+
+        class BrokenGantry:
+            """Raises on any axis lookup, simulating an unreadable accel."""
+
+            def axis(self, name):
+                """Simulate a gantry axis that can't be reached."""
+                raise RuntimeError("not connected")
+
+        survey = self._survey()  # accel_mm_s2 left unset
+        lab = FakeLab()
+        lab.gantry = BrokenGantry()
+        with caplog.at_level(logging.WARNING, logger="laguna.survey"):
+            SurveyRunner(lab, survey).run()
+        assert survey.accel_mm_s2 is None
+        assert "issue #58" in caplog.text or "seam" in caplog.text
+        assert "cruise_start_mm" not in lab.gocator.acquired[0]
