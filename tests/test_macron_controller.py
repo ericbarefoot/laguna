@@ -346,6 +346,21 @@ class TestSubsystemInterface:
         controller.estop()   # none may propagate
 
 
+def _seq(*values):
+    """Scripted response that walks through `values`, then repeats the last."""
+    it = iter(values)
+    last = [values[-1]]
+
+    def respond(_command):
+        try:
+            last[0] = next(it)
+        except StopIteration:
+            pass
+        return last[0]
+
+    return respond
+
+
 class TestMoveTo:
     def _make_controller(self, responses=None, mm_per_unit=15.0):
         conn = FakeSnapConnection(responses or {})
@@ -365,13 +380,17 @@ class TestMoveTo:
             "C1 BMT 10 0": "0",
             "C1 SPD": "20",  # no F word/speed given — read X/Y's own speed to predict duration
             "C1 MIF": "1",
-            "A1 ACP": "150",  # post-move resync of X/Y from hardware
+            "A1 ACP": _seq("0", "150"),  # pre-plan resync, then post-move resync of X/Y
             "A2 ACP": "0",
+            "A5 ACP": "0",
             "A6 ACP": "0",
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
+        # Every axis is read first (the planning cache is synced to hardware
+        # before anything is planned), then the move, then the touched-axes resync.
         assert conn.sent == [
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",
             "C1 INI 1 2", "C1 BMT 10 0", "C1 SPD", "C1 MIF", "A1 ACP", "A2 ACP", "A6 ACP",
         ]
 
@@ -381,44 +400,116 @@ class TestMoveTo:
             controller.move_to([1.0, 2.0])
 
     def test_vector_move_is_fence_checked(self):
-        cfg = dict(BASE_CONFIG, fences=[{"type": "box", "name": "bed", "x": [0, 10], "y": [0, 10], "z": [0, 10]}])
-        controller = GantryController.from_config(_cfg(cfg))
-        from laguna.robot.macron.fences import FenceViolation
+        from laguna.robot.macron.fences import BoxFence, FenceViolation
 
+        conn = FakeSnapConnection(
+            {"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"}
+        )
+        controller = GantryController(
+            connection=conn, mm_per_unit=15.0,
+            fences=[BoxFence("bed", 0, 10, 0, 10, 0, 10)],
+        )
         with pytest.raises(FenceViolation):
             controller.move_to([500.0, 500.0, 5.0, 0.0])
 
     def test_keyword_move_backfills_other_cartesian_axes_and_routes_through_gcode(self):
-        # Only X given -> Y/Z backfilled via a live get_actual_position()
-        # read, then the whole thing goes through the same coordinated
-        # gcode path as the vector form (C1 INI/SPD/BMT/MIF), not a
-        # single-axis A1 MVT.
+        # Only X given -> Y/Z backfilled from the just-synced planning cache
+        # (no separate read), then the whole thing goes through the same
+        # coordinated gcode path as the vector form (C1 INI/SPD/BMT/MIF),
+        # not a single-axis A1 MVT.
         responses = {
-            "A2 ACP": "0",  # Y backfill
-            "A5 ACP": "0",  # Z backfill
+            "A2 ACP": "0",  # Y, read once by the pre-plan sync
+            "A5 ACP": "0",  # Z, read once by the pre-plan sync
+            "A6 ACP": "0",
             "C1 INI 1 2": "0",
             "C1 SPD 0.133333": "0.133333",
             "C1 BMT 10 0": "0",
             "C1 MIF": "1",
-            "A1 ACP": "150",  # post-move resync of X/Y from hardware
+            "A1 ACP": _seq("0", "150"),  # pre-plan sync, then post-move resync
         }
         controller, conn = self._make_controller(responses)
         assert controller.move_to(X=150.0, speed=2.0) is True
         assert conn.sent == [
-            "A2 ACP", "A5 ACP", "C1 INI 1 2", "C1 SPD 0.133333", "C1 BMT 10 0", "C1 MIF",
+            "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",
+            "C1 INI 1 2", "C1 SPD 0.133333", "C1 BMT 10 0", "C1 MIF",
             "A1 ACP", "A2 ACP",
         ]
 
     def test_keyword_move_is_fence_checked(self):
         from laguna.robot.macron.fences import BoxFence, FenceViolation
 
-        conn = FakeSnapConnection({"A2 ACP": "0", "A5 ACP": "0"})
+        conn = FakeSnapConnection(
+            {"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"}
+        )
         controller = GantryController(
             connection=conn, mm_per_unit=15.0,
             fences=[BoxFence("bed", 0, 10, 0, 10, 0, 10)],
         )
         with pytest.raises(FenceViolation):
             controller.move_to(X=500.0)  # Y/Z backfill to 0,0 (in-bounds); X clearly outside
+
+    # -- planning starts from hardware, not from a stale cache ----------
+
+    def _stale_cache_controller(self, fences=None, responses=None):
+        """Gcode believes X=1200; hardware is really at X=450 (raw 30)."""
+        base = {
+            "A1 ACP": _seq("30", "80"),   # sync reads 450 mm; post-move reads 1200 mm
+            "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
+            "C1 INI 1 2": "0", "C1 BMT 80 0": "0", "C1 SPD": "20", "C1 MIF": "1",
+        }
+        base.update(responses or {})
+        conn = FakeSnapConnection(base)
+        controller = GantryController(connection=conn, mm_per_unit=15.0, fences=fences)
+        controller.gcode._current_pos = (1200.0, 0.0, 0.0)   # left over from before a scan
+        return controller, conn
+
+    def test_move_back_to_where_the_cache_thinks_we_are_still_moves(self):
+        """Regression: after scan_with_gantry() the cache still said X=1200, so
+        move_to(X=1200) planned a zero-length leg, sent nothing and returned True."""
+        controller, conn = self._stale_cache_controller()
+        assert controller.move_to(X=1200.0) is True
+        assert "C1 BMT 80 0" in conn.sent
+
+    def test_fence_check_uses_the_real_start_not_the_stale_cache(self):
+        """The real path is X 450 -> 1200; the stale cache's was 1200 -> 1200,
+        which never touches this fence."""
+        from laguna.robot.macron.fences import BoxFence, FenceViolation
+
+        controller, conn = self._stale_cache_controller(
+            fences=[BoxFence("blocker", 600, 700, -10, 10, -10, 10)]
+        )
+        with pytest.raises(FenceViolation):
+            controller.move_to(X=1200.0)
+        assert not any("BMT" in c for c in conn.sent)
+
+    def test_untouched_axes_are_backfilled_from_the_synced_reading_not_a_second_read(self):
+        """Two reads of a settling axis can differ by more than the position
+        epsilon; a backfill from a second read would plan a phantom near-zero
+        Y leg on an axis nobody asked to move."""
+        controller, conn = self._make_controller({
+            "A1 ACP": _seq("0", "10"),
+            "A2 ACP": _seq("0", "0.0001"),   # second read is 0.0015 mm away
+            "A5 ACP": "0", "A6 ACP": "0",
+            "C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 SPD": "20", "C1 MIF": "1",
+        })
+        assert controller.move_to(X=150.0) is True
+        assert "C1 BMT 10 0" in conn.sent       # Y stays exactly 0
+
+    def test_a_failed_position_read_refuses_the_move(self):
+        """Unknown position is not a reason to guess: nothing may be planned."""
+        from laguna.robot.macron.connection import SnapMotionError
+
+        controller, conn = self._make_controller({"A1 ACP": SnapMotionError(0, "timeout")})
+        with pytest.raises(SnapMotionError):
+            controller.move_to(X=150.0)
+        assert not any(c.startswith("C1") for c in conn.sent)
+
+    def test_dry_run_does_not_read_hardware_to_sync(self):
+        controller, conn = self._make_controller({"A2 ACP": "0", "A5 ACP": "0"})
+        controller.gcode._dry_run = True
+        controller.move_to(X=150.0)
+        assert "A1 ACP" not in conn.sent
+        assert conn.sent == ["A2 ACP", "A5 ACP"]
 
     def test_theta_only_keyword_move_does_not_touch_cartesian_axes(self):
         # A pure Theta move must not query, move, or otherwise touch X/Y/Z

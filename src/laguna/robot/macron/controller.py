@@ -799,11 +799,34 @@ class GantryController:
 
         cartesian_axes = [axis for axis in self._axes if axis.name != "Theta"]
         if any(axis.name in target_by_name for axis in cartesian_axes):
+            # Plan from where the gantry actually is, not from what gcode last
+            # believed. Anything that moved an axis without going through
+            # gcode (scan_with_gantry(), a direct lab.gantry.x.begin_move_to(),
+            # a manual jog) leaves that cache stale, and a stale start position
+            # is used for three things at once: deciding which legs run (a
+            # move to "where the cache thinks we are" silently no-ops while
+            # returning True), the fence check's path, and the leg distances.
+            # Not needed in dry-run, which has no hardware to read.
+            if self.gcode.dry_run:
+                live_by_name = {
+                    a.name: self.cmd.get_actual_position(a)
+                    for a in cartesian_axes
+                    if a.name not in target_by_name
+                }
+            else:
+                self.gcode.sync_position_from_hardware()
+                live_by_name = dict(zip(("X", "Y", "Z"), self.gcode.current_position))
             gcode_words: List[str] = []
             for axis in cartesian_axes:
                 value = target_by_name.get(axis.name)
                 if value is None:
-                    value = self.cmd.get_actual_position(axis)  # backfill: real current position
+                    # Backfill from the *same* reading the cache was just synced
+                    # to, never a second read: two reads of a settling axis can
+                    # differ by more than _POSITION_EPSILON_MM, and any such
+                    # difference on an axis nobody asked to move is a phantom
+                    # near-zero leg (see GCodeExecutor._sync_position_from_hardware
+                    # and _apply_scaled_ramp for what those do to ACL/DCL).
+                    value = live_by_name[axis.name]
                 gcode_words.append(f"{axis.name}{value:.6f}")
             if speed is not None:
                 gcode_words.append(f"F{speed * 60:.6f}")  # gcode feed rate is mm/min
@@ -927,6 +950,19 @@ class GantryController:
         # _persist_position()'s docstring), but that's still far closer to
         # reality than the stale pre-move state.
         self._sync_position_after_direct_motion("soft_stop()")
+
+    def resync_position(self, source: str) -> None:
+        """Re-read every axis into the planning cache and the position checkpoint.
+
+        Call after moving an axis directly — through an AxisHandle, self.cmd, or
+        anything else that bypasses move_to()'s gcode path — once that motion
+        has finished. move_to() also resyncs on its own before planning, so
+        this mainly keeps the on-disk checkpoint honest. Never raises.
+
+        Args:
+            source: Caller name, for the log message if the resync fails.
+        """
+        self._sync_position_after_direct_motion(source)
 
     def _sync_position_after_direct_motion(self, source: str) -> None:
         """Resync gcode's cached position and the on-disk checkpoint after direct motion.

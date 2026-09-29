@@ -692,6 +692,19 @@ class GCodeExecutor:
         self._group_initialized = False
         self._theta_group_initialized = False
 
+    @property
+    def dry_run(self) -> bool:
+        """True if moves are only logged and tracked, never sent to hardware."""
+        return self._dry_run
+
+    @property
+    def current_position(self) -> Point3D:
+        """The (X, Y, Z) this executor plans its next move from, in mm.
+
+        A cache, not a live read — see sync_position_from_hardware().
+        """
+        return self._current_pos
+
     def plan(self, text: str) -> CheckedTrajectory:
         """Parse G-code and fence-check both elbow orderings.
 
