@@ -1019,14 +1019,33 @@ class GantryController:
         (motor on first, brake released second — never leave an axis with
         neither holding it); turning it back on re-engages them, since
         safe_mode's own gate is about to stop motor torque being
-        re-commanded. No-op if not currently connected — connect() applies
-        the release side itself, using whatever safe_mode is set to by then.
+        re-commanded.
+
+        Turning safe_mode *off* requires an explicit connect() first and
+        raises otherwise, changing nothing. Without a live connection there is
+        no agent to relaunch and no brakes to release, so "off" would only
+        flip flags while whatever agent might exist keeps its old gate — the
+        flag would say motion is allowed when it isn't (or, worse, lie about
+        which state the hardware is in). Turning safe_mode *on* while
+        disconnected is always allowed: it can only make things safer, and
+        connect() applies the release side itself using whatever safe_mode is
+        set to by then.
 
         Returns:
             True if the change took effect (including a successful
             reconnect, if one was needed); False if a required reconnect
             failed — check logs and call connect() again once resolved.
+
+        Raises:
+            SnapMotionError: If ``enabled`` is False and connect() has not
+                been called (or the gantry was disconnected).
         """
+        if not enabled and not self._is_connected:
+            raise SnapMotionError(
+                0,
+                "Cannot disable safe_mode while disconnected — call connect() first "
+                "(lab.connect_all() or gantry.connect()). Nothing was changed.",
+            )
         self._safe_mode = enabled
         if hasattr(self._connection, "safe_mode"):
             self._connection.safe_mode = enabled

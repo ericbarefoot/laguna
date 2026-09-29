@@ -225,6 +225,59 @@ class TestIsConnected:
         assert conn.is_connected is False
 
 
+class TestNoImplicitConnect:
+    """send()/start_scan() must not open a link nobody asked for: launching
+    the agent fixes its --allow-motion gate, so a lazy first connect used to
+    bake in whatever safe_mode was set at that instant."""
+
+    def _never_connected(self, **overrides):
+        kwargs = dict(host="red", ssh_user="oak", remote_serial_device="/dev/x")
+        kwargs.update(overrides)
+        conn = PiGantryConnection(**kwargs)
+        conn.connect = lambda: pytest.fail("send() must not call connect()")
+        return conn
+
+    def test_send_before_connect_raises_without_connecting(self):
+        conn = self._never_connected(safe_mode=False)
+        with pytest.raises(SnapMotionError, match="call connect"):
+            conn.send("A1 ACP")
+
+    def test_start_scan_before_connect_raises_without_connecting(self):
+        conn = self._never_connected(safe_mode=False)
+        with pytest.raises(SnapMotionError, match="call connect"):
+            conn.start_scan(
+                axis="X", end_mm=10.0, feed_rate_mm_s=5.0,
+                al1342_host="h", pdin_port=1, output="o.csv",
+            )
+
+    def test_send_after_disconnect_raises_without_reconnecting(self):
+        conn, _ = _make_connection(safe_mode=False)
+        conn._connect_requested = True
+        conn.disconnect()
+        conn.connect = lambda: pytest.fail("send() must not call connect()")
+        with pytest.raises(SnapMotionError, match="call connect"):
+            conn.send("A1 ACP")
+
+    def test_dropped_link_after_explicit_connect_still_reconnects(self):
+        conn, channel = _make_connection(safe_mode=False)
+        conn._connect_requested = True
+        channel.closed = True
+        calls = []
+        conn._reconnect = lambda: calls.append("reconnect") or (_ for _ in ()).throw(
+            SnapMotionError(0, "stop here")
+        )
+        with pytest.raises(SnapMotionError, match="stop here"):
+            conn.send("A1 ACP")
+        assert calls == ["reconnect"]
+
+    def test_reconnect_disabled_raises_plain_not_connected(self):
+        conn, channel = _make_connection(reconnect_on_failure=False)
+        conn._connect_requested = True
+        channel.closed = True
+        with pytest.raises(SnapMotionError, match="Not connected"):
+            conn.send("A1 ACP")
+
+
 class TestSafeModeConnection:
     def test_blocks_unsafe_command_before_reaching_inner_connection(self):
         inner = FakeSnapConnection({})

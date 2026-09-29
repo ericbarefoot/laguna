@@ -291,6 +291,10 @@ class PiGantryConnection(SnapConnection):
                                                   # pattern as MqttSubscriber._is_connected
         self._reader_thread: Optional[threading.Thread] = None
         self._reader_stop = threading.Event()
+        # True only between a successful connect() and the next disconnect().
+        # Gates send()/start_scan()'s auto-reconnect so a link that was never
+        # opened deliberately is not silently opened for you — see _ensure_link().
+        self._connect_requested = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -376,6 +380,7 @@ class PiGantryConnection(SnapConnection):
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
 
+        self._connect_requested = True
         logger.info("Connected to gantry agent on %s via SSH", self.host)
 
     def _warn_about_stale_port_holders(self, client) -> None:
@@ -426,6 +431,7 @@ class PiGantryConnection(SnapConnection):
 
     def disconnect(self) -> None:
         """Close the connection to the gantry agent gracefully."""
+        self._connect_requested = False
         self._reader_stop.set()
         channel = self._channel
         client = self._client
@@ -539,11 +545,7 @@ class PiGantryConnection(SnapConnection):
             raise SnapMotionError(0, "Cannot send interactive command: scan in progress")
 
         with self._lock:
-            if not self.is_connected:
-                if self.reconnect_on_failure:
-                    self._reconnect()
-                else:
-                    raise SnapMotionError(0, "Not connected")
+            self._ensure_link()
 
             request_id = self._next_id
             self._next_id += 1
@@ -608,11 +610,7 @@ class PiGantryConnection(SnapConnection):
             raise SnapMotionError(0, "Scan already in progress")
 
         with self._lock:
-            if not self.is_connected:
-                if self.reconnect_on_failure:
-                    self._reconnect()
-                else:
-                    raise SnapMotionError(0, "Not connected")
+            self._ensure_link()
 
             request_id = self._next_id
             self._next_id += 1
@@ -671,6 +669,31 @@ class PiGantryConnection(SnapConnection):
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _ensure_link(self) -> None:
+        """Raise unless the link is open, or was open and may be re-opened.
+
+        Auto-reconnect exists to ride out a dropped link, not to open one
+        nobody asked for. Launching the agent is also what fixes its
+        --allow-motion gate (see connect()), so a lazy first connect used to
+        bake in whatever ``safe_mode`` happened to be set at that instant,
+        while the controller above never learned it was connected — no brake
+        release, no soft limits, no position sync — and a later
+        set_safe_mode(False) skipped the relaunch, leaving the agent blocking
+        motion that the client-side gate had allowed. Callers must connect()
+        explicitly; only a link that connect() opened is ever re-opened here.
+
+        Must be called with ``self._lock`` held.
+        """
+        if self.is_connected:
+            return
+        if not self._connect_requested:
+            raise SnapMotionError(
+                0, "Not connected — call connect() first (lab.connect_all() or gantry.connect())"
+            )
+        if not self.reconnect_on_failure:
+            raise SnapMotionError(0, "Not connected")
+        self._reconnect()
 
     def _reconnect(self) -> None:
         for attempt in range(1, self.max_reconnect_attempts + 1):

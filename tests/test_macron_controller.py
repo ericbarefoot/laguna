@@ -1118,15 +1118,40 @@ class TestSetSafeMode:
     def test_flag_propagates_to_the_transport_gate(self):
         controller, conn = self._make_controller(safe_mode=True)
         conn.safe_mode = True
+        controller.connect()
         controller.set_safe_mode(False)
         assert controller._safe_mode is False
         assert conn.safe_mode is False
 
-    def test_no_brake_traffic_when_not_connected(self):
-        """connect() applies the release side itself, with whatever
-        safe_mode is set to by then."""
+    def test_disabling_while_disconnected_raises_and_changes_nothing(self):
+        """No live agent to relaunch and no brakes to release — flipping the
+        flag alone would misreport what the hardware will actually allow."""
+        from laguna.robot.macron.connection import SnapMotionError
         controller, conn = self._make_controller(safe_mode=True)
-        controller.set_safe_mode(False)
+        conn.safe_mode = True
+        with pytest.raises(SnapMotionError, match="call connect"):
+            controller.set_safe_mode(False)
+        assert controller._safe_mode is True
+        assert conn.safe_mode is True
+        assert conn.sent == []
+
+    def test_disabling_after_disconnect_raises(self):
+        from laguna.robot.macron.connection import SnapMotionError
+        controller, _ = self._make_controller(safe_mode=True)
+        controller.connect()
+        controller.disconnect()
+        with pytest.raises(SnapMotionError):
+            controller.set_safe_mode(False)
+        assert controller._safe_mode is True
+
+    def test_enabling_while_disconnected_is_allowed_with_no_brake_traffic(self):
+        """Moving toward safe never needs a connection; connect() applies
+        the release side itself, with whatever safe_mode is set to by then."""
+        controller, conn = self._make_controller(safe_mode=False)
+        conn.safe_mode = False
+        assert controller.set_safe_mode(True) is True
+        assert controller._safe_mode is True
+        assert conn.safe_mode is True
         assert conn.sent == []
 
     def test_axis_handles_see_the_new_flag_immediately(self):
@@ -1134,6 +1159,7 @@ class TestSetSafeMode:
         must take effect without rebuilding them."""
         from laguna.robot.macron.connection import SnapMotionError
         controller, _ = self._make_controller(safe_mode=True)
+        controller.connect()
         with pytest.raises(SnapMotionError):
             controller.y.begin_move_to(1)
         controller.set_safe_mode(False)
