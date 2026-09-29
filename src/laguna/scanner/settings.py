@@ -30,6 +30,7 @@ What lives here, and what each knob is worth (all measured on hardware
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Dict, Optional
 
@@ -85,6 +86,45 @@ def _name(mapping: Dict[int, str], value: Any) -> str:
     key = int(value)
     return mapping.get(key, f"unknown({key})")
 
+def _stages_edits(fn):
+    """Decorate configure(): start from the sensor's real state, then stage.
+
+    Refreshes first (discarding any stale or half-applied local cache) so
+    what configure() leaves untouched is whatever the sensor actually holds
+    — including GUI edits — rather than a copy from connect() time. Marks the
+    cache dirty for the duration so the set_* calls nested inside it don't
+    each refresh and discard the edits configure() has already staged. If
+    configure() raises partway, the half-applied cache is discarded rather
+    than left looking like sensor state to the next get_*.
+
+    Passes straight through when not connected, so configure()'s own
+    argument validation still runs (and raises) in its usual order.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        if not self._is_connected:
+            return fn(self, *args, **kwargs)
+        self.refresh(discard_unflushed=True)
+        self._unflushed = True
+        try:
+            result = fn(self, *args, **kwargs)
+        except BaseException:
+            try:
+                self.refresh(discard_unflushed=True)
+            except Exception as exc:
+                logger.warning(
+                    "Could not discard a partly-applied configure() (%s) — call "
+                    "refresh(discard_unflushed=True) once the sensor is reachable",
+                    exc,
+                )
+            raise
+        self._unflushed = False
+        return result
+
+    return wrapper
+
+
 class GocatorSettingsMixin:
     """The Gocator's configuration surface.
 
@@ -95,6 +135,58 @@ class GocatorSettingsMixin:
     #: Active-area fields, in the order the web UI presents them: an origin
     #: (x, y, z) and the extents from it (width, length, height), all mm.
     _ACTIVE_AREA_FIELDS = ("x", "y", "z", "width", "length", "height")
+
+    #: True while set_*(flush=False) / configure() have written to the SDK's
+    #: local cache but not yet pushed it with GoSensor_Flush. refresh() will
+    #: not discard those edits unless told to.
+    _unflushed = False
+
+    def refresh(self, discard_unflushed: bool = False) -> bool:
+        """Re-read the sensor's configuration into the SDK's local cache.
+
+        Every ``get_*`` and ``GoSetup_*`` read here is served from a copy the
+        SDK loaded at ``connect()``, not a live query — so a change made in
+        the sensor's web GUI, by its alignment tool, or by another client
+        stays invisible until the cache is refreshed. This calls
+        ``GoSensor_Refresh``, which discards all locally-cached information
+        and re-reads it. Every public ``get_*`` and ``set_*`` calls this
+        first; call it directly to re-sync after GUI work.
+
+        Skipped, returning False, when it would do harm rather than good:
+
+          - **While acquiring** — the sensor is mid-scan and its
+            configuration is not something to reload underneath it.
+          - **With unflushed edits pending** (``set_*(flush=False)`` staged
+            but not yet flushed): refreshing would silently throw them away.
+            Flush them, or pass ``discard_unflushed=True`` to drop them.
+
+        Args:
+            discard_unflushed: Drop staged, unflushed edits and refresh
+                anyway.
+
+        Returns:
+            True if the cache was refreshed; False if skipped (a warning is
+            logged when unflushed edits were the reason).
+
+        Raises:
+            RuntimeError: If not connected.
+            GoSdkError: If the SDK call fails.
+        """
+        lib = self._require_connected()
+        if self._is_running:
+            logger.debug("Skipping Gocator refresh: acquisition is running")
+            return False
+        if self._unflushed and not discard_unflushed:
+            logger.warning(
+                "Gocator refresh skipped: unflushed set_*(flush=False) edits are "
+                "pending and would be discarded. Values read now reflect those "
+                "staged edits, not the sensor. Flush them, or call "
+                "refresh(discard_unflushed=True)."
+            )
+            return False
+        lib.call("GoSensor_Refresh", self._sensor)
+        self._unflushed = False
+        return True
 
     def get_active_area(self) -> Dict[str, Any]:
         """Read the sensor's active area (region of interest), in mm.
@@ -116,6 +208,15 @@ class GocatorSettingsMixin:
         Raises:
             RuntimeError: If not connected.
             GoSdkError: If any SDK call fails.
+        """
+        self.refresh()
+        return self._read_active_area()
+
+    def _read_active_area(self) -> Dict[str, Any]:
+        """Read from the SDK's local cache without refreshing first.
+
+        For internal read-backs inside a set_*/configure() sequence, where a
+        refresh would discard the edits just staged.
         """
         lib = self._require_connected()
         setup = lib.handle("GoSensor_Setup", self._sensor)
@@ -193,6 +294,7 @@ class GocatorSettingsMixin:
             )
 
         lib = self._require_connected()
+        self.refresh()
         setup = lib.handle("GoSensor_Setup", self._sensor)
         role = _g.k32s(_g.GO_ROLE_MAIN)
 
@@ -221,6 +323,7 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+        self._unflushed = not flush
 
         # configure() re-applies self._active_area on every call (any field
         # it's already tracking, not just ones this particular configure()
@@ -231,7 +334,7 @@ class GocatorSettingsMixin:
         # replace, matching "only the fields you pass are written" above.
         self._active_area = {**(self._active_area or {}), **given}
 
-        applied = self.get_active_area()
+        applied = self._read_active_area()
         logger.info(
             "Gocator active area set: %s -> %s",
             given,
@@ -265,6 +368,15 @@ class GocatorSettingsMixin:
             ``z_options`` (the divisors this sensor supports, e.g. [1, 2, 4]),
             and ``x_system_value``/``z_system_value`` (the sensor's own
             defaults).
+        """
+        self.refresh()
+        return self._read_subsampling()
+
+    def _read_subsampling(self) -> Dict[str, Any]:
+        """Read from the SDK's local cache without refreshing first.
+
+        For internal read-backs inside a set_*/configure() sequence, where a
+        refresh would discard the edits just staged.
         """
         lib = self._require_connected()
         setup = lib.handle("GoSensor_Setup", self._sensor)
@@ -317,9 +429,10 @@ class GocatorSettingsMixin:
             raise ValueError("set_subsampling() needs x= and/or z=")
 
         lib = self._require_connected()
+        self.refresh()
         setup = lib.handle("GoSensor_Setup", self._sensor)
         role = _g.k32s(_g.GO_ROLE_MAIN)
-        available = self.get_subsampling()
+        available = self._read_subsampling()
 
         for axis, value in (("x", x), ("z", z)):
             if value is None:
@@ -343,6 +456,7 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+        self._unflushed = not flush
 
         # See set_active_area()'s matching comment: configure() re-applies
         # self._subsampling on every call, so a direct set_subsampling()
@@ -351,12 +465,21 @@ class GocatorSettingsMixin:
         given = {k: v for k, v in (("x", x), ("z", z)) if v is not None}
         self._subsampling = {**(self._subsampling or {}), **given}
 
-        applied = self.get_subsampling()
+        applied = self._read_subsampling()
         logger.info("Gocator subsampling set: x=%s z=%s", applied["x"], applied["z"])
         return applied
 
     def get_spacing_interval(self) -> Dict[str, Any]:
         """Read the X resampling bin size (uniform spacing's grid pitch)."""
+        self.refresh()
+        return self._read_spacing_interval()
+
+    def _read_spacing_interval(self) -> Dict[str, Any]:
+        """Read from the SDK's local cache without refreshing first.
+
+        For internal read-backs inside a set_*/configure() sequence, where a
+        refresh would discard the edits just staged.
+        """
         lib = self._require_connected()
         setup = lib.handle("GoSensor_Setup", self._sensor)
         role = _g.k32s(_g.GO_ROLE_MAIN)
@@ -421,6 +544,7 @@ class GocatorSettingsMixin:
             )
 
         lib = self._require_connected()
+        self.refresh()
         setup = lib.handle("GoSensor_Setup", self._sensor)
         role = _g.k32s(_g.GO_ROLE_MAIN)
 
@@ -446,6 +570,7 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+        self._unflushed = not flush
 
         # See set_active_area()'s matching comment. Uses the resolved
         # `type` (defaulted to "custom" above when omitted), not the raw
@@ -453,7 +578,7 @@ class GocatorSettingsMixin:
         given = {k: v for k, v in (("type", type), ("value_mm", value_mm)) if v is not None}
         self._spacing_interval = {**(self._spacing_interval or {}), **given}
 
-        applied = self.get_spacing_interval()
+        applied = self._read_spacing_interval()
         logger.info("Gocator spacing interval set: %s", applied)
         return applied
 
@@ -465,6 +590,15 @@ class GocatorSettingsMixin:
             window_limit_max}}`` for each of ``_FILTERS``. ``available``
             mirrors the sensor's own ``GoSetup_*Used`` — false in
             point-cloud mode, since these act on the resampled grid.
+        """
+        self.refresh()
+        return self._read_filters()
+
+    def _read_filters(self) -> Dict[str, Dict[str, Any]]:
+        """Read from the SDK's local cache without refreshing first.
+
+        For internal read-backs inside a set_*/configure() sequence, where a
+        refresh would discard the edits just staged.
         """
         lib = self._require_connected()
         setup = lib.handle("GoSensor_Setup", self._sensor)
@@ -527,6 +661,7 @@ class GocatorSettingsMixin:
             )
 
         lib = self._require_connected()
+        self.refresh()
         setup = lib.handle("GoSensor_Setup", self._sensor)
 
         # Validate every window before writing any, so a bad value can't
@@ -558,11 +693,12 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+        self._unflushed = not flush
 
         # See set_active_area()'s matching comment.
         self._filters = {**(self._filters or {}), **filters}
 
-        applied = self.get_filters()
+        applied = self._read_filters()
         logger.info(
             "Gocator filters set: %s",
             {k: (applied[k]["enabled"], applied[k]["window_mm"]) for k in filters},
@@ -724,6 +860,15 @@ class GocatorSettingsMixin:
             (the sensor's live range), and ``max_mode`` (whether max-
             frame-rate mode is currently enabled).
         """
+        self.refresh()
+        return self._read_frame_rate()
+
+    def _read_frame_rate(self) -> Dict[str, Any]:
+        """Read from the SDK's local cache without refreshing first.
+
+        For internal read-backs inside a set_*/configure() sequence, where a
+        refresh would discard the edits just staged.
+        """
         lib = self._require_connected()
         setup = lib.handle("GoSensor_Setup", self._sensor)
         return {
@@ -780,6 +925,7 @@ class GocatorSettingsMixin:
             raise ValueError("set_frame_rate() needs hz= and/or max_mode=True")
 
         lib = self._require_connected()
+        self.refresh()
         setup = lib.handle("GoSensor_Setup", self._sensor)
 
         if max_mode:
@@ -799,6 +945,7 @@ class GocatorSettingsMixin:
 
         if flush:
             lib.call("GoSensor_Flush", self._sensor)
+        self._unflushed = not flush
 
         achieved = float(lib.go.GoSetup_FrameRate(setup))
         if not max_mode and abs(achieved - float(hz)) > 1e-3:
@@ -822,6 +969,7 @@ class GocatorSettingsMixin:
         )
         return {"frame_rate_hz": self._frame_rate_hz, "frame_rate_max": self._frame_rate_max}
 
+    @_stages_edits
     def configure(
         self,
         mode: Optional[str] = None,
@@ -1121,6 +1269,7 @@ class GocatorSettingsMixin:
                 self._travel_speed_mm_s = float(speed)
 
         lib.call("GoSensor_Flush", self._sensor)
+        self._unflushed = False
 
         if use_max:
             # There is no "requested" rate to validate against here — max

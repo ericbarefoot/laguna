@@ -57,6 +57,21 @@ gantry **X** — see "Sensor axes are not gantry axes".) So:
 - If you later measure the true velocity, `SurfaceScan.rescale_y()` fixes
   the travel axis without re-scanning.
 
+**Settings are served from a cache — `refresh()` re-syncs it.** The SDK loads
+the sensor's configuration once, at `connect()`, and every `get_*` reads that
+local copy, not the sensor. A change made afterwards in the web GUI, by the
+alignment tool, or by another client is invisible until
+`GoSensor_Refresh` discards the cache and re-reads it. Every public `get_*`
+and `set_*` calls `scanner.refresh()` first, and `configure()` starts with
+one, so values you didn't specify keep whatever the sensor really holds. Call
+`refresh()` yourself to re-sync after GUI work. It is skipped (returns False)
+while acquiring, and while `set_*(flush=False)` edits are staged but not yet
+flushed, since refreshing would silently discard them — pass
+`refresh(discard_unflushed=True)` to drop them deliberately.
+`configure()` is authoritative for every value in the config: those overwrite
+the sensor's, GUI-tuned or not, so copy settings you want to keep from the GUI
+into the config.
+
 `travel_speed` maps to `GoTransform_SetSpeed()` in the SDK, and to
 **Manage > Motion and Alignment > Speed** in the web UI. It writes to sensor
 **flash**, so `configure()` only pushes it when the value actually changes.
