@@ -34,8 +34,9 @@ from __future__ import annotations
 
 import time
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
 
 from .commands import (
     MMCCommands, Axis, IOMap, X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS,
@@ -105,6 +106,10 @@ class HomingConfig:
         )
 
 
+class HomingFailed(RuntimeError):
+    """Homing did not complete; the message names the axis and the cause."""
+
+
 @dataclass
 class HomingResult:
     """Result of a homing sequence execution."""
@@ -169,6 +174,12 @@ class HomingProcedure:
 
         self._disengage_brake_if_needed(axis)
 
+        with self._stop_on_failure(axis):
+            return self._home_axis_moving(axis, ax_cfg, is_tripped)
+
+    def _home_axis_moving(self, axis: Axis, ax_cfg: AxisHomingConfig, is_tripped) -> float:
+        """The motion part of home_axis(); any failure in here stops the axis."""
+        cfg = self._config
         self._backoff_if_already_tripped(axis, is_tripped, ax_cfg.homing_direction)
 
         self._issue(lambda: self._cmd._jog(axis, ax_cfg.homing_direction * cfg.homing_speed))
@@ -247,6 +258,14 @@ class HomingProcedure:
 
         self._disengage_brake_if_needed(axis)
 
+        with self._stop_on_failure(axis):
+            return self._locate_limit_switch_moving(axis, direction, is_tripped, ax_cfg)
+
+    def _locate_limit_switch_moving(
+        self, axis: Axis, direction: float, is_tripped, ax_cfg: AxisHomingConfig
+    ) -> float:
+        """The motion part of locate_limit_switch(); any failure in here stops the axis."""
+        cfg = self._config
         self._backoff_if_already_tripped(axis, is_tripped, direction)
 
         self._issue(lambda: self._cmd._jog(axis, direction * cfg.homing_speed))
@@ -296,6 +315,45 @@ class HomingProcedure:
     def _check_halt(self) -> None:
         if self._guard is not None:
             self._guard.check()
+
+    @contextmanager
+    def _stop_on_failure(self, axis: Axis) -> Iterator[None]:
+        """Abort `axis` if anything goes wrong while it may be moving, then re-raise.
+
+        Found on hardware 2026-10-05: one ``INB 3`` read timed out mid-search
+        (the controller went quiet for 5 s), the SnapMotionError escaped the
+        polling loop, home_all() recorded a failure and returned — and the
+        jog kept running, because nothing had told the axis to stop. A jog
+        is not bounded by the soft limits, so only a person stopped it.
+
+        A halt (MotionHalted) is left alone: the halt verb already sent its
+        own stop. Anything else gets ABT, retried, because the most likely
+        cause is the very link that has to carry it.
+        """
+        try:
+            yield
+        except MotionHalted:
+            raise
+        except BaseException:
+            self._abort_until_acknowledged(axis)
+            raise
+
+    def _abort_until_acknowledged(self, axis: Axis, attempts: int = 3) -> None:
+        for attempt in range(1, attempts + 1):
+            try:
+                self._cmd.abort(axis)
+                logger.error("Axis %s: homing failed mid-motion — axis aborted", axis.name)
+                return
+            except Exception as exc:
+                logger.critical(
+                    "Axis %s: homing failed mid-motion and ABORT attempt %d/%d failed: %s",
+                    axis.name, attempt, attempts, exc,
+                )
+                time.sleep(0.2)
+        logger.critical(
+            "Axis %s MAY STILL BE MOVING — could not confirm an abort. Stop it by hand "
+            "(physical e-stop) and check the link to the controller.", axis.name,
+        )
 
     def _issue(self, send) -> None:
         """Send one motion-starting command under the halt guard, if one is set."""

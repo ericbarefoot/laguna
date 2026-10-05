@@ -366,3 +366,65 @@ class TestHomingIsHaltable:
         with pytest.raises(MotionHalted):
             proc.home_all()
         assert "A1 JOG -10" not in conn.sent
+
+
+class TestAFailureMidSearchStopsTheAxis:
+    """Hardware regression 2026-10-05: an INB read timed out mid-search, the
+    error escaped, and the jog kept running until a person paused it."""
+
+    def _procedure(self, inb):
+        conn = FakeSnapConnection({"INB 1": inb, "A1 JOG -10": "-10", "A1 ABT": "0"})
+        config = HomingConfig(
+            poll_interval_s=0.001, default_timeout_s=5.0, backoff_timeout_s=1.0,
+            axis_configs={X_AXIS: AxisHomingConfig(input_index=1)},
+        )
+        return HomingProcedure(MMCCommands(conn), config), conn
+
+    def test_a_switch_read_timeout_aborts_the_jog(self):
+        reads = {"n": 0}
+
+        def inb(_cmd):
+            reads["n"] += 1
+            if reads["n"] >= 3:
+                raise SnapMotionError(600, "Timed out waiting for agent response to 'INB 1'")
+            return "0"
+
+        proc, conn = self._procedure(inb)
+        with pytest.raises(SnapMotionError, match="Timed out"):
+            proc.home_axis(X_AXIS)
+        assert conn.sent.index("A1 JOG -10") < conn.sent.index("A1 ABT")
+
+    def test_home_all_still_reports_the_failure_after_stopping(self):
+        def inb(_cmd):
+            raise SnapMotionError(600, "timeout")
+
+        proc, conn = self._procedure(inb)
+        proc._config.home_order = (X_AXIS,)
+        result = proc.home_all()
+        assert result.success is False
+        # The first INB read (already-tripped check) fails before any jog, so
+        # an abort is still sent — harmless, and the axis is certainly stopped.
+        assert "A1 ABT" in conn.sent
+
+    def test_the_abort_is_retried_when_the_link_is_flaky(self):
+        attempts = {"n": 0}
+
+        def abt(_cmd):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise SnapMotionError(600, "timeout")
+            return "0"
+
+        reads = {"n": 0}
+
+        def inb(_cmd):
+            reads["n"] += 1
+            if reads["n"] >= 2:
+                raise SnapMotionError(600, "timeout")
+            return "0"
+
+        proc, conn = self._procedure(inb)
+        conn.responses["A1 ABT"] = abt
+        with pytest.raises(SnapMotionError):
+            proc.home_axis(X_AXIS)
+        assert attempts["n"] == 3

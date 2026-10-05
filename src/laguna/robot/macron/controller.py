@@ -35,7 +35,7 @@ from .connection import EthernetConnection, RS232Connection, SnapConnection, Sna
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
 from .gcode import GCodeExecutor
 from .halt import HaltLatch, HaltLevel, MotionGuard, MotionHalted
-from .homing import AxisHomingConfig, HomingConfig, HomingProcedure
+from .homing import AxisHomingConfig, HomingConfig, HomingFailed, HomingProcedure
 from ..motion_arbiter import DEFAULT_ARBITER, MotionBusyError
 from .move_handle import MoveHandle
 from .pi_bridge import PiGantryConnection
@@ -800,6 +800,10 @@ class GantryController:
                     raise
                 except Exception:
                     logger.exception("%s — failed", description)
+                    # A failed command or poll mid-traverse says nothing about
+                    # whether the axes stopped — a jog or a long leg keeps
+                    # going on its own. Stop everything before reporting.
+                    self._stop_after_failure(description)
                     raise
                 finally:
                     self._persist_position()
@@ -815,6 +819,16 @@ class GantryController:
         return MoveHandle.run_in_background(
             description, _prepare, lambda: self.arbiter.hold(description, timeout_s=0)
         )
+
+    def _stop_after_failure(self, description: str) -> None:
+        """Best-effort BST on every axis after a motion operation failed mid-flight. Never raises."""
+        logger.error("%s failed mid-motion — stopping every axis", description)
+        try:
+            self.soft_stop()
+        except Exception as exc:  # soft_stop already guards per axis; belt and braces
+            logger.critical(
+                "%s: could not stop the gantry after a failure (%s) — STOP IT BY HAND", description, exc,
+            )
 
     def _resolve_targets(
         self,
@@ -1444,14 +1458,18 @@ class GantryController:
         """Run the homing routine on all configured axes. Non-blocking.
 
         Returns:
-            A MoveHandle; its ``result`` is True once every axis homed,
-            False if an axis failed (see the log for which and why).
+            A MoveHandle; ``.wait()`` raises HomingFailed (naming the axis
+            and cause) if any axis failed — every axis has been stopped by
+            then. ``result`` is True on success.
         """
         def _home_all() -> bool:
             result = self.homing.home_all()
             if not result.success:
-                logger.error("home() — did not find home: %s", result.error)
-            return result.success
+                raise HomingFailed(
+                    f"home() did not complete — homed {sorted(result.axis_results)} before "
+                    f"failing: {result.error}"
+                )
+            return True
 
         return self._run_homing("home()", _home_all)
 

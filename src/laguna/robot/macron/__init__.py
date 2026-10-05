@@ -21,7 +21,7 @@ from .commands import (
     THETA_AXIS,
     ALL_AXES,
 )
-from .homing import HomingConfig, HomingResult, HomingProcedure, AxisHomingConfig
+from .homing import HomingConfig, HomingFailed, HomingResult, HomingProcedure, AxisHomingConfig
 from .fences import (
     BoxFence,
     CylinderFence,
@@ -73,6 +73,7 @@ __all__ = [
     # homing
     "AxisHomingConfig",
     "HomingConfig",
+    "HomingFailed",
     "HomingResult",
     "HomingProcedure",
     # fences

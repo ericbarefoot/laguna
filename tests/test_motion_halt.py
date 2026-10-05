@@ -527,6 +527,27 @@ class TestMotorsOff:
         assert gantry.get_status()["motors_off"] == []
 
 
+class TestAFailureMidMoveStopsEverything:
+    def test_a_poll_timeout_mid_move_stops_every_axis(self):
+        """A failed MIF poll says nothing about whether the axis stopped —
+        the move used to keep going while the handle reported failure."""
+        gantry, conn = _gantry({
+            "C1 BMT 10 0": "0",
+            "C1 MIF": SnapMotionError(600, "Timed out waiting for agent response to 'C1 MIF'"),
+        })
+        with pytest.raises(SnapMotionError, match="Timed out"):
+            gantry.move_to(X=10.0).wait(timeout=2)
+        assert {"A1 BST", "A2 BST", "A5 BST", "A6 BST"} <= set(conn.sent)
+        assert conn.sent.index("C1 BMT 10 0") < conn.sent.index("A1 BST")
+
+    def test_a_halt_does_not_trigger_a_second_stop(self):
+        gantry, conn = _gantry({"C1 BMT 10 0": "0"})
+        conn.responses["C1 MIF"] = lambda _c: (gantry.pause(), "0")[1]
+        with pytest.raises(MotionHalted):
+            gantry.move_to(X=10.0).wait(timeout=2)
+        assert conn.sent.count("A1 BST") == 1
+
+
 class TestEstop:
     def test_does_not_read_positions_before_returning(self):
         """FlumeLab estops the gantry first; position reads here delayed the

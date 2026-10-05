@@ -571,7 +571,10 @@ class TestHomeEnableDisableWaitForMove:
             controller.homing, "home_all",
             lambda: HomingResult(success=False, axis_results={}, error="timeout"),
         )
-        assert controller.home().wait().result is False
+        from laguna.robot.macron.homing import HomingFailed
+
+        with pytest.raises(HomingFailed, match="timeout"):
+            controller.home().wait()
 
     def test_locate_limit_switch_delegates_to_homing_and_accepts_axis_forms(self, monkeypatch):
         controller, _conn = self._make_controller({})
@@ -617,7 +620,7 @@ class TestHomeEnableDisableWaitForMove:
         )
         with pytest.raises(SnapMotionError):
             controller.home_axis(X_AXIS).wait()
-        assert resynced == [True]
+        assert resynced, "position not resynced after a failed homing"
 
     def test_home_resyncs_gcode_position(self, monkeypatch):
         controller, _conn = self._make_controller({})
