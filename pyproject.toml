@@ -35,6 +35,9 @@ dependencies = [
     "paho-mqtt>=1.6",          # MQTT client — rangefinder/OD2000 data path via AL1342
 ]
 
+[project.scripts]
+laguna-picam = "laguna.camera.picam:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
