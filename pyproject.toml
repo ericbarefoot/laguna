@@ -51,6 +51,11 @@ scanner = [
     # smaller than CSV on a full-resolution scan.
     "laspy[lazrs]>=2.5",
 ]
+dslr = [
+    # Canon DSLR capture (laguna.camera.canon). The wheel bundles
+    # libgphoto2, so no system package is needed. Linux only.
+    "gphoto2>=2.5",
+]
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",

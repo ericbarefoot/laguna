@@ -124,7 +124,7 @@ Two separate channels, for two separate audiences:
 ```python
 lab.weir.go_to_elevation(300.0)     # -> archival row: weir / go_to_elevation / target_mm=300.00
 lab.flow.qin = True                 # -> archival row: flow / qin / state=True
-lab.dslr_cameras.capture_all()      # -> one archival row per camera: capture / file=...
+lab.dslr_cameras.capture_all()      # -> one archival row per camera: capture / file=... (or capture_failed)
 ```
 
 Passive reads stay **out** of the archival log by default — a reading
