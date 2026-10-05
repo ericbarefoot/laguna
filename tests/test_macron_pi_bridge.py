@@ -703,3 +703,24 @@ class TestSshKeyTildeExpansion:
     def test_absolute_path_is_unchanged(self, monkeypatch):
         monkeypatch.setenv("HOME", "/home/testuser")
         assert os.path.expanduser("/etc/keys/id_ed25519") == "/etc/keys/id_ed25519"
+
+
+class TestPerCommandTimeout:
+    def test_a_short_timeout_reaches_the_agent_and_bounds_the_wait(self):
+        import time as _time
+
+        conn, channel = _make_connection(timeout=5.0)
+        start = _time.monotonic()
+        with pytest.raises(SnapMotionError) as exc_info:
+            conn.send("INB 3", timeout=0.1)
+        assert _time.monotonic() - start < 1.0
+        assert exc_info.value.code == COMM_TIMEOUT_CODE
+        assert json.loads(channel.sent[0].decode("ascii"))["timeout"] == 0.1
+
+    def test_read_input_bit_rejects_a_command_string(self):
+        """read_input_bit("INB 3") used to send "INB INB 3" — escape 31."""
+        from laguna.robot.macron.commands import MMCCommands
+
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(TypeError, match="input number"):
+            cmd.read_input_bit("INB 3")

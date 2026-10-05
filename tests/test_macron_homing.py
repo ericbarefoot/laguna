@@ -151,7 +151,6 @@ class TestHomeAxisBrakeHandling:
     def test_disengages_brake_for_y_axis(self):
         responses = {
             "SOB 4 1": "0",  # disengage
-            "INB 8": "1",  # brake status confirms released
             # 1st call is the not-already-tripped backoff check; trips on
             # the 2nd (the first poll inside the jog-and-wait loop).
             "INB 3": _trip_after(1),
@@ -164,7 +163,7 @@ class TestHomeAxisBrakeHandling:
         }
         conn = FakeSnapConnection(responses)
         cmd = MMCCommands(conn)
-        io_map = IOMap(y_brake_output=4, y_brake_status_input=8)
+        io_map = IOMap(y_brake_output=4)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
             default_timeout_s=1.0, backoff_timeout_s=1.0,
@@ -173,6 +172,9 @@ class TestHomeAxisBrakeHandling:
         proc = HomingProcedure(cmd, config, io_map=io_map)
         proc.home_axis(Y_AXIS)
         assert "SOB 4 1" in conn.sent
+        # Command-only: INB 8 proved unreliable on hardware and is never read.
+        assert "INB 8" not in conn.sent
+        assert conn.sent.index("SOB 4 1") < conn.sent.index("A2 JOG -10")
 
     def test_raises_if_brake_channel_not_configured(self):
         conn = FakeSnapConnection({})
@@ -186,11 +188,8 @@ class TestHomeAxisBrakeHandling:
         with pytest.raises(ValueError):
             proc.home_axis(Y_AXIS)
 
-    def test_z_brake_status_unreachable_trusts_commanded_output_and_proceeds(self):
-        # z_brake_status_input is None by default (IOMap) — architecturally
-        # unreachable via ASCII, not just unconfigured. Homing must not
-        # raise NotImplementedError out of the confirm-wait; it should
-        # trust the SOB command it just issued and proceed.
+    def test_z_brake_release_trusts_the_commanded_output_and_proceeds(self):
+        # Brakes are command-only — no status input is read for any axis.
         responses = {
             "SOB 5 1": "0",  # disengage — never followed by an INB read for status
             "INB 5": _trip_after(1),  # 1st call = backoff check, 2nd = tripped
@@ -264,7 +263,7 @@ class TestHomeAll:
         }
         conn = FakeSnapConnection(responses)
         cmd = MMCCommands(conn)
-        io_map = IOMap(y_brake_output=4, y_brake_status_input=8)
+        io_map = IOMap(y_brake_output=4)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
             default_timeout_s=1.0, backoff_timeout_s=1.0,
@@ -428,3 +427,21 @@ class TestAFailureMidSearchStopsTheAxis:
         with pytest.raises(SnapMotionError):
             proc.home_axis(X_AXIS)
         assert attempts["n"] == 3
+
+
+class TestSwitchReadsAreShortTimeout:
+    def test_switch_reads_during_a_search_use_the_short_timeout(self):
+        """A stalled read at the 5 s default let the jog run 5 s unwatched
+        (hardware, 2026-10-05: ~50 mm past Y's switch)."""
+        conn = FakeSnapConnection({
+            "INB 1": _trip_after(2), "A1 JOG -10": "-10", "A1 BST": "0",
+            "A1 MIF": _trip_after(0), "A1 ACP": "0", "A1 ACP 0": "0", "A1 BMT 5": "0",
+        })
+        config = HomingConfig(
+            poll_interval_s=0.001, default_timeout_s=1.0, backoff_timeout_s=1.0,
+            switch_read_timeout_s=0.3,
+            axis_configs={X_AXIS: AxisHomingConfig(input_index=1)},
+        )
+        HomingProcedure(MMCCommands(conn), config).home_axis(X_AXIS)
+        inb_timeouts = [t for c, t in zip(conn.sent, conn.timeouts) if c == "INB 1"]
+        assert inb_timeouts and all(t == 0.3 for t in inb_timeouts)

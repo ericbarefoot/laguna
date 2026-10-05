@@ -75,7 +75,7 @@ class SnapConnection(ABC):
         ...
 
     @abstractmethod
-    def send(self, command: str) -> str:
+    def send(self, command: str, timeout: Optional[float] = None) -> str:
         """Send one ASCII command and return the response value token as a string.
 
         Appends CR, blocks until the controller responds with a ``>``-terminated
@@ -86,6 +86,10 @@ class SnapConnection(ABC):
 
         Args:
             command: ASCII command string (CR will be appended).
+            timeout: Seconds to wait for this reply, overriding the
+                connection's default. Used for reads that are only useful if
+                they're prompt — a homing switch poll that stalls for the
+                default 5 s lets the jog run on for 5 s unwatched.
 
         Returns:
             Response value token as a string.
@@ -163,11 +167,12 @@ class EthernetConnection(SnapConnection):
         """True if socket is currently open."""
         return self._socket is not None
 
-    def send(self, command: str) -> str:
+    def send(self, command: str, timeout: Optional[float] = None) -> str:
         """Send command over TCP/IP socket.
 
         Args:
             command: ASCII command string.
+            timeout: Reply timeout for this command; defaults to self.timeout.
 
         Returns:
             Response value token as a string.
@@ -178,18 +183,23 @@ class EthernetConnection(SnapConnection):
         with self._lock:
             if self._socket is None:
                 raise SnapMotionError(0, "Not connected")
+            wait = self.timeout if timeout is None else timeout
             try:
+                self._socket.settimeout(wait)
                 self._socket.sendall((command + "\r").encode("ascii"))
-                return _parse_response(self._read_until_prompt())
+                return _parse_response(self._read_until_prompt(wait))
             except socket.timeout:
                 raise SnapMotionError(
                     COMM_TIMEOUT_CODE, f"Timeout waiting for response to: {command!r}"
                 )
             except OSError as exc:
                 raise SnapMotionError(0, f"Socket error: {exc}") from exc
+            finally:
+                if self._socket is not None:
+                    self._socket.settimeout(self.timeout)
 
-    def _read_until_prompt(self) -> str:
-        """Read from socket until ``>`` prompt is received.
+    def _read_until_prompt(self, timeout: float) -> str:
+        """Read from socket until ``>`` prompt is received, or `timeout` elapses.
 
         Returns:
             Raw response string (bytes decoded as ASCII).
@@ -198,7 +208,7 @@ class EthernetConnection(SnapConnection):
             SnapMotionError: If timeout occurs or connection closes before prompt.
         """
         buf = b""
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + timeout
         while _PROMPT not in buf:
             if time.monotonic() > deadline:
                 raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for '>' prompt")
@@ -297,11 +307,12 @@ class RS232Connection(SnapConnection):
         """True if serial port is currently open."""
         return self._serial is not None and self._serial.is_open
 
-    def send(self, command: str) -> str:
+    def send(self, command: str, timeout: Optional[float] = None) -> str:
         """Send command over serial port.
 
         Args:
             command: ASCII command string.
+            timeout: Reply timeout for this command; defaults to self.timeout.
 
         Returns:
             Response value token as a string.
@@ -312,17 +323,22 @@ class RS232Connection(SnapConnection):
         with self._lock:
             if not self.is_connected:
                 raise SnapMotionError(0, "Not connected")
+            wait = self.timeout if timeout is None else timeout
             try:
+                self._serial.timeout = wait
                 self._serial.write((command + "\r").encode("ascii"))
-                raw = self._read_until_prompt()
+                raw = self._read_until_prompt(wait)
             except SnapMotionError:
                 raise
             except Exception as exc:
                 raise SnapMotionError(0, f"Serial error: {exc}") from exc
+            finally:
+                if self._serial is not None:
+                    self._serial.timeout = self.timeout
             return _parse_response(raw)
 
-    def _read_until_prompt(self) -> str:
-        """Read from serial port until ``>`` prompt is received.
+    def _read_until_prompt(self, timeout: float) -> str:
+        """Read from serial port until ``>`` prompt is received, or `timeout` elapses.
 
         Returns:
             Raw response string (bytes decoded as ASCII).
@@ -331,7 +347,7 @@ class RS232Connection(SnapConnection):
             SnapMotionError: If timeout occurs or no prompt received.
         """
         buf = b""
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + timeout
         while _PROMPT not in buf:
             if time.monotonic() > deadline:
                 raise SnapMotionError(COMM_TIMEOUT_CODE, "Timed out waiting for '>' prompt")

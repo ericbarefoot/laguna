@@ -312,13 +312,6 @@ class GantryController:
         """
         self._resolve_axis_handle(axis).disengage_brake()
 
-    def brake_is_disengaged(self, axis: "Axis | AxisHandle | str") -> bool:
-        """True if the given axis's brake is currently disengaged (released).
-
-        See engage_brake() above for accepted `axis` forms.
-        """
-        return self._resolve_axis_handle(axis).brake_is_disengaged()
-
     def read_home_switch(self, axis: "Axis | AxisHandle | str") -> bool:
         """Read the given axis's home switch state.
 
@@ -1636,13 +1629,9 @@ def _build_io_map(axes_cfg: List[Dict[str, Any]]) -> IOMap:
         if name == "y":
             if entry.get("brake_output") is not None:
                 kwargs["y_brake_output"] = entry["brake_output"]
-            if entry.get("brake_status_input") is not None:
-                kwargs["y_brake_status_input"] = entry["brake_status_input"]
         elif name == "z":
             if entry.get("brake_output") is not None:
                 kwargs["z_brake_output"] = entry["brake_output"]
-            if entry.get("brake_status_input") is not None:
-                kwargs["z_brake_status_input"] = entry["brake_status_input"]
         elif name == "theta":
             if entry.get("limit_input") is not None:
                 kwargs["theta_limit_input"] = entry["limit_input"]

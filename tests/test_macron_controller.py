@@ -30,7 +30,7 @@ BASE_CONFIG = {
     "safe_mode": True,
     "axes": [
         {"name": "X", "index": 1},
-        {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+        {"name": "Y", "index": 2, "brake_output": 4},
         {"name": "Z", "index": 5},
         {"name": "Theta", "index": 6},
     ],
@@ -86,11 +86,8 @@ class TestFromConfigAxesAndIOMap:
         controller = GantryController.from_config(_cfg(BASE_CONFIG))
         io_map = controller._io_map
         assert io_map.y_brake_output == 4
-        assert io_map.y_brake_status_input == 8
-        # z_brake_status_input / theta_limit_input live on the responder's
-        # own input bank — unreachable via ASCII, so they stay None even
-        # when unconfigured in the axes list (see IOMap docstring).
-        assert io_map.z_brake_status_input is None
+        # theta_limit_input lives on the responder's own input bank —
+        # unreachable via ASCII, so it stays None (see IOMap docstring).
         assert io_map.theta_limit_input is None
 
     def test_missing_axes_falls_back_to_default_four(self):
@@ -103,7 +100,7 @@ class TestFromConfigAxesAndIOMap:
         cfg = dict(BASE_CONFIG)
         cfg["axes"] = [
             {"name": "X", "index": 1, "soft_negative_limit_mm": -5, "soft_positive_limit_mm": 495},
-            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Y", "index": 2, "brake_output": 4},
             {"name": "Z", "index": 5},
             {"name": "Theta", "index": 6},
         ]
@@ -151,7 +148,7 @@ class TestFromConfigAxesAndIOMap:
         cfg = dict(BASE_CONFIG, mm_per_acp_unit=15.0)
         cfg["axes"] = [
             {"name": "X", "index": 1},
-            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Y", "index": 2, "brake_output": 4},
             {"name": "Z", "index": 5, "mm_per_unit": 13.5},
             {"name": "Theta", "index": 6},
         ]
@@ -189,7 +186,7 @@ class TestFromConfigHomingAndFences:
         cfg = dict(BASE_CONFIG)
         cfg["axes"] = [
             {"name": "X", "index": 1, "home_switch": "limit"},
-            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Y", "index": 2, "brake_output": 4},
             {"name": "Z", "index": 5},
             {"name": "Theta", "index": 6},
         ]
@@ -201,7 +198,7 @@ class TestFromConfigHomingAndFences:
         cfg = dict(BASE_CONFIG)
         cfg["axes"] = [
             {"name": "X", "index": 1, "home_trip_on_high": True},
-            {"name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8},
+            {"name": "Y", "index": 2, "brake_output": 4},
             {"name": "Z", "index": 5},
             {"name": "Theta", "index": 6},
         ]

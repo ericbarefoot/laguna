@@ -140,33 +140,13 @@ class TestIOMapGatedBrakeHelpers:
             cmd.disengage_brake(Y_AXIS, io_map)
         assert conn.sent == []  # never reached the wire
 
-    def test_brake_is_disengaged_uses_confirmed_y_status_channel(self):
-        # y_brake_status_input=8 (INB 8) is confirmed by eab-2026-07-16/17.dsm
-        # and is IOMap's default — should work with zero configuration.
-        conn = FakeSnapConnection({"INB 8": "1"})
-        cmd = MMCCommands(conn)
-        io_map = IOMap()
-        assert cmd.brake_is_disengaged(Y_AXIS, io_map) is True
-
-    def test_brake_is_disengaged_raises_not_implemented_for_z(self):
-        # z_brake_status_input lives on the responder's own input bank
-        # (TNamedIO ModuleNumber=1) and has no ASCII addressing path from
-        # here — this is an architectural gap, not a "not yet probed" one,
-        # so it must raise NotImplementedError rather than ValueError.
-        conn = FakeSnapConnection({})
-        cmd = MMCCommands(conn)
-        io_map = IOMap()  # z_brake_status_input defaults to None
-        with pytest.raises(NotImplementedError):
-            cmd.brake_is_disengaged(Z_AXIS, io_map)
-        assert conn.sent == []  # never reached the wire
-
-    def test_non_brake_axis_always_reports_free(self):
-        conn = FakeSnapConnection({})
-        cmd = MMCCommands(conn)
-        io_map = IOMap()
-        assert cmd.brake_is_disengaged(X_AXIS, io_map) is True
-        assert conn.sent == []
-
+    def test_brake_status_is_never_read(self):
+        """Brakes are command-only: Y's status input (INB 8) proved
+        unreliable on hardware and Z's is unreachable, so neither the
+        IOMap nor MMCCommands offers a status read any more."""
+        assert not hasattr(MMCCommands, "brake_is_disengaged")
+        assert not hasattr(IOMap(), "y_brake_status_input")
+        assert not hasattr(IOMap(), "z_brake_status_input")
 
 class TestIOMapGatedHomeAndLimitSwitches:
     def test_read_home_switch_uses_confirmed_default_channels(self):

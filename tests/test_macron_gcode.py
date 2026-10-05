@@ -209,7 +209,7 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None, with_
     # channel) so homing tests can exercise the full brake-confirm flow;
     # this is not a claim about real reachability.
     io_map = IOMap(
-        y_brake_output=4, z_brake_output=5, y_brake_status_input=8, z_brake_status_input=7
+        y_brake_output=4, z_brake_output=5
     )
     homing = HomingProcedure(cmd, homing_config, io_map=io_map)
     executor = GCodeExecutor(

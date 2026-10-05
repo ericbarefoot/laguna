@@ -147,7 +147,7 @@ class Config:
                         "max_travel_mm": 8000.0,
                     },
                     {
-                        "name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8,
+                        "name": "Y", "index": 2, "brake_output": 4,
                         "home_switch": "home", "home_trip_on_high": False,
                         "max_travel_mm": 1200.0,
                     },

@@ -47,6 +47,10 @@ from .halt import MotionGuard, MotionHalted
 
 logger = logging.getLogger(__name__)
 
+#: Seconds to wait after commanding a brake release before moving the axis.
+#: Matches the 0.5 s the old status-readback loop waited at most.
+BRAKE_RELEASE_SETTLE_S = 0.5
+
 
 @dataclass
 class AxisHomingConfig:
@@ -67,6 +71,11 @@ class HomingConfig:
     homing_speed: float = 10.0          # mm/s — slow enough to stop cleanly
     standoff_distance: float = 5.0      # mm to back off after zeroing
     poll_interval_s: float = 0.05       # 50 ms between switch polls
+    # Reply timeout for each switch read during a search. The connection's
+    # default (5 s) let a single stalled read leave the jog running unwatched
+    # for 5 s — 50 mm at 10 mm/s (hardware, 2026-10-05). A normal read
+    # answers in ~50 ms; a timeout aborts the axis (see _stop_on_failure).
+    switch_read_timeout_s: float = 0.3
     # Switch-search timeout = timeout_margin * max_travel_mm / homing_speed
     # + timeout_slack_s. A flat 60 s used to time out before the switch on
     # any long axis: X's ~8000 mm throw takes ~800 s at 10 mm/s. A long
@@ -364,17 +373,15 @@ class HomingProcedure:
             send()
 
     def _disengage_brake_if_needed(self, axis: Axis) -> None:
-        """Disengage brake for Y/Z axes before homing motion.
+        """Release Y/Z's brake before homing motion, then give it time to open.
 
-        Waits up to 0.5s for brake feedback to confirm disengagement, where
-        that feedback is reachable at all. Z's brake status input lives on
-        the responder node's own input bank and cannot be read via ASCII
-        (see IOMap in commands.py) — for axes in that situation, this
-        trusts the just-issued SOB command instead of trying to read it
-        back, the same way engage_brake()/disengage_brake() are trusted
-        everywhere else they're called without a confirm step. Logs a
-        warning (not the same as raising) if a *readable* status input
-        does not confirm within 0.5s, but continues anyway.
+        Trusts the SOB output command — there is no status readback. Y's
+        status input (INB 8) proved unreliable on hardware (2026-10-05: six
+        reads of 0 after SOB 4 1 while Y moved freely), and Z's is
+        unreachable over ASCII entirely, so neither is read any more. The
+        fixed settle keeps the jog from starting against a brake that's
+        still opening — a stall against an engaged brake is what corrupted
+        Y's encoder on 2026-07-30.
 
         Args:
             axis: Target axis (no-op for axes without brakes).
@@ -382,33 +389,20 @@ class HomingProcedure:
         if axis not in (Y_AXIS, Z_AXIS):
             return
         self._cmd.disengage_brake(axis, self._io_map)
-        # Wait up to 0.5 s for brake feedback to confirm release
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
-            try:
-                if self._cmd.brake_is_disengaged(axis, self._io_map):
-                    return
-            except NotImplementedError:
-                logger.info(
-                    "Axis %s: brake status input is not reachable via ASCII — "
-                    "trusting the SOB command just issued instead of a live readback",
-                    axis.name,
-                )
-                return
-            time.sleep(0.05)
-        logger.warning(
-            "Axis %s: brake release feedback did not confirm within 0.5 s — continuing anyway",
-            axis.name,
-        )
+        time.sleep(BRAKE_RELEASE_SETTLE_S)
 
     def _switch_is_tripped(self, axis: Axis, ax_cfg: AxisHomingConfig) -> bool:
         """Read this axis's configured (home or limit) switch and check its trip polarity."""
-        state = self._cmd.read_input_bit(ax_cfg.input_index)
+        state = self._cmd.read_input_bit(
+            ax_cfg.input_index, timeout=self._config.switch_read_timeout_s
+        )
         return state if ax_cfg.trip_on_high else not state
 
     def _limit_switch_is_tripped(self, axis: Axis, trip_on_high: bool) -> bool:
         """Read this axis's limit switch (IOMap, not AxisHomingConfig) and check trip polarity."""
-        state = self._cmd.read_limit_switch(axis, self._io_map)
+        state = self._cmd.read_limit_switch(
+            axis, self._io_map, timeout=self._config.switch_read_timeout_s
+        )
         return state if trip_on_high else not state
 
     def _backoff_if_already_tripped(self, axis: Axis, is_tripped, direction: float) -> None:

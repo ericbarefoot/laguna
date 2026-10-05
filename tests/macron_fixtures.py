@@ -23,6 +23,7 @@ class FakeSnapConnection(SnapConnection):
     def __init__(self, responses: Dict[str, Union[str, Exception, Callable[[str], str]]] = None):
         self.responses = dict(responses or {})
         self.sent: List[str] = []
+        self.timeouts: List = []   # per-command timeout overrides, parallel to sent
         self._connected = False
         self.connect_calls = 0
 
@@ -37,8 +38,9 @@ class FakeSnapConnection(SnapConnection):
     def is_connected(self) -> bool:
         return self._connected
 
-    def send(self, command: str) -> str:
+    def send(self, command: str, timeout=None) -> str:
         self.sent.append(command)
+        self.timeouts.append(timeout)
         if command not in self.responses:
             raise AssertionError(f"FakeSnapConnection: no scripted response for {command!r}")
         result = self.responses[command]

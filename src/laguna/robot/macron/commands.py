@@ -301,7 +301,8 @@ class IOMap:
       - z_home_input         = INB 5  (Zhome)
       - z_limit_input        = INB 6  (ZLim)
       - (INB 7 unused/spare in the .dsm)
-      - y_brake_status_input = INB 8  (Y_Brake_Status)
+      - INB 8 (Y_Brake_Status) — exists, but deliberately not read: it
+        proved unreliable on hardware (2026-10-05); brakes are command-only
       - y_brake_output       = SOB 4  (Y_Brake)
       - z_brake_output       = SOB 5  (Z_Brake)
 
@@ -318,15 +319,12 @@ class IOMap:
     (which resolves ModuleNumber internally on the controller) or the
     separate, vendor-encrypted Binary Commands node protocol used for
     responder axis motion — neither is reachable from here. So
-    z_brake_status_input and theta_limit_input default to None and are
-    architecturally unimplemented, not just unprobed: brake_is_disengaged()
-    raises NotImplementedError (not the usual ValueError) if asked to use
-    them, until some other path to read the responder's IO is built.
+    theta_limit_input defaults to None and is architecturally
+    unimplemented, not just unprobed. Brake status is not read at all —
+    brakes are driven by their SOB output alone (see INB 8 above).
     """
     y_brake_output: Optional[int] = 4    # SOB 4 — confirmed (eab-2026-07-16/17.dsm)
     z_brake_output: Optional[int] = 5    # SOB 5 — confirmed (eab-2026-07-16/17.dsm)
-    y_brake_status_input: Optional[int] = 8   # INB 8 — confirmed (eab-2026-07-16/17.dsm)
-    z_brake_status_input: Optional[int] = None  # on responder — unreachable via ASCII, see above
 
     x_home_input: Optional[int] = 1      # INB 1 — confirmed (eab-2026-07-16/17.dsm)
     x_limit_input: Optional[int] = 2     # INB 2 — confirmed (eab-2026-07-16/17.dsm)
@@ -496,8 +494,8 @@ class MMCCommands:
     def _gx(self) -> str:
         return GROUP_TOKEN_FMT.format(n=self._group)
 
-    def _send(self, cmd: str) -> float:
-        raw = self._conn.send(cmd)
+    def _send(self, cmd: str, timeout: Optional[float] = None) -> float:
+        raw = self._conn.send(cmd) if timeout is None else self._conn.send(cmd, timeout=timeout)
         try:
             return float(raw)
         except ValueError:
@@ -1173,7 +1171,7 @@ class MMCCommands:
     # Digital IO — brakes and general-purpose inputs/outputs
     # ------------------------------------------------------------------
 
-    def read_input_bit(self, index: int) -> bool:
+    def read_input_bit(self, index: int, timeout: Optional[float] = None) -> bool:
         """Read native digital input by index (INB).
 
         Used for: limit switch status, brake status, external sensors. This
@@ -1182,12 +1180,17 @@ class MMCCommands:
         controller wiring, see IOMap for the confirmed/unconfirmed channels.
 
         Args:
-            index: Input bit index (1-8).
+            index: Input bit index (1-8) — the number alone, not "INB 3".
+            timeout: Reply timeout override, seconds (see SnapConnection.send).
 
         Returns:
             Input state (True = HIGH, False = LOW).
         """
-        return bool(self._send(f"INB {index}"))
+        if isinstance(index, bool) or not isinstance(index, int):
+            # A string like "INB 3" used to go out as "INB INB 3" and come
+            # back as an opaque escape 31 (Parameter Out Of Range).
+            raise TypeError(f"read_input_bit() takes the input number, e.g. 3 — got {index!r}")
+        return bool(self._send(f"INB {index}", timeout=timeout))
 
     def read_home_switch(self, axis: "Axis | AxisHandle", io_map: IOMap) -> bool:
         """Read the home switch state for X, Y, or Z (INB, via IOMap).
@@ -1217,12 +1220,15 @@ class MMCCommands:
             )
         return self.read_input_bit(index)
 
-    def read_limit_switch(self, axis: "Axis | AxisHandle", io_map: IOMap) -> bool:
+    def read_limit_switch(
+        self, axis: "Axis | AxisHandle", io_map: IOMap, timeout: Optional[float] = None
+    ) -> bool:
         """Read the limit switch state for X, Y, Z, or Theta (INB, via IOMap).
 
         Args:
             axis: Target axis.
             io_map: IOMap with the confirmed limit-input channel for this axis.
+            timeout: Reply timeout override, seconds (see SnapConnection.send).
 
         Returns:
             Input state (True = HIGH, False = LOW).
@@ -1258,7 +1264,7 @@ class MMCCommands:
             raise ValueError(
                 f"io_map.{axis.name.lower()}_limit_input is not set — probe the native INB channel first"
             )
-        return self.read_input_bit(index)
+        return self.read_input_bit(index, timeout=timeout)
 
     def set_output_bit(self, index: int, state: bool) -> None:
         """Set native digital output by index (SOB).
@@ -1327,34 +1333,6 @@ class MMCCommands:
             if io_map.z_brake_output is None:
                 raise ValueError("io_map.z_brake_output is not set — probe the native SOB channel first")
             self.set_output_bit(io_map.z_brake_output, False)
-
-    def brake_is_disengaged(self, axis: "Axis | AxisHandle", io_map: IOMap) -> bool:
-        """Read brake feedback status. True = brake is currently disengaged (released).
-
-        Raises ValueError if the relevant IOMap channel hasn't been set yet
-        (this is currently the case for Y — only Z's status input is
-        confirmed on this hardware).
-        """
-        axis = self._resolve_axis(axis)
-        if axis == Y_AXIS:
-            if io_map.y_brake_status_input is None:
-                raise ValueError(
-                    "io_map.y_brake_status_input is not set — probe the native INB channel first"
-                )
-            return self.read_input_bit(io_map.y_brake_status_input)
-        elif axis == Z_AXIS:
-            if io_map.z_brake_status_input is None:
-                raise NotImplementedError(
-                    "Z brake status lives on the responder node's own input bank "
-                    "(TNamedIO ModuleNumber=1, index 1 in eab-2026-07-16/17.dsm) and "
-                    "is not reachable via the plain ASCII INB command from the "
-                    "commander — there is no node-scoped addressing in this "
-                    "firmware's ASCII grammar. Needs Named IO GUI config or the "
-                    "Binary Commands node protocol to expose this value; see "
-                    "docs/MACRON_GANTRY.md."
-                )
-            return self.read_input_bit(io_map.z_brake_status_input)
-        return True  # axes without brakes are always "free"
 
     # ------------------------------------------------------------------
     # Full axis state snapshot
@@ -1621,17 +1599,6 @@ class AxisHandle:
         """
         self._require_brake()
         self._cmd.engage_brake(self._axis, self._io_map)
-
-    def brake_is_disengaged(self) -> bool:
-        """True if this axis's brake is currently disengaged (released).
-
-        Raises ValueError if this axis has no brake (X/Theta), or if the
-        underlying IOMap channel hasn't been configured/probed yet — see
-        MMCCommands.brake_is_disengaged (also: Z's status feedback is not
-        reachable via ASCII at all on this hardware, see that method).
-        """
-        self._require_brake()
-        return self._cmd.brake_is_disengaged(self._axis, self._io_map)
 
     # -- home / limit switches ---------------------------------------------
 

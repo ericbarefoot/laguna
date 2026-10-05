@@ -224,11 +224,12 @@ class SafeModeConnection(SnapConnection):
         """True if inner connection is open."""
         return self._inner.is_connected
 
-    def send(self, command: str) -> str:
+    def send(self, command: str, timeout: Optional[float] = None) -> str:
         """Send command with safe-mode and ENA checks.
 
         Args:
             command: ASCII command string.
+            timeout: Passed through to the inner connection.
 
         Returns:
             Response value token.
@@ -239,7 +240,7 @@ class SafeModeConnection(SnapConnection):
         check_ena_banned(command)     # unconditional — see check_ena_banned
         if self.safe_mode:
             check_safe_mode(command)  # raises before touching the inner connection
-        return self._inner.send(command)
+        return self._inner.send(command, timeout=timeout)
 
 
 class PiGantryConnection(SnapConnection):
@@ -558,11 +559,13 @@ class PiGantryConnection(SnapConnection):
     # Command exchange (interactive)
     # ------------------------------------------------------------------
 
-    def send(self, command: str) -> str:
+    def send(self, command: str, timeout: Optional[float] = None) -> str:
         """Send a command to the agent and return the response.
 
         Args:
             command: ASCII command string to send.
+            timeout: Reply timeout for this command (the agent applies the
+                same limit to its own serial read); defaults to self.timeout.
 
         Returns:
             Response value token as a string.
@@ -581,7 +584,7 @@ class PiGantryConnection(SnapConnection):
 
         with self._lock:
             self._ensure_link()
-            msg = self._exchange(command, self.timeout)
+            msg = self._exchange(command, self.timeout if timeout is None else timeout)
 
         if "error" in msg:
             raise SnapMotionError(int(msg.get("code", 0)), str(msg["error"]))

@@ -114,11 +114,12 @@ class SimulatedSnapConnection:
         """
         return self._connected
 
-    def send(self, command: str) -> str:
+    def send(self, command: str, timeout: Optional[float] = None) -> str:
         """Send a command and get the response.
 
         Args:
             command: ASCII command string.
+            timeout: Accepted for interface parity; nothing here waits.
 
         Returns:
             Response string.
