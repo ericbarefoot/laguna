@@ -308,6 +308,7 @@ class GoSdkLib:
         sig(go, "GoSensor_Disconnect", kStatus, kObject)
         sig(go, "GoSensor_IsConnected", kBool, kObject)
         sig(go, "GoSensor_Flush", kStatus, kObject)
+        sig(go, "GoSensor_Refresh", kStatus, kObject)
         sig(go, "GoSensor_Trigger", kStatus, kObject)
         sig(go, "GoSensor_Setup", kObject, kObject)
         sig(go, "GoSensor_Transform", kObject, kObject)

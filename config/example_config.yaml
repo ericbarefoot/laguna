@@ -126,27 +126,34 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
                                 # real travel envelope on your hardware before filling these in,
                                 # e.g.:
                                 #   - {name: X, index: 1, soft_negative_limit_mm: -5, soft_positive_limit_mm: 495}
+                                #
+                                # max_travel_mm: the axis's full throw. Only sizes the homing
+                                # switch-search timeout (1.5 * max_travel_mm / homing speed + 30 s)
+                                # — it adds no travel. Approximate, pending measurement:
+                                # ericbarefoot/laguna#63.
     - {
       name: X, index: 1, 
       home_switch: home, home_trip_on_high: false,
-      soft_negative_limit_mm: -5, soft_positive_limit_mm: 2130
+      soft_negative_limit_mm: -5, soft_positive_limit_mm: 2130,
+      max_travel_mm: 8000
       }
     - {name: Y, index: 2, 
-      brake_output: 4, brake_status_input: 8,   # SOB 4 / INB 8 confirmed (commander)
+      brake_output: 4,   # SOB 4 confirmed (commander); brake status is not read
       home_switch: home, home_trip_on_high: false,
-      soft_negative_limit_mm: -5, soft_positive_limit_mm: 1200
+      soft_negative_limit_mm: -5, soft_positive_limit_mm: 1200,
+      max_travel_mm: 1200
       }
     - {name: Z, index: 5, brake_output: 5, mm_per_unit: 13.5,        # SOB 5 confirmed (commander);
-                                                                     # brake_status_input lives on the
-                                                                     # responder's own input bank and has
-                                                                     # no ASCII addressing path — see
-                                                                     # IOMap docstring in commands.py.
+                                                                     # brake status is not read (Z's status is
+                                                                     # unreachable over ASCII; Y's proved
+                                                                     # unreliable) — brakes are command-only.
                                                                      # mm_per_unit override: confirmed
                                                                      # 13.5, not the shared 15.0 default,
                                                                      # on hardware 2026-08-10 — see
                                                                      # docs/archive/GANTRY_UNIT_CALIBRATION.md
        home_switch: home, home_trip_on_high: false,
-       soft_negative_limit_mm: 0, soft_positive_limit_mm: 520
+       soft_negative_limit_mm: 0, soft_positive_limit_mm: 520,
+       max_travel_mm: 400
        }
     - {name: Theta, index: 6}   # limit switch lives on the responder — same caveat as Z's brake status;
                                 # no capture-latch homing support for Theta on this hardware

@@ -68,8 +68,18 @@ visible (this is exactly what `experiment/runner.py`'s closures do — see
 and returns the `Thread` immediately, freeing the caller (REPL, notebook,
 signal handler) for interactive control. `stop()` interrupts a running
 `run()`/`run_async()` call by setting an internal event and **pausing**
-(not stopping) the clock, so runtime is preserved and a later `run()` call
-can resume where it left off.
+(not stopping) the clock, so runtime is preserved.
+
+`run()` **never resumes a paused clock itself** — it refuses instead. It
+used to, which let a bare resume restart the schedule straight out of an
+estop. Resuming is `FlumeLab.resume()`'s job: it checks the rig isn't
+estopped or stopped and no safety trigger is still asserted, resumes the
+clock and subsystems, then restarts the schedule for the remaining time.
+Only one `run()` loop can be active at a time; a repeat keeps its phase
+across pauses (pausing doesn't restart its interval); an action due exactly
+at the end of the run still fires; and each firing re-checks, just before
+running, that the run wasn't stopped and the rig is still RUNNING
+(`Scheduler.gate`) — a skipped firing is written to the event log.
 
 ## `EventLog`
 

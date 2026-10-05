@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 from . import gosdk as _g
 from .gosdk import GoSdkError, GoSdkLib, GoSdkTimeout
+from ..robot.macron.commands import poll_until_move_finished
 from ..robot.motion_arbiter import DEFAULT_ARBITER
 from .mounting import SensorMounting
 from .pointcloud import (
@@ -295,9 +296,17 @@ class GocatorScanner(GocatorSettingsMixin):
         self._lib = None
         self._is_connected = False
         self._is_running = False
+        self._unflushed = False
 
     def get_status(self) -> Dict[str, Any]:
-        """Return connection/config state. Reads live values when connected."""
+        """Return connection/config state. Reads live values when connected.
+
+        Refreshes the SDK's cached configuration first (see
+        :meth:`~laguna.scanner.settings.GocatorSettingsMixin.refresh`), so
+        the ``sensor_*`` fields reflect the sensor rather than its state at
+        connect() time. Skipped while acquiring, so polling this mid-scan is
+        safe.
+        """
         status: Dict[str, Any] = {
             "is_connected": self._is_connected,
             "is_running": self._is_running,
@@ -313,6 +322,7 @@ class GocatorScanner(GocatorSettingsMixin):
         }
         if self._is_connected and self._lib:
             try:
+                self.refresh()   # before taking handles: a refresh may replace them
                 setup = self._lib.handle("GoSensor_Setup", self._sensor)
                 transform = self._lib.handle("GoSensor_Transform", self._sensor)
                 surface = self._lib.handle("GoSetup_SurfaceGeneration", setup)
@@ -835,17 +845,13 @@ class GocatorScanner(GocatorSettingsMixin):
         acceleration ramp, fires the software trigger, and receives the
         surface.
 
-        Drives the axis through its ``AxisHandle`` (``gantry.axis(name)``)
-        rather than ``gantry.move_to()``, because the trigger has to fire
-        *while* the axis is mid-move and ``move_to()`` runs the coordinated
-        gcode path, blocking until the move finishes. AxisHandle's
-        ``begin_move_to`` is non-blocking and — importantly — still enforces
-        the gantry's ``safe_mode`` gate, which the raw ``gantry.cmd`` path
-        does not on the ethernet/rs232 transports.
-
-        Note this path does **not** fence-check the target the way
-        ``move_to()`` does, so the caller is responsible for the destination
-        being inside the work envelope.
+        Starts the pass with ``gantry.begin_scan_move()`` rather than
+        ``gantry.move_to()``: the trigger has to fire *while* the axis is
+        mid-move, so the move must be a plain non-blocking single-axis
+        ``BMT``, not the coordinated gcode path. ``begin_scan_move()`` still
+        fence-checks the straight pass from the live position and refuses
+        under safe_mode or a halt, exactly like ``move_to()``; a halt during
+        the settle delay skips the trigger.
 
         Args:
             gantry: A connected GantryController.
@@ -877,8 +883,10 @@ class GocatorScanner(GocatorSettingsMixin):
 
         Raises:
             RuntimeError: If not connected.
-            KeyError: If `axis` isn't a configured axis on this gantry.
+            ValueError: If `axis` isn't a configured axis on this gantry.
             SnapMotionError: If the gantry's safe_mode blocks the move.
+            FenceViolation: If the pass would enter an exclusion zone.
+            MotionHalted: If the gantry is halted, or halts before the trigger.
         """
         # Fall back to the configured scan spec for anything not given, so
         # a rig configured once in file can scan without repeating itself —
@@ -905,7 +913,7 @@ class GocatorScanner(GocatorSettingsMixin):
         # Hold the gantry for the whole pass. Without this, a second
         # scheduled action could move an axis mid-traverse and the surface
         # would be silently wrong — Y spacing assumes constant velocity.
-        # Re-entrant, so handle.begin_move_to() re-acquiring is fine.
+        # begin_scan_move() requires the caller to hold it for the whole pass.
         arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
         with arbiter.hold(f"gocator scan {axis} -> {end_mm:.1f}mm"):
             return self._scan_with_gantry(
@@ -998,9 +1006,9 @@ class GocatorScanner(GocatorSettingsMixin):
                 end_mm,
                 feed_rate_mm_s,
             )
-            handle.set_speed(feed_rate_mm_s)
-            handle.begin_move_to(end_mm)   # safe_mode-gated, non-blocking
+            guard = gantry.begin_scan_move(axis, end_mm, feed_rate_mm_s)
             time.sleep(settle_s)
+            guard.check()
             self.trigger()
             return self.receive_surface(timeout_s=timeout_s, metadata=meta)
         finally:
@@ -1009,6 +1017,34 @@ class GocatorScanner(GocatorSettingsMixin):
                     self._end_acquisition()
                 except GoSdkError as e:
                     logger.warning("Error stopping after gantry scan: %s", e)
+            self._resync_gantry_after_pass(gantry, handle, axis)
+
+    @staticmethod
+    def _resync_gantry_after_pass(gantry, handle, axis: str) -> None:
+        """Wait for the pass's move to finish, then resync the gantry's position cache.
+
+        The pass moves the axis directly (``begin_scan_move``), bypassing the
+        G-code executor that normally keeps the gantry's planning position in
+        step with hardware. Left alone, the next ``move_to()`` would plan from
+        the pre-scan position — no-opping a move back to the start, and
+        fence-checking the wrong path. The surface can also complete before
+        the axis has stopped, so wait first: a resync mid-deceleration would
+        record a position the axis is still moving away from. Never raises —
+        this runs in a ``finally``, and a failure here must not mask the
+        scan's own result or error.
+        """
+        try:
+            if not poll_until_move_finished(handle.is_move_finished, predicted_s=0.0):
+                logger.warning(
+                    "%s was still moving when the post-scan wait ran out; resyncing "
+                    "anyway, the position recorded may be slightly early", axis,
+                )
+        except Exception as e:
+            logger.warning("Could not confirm %s stopped after the scan pass: %s", axis, e)
+        try:
+            gantry.resync_position("scan_with_gantry()")
+        except Exception as e:
+            logger.warning("Could not resync gantry position after scan pass: %s", e)
 
     def acquire(
         self, gantry: Optional["GantryController"] = None, **overrides: Any

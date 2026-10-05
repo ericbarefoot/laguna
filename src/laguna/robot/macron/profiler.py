@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Union
 
 from ..motion_arbiter import DEFAULT_ARBITER
+from .halt import MotionHalted
 
 if TYPE_CHECKING:
     from .controller import GantryController
@@ -125,6 +126,13 @@ class TopographicProfiler:
         another thread to cancel it early — the agent still finishes
         normally through the same completion path, just with fewer samples.
 
+        The pass is fence-checked (GantryController.plan_scan_move) and
+        refused under safe_mode or a halt before scan_start is sent. If a
+        pause/stop/estop cuts it short, or the agent fails mid-pass, the
+        samples collected so far are still retrieved to disk — then
+        MotionHalted/RuntimeError is raised, so the pass is not mistaken
+        for a complete one and gets re-run.
+
         Args:
             axis: BLC axis prefix, e.g. 'A1' for axis 1.
             end_mm: Target position in mm (absolute).
@@ -134,9 +142,13 @@ class TopographicProfiler:
             ProfileResult with path, metadata, and loaded DataFrame.
 
         Raises:
-            RuntimeError: If the agent reports a scan error.
-            SnapMotionError: If scan_start is rejected (blocked by the
-                agent's safe_mode, or a scan is already in progress).
+            RuntimeError: If the agent reports a scan error (any partial
+                CSV is retrieved first; its path is in the message).
+            MotionHalted: If the gantry is halted, or a halt cut the pass
+                short (the partial CSV is retrieved first).
+            FenceViolation: If the pass would enter an exclusion zone.
+            SnapMotionError: If scan_start is rejected (safe_mode, or a
+                scan is already in progress).
         """
         try:
             import pandas as pd  # type: ignore[import]
@@ -160,12 +172,14 @@ class TopographicProfiler:
         # arbiter via scan_with_gantry()) could command the gantry mid-pass.
         arbiter = getattr(self._gantry, "arbiter", DEFAULT_ARBITER)
         with arbiter.hold(f"topographic scan {axis} -> {end_mm:.1f}mm"):
+            guard = self._gantry.plan_scan_move(axis, end_mm)
             logger.info("Starting scan: %s -> %.3f mm at %.3f mm/s (sensor=%s)",
                         axis, end_mm, feed_rate_mm_s, self._sensor)
-            ack = self._gantry.connection.start_scan(
-                axis, end_mm, feed_rate_mm_s, self._al1342_host, self._pdin_port, remote_csv,
-                sensor=self._sensor,
-            )
+            with guard.issuing():
+                ack = self._gantry.connection.start_scan(
+                    axis, end_mm, feed_rate_mm_s, self._al1342_host, self._pdin_port, remote_csv,
+                    sensor=self._sensor,
+                )
             start_pos_mm = ack.get("start_pos_mm", 0.0)
             logger.info(
                 "Scan started; start_pos=%.3f mm, accel=%.3f, decel=%.3f",
@@ -177,7 +191,20 @@ class TopographicProfiler:
 
             result = self._gantry.connection.wait_for_scan_result(timeout=move_timeout)
             if "scan_error" in result:
-                raise RuntimeError(f"scan error: {result['scan_error']}")
+                kept = ""
+                if result.get("csv_path"):
+                    self._output_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        self._sftp_retrieve(remote_csv, local_csv, remote_meta, local_meta)
+                        kept = f" — partial profile ({result.get('samples', 0)} samples) kept at {local_csv}"
+                    except Exception as exc:
+                        kept = f" — partial profile left on the Pi at {remote_csv} (retrieval failed: {exc})"
+                raise RuntimeError(f"scan error: {result['scan_error']}{kept}")
+            try:
+                guard.check()
+                halted = None
+            except MotionHalted as exc:
+                halted = exc
 
         logger.info(
             "Scan complete: %d samples, %.1f -> %.1f mm",
@@ -187,6 +214,11 @@ class TopographicProfiler:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._sftp_retrieve(remote_csv, local_csv, remote_meta, local_meta)
         logger.info("Retrieved profile CSV -> %s", local_csv)
+        if halted is not None:
+            raise MotionHalted(
+                f"{halted} — scan cut short after {result.get('samples', 0)} samples; "
+                f"partial profile kept at {local_csv}, re-run the pass"
+            )
 
         metadata = dict(result)
         metadata.update({

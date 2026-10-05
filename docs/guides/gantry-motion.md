@@ -15,24 +15,25 @@ root `CLAUDE.md` for why.**
 
 ```mermaid
 flowchart TD
-    Call["lab.move_to(...)"] --> Fence["Fence check\n(TrajectoryChecker, pure in-memory,\nruns before connect_all())"]
+    Call["lab.move_to(...)"] --> Gate{"connected, safe_mode off,\nnot halted, gantry free?"}
+    Gate -->|no| Refuse(["SnapMotionError / MotionHalted /\nMotionBusyError — nothing sent"])
+    Gate -->|yes| Fence["Fence check from the live position\n(TrajectoryChecker, pure Python)"]
     Fence -->|violation| Reject(["FenceViolation raised —\nnothing sent to hardware"])
-    Fence -->|clear| SafeMode{"safe_mode?"}
-    SafeMode -->|True, default| Blocked(["Only read-only queries reach\nthe wire — motion refused"])
-    SafeMode -->|False, explicit opt-in| Allowlist["SAFE_COMMANDS allowlist\nchecked on PC and Pi independently"]
-    Allowlist --> Wire(["ASCII command sent\nto the real controller"])
+    Fence -->|clear| Handle(["MoveHandle returned —\ntraverse runs in the background"])
+    Handle --> Wire(["ASCII commands sent, each\nunder the halt latch"])
 ```
 
-Fence checking happens first and needs no hardware connection at all — it's
-pure Python. `safe_mode` gates everything after that: while it's `True`
-(the default, everywhere), only read-only queries can reach the hardware,
-structurally — a bug in a higher layer cannot bypass it.
+All of that happens on your thread before `move_to()` returns, so any
+refusal raises right there. `safe_mode` is checked client-side for every
+motion path and, on the Pi transport, again on the PC and the Pi
+independently. The full map of which calls are fenced (everything except
+homing and the explicitly named `*_unfenced` calls) is in
+[`docs/MOTION_CONTROL_LAYERS.md`](../MOTION_CONTROL_LAYERS.md).
 
 ## Worked example
 
 ```python
 from laguna import FlumeLab
-from laguna.robot.macron.fences import FenceViolation
 
 ALLOW_MOTION = False   # flip only once you've decided to actually move something
 
@@ -44,24 +45,23 @@ lab.config.config_dict["gantry"]["fences"] = [
 ]
 
 lab.add("gantry")
-lab.gantry.set_safe_mode(not ALLOW_MOTION)
 
-# Fence check demo — runs before connecting to anything.
-try:
-    lab.move_to([410.0, 410.0, 10.0, 0.0])
-except FenceViolation as exc:
-    print(f"Rejected, as expected: {exc}")
+# Fence check demo — pure Python, runs before connecting to anything.
+violations = lab.gantry.checker.check_ribbon((0.0, 0.0, 10.0), (410.0, 410.0, 10.0))
+print(f"Rejected, as expected: {violations[0]}")
 
 if not lab.connect_all():
     print("Not all subsystems connected — see warnings above.")
+lab.gantry.set_safe_mode(not ALLOW_MOTION)   # needs a live connection to disable
 
 if not ALLOW_MOTION:
     print("ALLOW_MOTION is False — no moves will be sent.")
     lab.disconnect_all()
     raise SystemExit(0)
 
-lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0)      # full [X, Y, Z, Theta] vector
-lab.move_to(X=150.0, speed=10.0)                        # partial move — Y/Z held
+# move_to() returns as soon as the move has started; .wait() to sequence.
+lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0).wait()   # full [X, Y, Z, Theta] vector
+lab.move_to(X=150.0, speed=10.0).wait()                     # partial move — Y/Z held
 lab.disconnect_all()
 ```
 
@@ -77,6 +77,15 @@ the part that can actually move something.
 [Rehearsing safely with `simulate=True`](simulate.md). Fence checking is
 real in simulation too, so a rehearsal catches a wrong fence definition or
 an out-of-bounds move target with no hardware involved at all.
+
+## Stopping from a notebook
+
+Because `move_to()` doesn't block, keep `lab.pause()` in a cell by itself
+and run it any time — the move in flight is cancelled (its next leg is never
+issued) and new motion is refused until `lab.resume()`. `lab.estop()` is the
+hard version; recovering from it takes `lab.rearm()`, which leaves the
+gantry in `safe_mode` until you explicitly call
+`lab.gantry.set_safe_mode(False)` again.
 
 ## Acquiring a topographic scan
 

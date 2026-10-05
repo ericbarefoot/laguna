@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from laguna import FlumeLab
+from laguna.safety import SafetyState
 from laguna.schedule import ExperimentSchedule
 
 logger = logging.getLogger(__name__)
@@ -161,7 +162,16 @@ def schedule_action(
             return
         df = exp_schedule._df
         if schedule_col and schedule_col in df.columns:
-            times = df.loc[df[schedule_col].astype(bool), "time_s"].tolist()
+            flags = df[schedule_col]
+            blanks = flags.isna().to_numpy().nonzero()[0]
+            if blanks.size:
+                # astype(bool) reads a blank (NaN) cell as True — a spurious
+                # scan/capture at every blank row.
+                raise ValueError(
+                    f"Schedule column {schedule_col!r} has blank cells at rows "
+                    f"{blanks.tolist()} — fill them with True/False"
+                )
+            times = df.loc[flags.astype(bool), "time_s"].tolist()
         else:
             times = df["time_s"].tolist()
         make = action_factory or (lambda t: action)
@@ -532,24 +542,24 @@ def run_blocking(lab: FlumeLab, duration: float) -> None:
     print(f"  kill -USR2 {pid}  — resume from another terminal")
     print(f"  tail -f experiment_events.csv — live status\n")
 
-    _paused = False
     _sigint_count = 0
     _resume_event = threading.Event()
 
     def _on_sigint(sig, frame):
-        nonlocal _paused, _sigint_count
+        nonlocal _sigint_count
         _sigint_count += 1
         if _sigint_count == 1:
-            _paused = True
-            lab.stop()
+            # Cleared *before* pausing: a stray SIGUSR2 from earlier would
+            # otherwise resume this pause the instant it began.
+            _resume_event.clear()
+            lab.pause(reason="SIGINT")
             print(f"\nPaused (Ctrl+C again to exit | kill -USR2 {pid} to resume)")
         else:
             raise SystemExit(0)
 
     def _on_pause(sig, frame):
-        nonlocal _paused
-        _paused = True
-        lab.stop()
+        _resume_event.clear()
+        lab.pause(reason="SIGUSR1")
         print(f"\nPaused (kill -USR2 {pid} to resume)")
 
     def _on_resume(sig, frame):
@@ -567,16 +577,29 @@ def run_blocking(lab: FlumeLab, duration: float) -> None:
         thread = lab.start(duration)
         while True:
             thread.join(timeout=0.5)
-            if not thread.is_alive():
-                if _paused:
-                    _resume_event.wait()        # Ctrl+C (second) raises SystemExit here
-                    _resume_event.clear()
-                    _paused = False
-                    _sigint_count = 0
-                    print("Resuming...")
-                    thread = lab.resume()       # uses stored _duration - elapsed
-                else:
-                    break
+            if thread.is_alive():
+                continue
+            # Decide from the rig's own state, not from whether *this*
+            # function paused it: a pause escalated from inside the run (a
+            # failed scan, a PAUSE sentinel) used to fall through to break,
+            # turning a recoverable pause into a full disconnect.
+            if lab.safety_state is not SafetyState.PAUSED:
+                break
+            _resume_event.wait()        # Ctrl+C (second) raises SystemExit here
+            _resume_event.clear()
+            _sigint_count = 0
+            print("Resuming...")
+            try:
+                resumed = lab.resume()  # uses stored _duration - elapsed
+            except RuntimeError as exc:
+                print(f"Cannot resume: {exc}")
+                break
+            if resumed is not None:
+                thread = resumed
+            elif lab.safety_state is SafetyState.PAUSED:
+                print(f"Resume refused — see the log. kill -USR2 {pid} to try again.")
+            else:
+                break               # resumed with no schedule time left
     finally:
         pid_file.unlink(missing_ok=True)
         lab.disconnect_all()

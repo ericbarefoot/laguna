@@ -88,6 +88,11 @@ class SafetyState(enum.Enum):
     STOPPED = "stopped"
     ESTOPPED = "estopped"
 
+    @property
+    def severity(self) -> int:
+        """Ordinal severity, RUNNING < PAUSED < STOPPED < ESTOPPED."""
+        return {"running": 0, "paused": 1, "stopped": 2, "estopped": 3}[self.value]
+
 
 @runtime_checkable
 class Quiescible(Protocol):
@@ -345,11 +350,23 @@ class SafetyMonitor:
                     self._fired_at = tier.severity
                     logger.critical("%s demanded by trigger %r", tier.name, name)
                     if self._on_trip is not None:
-                        try:
-                            self._on_trip(tier, name)
-                        except Exception:  # pragma: no cover - defensive
-                            logger.exception("Safety handler itself failed")
+                        # On its own thread, not this one: a handler stuck on
+                        # a blocking call (a pause() waiting on a serial
+                        # read) used to stop this loop polling, so an ESTOP
+                        # file touched meanwhile went unseen until the pause
+                        # returned — the very blocking-call problem this
+                        # thread exists to avoid.
+                        threading.Thread(
+                            target=self._dispatch, args=(tier, name), daemon=True,
+                            name=f"safety-{tier.value}",
+                        ).start()
             self._stop.wait(self._poll_s)
+
+    def _dispatch(self, tier: SafetyTier, name: str) -> None:
+        try:
+            self._on_trip(tier, name)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Safety handler itself failed")
 
 
 __all__ = [

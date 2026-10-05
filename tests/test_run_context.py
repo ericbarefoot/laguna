@@ -177,7 +177,7 @@ class TestFlumeLabIntegration:
         lab.run.started()
         lab.pause()
         assert lab.run.pauses and lab.run.pauses[-1][1] is None
-        lab.resume_from_pause()
+        lab.resume()
         assert lab.run.pauses[-1][1] is not None
 
     def test_the_recorded_timeline_matches_the_clock(self):
@@ -191,7 +191,7 @@ class TestFlumeLabIntegration:
         time.sleep(0.05)
         lab.pause()
         time.sleep(0.1)
-        lab.resume_from_pause()
+        lab.resume()
         time.sleep(0.05)
 
         wall, runtime = lab.clock.now()

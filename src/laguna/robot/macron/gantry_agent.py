@@ -191,6 +191,24 @@ def check_ena_banned(cmd: str) -> None:
         )
 
 
+# Kept in sync by hand with pi_bridge.py's STOP_MNEMONICS / is_stop_command —
+# see that module for why stop-class commands pass the safe_mode gate.
+STOP_MNEMONICS = frozenset({"BST", "ABT", "STP"})
+
+
+def is_stop_command(cmd: str) -> bool:
+    """True if `cmd` can only stop motion or engage a brake."""
+    try:
+        mnemonic, arg_count = parse_command(cmd)
+    except ValueError:
+        return False
+    if mnemonic in STOP_MNEMONICS:
+        return arg_count == 0
+    if mnemonic == "SOB":
+        return arg_count == 2 and cmd.split()[-1] == "0"
+    return False
+
+
 def check_safe_mode(cmd: str) -> None:
     """Check if a command is allowed by safe_mode restrictions.
 
@@ -200,6 +218,8 @@ def check_safe_mode(cmd: str) -> None:
     Raises:
         PermissionError: If the command is blocked by safe_mode.
     """
+    if is_stop_command(cmd):
+        return
     mnemonic, arg_count = parse_command(cmd)
     max_args = SAFE_COMMANDS.get(mnemonic)
     if max_args is None or arg_count > max_args:
@@ -368,11 +388,13 @@ def _poll_pdin_loop(al1342_host: str, pdin_path: str, out_queue: "queue.Queue[di
     headers = {"Content-Type": "application/json"}
     conn = http.client.HTTPConnection(al1342_host, 80, timeout=2)
     error_count = 0
+    consecutive_errors = 0
     while not stop_event.is_set():
         try:
             conn.request("POST", "/", body=payload, headers=headers)
             resp = conn.getresponse()
             data = json.loads(resp.read())
+            consecutive_errors = 0
             hex_str = _extract_pdin_hex_from_getdata(data)
             if hex_str:
                 wall_time = time.time()
@@ -381,11 +403,17 @@ def _poll_pdin_loop(al1342_host: str, pdin_path: str, out_queue: "queue.Queue[di
                 out_queue.put(decoded)
         except Exception as exc:
             error_count += 1
+            consecutive_errors += 1
             _log(f"PDIN poll error (#{error_count}): {exc}")
             try:
                 conn.close()
             except Exception:
                 pass
+            # Back off before reconnecting: an unreachable AL1342 refuses
+            # instantly, and retrying with no delay pins a CPU core (and
+            # floods the log) for as long as the outage lasts. Capped low,
+            # since every interval spent here is samples not collected.
+            stop_event.wait(min(0.05 * consecutive_errors, 1.0))
             conn = http.client.HTTPConnection(al1342_host, 80, timeout=2)
     try:
         conn.close()
@@ -607,11 +635,23 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
     own (irrelevant) parameter space rather than the sensor's laser — see
     docs/WTT12L_POWERPROX_SETUP.md, "Consequence: no programmatic laser
     control on this path".
+
+    If anything fails once the move has started (a MIF timeout, a dropped
+    serial read), the axis is sent BST first — otherwise it carries on to
+    end_mm with nobody watching — the PDIN poller is stopped, and whatever
+    samples were already collected are still written out, flagged
+    "partial" in the sidecar, so a failed pass doesn't throw away data it
+    already has.
     """
     ax = axis
     laser_was_turned_on = False
     t_move_start = t_move_done = None
     records = []
+    pdin_samples: "queue.Queue[dict]" = queue.Queue()
+    poll_stop = threading.Event()
+    poll_thread = None
+    actual_end_mm = None
+    error = None
 
     try:
         # KeyError on an unknown sensor is caught by the except below and
@@ -626,8 +666,6 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
             _log(f"sensor={sensor!r} — skipping laser control (not available via this path)")
 
         pdin_path = f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/pdin/getdata"
-        pdin_samples: "queue.Queue[dict]" = queue.Queue()
-        poll_stop = threading.Event()
         poll_thread = threading.Thread(
             target=_poll_pdin_loop,
             args=(al1342_host, pdin_path, pdin_samples, poll_stop, pdin_port, decode_fn),
@@ -638,8 +676,8 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
         end_raw = end_mm / MM_PER_ACP_UNIT
         bridge.send(f"{ax} SPD {feed_rate_raw}", timeout=5.0)
         poll_thread.start()
-        bridge.send(f"{ax} BMT {end_raw}", timeout=5.0)
         t_move_start = time.time()
+        bridge.send(f"{ax} BMT {end_raw}", timeout=5.0)
         _log(f"Scan move started: {ax} -> {end_mm} mm at {feed_rate_mm_s} mm/s "
              f"(raw: {end_raw:.3f} @ {feed_rate_raw:.3f})")
 
@@ -661,28 +699,77 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
             time.sleep(0.1)
 
         t_move_done = time.time()
-        poll_stop.set()
-        poll_thread.join(timeout=2.0)
-
-        while True:
-            try:
-                records.append(pdin_samples.get_nowait())
-            except queue.Empty:
-                break
-
         actual_end_raw = bridge.send(f"{ax} ACP", timeout=5.0)
         actual_end_mm = float(_parse_blc_response(actual_end_raw)) * MM_PER_ACP_UNIT
 
     except Exception as exc:
+        error = str(exc)
         _log(f"SCAN ERROR: {exc}")
-        _audit(log_path, {"id": request_id, "scan_error": str(exc)})
-        _emit({"scan_error": str(exc), "id": request_id})
-        return
+        if t_move_start is not None:
+            try:
+                bridge.send(f"{ax} BST", timeout=5.0)
+                _log("Scan aborted mid-move — sent BST")
+            except Exception as stop_exc:
+                _log(f"SCAN ERROR: could not send BST after failure: {stop_exc}")
+            t_move_done = time.time()
     finally:
+        poll_stop.set()
+        if poll_thread is not None and poll_thread.is_alive():
+            poll_thread.join(timeout=2.0)
         if laser_was_turned_on:
             _set_laser(al1342_host, pdin_port, on=False)
 
-    # ------------------------------------------------------------ fuse
+    while True:
+        try:
+            records.append(pdin_samples.get_nowait())
+        except queue.Empty:
+            break
+
+    if error is not None and (t_move_start is None or not records):
+        _audit(log_path, {"id": request_id, "scan_error": error})
+        _emit({"scan_error": error, "id": request_id})
+        return
+
+    try:
+        sidecar_path, achieved_rate = _write_scan_output(
+            output, records, ax, end_mm, feed_rate_mm_s, start_pos_mm, actual_end_mm,
+            accel_mm_s2, decel_mm_s2, t_move_start, t_move_done, al1342_host, pdin_port,
+            sensor, error,
+        )
+    except Exception as exc:
+        _log(f"SCAN ERROR: failed to write CSV: {exc}")
+        message = f"failed to write CSV: {exc}" if error is None else f"{error}; and failed to write CSV: {exc}"
+        _emit({"scan_error": message, "id": request_id})
+        return
+
+    if error is not None:
+        _audit(log_path, {"id": request_id, "scan_error": error, "csv_path": output,
+                          "samples": len(records), "partial": True})
+        _emit({"scan_error": error, "id": request_id, "csv_path": output,
+               "meta_path": sidecar_path, "samples": len(records), "partial": True})
+        return
+
+    _audit(log_path, {"id": request_id, "scan_done": True, "csv_path": output, "samples": len(records)})
+    _emit({
+        "scan_done": True,
+        "id": request_id,
+        "csv_path": output,
+        "meta_path": sidecar_path,
+        "actual_start_mm": start_pos_mm,
+        "actual_end_mm": actual_end_mm,
+        "samples": len(records),
+        "achieved_rate_hz": achieved_rate,
+    })
+
+
+def _write_scan_output(output, records, ax, end_mm, feed_rate_mm_s, start_pos_mm, actual_end_mm,
+                       accel_mm_s2, decel_mm_s2, t_move_start, t_move_done, al1342_host,
+                       pdin_port, sensor, error):
+    """Fuse samples with dead-reckoned position; write the CSV and its metadata sidecar.
+
+    Returns (sidecar_path, achieved_rate_hz). Raises if the CSV can't be
+    written; a sidecar failure is only logged.
+    """
     ramp_t_accel = feed_rate_mm_s / accel_mm_s2 if accel_mm_s2 > 0 else 0.0
     ramp_t_decel = feed_rate_mm_s / decel_mm_s2 if decel_mm_s2 > 0 else 0.0
     t_slew_start = t_move_start + ramp_t_accel
@@ -711,22 +798,16 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
         })
     csv_rows.sort(key=lambda r: r["wall_time_unix"])
 
-    # ------------------------------------------------------------ write
     # distance_nm/q1/q2 are OD2000-only, current_ma is wtt12l_powerprox-only
     # (see SENSOR_DECODERS) — whichever the current sensor doesn't produce
     # is written as an empty CSV field rather than a missing column, so a
     # single fixed schema works for both.
     fieldnames = ["wall_time_unix", "wall_time_iso", "pos_mm",
                   "distance_nm", "distance_mm", "q1", "q2", "in_ramp", "current_ma"]
-    try:
-        with open(output, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(csv_rows)
-    except Exception as exc:
-        _log(f"SCAN ERROR: failed to write CSV: {exc}")
-        _emit({"scan_error": f"failed to write CSV: {exc}", "id": request_id})
-        return
+    with open(output, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
 
     sidecar_path = output.replace(".csv", "_meta.json")
     duration_s = t_move_done - t_move_start
@@ -750,23 +831,17 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
         "pdin_port": pdin_port,
         "sensor": sensor,
     }
+    if error is not None:
+        # pos_mm past the failure point is dead-reckoned from a move that
+        # was cut short — treat it as unreliable.
+        metadata["partial"] = True
+        metadata["error"] = error
     try:
         with open(sidecar_path, "w") as f:
             json.dump(metadata, f, indent=2)
     except Exception as exc:
         _log(f"Failed to write metadata sidecar: {exc}")
-
-    _audit(log_path, {"id": request_id, "scan_done": True, "csv_path": output, "samples": len(records)})
-    _emit({
-        "scan_done": True,
-        "id": request_id,
-        "csv_path": output,
-        "meta_path": sidecar_path,
-        "actual_start_mm": start_pos_mm,
-        "actual_end_mm": actual_end_mm,
-        "samples": len(records),
-        "achieved_rate_hz": achieved_rate,
-    })
+    return sidecar_path, achieved_rate
 
 
 def main() -> None:

@@ -57,6 +57,21 @@ gantry **X** — see "Sensor axes are not gantry axes".) So:
 - If you later measure the true velocity, `SurfaceScan.rescale_y()` fixes
   the travel axis without re-scanning.
 
+**Settings are served from a cache — `refresh()` re-syncs it.** The SDK loads
+the sensor's configuration once, at `connect()`, and every `get_*` reads that
+local copy, not the sensor. A change made afterwards in the web GUI, by the
+alignment tool, or by another client is invisible until
+`GoSensor_Refresh` discards the cache and re-reads it. Every public `get_*`
+and `set_*` calls `scanner.refresh()` first, and `configure()` starts with
+one, so values you didn't specify keep whatever the sensor really holds. Call
+`refresh()` yourself to re-sync after GUI work. It is skipped (returns False)
+while acquiring, and while `set_*(flush=False)` edits are staged but not yet
+flushed, since refreshing would silently discard them — pass
+`refresh(discard_unflushed=True)` to drop them deliberately.
+`configure()` is authoritative for every value in the config: those overwrite
+the sensor's, GUI-tuned or not, so copy settings you want to keep from the GUI
+into the config.
+
 `travel_speed` maps to `GoTransform_SetSpeed()` in the SDK, and to
 **Manage > Motion and Alignment > Speed** in the web UI. It writes to sensor
 **flash**, so `configure()` only pushes it when the value actually changes.
@@ -109,15 +124,12 @@ Two things must be true before a scan pass can move anything:
   value. Without `--allow-motion`, the script always behaves like
   `--dry-run`.
 
-`scan_with_gantry()` drives the axis through its `AxisHandle`
-(`gantry.axis("X")`) rather than `gantry.move_to()`, because the trigger must
-fire *while* the axis is mid-move and `move_to()` blocks until the move
-finishes. `AxisHandle.begin_move_to()` is non-blocking and still enforces the
-gantry's `safe_mode` gate — the raw `gantry.cmd` path does not, on the
-ethernet/rs232 transports.
-
-It does **not** fence-check the target the way `move_to()` does, so validate
-your destination is inside the work envelope.
+`scan_with_gantry()` starts the pass with `gantry.begin_scan_move()` rather
+than `gantry.move_to()`, because the trigger must fire *while* the axis is
+mid-move, so the pass has to be a plain single-axis move rather than the
+coordinated gcode path. `begin_scan_move()` still fence-checks the straight
+pass from the live position and refuses under `safe_mode` or a halt, exactly
+like `move_to()` — see [`MOTION_CONTROL_LAYERS.md`](../MOTION_CONTROL_LAYERS.md).
 
 ### Manual lifecycle
 

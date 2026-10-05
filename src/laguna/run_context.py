@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,13 @@ def new_run_id() -> str:
     """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{secrets.token_hex(2)}"
+
+
+#: Serialises write(). It's called from clock pause/resume hooks, scheduler
+#: threads (record_output) and the main thread at once, and two overlapping
+#: writes to the one shared temp file could publish a spliced, unparseable
+#: run.json — the runtime↔wall timeline a resume depends on.
+_WRITE_LOCK = threading.Lock()
 
 
 class RunContext:
@@ -289,8 +297,12 @@ class RunContext:
                 return None
             path = directory / MANIFEST_NAME
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.to_dict(), indent=2))
-            os.replace(tmp, path)
+            with _WRITE_LOCK:
+                with open(tmp, "w") as f:
+                    f.write(json.dumps(self.to_dict(), indent=2))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
             return path
         except Exception as exc:
             # Broad on purpose, and the mkdir is inside the try: a bad root

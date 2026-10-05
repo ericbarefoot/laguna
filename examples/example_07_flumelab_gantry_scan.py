@@ -55,7 +55,6 @@ gantry connection, handled automatically below from the same flag).
 import time
 
 from laguna import FlumeLab
-from laguna.robot.macron.fences import FenceViolation
 
 # --- Connection settings — adjust for your setup ---
 PI_HOST = "red.lab"
@@ -124,14 +123,6 @@ def build_lab() -> FlumeLab:
     # human-readable way to confirm the AL1342 is actually publishing and
     # which port/sensor a given reading came from.
     lab.add("gantry").add("od2000").add("wtt12l")
-
-    # This script owns the motion decision, not the config file — set_safe_mode()
-    # is the real API for it (rather than mutating gantry_config["safe_mode"]
-    # before construction): it's an explicit, auditable verb call, and it
-    # correctly no-ops until connect() if called before connecting (see its
-    # docstring), same as here.
-    lab.gantry.set_safe_mode(not ALLOW_MOTION)
-
     return lab
 
 
@@ -139,25 +130,29 @@ def main():
     lab = build_lab()
 
     # ------------------------------------------------------------------
-    # Fence check — no hardware needed for this part at all. The fence
-    # check (TrajectoryChecker.check_and_wrap) runs entirely in Python
-    # before anything is sent over the wire, so this works even before
-    # connect_all(). Deliberately targets a point inside the
-    # "equipment_post" keepout zone defined in build_lab().
+    # Fence check — no hardware needed for this part at all. The checker
+    # is pure Python; move_to() runs this same check (from the gantry's
+    # live position) before anything is sent over the wire. Deliberately
+    # targets a point inside the "equipment_post" keepout zone defined in
+    # build_lab().
     # ------------------------------------------------------------------
 
     print("Fence check demo (runs before connecting to anything):")
-    try:
-        lab.move_to([410.0, 410.0, 10.0, 0.0])
-    except FenceViolation as exc:
-        print(f"  Rejected, as expected: {exc}")
+    violations = lab.gantry.checker.check_ribbon((0.0, 0.0, 10.0), (410.0, 410.0, 10.0))
+    if violations:
+        print(f"  Rejected, as expected: {violations[0]}")
     else:
-        print("  ERROR: expected a FenceViolation but the move was accepted!")
+        print("  ERROR: expected a FenceViolation but the path was accepted!")
     print()
 
     print("Connecting all subsystems (gantry, od2000, wtt12l)...")
     if not lab.connect_all():
         print("Not all subsystems connected — see warnings above.")
+
+    # This script owns the motion decision, not the config file —
+    # set_safe_mode() is the explicit, auditable verb for it. It needs a
+    # live connection to disable safe_mode, so it comes after connect_all().
+    lab.gantry.set_safe_mode(not ALLOW_MOTION)
 
     # Give the AL1342's MQTT stream a moment to deliver a message, then
     # show a live reading from each sensor — read-only, no motion.
@@ -191,14 +186,16 @@ def main():
     # for a real homing run.
     print("Skipping homing (assuming the gantry is already referenced).")
 
+    # move_to() returns as soon as the move is checked and started (so a
+    # pause() can be issued straight away); .wait() blocks until it's done.
     print("Moving to (100, 50, 10, 0) mm...")
-    lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0)
+    lab.move_to([100.0, 50.0, 10.0, 0.0], speed=10.0).wait()
 
     print("Moving X to 150mm only (Y/Z held at their current position, fence-checked)...")
-    lab.move_to(X=150.0, speed=10.0)
+    lab.move_to(X=150.0, speed=10.0).wait()
 
     print("Moving Z to 20mm only...")
-    lab.move_to(Z=20.0, speed=5.0)
+    lab.move_to(Z=20.0, speed=5.0).wait()
 
     # ------------------------------------------------------------------
     # A few scans — one per sensor, along X
@@ -234,7 +231,7 @@ def main():
     # this is the controller's zero, not wherever this run happened to
     # start.
     print("Returning to the origin...")
-    lab.gantry.move_to([0.0, 0.0, 0.0, 0.0], speed=10.0)
+    lab.gantry.move_to([0.0, 0.0, 0.0, 0.0], speed=10.0).wait()
 
     lab.disconnect_all()
     print("Done!")

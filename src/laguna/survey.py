@@ -44,6 +44,8 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .robot.motion_arbiter import DEFAULT_ARBITER
+
 logger = logging.getLogger(__name__)
 
 #: Cartesian axis name -> index into a 3-component [x, y, z] vector. Shared
@@ -621,50 +623,74 @@ class SurveyRunner:
         # safe.
         travel_speed = p.travel_speed if p.travel_speed is not None else p.scan_speed
         scanner = getattr(self.lab, p.instrument, None)
-        self.lab.place(
-            p.instrument, list(p.start), speed=travel_speed, reference_point=reference_point
-        )
+        gantry = getattr(self.lab, "gantry", None)
+        arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
 
+        # Held across the reposition *and* the scan, so nothing scheduled can
+        # move the gantry in between. Holding it also makes place() run
+        # inline (blocking) rather than returning a still-moving handle.
+        # Inside the try: a pass that fails while repositioning (a fence, a
+        # halt) is logged against the pass like any other failure.
         try:
-            if scanner is not None and hasattr(scanner, "acquire"):
-                gantry = getattr(self.lab, "gantry", None)
-                end_gantry = self.lab.frames.gantry_target_for(p.instrument, list(p.end))
-                axis_index = _AXIS_INDEX[p.axis]
-                scan = scanner.acquire(
-                    gantry=gantry,
-                    axis=p.axis,
-                    end_mm=float(end_gantry[axis_index]),
-                    **({"feed_rate_mm_s": p.scan_speed} if p.scan_speed else {}),
-                )
-                result_note = f"points={scan.valid_count}" if scan is not None else "no data"
-            else:
-                # No acquire() — a rangefinder transect goes through the
-                # profiler path instead, which has no per-instrument
-                # fallback rate the way GocatorScanner.acquire() does, so a
-                # survey/pass without one would otherwise fail deep inside
-                # FlumeLab.acquire_scan() with a message that doesn't name
-                # the pass.
-                if p.scan_speed is None:
-                    raise ValueError(
-                        f"pass {p.index} ({p.instrument}) has no scan_speed — "
-                        "set it on the Survey or override this Pass; unlike "
-                        "GocatorScanner.acquire(), the rangefinder profiler path "
-                        "has no configured-spec fallback to fall back to."
-                    )
-                result = self.lab.acquire_scan(
-                    p.instrument,
-                    start=None,
-                    end=self._acquire_scan_end(p),
-                    feed_rate_mm_s=p.scan_speed,
-                    axis=p.axis,
-                )
-                result_note = f"file={result.path}"
+            with arbiter.hold(f"survey pass {p.index} ({p.instrument})"):
+                return self._run_pass_held(p, reference_point, travel_speed, scanner, gantry)
         except Exception as exc:
             self.lab.event_log.log(
                 self.lab.clock.elapsed(), p.instrument, "survey_pass",
                 result=f"error: {exc}", notes=p.label or "",
             )
             raise
+
+    def _run_pass_held(
+        self,
+        p: Pass,
+        reference_point: Optional[List[float]],
+        travel_speed: Optional[float],
+        scanner: Any,
+        gantry: Any,
+    ) -> Any:
+        """Body of _run_pass(), with the gantry held."""
+        self.lab.place(
+            p.instrument, list(p.start), speed=travel_speed, reference_point=reference_point
+        ).wait()
+
+        if scanner is not None and hasattr(scanner, "acquire"):
+            # The same reference point as the start: an edge-aligned
+            # pass is positioned by its swath edge, and its end must be
+            # too, or a rotated mount shifts the end along the travel axis.
+            end_gantry = self.lab.frames.gantry_target_for(
+                p.instrument, list(p.end), reference_point=reference_point
+            )
+            axis_index = _AXIS_INDEX[p.axis]
+            scan = scanner.acquire(
+                gantry=gantry,
+                axis=p.axis,
+                end_mm=float(end_gantry[axis_index]),
+                **({"feed_rate_mm_s": p.scan_speed} if p.scan_speed else {}),
+            )
+            result_note = f"points={scan.valid_count}" if scan is not None else "no data"
+        else:
+            # No acquire() — a rangefinder transect goes through the
+            # profiler path instead, which has no per-instrument
+            # fallback rate the way GocatorScanner.acquire() does, so a
+            # survey/pass without one would otherwise fail deep inside
+            # FlumeLab.acquire_scan() with a message that doesn't name
+            # the pass.
+            if p.scan_speed is None:
+                raise ValueError(
+                    f"pass {p.index} ({p.instrument}) has no scan_speed — "
+                    "set it on the Survey or override this Pass; unlike "
+                    "GocatorScanner.acquire(), the rangefinder profiler path "
+                    "has no configured-spec fallback to fall back to."
+                )
+            result = self.lab.acquire_scan(
+                p.instrument,
+                start=None,
+                end=self._acquire_scan_end(p, reference_point),
+                feed_rate_mm_s=p.scan_speed,
+                axis=p.axis,
+            )
+            result_note = f"file={result.path}"
         self.lab.event_log.log(
             self.lab.clock.elapsed(), p.instrument, "survey_pass",
             result=result_note, notes=p.label or "",
@@ -747,7 +773,9 @@ class SurveyRunner:
         delta_gantry = mounting.apply_to_points(np.array([[edge_x, 0.0, 0.0]]))[0]
         return [float(v) for v in delta_gantry]
 
-    def _acquire_scan_end(self, p: Pass) -> List[float]:
+    def _acquire_scan_end(
+        self, p: Pass, reference_point: Optional[List[float]] = None
+    ) -> List[float]:
         """Build acquire_scan()'s full per-axis `end` from an experiment-frame target.
 
         gantry_target_for() only returns X/Y/Z — Theta is outside the
@@ -757,7 +785,9 @@ class SurveyRunner:
         backfilled with its live current position, same as move_to()'s
         keyword form leaves unspecified axes untouched.
         """
-        xyz = self.lab.frames.gantry_target_for(p.instrument, list(p.end))
+        xyz = self.lab.frames.gantry_target_for(
+            p.instrument, list(p.end), reference_point=reference_point
+        )
         by_name = {"X": float(xyz[0]), "Y": float(xyz[1]), "Z": float(xyz[2])}
         gantry = self.lab.gantry
         return [

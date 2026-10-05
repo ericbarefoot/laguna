@@ -198,7 +198,7 @@ class TestSafetyVerbs:
         lab = self._lab(a)
         lab.clock.start()
         lab.pause()
-        assert lab.resume_from_pause() is True
+        lab.resume()
         assert a.calls == ["pause", "resume"]
         assert lab.clock.is_paused is False
         assert lab.safety_state is SafetyState.RUNNING
@@ -327,23 +327,30 @@ class TestRearm:
         finally:
             lab.safety_monitor.stop()
 
-    def test_rearm_re_enables_the_gantry(self, tmp_path):
-        class FakeGantry(RecordingSubsystem):
-            def __init__(self):
-                super().__init__("gantry")
-                self.safe_mode_calls = []
+    def test_rearm_leaves_the_gantry_in_safe_mode(self, tmp_path):
+        """Re-arming clears the fault; it must not also re-enable motion.
+        It used to call set_safe_mode(False), so a run started in safe_mode
+        came out of an estop able to move."""
+        from laguna.robot.macron.connection import SnapMotionError
+        from laguna.robot.macron.controller import GantryController
+        from tests.macron_fixtures import FakeSnapConnection
 
-            def set_safe_mode(self, enabled):
-                self.safe_mode_calls.append(enabled)
-                return True
-
-        gantry = FakeGantry()
+        responses = {f"A{i} {verb}": "0" for i in (1, 2, 5, 6) for verb in ("ACP", "ABT", "BST", "MTR 0")}
+        responses.update({"SOB 4 0": "0", "SOB 5 0": "0"})
+        conn = FakeSnapConnection(responses)
+        gantry = GantryController(connection=conn, mm_per_unit=1.0)
+        gantry._is_connected = True
+        gantry._safe_mode = False
         lab = self._lab(tmp_path, gantry)
         try:
             lab.estop()
+            conn.sent.clear()
             assert lab.rearm() is True
-            # False re-enables motors and releases Y/Z brakes, in that order.
-            assert gantry.safe_mode_calls == [False]
+            assert gantry.halted is None
+            assert gantry._safe_mode is True
+            assert not any(c.endswith("MTR 1") for c in conn.sent), "rearm turned motors on"
+            with pytest.raises(SnapMotionError, match="safe_mode"):
+                gantry.move_to(X=10.0)
         finally:
             lab.safety_monitor.stop()
 
@@ -352,7 +359,7 @@ class TestRearm:
             def __init__(self):
                 super().__init__("gantry")
 
-            def set_safe_mode(self, enabled):
+            def rearm(self):
                 return False
 
         lab = self._lab(tmp_path, StubbornGantry())
@@ -368,7 +375,7 @@ class TestRearm:
         try:
             lab.estop()
             with pytest.raises(RuntimeError, match="call rearm"):
-                lab.resume_from_pause()
+                lab.resume()
         finally:
             lab.safety_monitor.stop()
 
@@ -560,9 +567,11 @@ class TestAllTiersArePollable:
         try:
             (tmp_path / "PAUSE").touch()
             assert self._wait(lab, SafetyState.PAUSED)
-            assert lab.resume_from_pause() is False
+            lab.resume()
+            assert lab.safety_state is SafetyState.PAUSED, "resumed into a live PAUSE"
             (tmp_path / "PAUSE").unlink()
-            assert lab.resume_from_pause() is True
+            lab.resume()
+            assert lab.safety_state is SafetyState.RUNNING
         finally:
             lab.safety_monitor.stop()
 
@@ -613,3 +622,114 @@ class TestEscalation:
         lab.escalate("unrecoverable", tier=SafetyTier.ESTOP)
         assert lab.safety_state is SafetyState.ESTOPPED
         assert sub.calls == ["estop"]
+
+
+class TestResumeAndTheSchedule:
+    """lab.resume() is the one way back from a pause, and never from worse."""
+
+    def test_resume_from_an_estop_never_restarts_the_schedule_or_clock(self):
+        """Regression: resume() went straight to scheduler.run_async(), which
+        resumed the clock itself — restarting scheduled actions after an estop."""
+        lab = FlumeLab()
+        fired = []
+        lab.scheduler.repeat(every=0.01, action=lambda: fired.append(True), name="pump")
+        lab.start(60)
+        lab.estop()
+        with pytest.raises(RuntimeError, match="rearm"):
+            lab.resume()
+        assert lab.clock.is_paused
+        assert _wait(lambda: not lab.scheduler.is_running)
+        count = len(fired)
+        import time
+        time.sleep(0.1)
+        assert len(fired) == count
+
+    def test_resume_after_end_run_is_refused(self):
+        lab = FlumeLab()
+        lab.start(60)
+        lab.end_run()
+        with pytest.raises(RuntimeError, match="new run"):
+            lab.resume()
+
+    def test_resume_after_a_pause_restarts_the_schedule_for_the_remaining_time(self):
+        lab = FlumeLab()
+        lab.start(60)
+        lab.pause()
+        import time
+        assert _wait(lambda: not lab.scheduler.is_running)
+        thread = lab.resume()
+        assert thread is not None and lab.scheduler.is_running
+        lab.pause()
+        thread.join(timeout=2)
+
+    def test_scheduled_firings_are_vetoed_unless_running(self):
+        lab = FlumeLab()
+        assert lab._scheduler_gate() is None
+        lab.pause()
+        assert "PAUSED" in lab._scheduler_gate()
+
+
+class TestStateNeverDowngrades:
+    def test_a_pause_finishing_after_an_estop_leaves_it_estopped(self):
+        """Safety-monitor trips now run concurrently; a slow pause() must not
+        overwrite the estop that landed while it was running."""
+        import threading
+
+        lab = FlumeLab()
+        in_pause, release = threading.Event(), threading.Event()
+
+        class SlowPause(RecordingSubsystem):
+            def pause(self):
+                in_pause.set()
+                release.wait(2)
+                return super().pause()
+
+        lab.add(SlowPause("weir"))
+        t = threading.Thread(target=lab.pause)
+        t.start()
+        in_pause.wait(2)
+        lab.estop()
+        release.set()
+        t.join(2)
+        assert lab.safety_state is SafetyState.ESTOPPED
+
+
+class TestMonitorKeepsPollingDuringAHandler:
+    def test_an_estop_is_seen_while_a_pause_handler_is_stuck(self, tmp_path):
+        """Handlers ran on the polling thread, so a pause() blocked on I/O
+        stopped the monitor from seeing an ESTOP file until it returned."""
+        import threading
+
+        lab = FlumeLab()
+        stuck, release = threading.Event(), threading.Event()
+
+        class Hangs(RecordingSubsystem):
+            def pause(self):
+                stuck.set()
+                release.wait(5)
+                return super().pause()
+
+        lab.add(Hangs("camera"))
+        lab.safety_monitor._poll_s = 0.01
+        lab.watch_for_safety(sentinels={
+            "pause": str(tmp_path / "PAUSE"), "estop": str(tmp_path / "ESTOP"),
+        })
+        try:
+            (tmp_path / "PAUSE").touch()
+            assert stuck.wait(2)
+            (tmp_path / "ESTOP").touch()
+            assert _wait(lambda: lab.safety_state is SafetyState.ESTOPPED)
+        finally:
+            release.set()
+            lab.safety_monitor.stop()
+
+
+def _wait(predicate, timeout=2.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
