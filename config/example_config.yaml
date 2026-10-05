@@ -297,22 +297,26 @@ gocator:
                                # $LAGUNA_GOSDK_LIB_DIR or a conventional path —
                                # build them first with scripts/build_gosdk.sh
 
-# dslr_cameras:
-#   dualcam_path: /path/to/dualcam-timelapse  # path to dualcam-timelapse repo
+# dslr_cameras:                # Canon EOS DSLRs via gphoto2 (pip install laguna[dslr]). Omit to disable.
 #   # Scheduling (choose one):
 #   interval_s: 20
 #   # trigger_at: [20, 40, 60]
 #   # use_schedule: true
-#   cameras:
+#   capture_target: card        # card: keep a backup copy on the SD card | ram: no card
+#                               #   (download is the only copy). One value for ALL cameras:
+#                               #   libgphoto2 holds a single capture target per host.
+#   card_reserve_shots: 500     # card mode: below this much free space, delete the oldest verified shots
+#   cameras:                    # any number; each bound by body serial, never by USB port
 #     Camera1:
-#       port: usb:001,001       # auto-detected if wrong; updated in-place after connect
-#       iso: "1600"
-#       aperture: "5.6"
-#       shutter: "1/125"
+#       serial: "852078018710"  # EOS body serial — list with scripts/setup_dslr_udev.py
+#       # device: /dev/dslr_camera1   # optional udev symlink, tried first (serial still checked)
+#       imageformat: RAW + L    # camera's own value; omit to leave as set on the body
+#       exposure:               # camera must be on M, lens on MF, auto power-off disabled
+#         iso: "800"
+#         aperture: "5.6"
+#         shutter: "1/125"
 #       output_dir: ./captures/Camera1
 #     Camera2:
-#       port: usb:001,002
-#       iso: "1600"
-#       aperture: "5.6"
-#       shutter: "1/125"
+#       serial: "CHANGEME"
+#       exposure: {iso: "800", aperture: "5.6", shutter: "1/125"}
 #       output_dir: ./captures/Camera2

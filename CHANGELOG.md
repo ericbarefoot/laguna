@@ -11,6 +11,31 @@ them into a dated release section when you cut a version.
 ## [Unreleased]
 
 ### Added
+- **`laguna-picam` CLI and `scripts/picam-remote.sh`** — snapshot or live-view
+  a Pi camera from a remote client, relayed client → laguna → pi over SSH
+  pipes (no ports opened). See `docs/subsystems/camera.md`. The Pi camera is
+  exclusive, so don't leave a view open when a scheduled capture is due.
+- **DSLR control is now part of laguna** (`laguna.camera.canon`, issue
+  #60). It is vendored from Minsik's (@yukms)
+  [dualcam-timelapse](https://github.com/yukms/dualcam-timelapse), which no
+  longer needs to be cloned separately. Install it with the new `dslr`
+  extra (`pip install -e ".[dslr]"`). Supports any number of cameras.
+  - Each camera is bound by its EOS body serial on every connect and
+    `resume()`, so cameras can't swap names when their USB ports change.
+  - Pre-flight refuses to connect unless the camera is on M, the lens is on
+    MF, and auto power-off is disabled. Every setting written is read back.
+  - Every download is verified against the card copy. Card files are
+    deleted (oldest first, verified files only) once free space drops below
+    `card_reserve_shots`. A failed download is retried once.
+  - `capture_target: ram` supports bodies with no SD card. The verified
+    download is then the only copy. It applies to every camera, because
+    libgphoto2 holds one capture target for the whole computer; a
+    per-camera value is an error.
+  - A failed capture escalates to a lab-wide pause.
+  - `scripts/setup_dslr_udev.py` lists cameras by serial and installs
+    `/dev/dslr_<name>` symlinks.
+  - Pre-flight sets each camera's clock from the PC (`syncdatetime`), so
+    EXIF times are correct. On the lab T7s they come out in UTC.
 - **`simulate=True` now rehearses every subsystem in
   `laguna.registry.SUBSYSTEM_REGISTRY`** — weir, flow, gauge, both camera
   subsystems, and both AL1342 rangefinders (`od2000`/`wtt12l`), not just
@@ -76,6 +101,14 @@ them into a dated release section when you cut a version.
   archiving. Defaults to `false`.
 
 ### Changed
+- **Breaking: new `dslr_cameras` config schema.** Each camera now needs
+  `serial` and `exposure: {iso, aperture, shutter}`. Optional keys are
+  `imageformat`, `device`, `capture_target` and `card_reserve_shots`. `dualcam_path`,
+  `config_path` and `port` are gone, and laguna no longer writes detected
+  ports back into the experiment YAML.
+- **Breaking:** `DslrCameraSubsystem.capture_all()` now returns
+  `{name: CaptureRecord}` instead of `{name: Path | None}`.
+  `DslrCameraSubsystem` now implements `pause`/`resume`/`stop`/`estop`.
 - **Breaking:** Minimum supported Python bumped from 3.9 to **3.14**
   (`requires-python`, `ruff`/`black`/`mypy` target versions all updated to
   match). The repo's `.venv` is currently on 3.13.13 and will need

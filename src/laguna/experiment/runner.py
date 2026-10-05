@@ -269,6 +269,9 @@ def setup_run(
         # self-contained artifact — see laguna.run_context.
         lab.gocator._output_dir = lab.run.path_for("gocator", str(lab.gocator._output_dir))
 
+    if "dslr_cameras" in lab._subsystems and lab.run.root is not None:
+        lab.dslr_cameras.set_output_root(lab.run.path_for("dslr_cameras", "."))
+
     pi_output_dir: Optional[Path] = None
     if "pi_cameras" in lab._subsystems:
         pi_output_dir = Path(lab.config.get("pi_cameras").get("output_dir", "./captures/pi"))
@@ -409,18 +412,26 @@ def setup_run(
 
     def _capture_dslr():
         # capture_all() logs its own per-camera capture/capture_failed
-        # events now — see DslrCameraSubsystem.capture_all().
+        # events. A missed frame can't be retaken later and still mean the
+        # same thing, so any failure pauses the lab for a human to look —
+        # see laguna.camera.dslr's module docstring.
+        runtime_s = lab.clock.elapsed()
+        logger.info("DSLR cameras: triggering capture...")
         try:
-            logger.info("DSLR cameras: triggering capture...")
-            results = lab.dslr_cameras.capture_all()
-            for cam_name, path in results.items():
-                if path:
-                    logger.info("  %s -> %s", cam_name, Path(path).name)
-                else:
-                    logger.warning("  %s FAILED", cam_name)
-        except Exception as e:
-            logger.error("DSLR capture failed: %s", e)
-            raise
+            records = lab.dslr_cameras.capture_all(runtime_s)
+        except Exception as exc:
+            lab.escalate(f"DSLR capture failed unexpectedly: {exc}")
+            return
+        failed = []
+        for cam_name, record in records.items():
+            for path in record.files:
+                lab.run.record_output("dslr_cameras", path, runtime_s, camera=cam_name)
+            if record.ok:
+                logger.info("  %s -> %s", cam_name, ", ".join(p.name for p in record.files))
+            else:
+                failed.append(f"{cam_name}: {record.error}")
+        if failed:
+            lab.escalate("DSLR capture missed data — " + "; ".join(failed))
 
     # ------------------------------------------------------------------ #
     # Register scheduled actions                                           #

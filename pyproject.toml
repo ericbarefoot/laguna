@@ -35,6 +35,9 @@ dependencies = [
     "paho-mqtt>=1.6",          # MQTT client — rangefinder/OD2000 data path via AL1342
 ]
 
+[project.scripts]
+laguna-picam = "laguna.camera.picam:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
@@ -50,6 +53,11 @@ scanner = [
     # LAZ compression backend, which is what makes LAZ ~100x faster and ~85x
     # smaller than CSV on a full-resolution scan.
     "laspy[lazrs]>=2.5",
+]
+dslr = [
+    # Canon DSLR capture (laguna.camera.canon). The wheel bundles
+    # libgphoto2, so no system package is needed. Linux only.
+    "gphoto2>=2.5",
 ]
 docs = [
     "mkdocs>=1.6",
