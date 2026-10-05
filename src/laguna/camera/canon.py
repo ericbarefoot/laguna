@@ -504,12 +504,38 @@ class CanonDslr:
             )
         for key, value in self.exposure.as_widgets().items():
             self._write_and_verify(key, value)
+        self._sync_clock()
         self._settle()
         logger.info(
             "[%s] pre-flight ok: ISO %s, f/%s, %s s, %s, to %s",
             self.name, self.exposure.iso, self.exposure.aperture,
             self.exposure.shutter, self.read_setting("imageformat"), self.capture_target,
         )
+
+    def _sync_clock(self) -> None:
+        """Set the body's clock from the PC's, so EXIF times can be trusted.
+
+        Laguna's filenames carry PC time either way; this is for the EXIF
+        timestamps inside the images. Writing ``datetime`` directly does
+        nothing on the T7 — only libgphoto2's ``syncdatetime`` trigger does.
+        After it, both lab T7s wrote EXIF DateTimeOriginal in **UTC**
+        (checked against the PC, 2026-10-05). The read-back values can't
+        confirm it: ``datetimeutc`` came back stale on one body and an hour
+        out on the other while both images were right, so nothing here
+        compares them. A failed sync is logged, not refused — it affects
+        metadata only, never whether a frame is kept.
+        """
+        try:
+            config = self._config()
+            config.get_child_by_name("syncdatetime").set_value(1)
+            self._camera.set_config(config, self._context)
+        except Exception as exc:
+            logger.warning(
+                "[%s] could not sync the camera clock (EXIF times will be wrong): %s",
+                self.name, exc,
+            )
+            return
+        logger.info("[%s] camera clock synced from the PC", self.name)
 
     def available_shots(self) -> Optional[int]:
         """Free card space as the camera reports it, in shots."""

@@ -74,7 +74,8 @@ How it behaves:
   its mode dial is on **M**, its lens is on **MF**, and auto power-off is
   disabled; an asleep T7 drops off USB. Exposure, image format and
   capture target (the memory card) are written to the camera and read
-  back.
+  back. Each camera's clock is set from the PC so EXIF times can be
+  trusted.
 - **Connect is all-or-nothing.** If one configured camera is missing,
   none of them connect.
 - **Every capture is verified, and card copies are a rolling backup.**

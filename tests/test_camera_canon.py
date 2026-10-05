@@ -105,6 +105,20 @@ class TestPreflight:
             make_cam(tmp_path, imageformat="RAW+JPEG").connect()
 
 
+class TestClockSync:
+    def test_preflight_sets_the_body_clock_to_the_pc(self, bus, tmp_path):
+        import time
+
+        make_cam(tmp_path).connect()
+        assert abs(int(bus.ports["usb:001,005"].settings["datetimeutc"]) - time.time()) <= 2
+
+    def test_a_body_without_the_setting_still_connects(self, bus, tmp_path, caplog):
+        del bus.ports["usb:001,005"].settings["syncdatetime"]
+        cam = make_cam(tmp_path)
+        cam.connect()
+        assert cam.is_connected and "could not sync" in caplog.text
+
+
 class TestCapture:
     def test_raw_plus_jpeg_downloads_both_verified(self, bus, tmp_path):
         cam = make_cam(tmp_path, imageformat="RAW + L")

@@ -34,6 +34,8 @@ them into a dated release section when you cut a version.
   - A failed capture escalates to a lab-wide pause.
   - `scripts/setup_dslr_udev.py` lists cameras by serial and installs
     `/dev/dslr_<name>` symlinks.
+  - Pre-flight sets each camera's clock from the PC (`syncdatetime`), so
+    EXIF times are correct. On the lab T7s they come out in UTC.
 - **`simulate=True` now rehearses every subsystem in
   `laguna.registry.SUBSYSTEM_REGISTRY`** — weir, flow, gauge, both camera
   subsystems, and both AL1342 rangefinders (`od2000`/`wtt12l`), not just

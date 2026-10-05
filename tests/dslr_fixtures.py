@@ -8,6 +8,7 @@ re-enumeration, or delete it to model a camera dropping off USB.
 
 import sys
 import threading
+import time
 import types
 from typing import Dict, List, Optional, Tuple
 
@@ -41,6 +42,8 @@ class FakeBody:
             "aperture": "5.6",
             "shutterspeed": "1/60",
             "availableshots": "5000",
+            "datetimeutc": "946684800",   # 2000-01-01: a reset T7 clock
+            "syncdatetime": "0",
         }
         self.settings.update(settings)
         self.choices: Dict[str, List[str]] = {
@@ -206,6 +209,11 @@ def install_fake_gphoto2(monkeypatch, bus: FakeBus) -> types.ModuleType:
             for key, widget in config._widgets.items():
                 if key not in body.sticky:
                     body.settings[key] = widget.get_value()
+            # Like the T7: syncdatetime is a trigger that sets the clock to
+            # the host's time, not a value that sticks.
+            if str(body.settings.get("syncdatetime")) == "1" and "syncdatetime" not in body.sticky:
+                body.settings["datetimeutc"] = str(int(time.time()))
+                body.settings["syncdatetime"] = "0"
 
         def wait_for_event(self, timeout, context=None):
             self._live()
