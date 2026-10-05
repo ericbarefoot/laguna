@@ -6,7 +6,7 @@ Public API:
     CaptureResult     — result dataclass from a network capture
     LocalCamera       — single locally-attached camera via OpenCV
     CameraAcquisition — backwards-compatibility alias for LocalCamera
-    DslrCameraSubsystem — DSLR camera wrapper for dualcam-timelapse
+    DslrCameraSubsystem — Canon DSLRs bound by body serial (see canon.py)
 """
 
 from .dslr import DslrCameraSubsystem

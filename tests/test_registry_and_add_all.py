@@ -140,7 +140,10 @@ class TestFromConfigAcrossEveryRegistrySubsystem:
             "weir": {"port": "/dev/ttyUSB0"},
             "flow": {"vfd_port": "/dev/ttyUSB1"},
             "pi_cameras": {"hosts": ["pi1.local"]},
-            "dslr_cameras": {"cameras": {"Cam1": {"port": "usb:001,001", "output_dir": "./out"}}},
+            "dslr_cameras": {"cameras": {"Cam1": {
+                "serial": "852078018710", "output_dir": "./out",
+                "exposure": {"iso": "800", "aperture": "5.6", "shutter": "1/125"},
+            }}},
             "mqtt": {"broker_host": "red.lab"},
             "od2000": {"topic": "laguna/od2000", "al1342_host": "192.168.1.251"},
             "wtt12l": {"topic": "laguna/wtt12l", "al1342_host": "192.168.1.251"},
@@ -173,8 +176,8 @@ class TestFromConfigAcrossEveryRegistrySubsystem:
     def test_dslr_from_config_resolves_output_dir_relative_to_the_yaml(self, tmp_path):
         lab = FlumeLab(self._full_config_path(tmp_path))
         lab.add("dslr_cameras")
-        out_dir = lab.dslr_cameras._config["cameras"]["Cam1"]["output_dir"]
-        assert out_dir == str((tmp_path / "out").resolve())
+        out_dir = lab.dslr_cameras.cameras["Cam1"].output_dir
+        assert out_dir == (tmp_path / "out").resolve()
 
     def test_pi_cameras_without_explicit_hosts_targets_nothing(self, tmp_path):
         """A pi_cameras: section with some other key set but no hosts: must
