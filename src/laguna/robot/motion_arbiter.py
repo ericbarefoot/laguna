@@ -66,6 +66,7 @@ class MotionArbiter:
         self._lock = threading.RLock()
         self._timeout_s = timeout_s
         self._holder: Optional[str] = None
+        self._owner: Optional[int] = None
         self._depth = 0
 
     @property
@@ -77,6 +78,15 @@ class MotionArbiter:
     def is_held(self) -> bool:
         """True if any thread currently holds the gantry."""
         return self._holder is not None
+
+    def held_by_current_thread(self) -> bool:
+        """True if the calling thread is the one holding the gantry.
+
+        GantryController.move_to() runs inline rather than on a background
+        thread when this is true — a background thread would wait on the
+        very hold its caller is sitting in.
+        """
+        return self._owner == threading.get_ident()
 
     @contextmanager
     def hold(
@@ -111,6 +121,7 @@ class MotionArbiter:
         self._depth += 1
         if outermost:
             self._holder = description
+            self._owner = threading.get_ident()
             logger.debug("Gantry acquired for %s", description)
         try:
             yield
@@ -118,6 +129,7 @@ class MotionArbiter:
             self._depth -= 1
             if self._depth == 0:
                 self._holder = None
+                self._owner = None
                 logger.debug("Gantry released after %s", description)
             self._lock.release()
 

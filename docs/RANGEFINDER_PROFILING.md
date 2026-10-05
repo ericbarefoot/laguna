@@ -118,7 +118,7 @@ gantry controller's spare digital input, IO-Link left untouched.
 - **Constant-velocity moves are already supported.** The G-code executor
   (`src/laguna/robot/macron/gcode.py`) parses the standard `F` feed-rate
   word and, for coordinated moves, calls `group_set_speed()` (`C<n> SPD`)
-  before `group_begin_move_to()` (`C<n> BMT`) — this is the ordinary,
+  before `_group_begin_move_to()` (`C<n> BMT`) — this is the ordinary,
   already-used, safe way to use the `C<n>` group prefix **for motion**.
   This is worth being explicit about, since it's easy to conflate with the
   earlier finding that `C<n> ACP` (a group *read*) is unsafe/nonfunctional

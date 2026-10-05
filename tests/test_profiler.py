@@ -305,10 +305,15 @@ class TestProfilerScan:
         """
         from laguna.robot.motion_arbiter import MotionArbiter
 
+        from laguna.robot.macron.halt import HaltLatch
+
         class RealishGantry:
             def __init__(self, connection):
                 self.connection = connection
                 self.arbiter = MotionArbiter()
+
+            def plan_scan_move(self, axis, end_mm):
+                return HaltLatch().guard("scan")
 
         conn = FakeGantryConnection()
         gantry = RealishGantry(conn)
@@ -348,6 +353,81 @@ class TestProfilerScan:
         second, _, _ = self._run_scan(tmp_path)
         assert first.path != second.path
         assert first.path.exists() and second.path.exists()
+
+
+class TestProfilerSafety:
+    """The Pi-agent pass goes through the same gates as every other motion."""
+
+    def _gantry(self, conn, fences=()):
+        from laguna.robot.macron.controller import GantryController
+        from tests.macron_fixtures import FakeSnapConnection
+
+        wire = FakeSnapConnection({"A1 ACP": "6.667", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"})
+        gantry = GantryController(connection=wire, mm_per_unit=15.0, fences=list(fences))
+        gantry._is_connected = True
+        gantry._safe_mode = False
+        gantry._connection = conn  # scan control goes to the fake agent API
+        return gantry
+
+    def _profiler(self, gantry, tmp_path):
+        return TopographicProfiler(
+            gantry=gantry, pi_host="red.lab", pi_user="oak",
+            pdin_port=2, al1342_host="192.168.1.251", output_dir=str(tmp_path),
+        )
+
+    def test_a_pass_into_a_fence_never_starts(self, tmp_path):
+        from laguna.robot.macron.fences import BoxFence, FenceViolation
+
+        conn = FakeGantryConnection()
+        gantry = self._gantry(conn, fences=[BoxFence("post", 300, 310, -5, 5, -5, 5)])
+        with pytest.raises(FenceViolation):
+            self._profiler(gantry, tmp_path).scan(axis="A1", end_mm=500.0, feed_rate_mm_s=5.0)
+        assert conn.start_scan_calls == []
+
+    def test_a_halted_gantry_never_starts_a_pass(self, tmp_path):
+        from laguna.robot.macron.halt import MotionHalted
+
+        conn = FakeGantryConnection()
+        gantry = self._gantry(conn)
+        from laguna.robot.macron.halt import HaltLevel
+
+        gantry._halt.trip(HaltLevel.PAUSE, "pause()")
+        with pytest.raises(MotionHalted):
+            self._profiler(gantry, tmp_path).scan(axis="A1", end_mm=500.0, feed_rate_mm_s=5.0)
+        assert conn.start_scan_calls == []
+
+    def test_a_halt_mid_pass_keeps_the_partial_profile_and_raises(self, tmp_path):
+        """A pause cuts the pass short through the agent's normal scan_done
+        path; it must not be mistaken for a complete pass."""
+        from laguna.robot.macron.halt import HaltLevel, MotionHalted
+
+        conn = FakeGantryConnection(result=_make_result(samples=12))
+        gantry = self._gantry(conn)
+        original_wait = conn.wait_for_scan_result
+
+        def wait_then_pause(timeout):
+            gantry._halt.trip(HaltLevel.PAUSE, "pause()")
+            return original_wait(timeout)
+
+        conn.wait_for_scan_result = wait_then_pause
+        fake_client = FakeSSHClient()
+        with patch("paramiko.SSHClient", return_value=fake_client):
+            with pytest.raises(MotionHalted, match="partial profile kept"):
+                self._profiler(gantry, tmp_path).scan(axis="A1", end_mm=500.0, feed_rate_mm_s=5.0)
+        assert fake_client.sftp.gets, "the partial CSV must still be retrieved"
+        assert list(tmp_path.glob("profile_*.csv"))
+
+    def test_an_agent_error_with_partial_data_retrieves_it_first(self, tmp_path):
+        conn = FakeGantryConnection(result={
+            "scan_error": "MIF timeout", "id": 1, "csv_path": "/tmp/x.csv",
+            "samples": 40, "partial": True,
+        })
+        gantry = self._gantry(conn)
+        fake_client = FakeSSHClient()
+        with patch("paramiko.SSHClient", return_value=fake_client):
+            with pytest.raises(RuntimeError, match="partial profile .*kept"):
+                self._profiler(gantry, tmp_path).scan(axis="A1", end_mm=500.0, feed_rate_mm_s=5.0)
+        assert fake_client.sftp.gets
 
 
 class TestProfilerStop:

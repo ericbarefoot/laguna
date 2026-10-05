@@ -372,8 +372,10 @@ class FakeLab:
         self.event_log = _EventLog()
 
     def place(self, instrument, point, speed=None, reference_point=None):
+        from laguna.robot.macron.move_handle import MoveHandle
+
         self.placed.append((instrument, tuple(point), speed, reference_point))
-        return True
+        return MoveHandle.run_inline(f"place({instrument})", lambda: None)
 
 
 class TestSurveyRunner:
@@ -575,6 +577,38 @@ class TestSurveyRunner:
         assert len(lab.event_log.rows) == 1
         (args, kwargs) = lab.event_log.rows[0]
         assert "error" in kwargs.get("result", args[3] if len(args) > 3 else "")
+
+    def test_a_pass_that_fails_while_repositioning_is_logged(self):
+        """A fence or halt refusing the reposition used to escape before the
+        pass's error row was written."""
+        lab = FakeLab()
+
+        def refuse(*a, **kw):
+            raise RuntimeError("fence: post")
+
+        lab.place = refuse
+        with pytest.raises(RuntimeError, match="fence"):
+            SurveyRunner(lab, self._survey()).run()
+        (args, kwargs) = lab.event_log.rows[0]
+        assert "error" in kwargs.get("result", "")
+        assert lab.gocator.acquired == []
+
+    def test_an_edge_aligned_scan_ends_at_the_same_edge_it_started_from(self):
+        """The scan end used to be computed from the instrument's centerline
+        while the start used the swath edge — fine for an axis-aligned
+        mount, wrong along the travel axis for a rotated one."""
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea(x_mm=-750.0, width_mm=1500.0)
+        seen = []
+        original = lab.frames.gantry_target_for
+
+        def spy(instrument, point, reference_point=None):
+            seen.append(reference_point)
+            return original(instrument, point, reference_point=reference_point)
+
+        lab.frames.gantry_target_for = spy
+        SurveyRunner(lab, self._survey()).run()
+        assert seen and all(ref == [-750.0, 0.0, 0.0] for ref in seen)
 
     def test_rangefinder_pass_without_a_scan_speed_raises_clearly(self):
         """acquire_scan() (the rangefinder path) has no configured-spec

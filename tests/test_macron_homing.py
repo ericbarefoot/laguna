@@ -3,6 +3,8 @@
 All scripted against FakeSnapConnection — no hardware.
 """
 
+import time
+
 import pytest
 
 from laguna.robot.macron.commands import IOMap, MMCCommands, X_AXIS, Y_AXIS, Z_AXIS
@@ -30,7 +32,7 @@ class TestHomeAxisHappyPath:
             homing_speed=10.0,
             standoff_distance=5.0,
             poll_interval_s=0.001,
-            timeout_s=1.0,
+            default_timeout_s=1.0,
             backoff_timeout_s=1.0,
             axis_configs={X_AXIS: AxisHomingConfig(input_index=1)},
             **config_overrides,
@@ -105,7 +107,7 @@ class TestHomeAxisHappyPath:
         cmd = MMCCommands(conn)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=1.0, backoff_timeout_s=1.0,
+            default_timeout_s=1.0, backoff_timeout_s=1.0,
             axis_configs={X_AXIS: AxisHomingConfig(input_index=1, trip_on_high=False)},
         )
         proc = HomingProcedure(cmd, config)
@@ -136,7 +138,7 @@ class TestHomeAxisTimeout:
         cmd = MMCCommands(conn)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=0.02, backoff_timeout_s=1.0,
+            default_timeout_s=0.02, backoff_timeout_s=1.0,
             axis_configs={X_AXIS: AxisHomingConfig(input_index=1)},
         )
         proc = HomingProcedure(cmd, config)
@@ -165,7 +167,7 @@ class TestHomeAxisBrakeHandling:
         io_map = IOMap(y_brake_output=4, y_brake_status_input=8)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=1.0, backoff_timeout_s=1.0,
+            default_timeout_s=1.0, backoff_timeout_s=1.0,
             axis_configs={Y_AXIS: AxisHomingConfig(input_index=3)},
         )
         proc = HomingProcedure(cmd, config, io_map=io_map)
@@ -199,7 +201,7 @@ class TestHomeAxisBrakeHandling:
         cmd = MMCCommands(conn)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=1.0, backoff_timeout_s=1.0,
+            default_timeout_s=1.0, backoff_timeout_s=1.0,
             axis_configs={Z_AXIS: AxisHomingConfig(input_index=5)},
         )
         proc = HomingProcedure(cmd, config)  # default IOMap
@@ -226,7 +228,7 @@ class TestLocateLimitSwitch:
         cmd = MMCCommands(conn)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=1.0, backoff_timeout_s=1.0,
+            default_timeout_s=1.0, backoff_timeout_s=1.0,
             axis_configs={X_AXIS: AxisHomingConfig(input_index=1)},  # home switch, unused here
         )
         proc = HomingProcedure(cmd, config)
@@ -265,7 +267,7 @@ class TestHomeAll:
         io_map = IOMap(y_brake_output=4, y_brake_status_input=8)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=1.0, backoff_timeout_s=1.0,
+            default_timeout_s=1.0, backoff_timeout_s=1.0,
             home_order=(X_AXIS, Y_AXIS),
             axis_configs={
                 X_AXIS: AxisHomingConfig(input_index=1),
@@ -288,7 +290,7 @@ class TestHomeAll:
         cmd = MMCCommands(conn)
         config = HomingConfig(
             homing_speed=10.0, standoff_distance=5.0, poll_interval_s=0.001,
-            timeout_s=0.02, backoff_timeout_s=1.0,
+            default_timeout_s=0.02, backoff_timeout_s=1.0,
             home_order=(X_AXIS, Y_AXIS),
             axis_configs={X_AXIS: AxisHomingConfig(input_index=1)},
         )
@@ -298,3 +300,69 @@ class TestHomeAll:
         assert "X" not in result.axis_results
         assert "Y" not in result.axis_results  # never reached — X failed first
         assert not any(c.startswith("A2") for c in conn.sent)
+
+
+class TestSearchTimeoutFromTravel:
+    """A flat 60 s timed out long before X's home switch: ~8000 mm at 10 mm/s is ~800 s."""
+
+    def test_timeout_scales_with_the_axis_throw(self):
+        config = HomingConfig(homing_speed=10.0)
+        x = AxisHomingConfig(input_index=1, max_travel_mm=8000.0)
+        z = AxisHomingConfig(input_index=5, max_travel_mm=400.0)
+        assert config.search_timeout_s(x) == pytest.approx(1.5 * 8000 / 10 + 30)
+        assert config.search_timeout_s(z) == pytest.approx(1.5 * 400 / 10 + 30)
+
+    def test_an_axis_without_a_throw_uses_the_default(self):
+        config = HomingConfig(default_timeout_s=60.0)
+        assert config.search_timeout_s(AxisHomingConfig(input_index=1)) == 60.0
+
+    def test_config_defaults_give_every_linear_axis_a_throw(self):
+        from laguna.config import Config
+        from laguna.robot.macron.controller import GantryController
+
+        gantry = GantryController.from_config(Config())
+        throws = {
+            axis.name: cfg.max_travel_mm for axis, cfg in gantry.homing._config.axis_configs.items()
+        }
+        assert throws == {"X": 8000.0, "Y": 1200.0, "Z": 400.0}
+
+
+class TestHomingIsHaltable:
+    def _procedure(self, responses):
+        conn = FakeSnapConnection(responses)
+        config = HomingConfig(
+            poll_interval_s=0.001, default_timeout_s=5.0, backoff_timeout_s=1.0,
+            axis_configs={X_AXIS: AxisHomingConfig(input_index=1)},
+        )
+        return HomingProcedure(MMCCommands(conn), config), conn
+
+    def test_a_halt_during_the_switch_search_raises_motion_halted(self):
+        from laguna.robot.macron.halt import HaltLatch, HaltLevel, MotionHalted
+
+        latch = HaltLatch()
+        polls = {"n": 0}
+
+        def switch(_cmd):
+            polls["n"] += 1
+            if polls["n"] == 3:
+                latch.trip(HaltLevel.PAUSE, "pause()")
+            return "0"  # never trips (trip_on_high default) — would run to timeout
+
+        proc, conn = self._procedure({"INB 1": switch, "A1 JOG -10": "-10"})
+        proc._guard = latch.guard("home_axis(X)")
+        start = time.monotonic()
+        with pytest.raises(MotionHalted):
+            proc.home_axis(X_AXIS)
+        assert time.monotonic() - start < 2.0
+
+    def test_home_all_does_not_swallow_a_halt_as_an_axis_failure(self):
+        from laguna.robot.macron.halt import HaltLatch, HaltLevel, MotionHalted
+
+        latch = HaltLatch()
+        proc, conn = self._procedure({"INB 1": "0", "A1 JOG -10": "-10"})
+        proc._config.home_order = (X_AXIS,)
+        proc._guard = latch.guard("home()")
+        latch.trip(HaltLevel.ESTOP, "estop()")
+        with pytest.raises(MotionHalted):
+            proc.home_all()
+        assert "A1 JOG -10" not in conn.sent

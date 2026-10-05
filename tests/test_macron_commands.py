@@ -65,7 +65,7 @@ class TestTokenFormat:
     def test_group_move_formats_multiple_params(self):
         conn = FakeSnapConnection({"C1 BMT 10 20 30": "0"})
         cmd = MMCCommands(conn)
-        cmd.group_begin_move_to(10, 20, 30)
+        cmd._group_begin_move_to(10, 20, 30)
         assert conn.sent == ["C1 BMT 10 20 30"]
 
     def test_z_axis_index_five(self):
@@ -450,13 +450,13 @@ class TestAcceptsAxisHandle:
     def test_get_actual_position_accepts_axis_handle(self):
         conn = FakeSnapConnection({"A1 ACP": "12.000"})
         cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, X_AXIS, is_safe_mode=lambda: True)
+        handle = AxisHandle(cmd, X_AXIS)
         assert cmd.get_actual_position(handle) == 12.0
         assert conn.sent == ["A1 ACP"]
 
     def test_read_home_switch_dispatches_correctly_by_wrapped_axis(self):
         conn = FakeSnapConnection({"INB 3": "1"})
         cmd = MMCCommands(conn)
-        handle = AxisHandle(cmd, Y_AXIS, is_safe_mode=lambda: True)
+        handle = AxisHandle(cmd, Y_AXIS)
         io_map = IOMap(y_home_input=3)
         assert cmd.read_home_switch(handle, io_map) is True

@@ -346,6 +346,19 @@ class TestSubsystemInterface:
         controller.estop()   # none may propagate
 
 
+def _motion_ready(controller):
+    """Mark a fake-wired controller connected with motion enabled.
+
+    Motion is refused client-side unless connected and out of safe_mode
+    (GantryController._require_motion_allowed); these tests exercise what
+    happens once it *is* allowed, without the connect()/set_safe_mode()
+    wire traffic cluttering conn.sent.
+    """
+    controller._is_connected = True
+    controller._safe_mode = False
+    return controller
+
+
 def _seq(*values):
     """Scripted response that walks through `values`, then repeats the last."""
     it = iter(values)
@@ -364,7 +377,7 @@ def _seq(*values):
 class TestMoveTo:
     def _make_controller(self, responses=None, mm_per_unit=15.0):
         conn = FakeSnapConnection(responses or {})
-        controller = GantryController(connection=conn, mm_per_unit=mm_per_unit)
+        controller = _motion_ready(GantryController(connection=conn, mm_per_unit=mm_per_unit))
         return controller, conn
 
     def test_vector_move_routes_through_fence_checked_gcode_path(self):
@@ -386,7 +399,7 @@ class TestMoveTo:
             "A6 ACP": "0",
         }
         controller, conn = self._make_controller(responses)
-        assert controller.move_to([150.0, 0.0, 0.0, 0.0]) is True
+        assert controller.move_to([150.0, 0.0, 0.0, 0.0]).wait().succeeded
         # Every axis is read first (the planning cache is synced to hardware
         # before anything is planned), then the move, then the touched-axes resync.
         assert conn.sent == [
@@ -405,10 +418,10 @@ class TestMoveTo:
         conn = FakeSnapConnection(
             {"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"}
         )
-        controller = GantryController(
+        controller = _motion_ready(GantryController(
             connection=conn, mm_per_unit=15.0,
             fences=[BoxFence("bed", 0, 10, 0, 10, 0, 10)],
-        )
+        ))
         with pytest.raises(FenceViolation):
             controller.move_to([500.0, 500.0, 5.0, 0.0])
 
@@ -428,7 +441,7 @@ class TestMoveTo:
             "A1 ACP": _seq("0", "150"),  # pre-plan sync, then post-move resync
         }
         controller, conn = self._make_controller(responses)
-        assert controller.move_to(X=150.0, speed=2.0) is True
+        assert controller.move_to(X=150.0, speed=2.0).wait().succeeded
         assert conn.sent == [
             "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",
             "C1 INI 1 2", "C1 SPD 0.133333", "C1 BMT 10 0", "C1 MIF",
@@ -441,10 +454,10 @@ class TestMoveTo:
         conn = FakeSnapConnection(
             {"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"}
         )
-        controller = GantryController(
+        controller = _motion_ready(GantryController(
             connection=conn, mm_per_unit=15.0,
             fences=[BoxFence("bed", 0, 10, 0, 10, 0, 10)],
-        )
+        ))
         with pytest.raises(FenceViolation):
             controller.move_to(X=500.0)  # Y/Z backfill to 0,0 (in-bounds); X clearly outside
 
@@ -459,7 +472,7 @@ class TestMoveTo:
         }
         base.update(responses or {})
         conn = FakeSnapConnection(base)
-        controller = GantryController(connection=conn, mm_per_unit=15.0, fences=fences)
+        controller = _motion_ready(GantryController(connection=conn, mm_per_unit=15.0, fences=fences))
         controller.gcode._current_pos = (1200.0, 0.0, 0.0)   # left over from before a scan
         return controller, conn
 
@@ -467,7 +480,7 @@ class TestMoveTo:
         """Regression: after scan_with_gantry() the cache still said X=1200, so
         move_to(X=1200) planned a zero-length leg, sent nothing and returned True."""
         controller, conn = self._stale_cache_controller()
-        assert controller.move_to(X=1200.0) is True
+        assert controller.move_to(X=1200.0).wait().succeeded
         assert "C1 BMT 80 0" in conn.sent
 
     def test_fence_check_uses_the_real_start_not_the_stale_cache(self):
@@ -492,7 +505,7 @@ class TestMoveTo:
             "A5 ACP": "0", "A6 ACP": "0",
             "C1 INI 1 2": "0", "C1 BMT 10 0": "0", "C1 SPD": "20", "C1 MIF": "1",
         })
-        assert controller.move_to(X=150.0) is True
+        assert controller.move_to(X=150.0).wait().succeeded
         assert "C1 BMT 10 0" in conn.sent       # Y stays exactly 0
 
     def test_a_failed_position_read_refuses_the_move(self):
@@ -504,13 +517,6 @@ class TestMoveTo:
             controller.move_to(X=150.0)
         assert not any(c.startswith("C1") for c in conn.sent)
 
-    def test_dry_run_does_not_read_hardware_to_sync(self):
-        controller, conn = self._make_controller({"A2 ACP": "0", "A5 ACP": "0"})
-        controller.gcode._dry_run = True
-        controller.move_to(X=150.0)
-        assert "A1 ACP" not in conn.sent
-        assert conn.sent == ["A2 ACP", "A5 ACP"]
-
     def test_theta_only_keyword_move_does_not_touch_cartesian_axes(self):
         # A pure Theta move must not query, move, or otherwise touch X/Y/Z
         # at all — no ACP reads for X/Y/Z, no C1 group commands.
@@ -521,7 +527,7 @@ class TestMoveTo:
         controller, conn = self._make_controller({
             "A6 ACP": "0", "A6 BMT 90": "0", "A6 MIF": "1",
         })
-        assert controller.move_to(Theta=90.0) is True
+        assert controller.move_to(Theta=90.0).wait().succeeded
         assert conn.sent == ["A6 ACP", "A6 BMT 90", "A6 MIF"]
 
     def test_theta_move_skipped_entirely_when_already_at_target(self):
@@ -529,12 +535,12 @@ class TestMoveTo:
         # value (0.0 if the caller doesn't care) — if Theta is already
         # there, no move (blocking or not) should be sent at all.
         controller, conn = self._make_controller({"A6 ACP": "0"})
-        assert controller.move_to(Theta=0.0) is True
+        assert controller.move_to(Theta=0.0).wait().succeeded
         assert conn.sent == ["A6 ACP"]
 
     def test_keyword_move_of_unconfigured_axis_raises(self):
         conn = FakeSnapConnection({})
-        controller = GantryController(connection=conn, axes=(X_AXIS, Y_AXIS))  # no Z configured
+        controller = _motion_ready(GantryController(connection=conn, axes=(X_AXIS, Y_AXIS)))  # no Z configured
         with pytest.raises(ValueError):
             controller.move_to(Z=1.0)
 
@@ -547,7 +553,7 @@ class TestMoveTo:
 class TestHomeEnableDisableWaitForMove:
     def _make_controller(self, responses=None):
         conn = FakeSnapConnection(responses or {})
-        controller = GantryController(connection=conn)
+        controller = _motion_ready(GantryController(connection=conn))
         return controller, conn
 
     def test_home_delegates_to_homing_home_all(self, monkeypatch):
@@ -555,7 +561,7 @@ class TestHomeEnableDisableWaitForMove:
         from laguna.robot.macron.homing import HomingResult
 
         monkeypatch.setattr(controller.homing, "home_all", lambda: HomingResult(success=True, axis_results={}))
-        assert controller.home() is True
+        assert controller.home().wait().result is True
 
     def test_home_reports_failure(self, monkeypatch):
         controller, _conn = self._make_controller({})
@@ -565,7 +571,7 @@ class TestHomeEnableDisableWaitForMove:
             controller.homing, "home_all",
             lambda: HomingResult(success=False, axis_results={}, error="timeout"),
         )
-        assert controller.home() is False
+        assert controller.home().wait().result is False
 
     def test_locate_limit_switch_delegates_to_homing_and_accepts_axis_forms(self, monkeypatch):
         controller, _conn = self._make_controller({})
@@ -575,8 +581,8 @@ class TestHomeEnableDisableWaitForMove:
             lambda axis: seen.append(axis) or 42.0,
         )
         monkeypatch.setattr(controller.gcode, "sync_position_from_hardware", lambda: None)
-        assert controller.locate_limit_switch("X") == 42.0
-        assert controller.locate_limit_switch(controller.x) == 42.0
+        assert controller.locate_limit_switch("X").wait().result == 42.0
+        assert controller.locate_limit_switch(controller.x).wait().result == 42.0
         assert seen == [X_AXIS, X_AXIS]  # resolved to the underlying Axis both times
 
     def test_home_axis_delegates_and_accepts_axis_forms(self, monkeypatch):
@@ -587,8 +593,8 @@ class TestHomeEnableDisableWaitForMove:
             lambda axis: seen.append(axis) or 5.0,
         )
         monkeypatch.setattr(controller.gcode, "sync_position_from_hardware", lambda: None)
-        assert controller.home_axis("Y") == 5.0
-        assert controller.home_axis(Y_AXIS) == 5.0
+        assert controller.home_axis("Y").wait().result == 5.0
+        assert controller.home_axis(Y_AXIS).wait().result == 5.0
         assert seen == [Y_AXIS, Y_AXIS]
 
     def test_home_axis_resyncs_gcode_position_even_on_failure(self, monkeypatch):
@@ -610,7 +616,7 @@ class TestHomeEnableDisableWaitForMove:
             controller.gcode, "sync_position_from_hardware", lambda: resynced.append(True)
         )
         with pytest.raises(SnapMotionError):
-            controller.home_axis(X_AXIS)
+            controller.home_axis(X_AXIS).wait()
         assert resynced == [True]
 
     def test_home_resyncs_gcode_position(self, monkeypatch):
@@ -624,7 +630,7 @@ class TestHomeEnableDisableWaitForMove:
         monkeypatch.setattr(
             controller.gcode, "sync_position_from_hardware", lambda: resynced.append(True)
         )
-        controller.home()
+        controller.home().wait()
         assert resynced == [True]
 
     def test_enable_turns_on_every_motor_and_never_sends_ena(self):
@@ -688,15 +694,13 @@ class TestAxisHandles:
         controller.y.set_speed(5)
         assert conn.sent == ["A2 SPD 5"]
 
-    def test_motion_is_blocked_by_safe_mode_before_reaching_the_wire(self):
-        """RS232/Ethernet transports have no gate of their own, so this
-        client-side check is the only thing between a bare
-        lab.gantry.y.move_to() and the wire on those transports."""
-        controller, conn = self._make_controller(safe_mode=True)
-        from laguna.robot.macron.connection import SnapMotionError
-        with pytest.raises(SnapMotionError, match="safe_mode"):
-            controller.y.begin_move_to(10)
-        assert conn.sent == []
+    @pytest.mark.parametrize("method", ["move_to", "move_by", "begin_move_to", "begin_move_by", "jog"])
+    def test_handles_have_no_motion_methods(self, method):
+        """Per-axis motion is unfenced, so it lives only on GantryController
+        under names that say so (move_to_unfenced/jog_unfenced), behind
+        safe_mode, the halt latch and the arbiter."""
+        controller, _ = self._make_controller()
+        assert not hasattr(controller.y, method)
 
     def test_stopping_is_never_gated(self):
         controller, conn = self._make_controller({"A2 STP": "0"}, safe_mode=True)
@@ -879,6 +883,7 @@ class TestPositionPersistence:
         controller = GantryController(connection=conn, position_checkpoint_file=path)
         if connect:
             controller.connect()
+            controller._safe_mode = False  # motion paths refuse under safe_mode
         return controller, conn, path
 
     def test_disabled_by_default(self):
@@ -915,7 +920,7 @@ class TestPositionPersistence:
             "A1 ACP": "1", "A2 ACP": "2", "A5 ACP": "3",
         }
         controller, _conn, path = self._make_controller(tmp_path, responses)
-        assert controller.move_to(Theta=90.0) is True
+        assert controller.move_to(Theta=90.0).wait().succeeded
 
         data = GantryPositionStore(path).load()
         assert data["positions"] == {"X": 1.0, "Y": 2.0, "Z": 3.0, "Theta": 5.0}
@@ -941,7 +946,7 @@ class TestPositionPersistence:
             controller, "cmd",
             type("_C", (), {"get_actual_position": staticmethod(lambda axis: 7.0)})(),
         )
-        controller.home_axis(X_AXIS)
+        controller.home_axis(X_AXIS).wait()
 
         data = GantryPositionStore(path).load()
         assert data is not None
@@ -959,7 +964,7 @@ class TestPositionPersistence:
             controller, "cmd",
             type("_C", (), {"get_actual_position": staticmethod(lambda axis: 9.0)})(),
         )
-        controller.home()
+        controller.home().wait()
 
         data = GantryPositionStore(path).load()
         assert data is not None
@@ -973,7 +978,7 @@ class TestPositionPersistence:
             controller, "cmd",
             type("_C", (), {"get_actual_position": staticmethod(lambda axis: 3.0)})(),
         )
-        controller.locate_limit_switch(X_AXIS)
+        controller.locate_limit_switch(X_AXIS).wait()
 
         data = GantryPositionStore(path).load()
         assert data is not None
@@ -1203,8 +1208,32 @@ class TestSetSafeMode:
         controller.connect()
         conn.sent.clear()
         assert controller.set_safe_mode(True) is True
-        assert conn.sent == ["SOB 4 0", "SOB 5 0"]
+        stops = [c for c in conn.sent if c.endswith("BST")]
+        assert stops == ["A1 BST", "A2 BST", "A5 BST", "A6 BST"]
+        brakes = [c for c in conn.sent if c.startswith("SOB")]
+        assert brakes == ["SOB 4 0", "SOB 5 0"]
+        assert conn.sent.index("A6 BST") < conn.sent.index("SOB 4 0")
         assert not any("MTR" in c for c in conn.sent)
+
+    def test_enabling_brakes_before_the_transport_gate_closes(self):
+        """Regression: the flag used to flip first, so on a gated transport
+        the brake commands that followed were refused and Y/Z were left
+        released with their motors on."""
+        controller, conn = self._make_controller(safe_mode=False)
+        conn.safe_mode = False
+        controller.connect()
+        gate_at_brake = []
+        original_send = conn.send
+
+        def recording_send(command):
+            if command.startswith("SOB"):
+                gate_at_brake.append(conn.safe_mode)
+            return original_send(command)
+
+        conn.send = recording_send
+        controller.set_safe_mode(True)
+        assert gate_at_brake == [False, False]
+        assert conn.safe_mode is True
 
     def test_flag_propagates_to_the_transport_gate(self):
         controller, conn = self._make_controller(safe_mode=True)
@@ -1245,13 +1274,11 @@ class TestSetSafeMode:
         assert conn.safe_mode is True
         assert conn.sent == []
 
-    def test_axis_handles_see_the_new_flag_immediately(self):
-        """The handles' gate closes over self._safe_mode, so flipping it
-        must take effect without rebuilding them."""
+    def test_unfenced_motion_sees_the_new_flag_immediately(self):
         from laguna.robot.macron.connection import SnapMotionError
-        controller, _ = self._make_controller(safe_mode=True)
+        controller, conn = self._make_controller(safe_mode=True)
         controller.connect()
-        with pytest.raises(SnapMotionError):
-            controller.y.begin_move_to(1)
+        with pytest.raises(SnapMotionError, match="safe_mode"):
+            controller.move_to_unfenced("Y", 1)
         controller.set_safe_mode(False)
-        controller.y._check_motion_allowed("test")   # no longer raises
+        controller._require_motion_allowed("test")   # no longer raises

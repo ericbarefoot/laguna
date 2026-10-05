@@ -122,7 +122,16 @@ lab.emergency_stop()         # stop + disconnect every registered subsystem
 lab.stop()                   # pause only (resumable)
 lab.resume()                 # resume for the remaining configured duration
 lab.resume(60)               # resume for 60 more experiment-seconds instead
+
+lab.move_to(X=150)           # non-blocking: returns a MoveHandle at once
+lab.move_to(X=150).wait()    # ...or block until the move finishes
+lab.pause()                  # cancels the move in flight; lab.resume() to continue
+lab.rearm()                  # after estop — leaves the gantry in safe_mode
 ```
+
+Every gantry move is fence-checked except homing and the explicitly named
+`move_to_unfenced()`/`jog_unfenced()` — see
+[Motion control layers](MOTION_CONTROL_LAYERS.md).
 
 Per-subsystem access after `lab.add(...)` — the subsystem is available as
 `lab.<subsystem_name>`:

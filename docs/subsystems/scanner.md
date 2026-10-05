@@ -124,15 +124,12 @@ Two things must be true before a scan pass can move anything:
   value. Without `--allow-motion`, the script always behaves like
   `--dry-run`.
 
-`scan_with_gantry()` drives the axis through its `AxisHandle`
-(`gantry.axis("X")`) rather than `gantry.move_to()`, because the trigger must
-fire *while* the axis is mid-move and `move_to()` blocks until the move
-finishes. `AxisHandle.begin_move_to()` is non-blocking and still enforces the
-gantry's `safe_mode` gate — the raw `gantry.cmd` path does not, on the
-ethernet/rs232 transports.
-
-It does **not** fence-check the target the way `move_to()` does, so validate
-your destination is inside the work envelope.
+`scan_with_gantry()` starts the pass with `gantry.begin_scan_move()` rather
+than `gantry.move_to()`, because the trigger must fire *while* the axis is
+mid-move, so the pass has to be a plain single-axis move rather than the
+coordinated gcode path. `begin_scan_move()` still fence-checks the straight
+pass from the live position and refuses under `safe_mode` or a halt, exactly
+like `move_to()` — see [`MOTION_CONTROL_LAYERS.md`](../MOTION_CONTROL_LAYERS.md).
 
 ### Manual lifecycle
 

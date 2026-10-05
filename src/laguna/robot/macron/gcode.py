@@ -104,15 +104,20 @@ hard hardware limitation (no cross-node group support), not a bug to
 route around.
 
 Because of that residual uncertainty, the actual swept path can't be
-assumed to be a single line or a single L-shaped elbow — the only thing
-guaranteed is that each axis moves monotonically from start to end at
-its own rate, so the true envelope is the bounding box between start and
-end. Rather than adding bounding-box-vs-fence geometry to fences.py,
-`GCodeExecutor.plan()` conservatively fence-checks *both* possible elbow
-orderings (Z-first and XY-first — the two extreme corners of that box)
-through the existing `TrajectoryChecker`, via `GCodeProgram.to_waypoints`'s
-`z_first` parameter, before allowing the move. See `GCodeExecutor.plan()`
-and `_execute_concurrent_pair`.
+assumed to be a single line or a single L-shaped elbow. What *is*
+guaranteed: X and Y run as one coordinated group, so they stay on their
+straight line; Z moves monotonically from start to end on its own clock.
+The true envelope is therefore a vertical "ribbon" — the X/Y line, with Z
+anywhere in its start–end range at every point along it.
+`GCodeExecutor.plan()` fence-checks exactly that region
+(`TrajectoryChecker.check_ribbon`). It used to check only the two extreme
+"elbow" corner paths, which missed the interior of the move — including
+the straight diagonal itself.
+
+Halting: `execute()` takes an optional `MotionGuard` (see halt.py). Every
+motion-starting command is issued under it and every poll checks it, so a
+pause/stop/estop fired from another thread cancels the rest of a program
+instead of letting the next leg start.
 """
 
 from __future__ import annotations
@@ -128,8 +133,10 @@ from .commands import (
     Axis, MMCCommands, THETA_AXIS, X_AXIS, Y_AXIS, Z_AXIS,
     poll_until_move_finished, predicted_move_s, resolve_timeout_s,
 )
+from .commands import _sleep_checking_halt
 from .connection import SnapMotionError
 from .fences import CheckedTrajectory, FenceViolation, Point3D, TrajectoryChecker
+from .halt import MotionGuard
 from .homing import HomingProcedure
 
 logger = logging.getLogger(__name__)
@@ -196,7 +203,7 @@ class GCodeProgram:
 
     moves: List[GCodeMove] = field(default_factory=list)
 
-    def to_waypoints(self, start: Point3D, z_first: bool = True) -> List[Point3D]:
+    def to_waypoints(self, start: Point3D) -> List[Point3D]:
         """Expand this program into the flat XYZ waypoint list TrajectoryChecker expects.
 
         Only LINEAR and HOME moves contribute waypoints (DWELL/PAUSE don't
@@ -206,23 +213,13 @@ class GCodeProgram:
         HomingProcedure actually finds, but this is only used to validate
         what happens *after* the G28 in the same program.
 
-        A move that changes both Z and X/Y runs as two concurrent legs, not
-        a single line (see the module docstring's "concurrent responder/
-        commander legs" note) — its true swept path is the bounding box
-        between start and end, not one line. `z_first` picks which of that
-        box's two extreme corners this waypoint list represents (the
-        Z-first or the XY-first elbow); `GCodeExecutor.plan()` calls this
-        twice, once per ordering, to conservatively check both.
+        Each consecutive pair is one move's start and end; plan() checks
+        each as a ribbon, not a line — see the module docstring.
         """
         waypoints = [start]
         pos = start
         for move in self.moves:
             if move.kind == "LINEAR" and move.target is not None:
-                tx, ty, tz = move.target
-                px, py, pz = pos
-                if _moved(tz, pz) and (_moved(tx, px) or _moved(ty, py)):
-                    elbow = (px, py, tz) if z_first else (tx, ty, pz)
-                    waypoints.append(elbow)
                 waypoints.append(move.target)
                 pos = move.target
             elif move.kind == "HOME":
@@ -443,6 +440,11 @@ class GCodeParser:
         standard G-code semantics.
         """
         if "F" in words:
+            if not words["F"] > 0:
+                # SPD 0 or a negative SPD would otherwise reach the controller
+                # — undefined motion at best, a move that never finishes and
+                # times out mid-run at worst.
+                raise GCodeError(f"Feed rate must be positive, got F{words['F']:g}")
             self._feed_mm_s = words["F"] / 60.0  # G-code feed rate is mm/min
         return self._feed_mm_s
 
@@ -691,6 +693,8 @@ class GCodeExecutor:
         # each group — see _init_group/_init_theta_group and reset_group_init.
         self._group_initialized = False
         self._theta_group_initialized = False
+        # Set only for the duration of one execute() call — see _issue().
+        self._guard: Optional[MotionGuard] = None
 
     @property
     def dry_run(self) -> bool:
@@ -706,39 +710,34 @@ class GCodeExecutor:
         return self._current_pos
 
     def plan(self, text: str) -> CheckedTrajectory:
-        """Parse G-code and fence-check both elbow orderings.
+        """Parse G-code and fence-check every region it could sweep.
 
-        Covers both elbow orderings a concurrent XY+Z(Theta) leg's swept
-        bounding box could take.
+        Each move is checked as a ribbon (X/Y line, Z anywhere in its
+        range) — the true envelope of a move whose Z leg runs independently
+        of the X/Y group. See the module docstring.
 
-        A move that changes both X/Y and Z runs as two concurrent legs, not
-        a single line or a fixed elbow (see the module docstring's
-        "concurrent responder/commander legs" note) — its true path lies
-        somewhere in the bounding box between start and end. Rather than
-        checking that box directly, this checks both extreme corners
-        (Z-first and XY-first orderings, via GCodeProgram.to_waypoints)
-        through the existing TrajectoryChecker — conservative, and needs no
-        new geometry in fences.py.
-
-        Raises FenceViolation if either ordering enters an exclusion zone.
-        The returned CheckedTrajectory must be passed to execute()
+        Raises FenceViolation if any move's region enters an exclusion
+        zone. The returned CheckedTrajectory must be passed to execute()
         unmodified — it is the only object execute() will accept.
         """
         program = GCodeParser().parse(text, start=self._current_pos, start_theta=self._current_theta)
-        xy_first_violations = self._checker.check_trajectory(
-            program.to_waypoints(self._current_pos, z_first=False)
-        )
-        if xy_first_violations:
-            raise xy_first_violations[0]
         trajectory = self._checker.check_and_wrap(
-            program.to_waypoints(self._current_pos, z_first=True)
+            program.to_waypoints(self._current_pos), independent_z=True
         )
         self._pending_program = program
         self._pending_trajectory = trajectory
         return trajectory
 
-    def execute(self, trajectory: CheckedTrajectory) -> None:
-        """Execute a trajectory previously returned by plan(). Never call with anything else."""
+    def execute(self, trajectory: CheckedTrajectory, guard: Optional[MotionGuard] = None) -> None:
+        """Execute a trajectory previously returned by plan(). Never call with anything else.
+
+        Args:
+            trajectory: The exact object the most recent plan() returned.
+            guard: Halt guard for this move (see halt.py). Each
+                motion-starting command is issued under it and each poll
+                checks it, so a halt from another thread raises
+                MotionHalted here instead of letting the next leg start.
+        """
         if not isinstance(trajectory, CheckedTrajectory):
             raise TypeError("execute() requires a CheckedTrajectory produced by plan()")
         if not trajectory.is_safe:
@@ -749,21 +748,41 @@ class GCodeExecutor:
                 "returned by the most recent plan() call"
             )
         program = self._pending_program
-
-        for move in program.moves:
-            if move.kind == "LINEAR":
-                self._execute_linear(move)
-            elif move.kind == "HOME":
-                self._execute_home(move)
-            elif move.kind == "DWELL":
-                self._execute_dwell(move)
-            elif move.kind == "PAUSE":
-                self._execute_pause(move)
-            else:
-                raise GCodeError(f"executor does not know how to run move kind {move.kind!r}")
-
+        # Consumed whether or not the run completes: a program cancelled
+        # partway must be re-planned from wherever the gantry actually
+        # stopped, never resumed from a stale plan.
         self._pending_program = None
         self._pending_trajectory = None
+
+        self._guard = guard
+        try:
+            for move in program.moves:
+                self._check_halt()
+                if move.kind == "LINEAR":
+                    self._execute_linear(move)
+                elif move.kind == "HOME":
+                    self._execute_home(move)
+                elif move.kind == "DWELL":
+                    self._execute_dwell(move)
+                elif move.kind == "PAUSE":
+                    self._execute_pause(move)
+                else:
+                    raise GCodeError(f"executor does not know how to run move kind {move.kind!r}")
+        finally:
+            self._guard = None
+
+    def _check_halt(self) -> None:
+        """Raise MotionHalted if this execute() call's guard has been tripped."""
+        if self._guard is not None:
+            self._guard.check()
+
+    def _issue(self, send: Callable[[], None]) -> None:
+        """Send one motion-starting command under the halt guard (see halt.py)."""
+        if self._guard is None:
+            send()
+            return
+        with self._guard.issuing():
+            send()
 
     # -- internal execution steps --------------------------------------
 
@@ -1048,7 +1067,7 @@ class GCodeExecutor:
             )
         if speed is not None:
             self._cmd.set_speed(self._z_axis, speed)
-        self._cmd.begin_move_to(self._z_axis, move.target[2])
+        self._issue(lambda: self._cmd._begin_move_to(self._z_axis, move.target[2]))
 
     def _poll_z_leg(
         self,
@@ -1088,7 +1107,7 @@ class GCodeExecutor:
             )
         if speed is not None:
             self._cmd.set_speed(self._theta_axis, speed)
-        self._cmd.begin_move_to(self._theta_axis, move.theta)
+        self._issue(lambda: self._cmd._begin_move_to(self._theta_axis, move.theta))
 
     def _poll_theta_leg(
         self,
@@ -1125,7 +1144,7 @@ class GCodeExecutor:
             )
         if speed is not None:
             self._theta_cmd.group_set_speed(speed)
-        self._theta_cmd.group_begin_move_to(move.target[2], move.theta)
+        self._issue(lambda: self._theta_cmd._group_begin_move_to(move.target[2], move.theta))
 
     def _poll_zt_leg(
         self,
@@ -1169,7 +1188,7 @@ class GCodeExecutor:
             )
         if speed is not None:
             self._cmd.group_set_speed(speed)
-        self._cmd.group_begin_move_to(move.target[0], move.target[1])
+        self._issue(lambda: self._cmd._group_begin_move_to(move.target[0], move.target[1]))
 
     def _poll_xy_leg(
         self,
@@ -1505,7 +1524,8 @@ class GCodeExecutor:
                 (`group_abort()`) before raising.
         """
         if not poll_until_move_finished(
-            self._cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s
+            self._cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s,
+            check_halt=self._check_halt,
         ):
             self._cmd.group_abort()
             effective_timeout = resolve_timeout_s(predicted_s, timeout_s)
@@ -1528,7 +1548,8 @@ class GCodeExecutor:
                 (`group_abort()`) before raising.
         """
         if not poll_until_move_finished(
-            self._theta_cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s
+            self._theta_cmd.group_move_is_finished, predicted_s=predicted_s, timeout_s=timeout_s,
+            check_halt=self._check_halt,
         ):
             self._theta_cmd.group_abort()
             effective_timeout = resolve_timeout_s(predicted_s, timeout_s)
@@ -1553,7 +1574,8 @@ class GCodeExecutor:
                 (`abort(axis)`) before raising.
         """
         if not poll_until_move_finished(
-            lambda: self._cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout_s
+            lambda: self._cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout_s,
+            check_halt=self._check_halt,
         ):
             self._cmd.abort(axis)
             effective_timeout = resolve_timeout_s(predicted_s, timeout_s)
@@ -1596,7 +1618,7 @@ class GCodeExecutor:
             logger.info("[dry-run] dwell %.3fs", move.dwell_s or 0.0)
             return
         logger.debug("dwell %.3fs", move.dwell_s or 0.0)
-        time.sleep(move.dwell_s or 0.0)
+        _sleep_checking_halt(move.dwell_s or 0.0, self._check_halt if self._guard else None)
 
     def _execute_pause(self, move: GCodeMove) -> None:
         """Run an M0/M1 PAUSE move: entirely delegated to confirm_cb.

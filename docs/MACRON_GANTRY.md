@@ -199,7 +199,12 @@ unreachability.
 **Homing** (`HomingProcedure.home_all()` / `GantryController.home()`) jogs
 each configured axis toward its home switch by default (`INB 1/3/5`),
 configurable per axis to the limit switch instead (`home_switch: limit` in
-config) — see `GantryController._build_homing_config`. See
+config) — see `GantryController._build_homing_config`. Each axis's
+switch-search timeout is `1.5 × max_travel_mm / homing speed + 30 s`
+(`max_travel_mm` per axis in config; a flat 60 s used to time out long
+before X's switch). `GantryController.home()`/`home_axis()` are
+non-blocking (they return a `MoveHandle`) and are cancelled by
+`pause()`/`estop()` like any other move. See
 `examples/example_09_gantry_home_axis_test.py` for a per-axis test script
 with a Ctrl-C safety stop.
 

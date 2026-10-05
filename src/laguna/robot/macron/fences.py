@@ -9,9 +9,25 @@ Fence types:
   BoxFence       — axis-aligned bounding box
   CylinderFence  — vertical cylinder (useful for mounting posts, sensors)
 
-Checking is done by sampling each line segment at resolution_mm intervals and
-testing every interpolated point. This catches trajectories that pass through a
-fence without landing a waypoint inside it.
+Checking is analytic, not sampled: each fence answers exactly whether a
+segment (or a swept region, below) touches it. Sampling every 0.5 mm used to
+miss a fence thinner than that, or a path grazing a cylinder along a chord
+shorter than one step.
+
+Two swept shapes are checked:
+
+- ``check_segment`` — a straight 3D line. Used for single-axis moves (scan
+  passes), where the path really is a line.
+- ``check_ribbon`` — the X/Y straight line, with Z free to be anywhere in its
+  start–end range at any point along it. This is what a G-code move that
+  changes both X/Y and Z actually sweeps on this hardware: X/Y run as one
+  coordinated group (so they stay on the line), but Z is on a different PLC
+  node and runs as an independent leg — see gcode.py's module docstring. The
+  old check (two "elbow" paths at the corners of the bounding box) missed the
+  interior entirely, including the straight diagonal itself.
+
+Non-finite coordinates (NaN, inf) raise ValueError rather than passing:
+every comparison with NaN is false, so a NaN would otherwise sail through.
 
 Only XYZ coordinates are checked. The Theta (rotational) axis is not considered
 in spatial fence tests — if instrument orientation affects reach, define a BoxFence
@@ -24,11 +40,9 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Sequence
+from typing import Optional, Sequence
 
 Point3D = tuple[float, float, float]
-
-DEFAULT_RESOLUTION_MM = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +67,68 @@ class Fence(ABC):
     def describe(self) -> str:
         """Human-readable description for violation messages."""
         ...
+
+    @abstractmethod
+    def first_hit_on_ribbon(
+        self, start: Point3D, end: Point3D, z_lo: float, z_hi: float
+    ) -> Optional[Point3D]:
+        """First point inside this fence on the X/Y line start→end, with Z anywhere in [z_lo, z_hi].
+
+        A straight 3D segment is checked by passing ``z_lo == z_hi`` per
+        sub-interval — see TrajectoryChecker.check_segment, which handles
+        the Z-varies-with-X/Y case separately.
+
+        Returns:
+            A representative violating point, or None if the region misses
+            this fence entirely.
+        """
+        ...
+
+    @abstractmethod
+    def first_hit_on_segment(self, start: Point3D, end: Point3D) -> Optional[Point3D]:
+        """First point inside this fence along the straight 3D segment start→end, or None."""
+        ...
+
+
+def _clip_slab(p: float, d: float, lo: float, hi: float, t0: float, t1: float) -> Optional[tuple[float, float]]:
+    """Clip parameter interval [t0, t1] of p + t*d to the slab lo <= x <= hi (inclusive)."""
+    if d == 0.0:
+        return (t0, t1) if lo <= p <= hi else None
+    ta = (lo - p) / d
+    tb = (hi - p) / d
+    if ta > tb:
+        ta, tb = tb, ta
+    t0 = max(t0, ta)
+    t1 = min(t1, tb)
+    return (t0, t1) if t0 <= t1 else None
+
+
+def _clip_disc(
+    px: float, py: float, dx: float, dy: float, cx: float, cy: float, r: float,
+    t0: float, t1: float,
+) -> Optional[tuple[float, float]]:
+    """Clip [t0, t1] of (px, py) + t*(dx, dy) to the closed disc of radius r about (cx, cy)."""
+    fx, fy = px - cx, py - cy
+    a = dx * dx + dy * dy
+    c = fx * fx + fy * fy - r * r
+    if a == 0.0:
+        return (t0, t1) if c <= 0.0 else None
+    b = 2.0 * (fx * dx + fy * dy)
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return None
+    root = math.sqrt(disc)
+    t0 = max(t0, (-b - root) / (2.0 * a))
+    t1 = min(t1, (-b + root) / (2.0 * a))
+    return (t0, t1) if t0 <= t1 else None
+
+
+def _at(start: Point3D, end: Point3D, t: float) -> Point3D:
+    return (
+        start[0] + t * (end[0] - start[0]),
+        start[1] + t * (end[1] - start[1]),
+        start[2] + t * (end[2] - start[2]),
+    )
 
 
 @dataclass
@@ -83,6 +159,31 @@ class BoxFence(Fence):
             and self.y_min <= y <= self.y_max
             and self.z_min <= z <= self.z_max
         )
+
+    def first_hit_on_segment(self, start: Point3D, end: Point3D) -> Optional[Point3D]:
+        """First point inside the box along start→end, or None."""
+        span: Optional[tuple[float, float]] = (0.0, 1.0)
+        for i, (lo, hi) in enumerate(
+            ((self.x_min, self.x_max), (self.y_min, self.y_max), (self.z_min, self.z_max))
+        ):
+            span = _clip_slab(start[i], end[i] - start[i], lo, hi, *span)
+            if span is None:
+                return None
+        return _at(start, end, span[0])
+
+    def first_hit_on_ribbon(
+        self, start: Point3D, end: Point3D, z_lo: float, z_hi: float
+    ) -> Optional[Point3D]:
+        """First point inside the box on the X/Y line, Z anywhere in [z_lo, z_hi], or None."""
+        if z_hi < self.z_min or z_lo > self.z_max:
+            return None
+        span: Optional[tuple[float, float]] = (0.0, 1.0)
+        for i, (lo, hi) in enumerate(((self.x_min, self.x_max), (self.y_min, self.y_max))):
+            span = _clip_slab(start[i], end[i] - start[i], lo, hi, *span)
+            if span is None:
+                return None
+        x, y, _ = _at(start, end, span[0])
+        return (x, y, min(max(z_lo, self.z_min), self.z_max))
 
     def describe(self) -> str:
         """Human-readable description for violation messages."""
@@ -123,6 +224,32 @@ class CylinderFence(Fence):
             math.hypot(x - self.center_x, y - self.center_y) <= self.radius
             and self.z_min <= z <= self.z_max
         )
+
+    def first_hit_on_segment(self, start: Point3D, end: Point3D) -> Optional[Point3D]:
+        """First point inside the cylinder along start→end, or None."""
+        span = _clip_slab(start[2], end[2] - start[2], self.z_min, self.z_max, 0.0, 1.0)
+        if span is None:
+            return None
+        span = _clip_disc(
+            start[0], start[1], end[0] - start[0], end[1] - start[1],
+            self.center_x, self.center_y, self.radius, *span,
+        )
+        return None if span is None else _at(start, end, span[0])
+
+    def first_hit_on_ribbon(
+        self, start: Point3D, end: Point3D, z_lo: float, z_hi: float
+    ) -> Optional[Point3D]:
+        """First point inside the cylinder on the X/Y line, Z anywhere in [z_lo, z_hi], or None."""
+        if z_hi < self.z_min or z_lo > self.z_max:
+            return None
+        span = _clip_disc(
+            start[0], start[1], end[0] - start[0], end[1] - start[1],
+            self.center_x, self.center_y, self.radius, 0.0, 1.0,
+        )
+        if span is None:
+            return None
+        x, y, _ = _at(start, end, span[0])
+        return (x, y, min(max(z_lo, self.z_min), self.z_max))
 
     def describe(self) -> str:
         """Human-readable description for violation messages."""
@@ -259,31 +386,26 @@ class CheckedTrajectory:
 # Trajectory checker
 # ---------------------------------------------------------------------------
 
+def _require_finite(*points: Point3D) -> None:
+    for point in points:
+        if len(point) != 3 or not all(math.isfinite(v) for v in point):
+            raise ValueError(f"Fence check needs finite (x, y, z) coordinates, got {point!r}")
+
+
 class TrajectoryChecker:
     """Validates waypoint sequences against a FenceRegistry.
 
-    Segments are sampled at resolution_mm intervals so that a trajectory
-    passing *through* a fence is caught even if no waypoint lands inside it.
+    Exact, not sampled — see the module docstring for the two swept shapes
+    (``check_segment`` and ``check_ribbon``) and which moves use which.
     """
 
-    def __init__(
-        self,
-        registry: FenceRegistry,
-        resolution_mm: float = DEFAULT_RESOLUTION_MM,
-    ):
+    def __init__(self, registry: FenceRegistry):
         """Bind a checker to a fence registry.
 
         Args:
             registry: Fences to check trajectories against.
-            resolution_mm: Sampling interval along each segment.
-
-        Raises:
-            ValueError: ``resolution_mm`` is not positive.
         """
-        if resolution_mm <= 0:
-            raise ValueError(f"resolution_mm must be positive, got {resolution_mm}")
         self._registry = registry
-        self.resolution_mm = resolution_mm
 
     def check_point(self, x: float, y: float, z: float) -> list[FenceViolation]:
         """Return violations for a single point (may hit more than one fence).
@@ -295,66 +417,78 @@ class TrajectoryChecker:
 
         Returns:
             List of FenceViolation objects for any fences containing this point.
+
+        Raises:
+            ValueError: A coordinate is NaN or infinite.
         """
+        _require_finite((x, y, z))
         return [
             FenceViolation(f, (x, y, z))
             for f in self._registry.list()
             if f.contains(x, y, z)
         ]
 
-    def check_segment(
-        self, p1: Point3D, p2: Point3D
-    ) -> list[FenceViolation]:
-        """Sample p1→p2 at resolution_mm steps; return all fence violations found.
+    def check_segment(self, p1: Point3D, p2: Point3D) -> list[FenceViolation]:
+        """Return one violation per fence the straight segment p1→p2 touches.
 
         Args:
             p1: Segment start point (x, y, z).
             p2: Segment end point (x, y, z).
 
-        Returns:
-            List of FenceViolation objects for any fence intersections found.
+        Raises:
+            ValueError: A coordinate is NaN or infinite.
         """
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        dz = p2[2] - p1[2]
-        length = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-        if length == 0.0:
-            return [
-                FenceViolation(f, p1, (p1, p2))
-                for f in self._registry.list()
-                if f.contains(*p1)
-            ]
-
-        n_steps = max(1, math.ceil(length / self.resolution_mm))
+        _require_finite(p1, p2)
         violations: list[FenceViolation] = []
-        seen: set[str] = set()  # avoid duplicate violations for the same fence
-
-        for i in range(n_steps + 1):
-            t = i / n_steps
-            x = p1[0] + t * dx
-            y = p1[1] + t * dy
-            z = p1[2] + t * dz
-            for fence in self._registry.list():
-                if fence.name not in seen and fence.contains(x, y, z):
-                    violations.append(FenceViolation(fence, (x, y, z), (p1, p2)))
-                    seen.add(fence.name)  # one violation per fence per segment
-
+        for fence in self._registry.list():
+            hit = fence.first_hit_on_segment(p1, p2)
+            if hit is not None:
+                violations.append(FenceViolation(fence, hit, (p1, p2)))
         return violations
 
-    def check_trajectory(self, waypoints: Sequence[Point3D]) -> list[FenceViolation]:
-        """Check every segment in a full waypoint sequence. Returns all violations."""
+    def check_ribbon(self, p1: Point3D, p2: Point3D) -> list[FenceViolation]:
+        """Like check_segment, but with Z free anywhere in its p1–p2 range along the X/Y line.
+
+        The swept region of a move whose X/Y and Z legs run independently —
+        see the module docstring.
+
+        Raises:
+            ValueError: A coordinate is NaN or infinite.
+        """
+        _require_finite(p1, p2)
+        z_lo, z_hi = min(p1[2], p2[2]), max(p1[2], p2[2])
+        violations: list[FenceViolation] = []
+        for fence in self._registry.list():
+            hit = fence.first_hit_on_ribbon(p1, p2, z_lo, z_hi)
+            if hit is not None:
+                violations.append(FenceViolation(fence, hit, (p1, p2)))
+        return violations
+
+    def check_trajectory(
+        self, waypoints: Sequence[Point3D], independent_z: bool = False
+    ) -> list[FenceViolation]:
+        """Check every leg of a waypoint sequence. Returns all violations.
+
+        Args:
+            waypoints: Points visited in order.
+            independent_z: Check each leg as a ribbon (check_ribbon) rather
+                than a straight segment — for G-code moves, whose Z leg
+                isn't coordinated with X/Y.
+        """
         if len(waypoints) < 2:
             if len(waypoints) == 1:
                 return self.check_point(*waypoints[0])
             return []
 
+        check = self.check_ribbon if independent_z else self.check_segment
         violations: list[FenceViolation] = []
         for i in range(len(waypoints) - 1):
-            violations.extend(self.check_segment(waypoints[i], waypoints[i + 1]))
+            violations.extend(check(waypoints[i], waypoints[i + 1]))
         return violations
 
-    def check_and_wrap(self, waypoints: Sequence[Point3D]) -> CheckedTrajectory:
+    def check_and_wrap(
+        self, waypoints: Sequence[Point3D], independent_z: bool = False
+    ) -> CheckedTrajectory:
         """Check the trajectory and return a CheckedTrajectory if safe.
 
         Raises FenceViolation (the first one found) if any part of the path
@@ -363,8 +497,12 @@ class TrajectoryChecker:
 
         To inspect ALL violations before deciding what to do, call
         check_trajectory() directly instead.
+
+        Args:
+            waypoints: Points visited in order.
+            independent_z: See check_trajectory().
         """
-        violations = self.check_trajectory(waypoints)
+        violations = self.check_trajectory(waypoints, independent_z=independent_z)
         if violations:
             raise violations[0]
         return CheckedTrajectory(

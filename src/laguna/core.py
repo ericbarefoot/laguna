@@ -29,6 +29,7 @@ from .timing import CheckpointStore, EventLog, ExperimentClock, Scheduler
 if TYPE_CHECKING:
     from .rangefinder import OD2000Rangefinder, WTT12LRangefinder
     from .robot.macron.controller import GantryController
+    from .robot.macron.move_handle import MoveHandle
     from .robot.macron.profiler import ProfileResult
 
 logging.basicConfig(
@@ -141,6 +142,11 @@ class FlumeLab:
         # Safety lifecycle — see laguna.safety. The monitor is created here
         # but stays idle until watch_for_estop() adds triggers and starts it.
         self._safety_state = SafetyState.RUNNING
+        # Guards escalating _safety_state: pause/end_run/estop can now run
+        # concurrently (each safety-monitor trip gets its own thread), and a
+        # pause finishing after an estop must not set the state back to
+        # PAUSED.
+        self._state_lock = threading.Lock()
         self.safety_monitor = SafetyMonitor(on_trip=self._on_safety_trigger)
 
         # Ties this run's outputs together and records the piecewise
@@ -189,6 +195,7 @@ class FlumeLab:
                 notes=f"rehearsal — no hardware contacted; speed_factor={self.speed_factor}",
             )
         self.scheduler = Scheduler(clock=self.clock, event_log=self.event_log)
+        self.scheduler.gate = self._scheduler_gate
 
         # Locks shared across schedule_action() registrations that opt into
         # the same exclusive_with tag, so two differently-named scheduled
@@ -206,6 +213,9 @@ class FlumeLab:
         self._subsystems: Dict[str, Any] = {}
 
         self._duration: Optional[float] = None   # set by start(), used by resume()
+        #: The CheckpointStore for the current experiment() block — mark
+        #: completed events with ``lab.checkpoint.mark_complete(...)``.
+        self.checkpoint: Optional[CheckpointStore] = None
         self._start_wall: Optional[float] = None  # wall time of lab.start()
         self.is_running = False
         logger.info("FlumeLab timing backbone ready — add subsystems via lab.add()")
@@ -397,12 +407,14 @@ class FlumeLab:
                 (timing.checkpoint_file).
 
         Yields:
-            ExperimentClock: The experiment's clock for this run.
+            ExperimentClock: The experiment's clock for this run. The
+            checkpoint store is ``lab.checkpoint`` — it used to be created
+            and then dropped, so nothing could ever record into it.
         """
         cp_path = checkpoint_file or self.config.get_value(
             "timing.checkpoint_file", "./experiment_checkpoint.json"
         )
-        store = CheckpointStore(cp_path, resume=resume)
+        self.checkpoint = CheckpointStore(cp_path, resume=resume)
 
         self.clock.start()
         self.run.started()
@@ -568,27 +580,78 @@ class FlumeLab:
         """
         self.pause(reason="lab.stop()")
 
-    def resume(self, remaining_s: Optional[float] = None) -> threading.Thread:
-        """Resume after stop(): restart scheduler loop in background thread.
+    def resume(self, remaining_s: Optional[float] = None) -> Optional[threading.Thread]:
+        """Undo pause() — restart the clock, restore setpoints, resume the schedule.
+
+        The one way back from a pause. Refuses from an estop (that needs
+        rearm()) or after end_run() (start a new run instead), and while any
+        safety trigger is still asserted — resuming into the condition that
+        tripped it is how a second incident happens. It used to restart the
+        scheduler unconditionally, which also restarted the clock, straight
+        out of an estop.
+
+        If a scheduled run (start()) was in progress, its scheduler restarts
+        for the remaining time, or for `remaining_s` if given.
 
         Args:
-            remaining_s: How long to run in experiment-time seconds. If omitted,
-                uses the time remaining from the original start() call.
+            remaining_s: How long to run the schedule, experiment-seconds.
+                Defaults to whatever was left of start()'s duration.
 
         Returns:
-            The scheduler thread.
+            The restarted scheduler thread, or None if there was no
+            schedule to restart or the resume was refused.
+
+        Raises:
+            RuntimeError: If the rig is ESTOPPED or STOPPED.
         """
+        if self._safety_state is SafetyState.ESTOPPED:
+            raise RuntimeError(
+                "Cannot resume from an estop — call rearm() instead, once the "
+                "condition that tripped it has been cleared."
+            )
+        if self._safety_state is SafetyState.STOPPED:
+            raise RuntimeError(
+                "Cannot resume after end_run() — the run is over. Start a new run."
+            )
+        still = self.safety_monitor.tripped_by()
+        if still is not None:
+            logger.error(
+                "Refusing to resume: safety trigger %r is still asserted. "
+                "Clear it first (%s).", still, self.safety_monitor.hint_for(still),
+            )
+            return None
+
+        logger.info("Resuming from pause...")
+        if self.clock.is_running and self.clock.is_paused:
+            self.clock.resume()
+        self._for_each_subsystem("resume")
+        self.safety_monitor.rearm()
+        self.event_log.log(self.clock.elapsed(), "flume_lab", "experiment_resume")
+        with self._state_lock:
+            if self._safety_state.severity > SafetyState.PAUSED.severity:
+                # Escalated (stop/estop) while resuming — stay down.
+                return None
+            self._safety_state = SafetyState.RUNNING
+
+        if self.scheduler.is_running or (self._duration is None and remaining_s is None):
+            return None
         if remaining_s is None:
-            if self._duration is None:
-                raise RuntimeError("No duration stored — call lab.start(duration) before resume()")
             remaining_s = max(0.0, self._duration - self.clock.elapsed())
             logger.info(
-                "Resuming for %.1f remaining seconds (%.1fs elapsed of %.1fs total)",
+                "Resuming schedule for %.1f remaining seconds (%.1fs elapsed of %.1fs total)",
                 remaining_s, self.clock.elapsed(), self._duration,
             )
         else:
-            logger.info("Resuming experiment for %.1f more seconds...", remaining_s)
+            logger.info("Resuming schedule for %.1f more seconds...", remaining_s)
+        if remaining_s <= 0:
+            return None
         return self.scheduler.run_async(remaining_s)
+
+    def _scheduler_gate(self) -> Optional[str]:
+        """Scheduler.gate: refuse any firing unless the rig is RUNNING."""
+        if self._safety_state is not SafetyState.RUNNING:
+            return f"rig is {self._safety_state.name}"
+        return None
 
     # ------------------------------------------------------------------
     # Simple verbs — thin delegates to the richer per-subsystem API, for
@@ -597,19 +660,21 @@ class FlumeLab:
     # these don't cover).
     # ------------------------------------------------------------------
 
-    def move_to(self, vector: Optional[list] = None, **axes: Optional[float]) -> bool:
-        """Move the gantry to an absolute position.
+    def move_to(self, vector: Optional[list] = None, **axes: Optional[float]) -> "MoveHandle":
+        """Move the gantry to an absolute position. Non-blocking.
 
         Thin delegate to ``self.gantry.move_to()``; see GantryController for
         the full vector (``move_to([x, y, z, theta])``) vs. per-axis keyword
-        (``move_to(X=100)``) forms.
+        (``move_to(X=100)``) forms. Returns as soon as the move is checked
+        and started, so ``lab.pause()`` can be called right away; call
+        ``.wait()`` on the result to block until it finishes.
 
         Args:
             vector: Optional [x, y, z, theta] position vector.
             **axes: Keyword arguments for per-axis positioning (e.g., X=100).
 
         Returns:
-            True if move was issued.
+            A MoveHandle for the move in progress.
 
         Raises:
             RuntimeError: If no 'gantry' subsystem is registered.
@@ -625,8 +690,8 @@ class FlumeLab:
         experiment_point: list,
         speed: Optional[float] = None,
         reference_point: Optional[list] = None,
-    ) -> bool:
-        """Move so `instrument` measures at a point in the experiment frame.
+    ) -> "MoveHandle":
+        """Move so `instrument` measures at a point in the experiment frame. Non-blocking.
 
         Counterpart to move_to(): specifies the measurement target rather than
         the robot position. Because each instrument is mounted somewhere
@@ -643,7 +708,7 @@ class FlumeLab:
                 ``FrameRegistry.gantry_target_for()``.
 
         Returns:
-            True if a move was issued.
+            A MoveHandle for the move in progress — see move_to().
 
         Raises:
             RuntimeError: If no 'gantry' subsystem is registered.
@@ -879,6 +944,12 @@ class FlumeLab:
                 )
         return failed
 
+    def _escalate_state(self, state: SafetyState) -> None:
+        """Move to `state` unless the rig is already in a more severe one."""
+        with self._state_lock:
+            if state.severity >= self._safety_state.severity:
+                self._safety_state = state
+
     def _on_safety_trigger(self, tier: SafetyTier, name: str) -> None:
         """Dispatch a monitor trip to the matching verb."""
         {
@@ -926,42 +997,11 @@ class FlumeLab:
         self.event_log.log(
             self.clock.elapsed(), "flume_lab", "experiment_pause", notes=reason
         )
+        self._escalate_state(SafetyState.PAUSED)
         self.scheduler.stop()
         self._for_each_subsystem("pause")
         if self.clock.is_running and not self.clock.is_paused:
             self.clock.pause()
-        self._safety_state = SafetyState.PAUSED
-
-    def resume_from_pause(self) -> bool:
-        """Undo pause() — restart the clock and restore setpoints.
-
-        Refuses while a pause trigger is still asserted, preventing resumption
-        into the condition that tripped it. Clear the trigger first.
-
-        Returns:
-            True if resume succeeded, False if a trigger is still asserted.
-        """
-        if self._safety_state is SafetyState.ESTOPPED:
-            raise RuntimeError(
-                "Cannot resume from an estop — call rearm() instead, once the "
-                "condition that tripped it has been cleared."
-            )
-        still = self.safety_monitor.tripped_by()
-        if still is not None:
-            logger.error(
-                "Refusing to resume: safety trigger %r is still asserted. "
-                "Clear it first (%s).", still, self.safety_monitor.hint_for(still),
-            )
-            return False
-
-        logger.info("Resuming from pause...")
-        if self.clock.is_paused:
-            self.clock.resume()
-        self._for_each_subsystem("resume")
-        self.safety_monitor.rearm()
-        self.event_log.log(self.clock.elapsed(), "flume_lab", "experiment_resume")
-        self._safety_state = SafetyState.RUNNING
-        return True
 
     def end_run(self, reason: str = "manual") -> None:
         """Stop cleanly — quiesce everything into a disconnectable state.
@@ -982,11 +1022,11 @@ class FlumeLab:
         self.event_log.log(
             self.clock.elapsed(), "flume_lab", "experiment_stop_requested", notes=reason
         )
+        self._escalate_state(SafetyState.STOPPED)
         self.scheduler.stop()
         self._for_each_subsystem("stop", order=self._ESTOP_ORDER)
         if self.clock.is_running and not self.clock.is_paused:
             self.clock.pause()
-        self._safety_state = SafetyState.STOPPED
 
     def estop(self, reason: str = "manual") -> None:
         """Emergency stop — bring everything to a halt as fast as possible.
@@ -1000,6 +1040,7 @@ class FlumeLab:
             reason: Annotation for the event log.
         """
         logger.critical("EMERGENCY STOP (%s)", reason)
+        self._escalate_state(SafetyState.ESTOPPED)
         self.event_log.log(
             self.clock.elapsed(), "flume_lab", "emergency_stop", notes=reason
         )
@@ -1011,7 +1052,14 @@ class FlumeLab:
         failed = self._for_each_subsystem("estop", order=self._ESTOP_ORDER)
         if self.clock.is_running and not self.clock.is_paused:
             self.clock.pause()
-        self._safety_state = SafetyState.ESTOPPED
+        # Deferred out of GantryController.estop() so its position reads
+        # don't delay the pump and valves — see that method.
+        gantry = self._subsystems.get("gantry")
+        if gantry is not None and hasattr(gantry, "resync_position"):
+            try:
+                gantry.resync_position("estop()")
+            except Exception as exc:
+                logger.error("Could not resync gantry position after estop: %s", exc)
         if failed:
             logger.error(
                 "ESTOP completed, but these subsystems reported errors: %s. "
@@ -1020,12 +1068,18 @@ class FlumeLab:
             )
 
     def rearm(self) -> bool:
-        """Return from ESTOPPED to RUNNING if safe.
+        """Return from ESTOPPED (or STOPPED) to RUNNING if safe — with the gantry in safe_mode.
 
         Refuses while any trigger is still asserted (e.g., a sentinel file on
         disk or the VFD's hardware e-stop still latched), ensuring the rig
-        cannot be brought back up into a live emergency. Re-enables motors and
-        releases brakes via gantry.set_safe_mode(False).
+        cannot be brought back up into a live emergency.
+
+        Never re-enables gantry motion. It used to call
+        gantry.set_safe_mode(False), so a run started in safe_mode came out
+        of an estop able to move. Now the gantry is left in safe_mode;
+        enabling motion again is a separate, explicit
+        ``lab.gantry.set_safe_mode(False)`` — a human's "go", made after
+        checking the rig, not a side effect of clearing the fault.
 
         Returns:
             True if re-arm succeeded, False if a trigger is still asserted or
@@ -1042,15 +1096,16 @@ class FlumeLab:
         logger.warning("Re-arming after emergency stop...")
         gantry = self._subsystems.get("gantry")
         ok = True
-        if gantry is not None and hasattr(gantry, "set_safe_mode"):
+        if gantry is not None and hasattr(gantry, "rearm"):
             try:
-                ok = bool(gantry.set_safe_mode(False))
+                ok = bool(gantry.rearm())
             except Exception as exc:
                 logger.error("Could not re-arm the gantry: %s", exc)
                 ok = False
 
         self.safety_monitor.rearm()
-        self._safety_state = SafetyState.RUNNING if ok else SafetyState.ESTOPPED
+        with self._state_lock:
+            self._safety_state = SafetyState.RUNNING if ok else SafetyState.ESTOPPED
         self.event_log.log(
             self.clock.elapsed(), "flume_lab", "rearm",
             result="ok" if ok else "failed",

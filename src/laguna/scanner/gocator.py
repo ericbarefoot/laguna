@@ -845,17 +845,13 @@ class GocatorScanner(GocatorSettingsMixin):
         acceleration ramp, fires the software trigger, and receives the
         surface.
 
-        Drives the axis through its ``AxisHandle`` (``gantry.axis(name)``)
-        rather than ``gantry.move_to()``, because the trigger has to fire
-        *while* the axis is mid-move and ``move_to()`` runs the coordinated
-        gcode path, blocking until the move finishes. AxisHandle's
-        ``begin_move_to`` is non-blocking and — importantly — still enforces
-        the gantry's ``safe_mode`` gate, which the raw ``gantry.cmd`` path
-        does not on the ethernet/rs232 transports.
-
-        Note this path does **not** fence-check the target the way
-        ``move_to()`` does, so the caller is responsible for the destination
-        being inside the work envelope.
+        Starts the pass with ``gantry.begin_scan_move()`` rather than
+        ``gantry.move_to()``: the trigger has to fire *while* the axis is
+        mid-move, so the move must be a plain non-blocking single-axis
+        ``BMT``, not the coordinated gcode path. ``begin_scan_move()`` still
+        fence-checks the straight pass from the live position and refuses
+        under safe_mode or a halt, exactly like ``move_to()``; a halt during
+        the settle delay skips the trigger.
 
         Args:
             gantry: A connected GantryController.
@@ -887,8 +883,10 @@ class GocatorScanner(GocatorSettingsMixin):
 
         Raises:
             RuntimeError: If not connected.
-            KeyError: If `axis` isn't a configured axis on this gantry.
+            ValueError: If `axis` isn't a configured axis on this gantry.
             SnapMotionError: If the gantry's safe_mode blocks the move.
+            FenceViolation: If the pass would enter an exclusion zone.
+            MotionHalted: If the gantry is halted, or halts before the trigger.
         """
         # Fall back to the configured scan spec for anything not given, so
         # a rig configured once in file can scan without repeating itself —
@@ -915,7 +913,7 @@ class GocatorScanner(GocatorSettingsMixin):
         # Hold the gantry for the whole pass. Without this, a second
         # scheduled action could move an axis mid-traverse and the surface
         # would be silently wrong — Y spacing assumes constant velocity.
-        # Re-entrant, so handle.begin_move_to() re-acquiring is fine.
+        # begin_scan_move() requires the caller to hold it for the whole pass.
         arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
         with arbiter.hold(f"gocator scan {axis} -> {end_mm:.1f}mm"):
             return self._scan_with_gantry(
@@ -1008,9 +1006,9 @@ class GocatorScanner(GocatorSettingsMixin):
                 end_mm,
                 feed_rate_mm_s,
             )
-            handle.set_speed(feed_rate_mm_s)
-            handle.begin_move_to(end_mm)   # safe_mode-gated, non-blocking
+            guard = gantry.begin_scan_move(axis, end_mm, feed_rate_mm_s)
             time.sleep(settle_s)
+            guard.check()
             self.trigger()
             return self.receive_surface(timeout_s=timeout_s, metadata=meta)
         finally:
@@ -1025,7 +1023,7 @@ class GocatorScanner(GocatorSettingsMixin):
     def _resync_gantry_after_pass(gantry, handle, axis: str) -> None:
         """Wait for the pass's move to finish, then resync the gantry's position cache.
 
-        The pass moves the axis directly (``begin_move_to``), bypassing the
+        The pass moves the axis directly (``begin_scan_move``), bypassing the
         G-code executor that normally keeps the gantry's planning position in
         step with hardware. Left alone, the next ``move_to()`` would plan from
         the pre-scan position — no-opping a move back to the start, and

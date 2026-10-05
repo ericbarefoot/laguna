@@ -114,12 +114,40 @@ class TestCheckSafeMode:
             "A1 AIC",        # arm hardware capture
             "A1 MVT 5",      # blocking move
             "C1 INI 1 2 3",  # group init
-            "A1 ABT",        # abort — not on the read-only list at all
+            "A1 MTR 0",      # motor off — drops a released Z, so never stop-class
+            "A1 BST 5",      # a stop mnemonic with an argument is not a bare stop
         ],
     )
     def test_blocks_motion_and_set_commands(self, cmd):
         with pytest.raises(SnapMotionError):
             check_safe_mode(cmd)
+
+    @pytest.mark.parametrize("cmd", ["A1 ABT", "A2 BST", "C1 BST", "C2 ABT", "A5 STP", "SOB 4 0", "SOB 5 0"])
+    def test_allows_stop_class_commands(self, cmd):
+        """Stopping and engaging a brake must work under safe_mode — it is
+        what set_safe_mode(True) and every halt verb send."""
+        check_safe_mode(cmd)  # must not raise
+
+    @pytest.mark.parametrize(
+        "cmd",
+        ["A1 ABT", "C1 BST", "A5 STP", "SOB 4 0", "SOB 4 1", "A1 MTR 0", "A1 BMT 5", "A1 BST 5", "A1 ACP"],
+    )
+    def test_agent_copy_agrees_with_the_pc_side(self, cmd):
+        """gantry_agent.py keeps its own copy of both tables (it runs
+        standalone on the Pi); the two must never drift apart."""
+        from laguna.robot.macron import gantry_agent
+
+        try:
+            check_safe_mode(cmd)
+            pc_allows = True
+        except SnapMotionError:
+            pc_allows = False
+        try:
+            gantry_agent.check_safe_mode(cmd)
+            agent_allows = True
+        except PermissionError:
+            agent_allows = False
+        assert pc_allows == agent_allows
 
     def test_unknown_mnemonic_blocked(self):
         with pytest.raises(SnapMotionError):
@@ -488,6 +516,34 @@ class TestSendBlockedDuringScan:
         conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
         with pytest.raises(SnapMotionError, match="scan in progress"):
             conn.send("A1 ACP")
+
+    @pytest.mark.parametrize("cmd", ["A1 BST", "A1 ABT", "SOB 4 0"])
+    def test_stop_commands_still_go_through_during_a_scan(self, cmd):
+        """A halt during a Pi-agent scan used to be refused here, so estop
+        couldn't stop the traverse."""
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
+                             "accel_mm_s2": 1.0, "decel_mm_s2": 1.0})
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        channel.queue_line({"id": 2, "raw": "0 0.000 >"})
+        conn.send(cmd)
+        assert json.loads(channel.sent[-1].decode("ascii"))["cmd"] == cmd
+
+    def test_stop_commands_do_not_wait_behind_an_in_flight_request(self):
+        """An ordinary request holds the lock for its whole round trip; a
+        stop must not queue behind it."""
+        conn, channel = _make_connection(safe_mode=True, timeout=5.0)
+        channel.queue_line({"id": 1, "raw": "0 0.000 >"})
+        with conn._lock:  # as if a MIF poll were mid-round-trip
+            assert conn.send("A1 BST") == "0.000"
+
+    def test_stop_commands_never_reconnect(self):
+        conn, channel = _make_connection(safe_mode=False)
+        channel.closed = True
+        conn._connect_requested = True
+        conn._reconnect = lambda: pytest.fail("a stop must not relaunch the agent")
+        with pytest.raises(SnapMotionError, match="not connected"):
+            conn.send("A1 ABT")
 
     def test_send_allowed_again_after_scan_completes(self):
         conn, channel = _make_connection(safe_mode=False)

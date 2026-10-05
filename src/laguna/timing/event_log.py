@@ -1,6 +1,7 @@
 """Event log — append-only CSV record of all experiment events."""
 
 import csv
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -38,6 +39,16 @@ def _last_event_id(path: Path) -> int:
     return 0
 
 
+def _ends_with_newline(path: Path) -> bool:
+    """True if the file's last byte is a newline (or the file is empty)."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        if f.tell() == 0:
+            return True
+        f.seek(-1, os.SEEK_END)
+        return f.read(1) in (b"\n", b"\r")
+
+
 class EventLog:
     """Thread-safe append-only CSV log of experiment events.
 
@@ -72,9 +83,12 @@ class EventLog:
     def __init__(self, path: str) -> None:
         """Initialize the event log.
 
-        Creates the file with a header row on first open; if the file already
-        exists, appends to it without re-writing the header so resumed
-        experiments accumulate in the same log.
+        Creates the file with a header row on first open (or if it exists
+        but is empty); if the file already has rows, appends to it without
+        re-writing the header so resumed experiments accumulate in the same
+        log. A last row left without its newline by a crash mid-write is
+        terminated first — otherwise the next row would be glued onto it
+        and both would be lost to a CSV reader.
 
         Args:
             path: File path for the CSV event log.
@@ -82,13 +96,26 @@ class EventLog:
         self._path = Path(path)
         self._lock = threading.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        write_header = not self._path.exists()
+        write_header = not self._path.exists() or self._path.stat().st_size == 0
         self._next_id = 1 if write_header else _last_event_id(self._path) + 1
-        self._fh = open(self._path, "a", newline="")
-        self._writer = csv.writer(self._fh)
+        needs_newline = not write_header and not _ends_with_newline(self._path)
+        self._open()
+        if needs_newline:
+            self._fh.write("\n")
         if write_header:
             self._writer.writerow(_HEADER)
-            self._fh.flush()
+        self._sync()
+
+    def _open(self) -> None:
+        self._fh = open(self._path, "a", newline="")
+        self._writer = csv.writer(self._fh)
+
+    def _sync(self) -> None:
+        # fsync, not just flush: rows are seconds apart at most, and a
+        # power cut otherwise loses whatever the OS hadn't written back yet
+        # — exactly the rows describing what led up to it.
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
 
     def log(
         self,
@@ -117,17 +144,24 @@ class EventLog:
         now = time.time()
         iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
         with self._lock:
+            if self._fh.closed:
+                # A late row (a scheduled action finishing, a disconnect)
+                # after close() used to raise in whatever thread logged it
+                # and be lost. Reopen and keep it.
+                self._open()
             event_id = self._next_id
             self._next_id += 1
             self._writer.writerow([
                 event_id, iso, f"{now:.6f}", f"{runtime_s:.3f}", subsystem,
                 event_type, result, notes, "" if refers_to is None else refers_to,
             ])
-            self._fh.flush()
+            self._sync()
         return event_id
 
     def close(self) -> None:
-        """Flush and close the event log file."""
+        """Flush and close the event log file. A later log() reopens it."""
         with self._lock:
-            self._fh.flush()
+            if self._fh.closed:
+                return
+            self._sync()
             self._fh.close()

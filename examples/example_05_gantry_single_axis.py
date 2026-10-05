@@ -142,9 +142,9 @@ def set_brake(gantry: GantryController, axis, disengaged: bool) -> None:
 def stop_axis(gantry: GantryController, axis) -> None:
     """Send an immediate stop (BST) to one axis. Requires safe_mode=False.
 
-    Useful to call from a second connection while a move issued via
-    gantry.move_to() is still blocking on another one — BST takes effect
-    immediately, independent of any particular connection.
+    Useful while a move issued via gantry.move_to() is still running — BST
+    takes effect immediately. Prefer gantry.pause(), which also cancels the
+    rest of the move rather than letting its next leg start.
     """
     gantry.cmd.begin_stop(axis)
 
@@ -175,9 +175,9 @@ def main():
         target = current - 2.0  # small 2mm move — adjust as needed
         print(f"Moving X from {current:.3f} mm to {target:.3f} mm at 1 mm/s...")
         # move_to() is fence-checked (routed through the coordinated gcode
-        # path — it reads Y/Z's real current position to do so) and blocks
-        # until the move completes.
-        gantry.move_to(X=target, speed=1.0)
+        # path — it reads Y/Z's real current position to do so) and returns
+        # once the move has started; .wait() blocks until it completes.
+        gantry.move_to(X=target, speed=1.0).wait()
         final = gantry.cmd.get_actual_position(X_AXIS)
         print(f"Done. Final X position: {final:.3f} mm")
     finally:

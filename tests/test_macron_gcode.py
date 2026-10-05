@@ -5,6 +5,8 @@ on the same fake for the G28 path.
 """
 
 import math
+import threading
+import time
 
 import pytest
 
@@ -191,7 +193,7 @@ def _make_executor(responses, dry_run=False, confirm_cb=None, fences=None, with_
         registry.add(fence)
     checker = TrajectoryChecker(registry)
     homing_config = HomingConfig(
-        poll_interval_s=0.001, timeout_s=1.0, backoff_timeout_s=1.0,
+        poll_interval_s=0.001, default_timeout_s=1.0, backoff_timeout_s=1.0,
         # Default IOMap home inputs (X=INB1, Y=INB3, Z=INB5) — see IOMap in
         # commands.py. Only exercised by G28 tests; harmless for the rest.
         axis_configs={
@@ -1116,3 +1118,64 @@ class TestExecutorHomeDwellPause:
         executor, conn = _make_executor({})
         trajectory = executor.plan("M0")
         executor.execute(trajectory)  # should not raise
+
+
+class TestPlanChecksTheWholeSweptRegion:
+    def test_a_fence_on_the_straight_diagonal_is_caught(self):
+        """Regression: plan() checked only the two corner "elbow" paths, so a
+        fence the diagonal itself passes through was never seen."""
+        from laguna.robot.macron.fences import BoxFence
+
+        executor, conn = _make_executor({}, fences=[BoxFence("post", 4, 6, 4, 6, 2, 3)])
+        with pytest.raises(FenceViolation):
+            executor.plan("G1 X10 Y10 Z5 F600")
+        assert conn.sent == []
+
+    def test_a_fence_beside_the_xy_line_does_not_block_the_move(self):
+        """The check follows the X/Y line, not the whole bounding box —
+        which would refuse legitimate moves around a post."""
+        from laguna.robot.macron.fences import BoxFence
+
+        executor, _ = _make_executor({}, fences=[BoxFence("post", 8, 9, 0, 1, 0, 5)])
+        executor.plan("G1 X10 Y10 Z5 F600")
+
+
+class TestFeedRateValidation:
+    @pytest.mark.parametrize("line", ["G1 X10 F0", "G1 X10 F-600", "G1 X10 F-0.5"])
+    def test_a_zero_or_negative_feed_is_refused_at_parse_time(self, line):
+        """F0 used to reach the controller as SPD 0 (and F-600 as SPD -10)."""
+        with pytest.raises(GCodeError, match="Feed rate must be positive"):
+            GCodeParser().parse(line)
+
+    def test_a_positive_feed_still_parses(self):
+        assert GCodeParser().parse("G1 X10 F1").moves[0].feed_mm_s == pytest.approx(1 / 60)
+
+
+class TestDwellIsHaltable:
+    def test_a_halt_ends_a_dwell_early(self):
+        from laguna.robot.macron.halt import HaltLatch, HaltLevel, MotionHalted
+
+        executor, _ = _make_executor({})
+        latch = HaltLatch()
+        guard = latch.guard("program")
+        trajectory = executor.plan("G4 P5000")
+        threading.Timer(0.05, lambda: latch.trip(HaltLevel.PAUSE, "pause()")).start()
+        start = time.monotonic()
+        with pytest.raises(MotionHalted):
+            executor.execute(trajectory, guard=guard)
+        assert time.monotonic() - start < 2.0
+
+    def test_an_aborted_program_cannot_be_executed_again(self):
+        """A cancelled program must be re-planned from where the gantry
+        actually stopped, never resumed from a stale plan."""
+        from laguna.robot.macron.halt import HaltLatch, HaltLevel, MotionHalted
+
+        executor, _ = _make_executor({})
+        latch = HaltLatch()
+        guard = latch.guard("program")
+        trajectory = executor.plan("G4 P10")
+        latch.trip(HaltLevel.PAUSE, "pause()")
+        with pytest.raises(MotionHalted):
+            executor.execute(trajectory, guard=guard)
+        with pytest.raises(RuntimeError, match="most recent plan"):
+            executor.execute(trajectory)

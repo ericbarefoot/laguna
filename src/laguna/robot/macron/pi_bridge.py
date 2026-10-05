@@ -44,8 +44,9 @@ Safe-mode gate: every command is checked against SAFE_COMMANDS by
 check_safe_mode() BEFORE anything is written to the channel. This is
 independent of any other safety layer in this codebase (fences, dry_run,
 confirm_cb) and cannot be bypassed by a bug elsewhere — while safe_mode is
-True, only read-only query commands can ever reach the wire from this
-class. gantry_agent.py keeps an identical, independently-enforced copy of
+True, only read-only query commands and stop-class commands (BST/ABT/STP,
+and switching a brake output off — see is_stop_command) can ever reach the
+wire from this class. gantry_agent.py keeps an identical, independently-enforced copy of
 this table on the Pi side as defense in depth. scan_start is gated the same
 way agent-side (checked against "BMT", not on the allowlist) — this class
 does not duplicate that check client-side since scan_start isn't a bare
@@ -74,6 +75,10 @@ REMOTE_AGENT_PATH = "/tmp/laguna_gantry_agent.py"
 DEFAULT_SSH_PORT = 22
 DEFAULT_TIMEOUT = 5.0
 READY_TIMEOUT = 10.0
+#: Reply timeout for stop-class commands (see is_stop_command). Shorter than
+#: DEFAULT_TIMEOUT so an unresponsive agent costs a halt seconds, not tens of
+#: seconds across the ~10 commands an estop sends.
+STOP_TIMEOUT = 2.0
 
 # mnemonic -> max allowed argument count (0 = bare read only). Checked
 # BEFORE any byte reaches the wire whenever safe_mode is True. See module
@@ -88,6 +93,32 @@ SAFE_COMMANDS = {
 }
 
 _PREFIX_RE = re.compile(r"^[AC]\d+$")
+
+# Commands that can only ever take motion *away*: decelerate (BST), abort
+# (ABT), stop (STP), and switch a native output off (SOB <n> 0 — on this
+# machine the native outputs are the Y/Z brakes, and off = engaged for
+# both; see IOMap in commands.py). These pass the safe_mode allowlist and
+# the "scan in progress" guard, and skip the request lock, because the
+# moments they matter most are exactly when those would block them: a halt
+# during a Pi-agent scan, or set_safe_mode(True) parking the brakes as the
+# gate closes. gantry_agent.py keeps an identical copy. MTR 0 is
+# deliberately not here — cutting a motor while its brake is released
+# drops Z under gravity, so motor-off stays an ordinary, gated command.
+STOP_MNEMONICS = frozenset({"BST", "ABT", "STP"})
+
+
+def is_stop_command(cmd: str) -> bool:
+    """True if `cmd` can only stop motion or engage a brake — see STOP_MNEMONICS."""
+    try:
+        mnemonic, arg_count = parse_command(cmd)
+    except ValueError:
+        return False
+    if mnemonic in STOP_MNEMONICS:
+        return arg_count == 0
+    if mnemonic == "SOB":
+        tokens = cmd.split()
+        return arg_count == 2 and tokens[-1] == "0"
+    return False
 
 # ENA is refused unconditionally — NOT part of the safe_mode allowlist,
 # because safe_mode only applies when it is switched on and this must hold
@@ -143,8 +174,10 @@ def check_safe_mode(cmd: str) -> None:
     """Raise SnapMotionError if cmd is not on the query-only allowlist.
 
     Must be called before any byte is written to the wire while safe_mode
-    is active.
+    is active. Stop-class commands (see is_stop_command) always pass.
     """
+    if is_stop_command(cmd):
+        return
     mnemonic, arg_count = parse_command(cmd)
     max_args = SAFE_COMMANDS.get(mnemonic)
     if max_args is None or arg_count > max_args:
@@ -538,6 +571,8 @@ class PiGantryConnection(SnapConnection):
             SnapMotionError: If response is an error, timeout occurs, or safe_mode blocks the command.
         """
         check_ena_banned(command)     # unconditional — see check_ena_banned
+        if is_stop_command(command):
+            return self._send_stop(command)
         if self.safe_mode:
             check_safe_mode(command)  # raises before anything is written
 
@@ -546,32 +581,53 @@ class PiGantryConnection(SnapConnection):
 
         with self._lock:
             self._ensure_link()
-
-            request_id = self._next_id
-            self._next_id += 1
-            q: "queue.Queue[dict]" = queue.Queue()
-            with self._pending_lock:
-                self._pending[request_id] = q
-            payload = json.dumps({"id": request_id, "cmd": command, "timeout": self.timeout})
-            try:
-                self._write_line(payload)
-            except Exception as exc:
-                with self._pending_lock:
-                    self._pending.pop(request_id, None)
-                raise SnapMotionError(0, f"Failed to send to agent: {exc}") from exc
-
-            try:
-                msg = q.get(timeout=self.timeout)
-            except queue.Empty:
-                with self._pending_lock:
-                    self._pending.pop(request_id, None)
-                raise SnapMotionError(
-                    COMM_TIMEOUT_CODE, f"Timed out waiting for agent response to {command!r}"
-                )
+            msg = self._exchange(command, self.timeout)
 
         if "error" in msg:
             raise SnapMotionError(int(msg.get("code", 0)), str(msg["error"]))
         return _parse_response(msg["raw"])
+
+    def _send_stop(self, command: str) -> str:
+        """Send a stop-class command without waiting on anything that could delay it.
+
+        Skips ``self._lock``: an ordinary request (a MIF poll from a move's
+        background thread, say) holds it for its whole round trip, up to
+        ``timeout`` on a sluggish agent, and a halt must not queue behind
+        that. Responses are matched by request id, so an overlapping
+        exchange is safe protocol-wise, and the agent serialises the wire
+        itself. Never reconnects either: a dropped link is reported at once
+        rather than spending seconds relaunching the agent mid-halt.
+        """
+        if not self.is_connected:
+            raise SnapMotionError(0, f"Cannot send {command!r}: not connected to the gantry agent")
+        msg = self._exchange(command, min(self.timeout, STOP_TIMEOUT))
+        if "error" in msg:
+            raise SnapMotionError(int(msg.get("code", 0)), str(msg["error"]))
+        return _parse_response(msg["raw"])
+
+    def _exchange(self, command: str, timeout: float) -> dict:
+        """Write one request and wait for the reply matched to its id."""
+        q: "queue.Queue[dict]" = queue.Queue()
+        with self._pending_lock:
+            request_id = self._next_id
+            self._next_id += 1
+            self._pending[request_id] = q
+        payload = json.dumps({"id": request_id, "cmd": command, "timeout": timeout})
+        try:
+            self._write_line(payload)
+        except Exception as exc:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise SnapMotionError(0, f"Failed to send to agent: {exc}") from exc
+
+        try:
+            return q.get(timeout=timeout)
+        except queue.Empty:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise SnapMotionError(
+                COMM_TIMEOUT_CODE, f"Timed out waiting for agent response to {command!r}"
+            )
 
     # ------------------------------------------------------------------
     # Scan control
@@ -612,10 +668,10 @@ class PiGantryConnection(SnapConnection):
         with self._lock:
             self._ensure_link()
 
-            request_id = self._next_id
-            self._next_id += 1
             q: "queue.Queue[dict]" = queue.Queue()
             with self._pending_lock:
+                request_id = self._next_id
+                self._next_id += 1
                 self._pending[request_id] = q
             payload = json.dumps({
                 "id": request_id, "op": "scan_start",

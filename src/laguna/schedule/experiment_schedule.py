@@ -50,6 +50,7 @@ class ExperimentSchedule:
         """
         interp_modes = {**self.INTERP_DEFAULTS, **(interpolation or {})}
         times = df["time_s"].to_numpy(dtype=float)
+        self._validate(df, times, [col for col in interp_modes if col in df.columns])
 
         self._df = df
         self._interpolators: Dict[str, Callable] = {}
@@ -190,6 +191,34 @@ class ExperimentSchedule:
                 f"Ensure the schedule dataframe contains this column."
             )
         return self._interpolators[col]
+
+    @staticmethod
+    def _validate(df: pd.DataFrame, times: np.ndarray, columns: list) -> None:
+        """Refuse a schedule the interpolators would silently misread.
+
+        np.interp and np.searchsorted assume sorted, unique times and give
+        wrong answers — not errors — otherwise: an out-of-order row once
+        turned a 10 L/min setpoint into 15. A blank cell becomes NaN, which
+        reached set_flowrate() as-is and, in a valve column, read as True
+        and opened the valve.
+
+        Raises:
+            ValueError: Naming the offending rows.
+        """
+        bad = np.flatnonzero(~np.isfinite(times))
+        if bad.size:
+            raise ValueError(f"time_s must be finite; check rows {bad.tolist()}")
+        if times.size > 1:
+            out_of_order = np.flatnonzero(np.diff(times) <= 0)
+            if out_of_order.size:
+                raise ValueError(
+                    "time_s must be strictly increasing (no repeats); check rows "
+                    f"{(out_of_order + 1).tolist()}"
+                )
+        for col in columns:
+            missing = np.flatnonzero(df[col].isna().to_numpy())
+            if missing.size:
+                raise ValueError(f"Column {col!r} has blank cells at rows {missing.tolist()}")
 
     @staticmethod
     def _build_spline(times: np.ndarray, values: np.ndarray) -> Callable[[float], float]:

@@ -69,3 +69,39 @@ class TestResumeContinuesEventId:
 
         resumed = EventLog(str(path))
         assert resumed.log(2.0, "gauge", "read_mm") == 3
+
+
+class TestCrashRecovery:
+    def test_a_partial_last_row_is_terminated_before_appending(self, tmp_path):
+        """A crash mid-row used to leave the next row glued onto it, losing both."""
+        import csv
+
+        path = tmp_path / "events.csv"
+        log = EventLog(str(path))
+        log.log(1.0, "weir", "move")
+        log.close()
+        with open(path, "a") as f:
+            f.write("2,2026-01-01T00:00:00+00:00,0,2.0,gauge,read")  # no newline: crash
+        log = EventLog(str(path))
+        log.log(3.0, "flow", "start")
+        log.close()
+        rows = list(csv.reader(open(path, newline="")))
+        assert rows[-1][4:6] == ["flow", "start"]
+
+    def test_an_empty_existing_file_gets_its_header(self, tmp_path):
+        path = tmp_path / "events.csv"
+        path.write_text("")
+        log = EventLog(str(path))
+        log.log(1.0, "weir", "move")
+        log.close()
+        assert path.read_text().splitlines()[0].startswith("event_id,")
+
+    def test_a_row_logged_after_close_is_kept(self, tmp_path):
+        """Late rows (a scheduled action finishing after experiment() closed
+        the log) used to raise in that thread and vanish."""
+        path = tmp_path / "events.csv"
+        log = EventLog(str(path))
+        log.close()
+        log.log(9.0, "gocator", "scan", result="points=10")
+        log.close()
+        assert "gocator,scan,points=10" in path.read_text()

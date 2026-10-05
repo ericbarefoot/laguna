@@ -1057,9 +1057,9 @@ class TestScanLifecycle:
 class FakeAxisHandle:
     """Stand-in for macron.commands.AxisHandle (gantry.axis("X")).
 
-    Mirrors the real one's safe_mode gating on motion-starting calls, which
-    is the whole reason the scanner drives axes through AxisHandle rather
-    than the ungated raw `gantry.cmd` path.
+    The real AxisHandle has no motion methods; begin_move_to here only
+    records the BMT that FakeGantry.begin_scan_move stands in for, gated
+    on safe_mode the way GantryController.begin_scan_move is.
     """
 
     def __init__(self, name, calls, safe_mode=False, position=0.0):
@@ -1089,6 +1089,11 @@ class FakeAxisHandle:
         self._calls.append(("begin_move_to", self.name, position))
 
 
+class _NeverHaltedGuard:
+    def check(self):
+        pass
+
+
 class FakeGantry:
     def __init__(self, safe_mode=False, positions=None):
         from laguna.robot.macron.commands import Axis
@@ -1111,6 +1116,13 @@ class FakeGantry:
         if self.resync_error is not None:
             raise self.resync_error
 
+    def begin_scan_move(self, axis, end_mm, feed_rate_mm_s):
+        """Mirror of GantryController.begin_scan_move: gated, then non-blocking."""
+        handle = self.axis(axis)
+        handle.set_speed(feed_rate_mm_s)
+        handle.begin_move_to(end_mm)
+        return _NeverHaltedGuard()
+
     def axis(self, name):
         try:
             return self._handles[name]
@@ -1124,8 +1136,8 @@ class FakeGantry:
     @property
     def cmd(self):
         raise AssertionError(
-            "scan_with_gantry must drive axes via gantry.axis(...) (AxisHandle), "
-            "not the ungated gantry.cmd path — see AxisHandle's safe_mode gate"
+            "scan_with_gantry must start the pass via gantry.begin_scan_move() "
+            "(fence-checked, safe_mode- and halt-gated), not the raw gantry.cmd path"
         )
 
 
@@ -1205,6 +1217,43 @@ class TestScanWithGantry:
             )
         # And acquisition is left stopped, not running.
         assert scanner.get_status()["is_running"] is False
+
+    def test_the_pass_is_fence_checked_before_anything_moves(self, scanner):
+        """scan_with_gantry() used to start the pass with no fence check."""
+        from laguna.robot.macron.controller import GantryController
+        from laguna.robot.macron.fences import BoxFence, FenceViolation
+        from tests.macron_fixtures import FakeSnapConnection
+
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        conn = FakeSnapConnection({"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"})
+        gantry = GantryController(
+            connection=conn, mm_per_unit=1.0,
+            fences=[BoxFence("post", 100, 110, -5, 5, -5, 5)],
+        )
+        gantry._is_connected = True
+        gantry._safe_mode = False
+        with pytest.raises(FenceViolation):
+            scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+            )
+        assert not any("BMT" in c for c in conn.sent)
+        assert scanner.get_status()["is_running"] is False
+
+    def test_a_halt_during_settle_skips_the_trigger(self, scanner):
+        from laguna.robot.macron.halt import MotionHalted
+
+        class HaltedGuard:
+            def check(self):
+                raise MotionHalted("paused")
+
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry()
+        gantry.begin_scan_move = lambda axis, end_mm, feed: HaltedGuard()
+        with pytest.raises(MotionHalted):
+            scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+            )
+        assert "GoSensor_Trigger" not in scanner._fake.call_names()
 
     def test_stops_acquisition_when_scan_fails(self, scanner):
         scanner._fake.go.datasets = []
