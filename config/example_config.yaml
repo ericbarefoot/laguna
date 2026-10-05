@@ -302,8 +302,9 @@ gocator:
 #   interval_s: 20
 #   # trigger_at: [20, 40, 60]
 #   # use_schedule: true
-#   capture_target: card        # card: keep a backup copy on the SD card | ram: body has no card
-#                               #   (the verified download is then the only copy)
+#   capture_target: card        # card: keep a backup copy on the SD card | ram: no card
+#                               #   (download is the only copy). One value for ALL cameras:
+#                               #   libgphoto2 holds a single capture target per host.
 #   card_reserve_shots: 500     # card mode: below this much free space, delete the oldest verified shots
 #   cameras:                    # any number; each bound by body serial, never by USB port
 #     Camera1:

@@ -54,6 +54,14 @@ CANON_VENDOR_ID = "04a9"
 MANUAL_EXPOSURE_MODE = "Manual"
 MANUAL_FOCUS_MODE = "Manual"
 #: laguna's capture_target option -> the camera's capturetarget value.
+#:
+#: Not a camera setting: libgphoto2's ptp2 driver keeps ONE capturetarget
+#: for the whole host (``ptp2=capturetarget=`` in ~/.config/gphoto/settings)
+#: and pushes it to whichever body is about to shoot. Two cameras with
+#: different targets therefore clobber each other — the last pre-flight wins
+#: for both, and a cardless body told "card" blocks ~90 s per capture before
+#: failing. Read-back can't catch it (it reads the same shared value), so
+#: DslrCameraSubsystem only accepts one target for every camera.
 CAPTURE_TARGETS = {"card": "Memory card", "ram": "Internal RAM"}
 AUTO_POWER_OFF_DISABLED = ("Off", "Disable", "Disabled", "0")
 
@@ -476,15 +484,24 @@ class CanonDslr:
             raise CameraNotReadyError(f"[{self.name}] " + "; ".join(problems))
 
         self._write_and_verify("capturetarget", CAPTURE_TARGETS[self.capture_target])
-        # availableshots describes the card; in RAM mode it's meaningless.
-        shots = self.available_shots()
-        if self.capture_target == "card" and (shots is None or shots < MIN_FREE_SHOTS):
-            raise CameraNotReadyError(
-                f"[{self.name}] card has room for {shots} shots — is a card "
-                "inserted, not full, and its lock tab off?"
-            )
         if self.imageformat:
             self._write_and_verify("imageformat", self.imageformat)
+        # After imageformat: the count is per shot at the current format. In
+        # RAM mode it is the RAM buffer's room, so it matters there too.
+        shots = self.available_shots()
+        if shots is None or shots < MIN_FREE_SHOTS:
+            where = (
+                "card — is a card inserted, not full, and its lock tab off?"
+                if self.capture_target == "card" else "camera RAM buffer"
+            )
+            raise CameraNotReadyError(f"[{self.name}] room for {shots} shots on the {where}")
+        if self.capture_target == "card" and shots < self.card_reserve_shots:
+            logger.warning(
+                "[%s] card has room for %d shots, below card_reserve_shots=%d: each "
+                "shot will be deleted from the card as soon as it is verified, so the "
+                "card keeps no backup",
+                self.name, shots, self.card_reserve_shots,
+            )
         for key, value in self.exposure.as_widgets().items():
             self._write_and_verify(key, value)
         self._settle()

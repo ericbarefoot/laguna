@@ -60,12 +60,18 @@ class TestConfig:
             DslrCameraSubsystem(cameras={"A": {"serial": "1", "exposure": {"iso": "800", "aperture": "8"}}})
 
 
-    def test_section_capture_target_is_the_default_camera_override_wins(self):
+    def test_capture_target_applies_to_every_camera(self):
+        cams = {n: {"serial": n, "exposure": EXPOSURE} for n in ("A", "B")}
+        dslr = DslrCameraSubsystem(cameras=cams, capture_target="ram")
+        assert {c.capture_target for c in dslr.cameras.values()} == {"ram"}
+
+    def test_per_camera_capture_target_is_rejected(self):
+        """libgphoto2 holds one target per host: mixing silently sent a
+        cardless body to "card" on real hardware (90 s hang per capture)."""
         cams = {n: {"serial": n, "exposure": EXPOSURE} for n in ("A", "B")}
         cams["B"]["capture_target"] = "card"
-        dslr = DslrCameraSubsystem(cameras=cams, capture_target="ram")
-        assert dslr.cameras["A"].capture_target == "ram"
-        assert dslr.cameras["B"].capture_target == "card"
+        with pytest.raises(ValueError, match="once for"):
+            DslrCameraSubsystem(cameras=cams, capture_target="ram")
 
 
 class TestConnect:

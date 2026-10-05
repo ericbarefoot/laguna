@@ -85,7 +85,7 @@ class TestPreflight:
     def test_refuses_a_card_without_room(self, monkeypatch, tmp_path, shots):
         """No card / full / locked: a T7 then blocks ~90 s per capture."""
         install_fake_gphoto2(monkeypatch, FakeBus({"usb:001,005": FakeBody("111", availableshots=shots)}))
-        with pytest.raises(CameraNotReadyError, match="card has room"):
+        with pytest.raises(CameraNotReadyError, match="inserted, not full"):
             make_cam(tmp_path).connect()
 
     def test_writes_exposure_and_card_target(self, bus, tmp_path):
@@ -177,9 +177,16 @@ class TestCardSpace:
 class TestCardlessRamMode:
     @pytest.fixture
     def cardless(self, monkeypatch):
-        body = FakeBody("111", availableshots="0")
+        # A cardless T7 in RAM mode reports its RAM buffer's room (~100k).
+        body = FakeBody("111", availableshots="100000")
         install_fake_gphoto2(monkeypatch, FakeBus({"usb:001,005": body}))
         return body
+
+    def test_refuses_a_full_ram_buffer(self, monkeypatch, tmp_path):
+        body = FakeBody("111", availableshots="0")
+        install_fake_gphoto2(monkeypatch, FakeBus({"usb:001,005": body}))
+        with pytest.raises(CameraNotReadyError, match="RAM buffer"):
+            make_cam(tmp_path, capture_target="ram").connect()
 
     def test_connects_with_no_card_and_targets_ram(self, cardless, tmp_path):
         make_cam(tmp_path, capture_target="ram").connect()

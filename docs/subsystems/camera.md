@@ -84,11 +84,15 @@ How it behaves:
   once free space drops below `card_reserve_shots` and the download has
   been verified. A download that fails is retried once (the shutter has
   already fired, so this costs no timing).
-- **Cardless bodies:** `capture_target: ram` (section-wide or per camera)
-  sends shots to the camera's RAM instead. Pre-flight then skips the
-  card-space check, and each shot is released from RAM after download.
+- **Cardless bodies:** `capture_target: ram` sends shots to the
+  camera's RAM instead, and each shot is released from RAM after download.
   There is no second copy, so a failed download is a lost frame, which
-  still pauses the lab.
+  still pauses the lab. **`capture_target` applies to every camera.**
+  libgphoto2 keeps one capture target for the whole computer (in
+  `~/.config/gphoto/settings`), not one per camera, so setting it per
+  camera would let one camera overwrite another's. On hardware, that sent
+  a cardless body to "card", and each of its captures hung for 90 s.
+  Either every camera has a card, or all of them use `ram`.
 - **A failed capture pauses the lab.** `capture_all()` never retries,
   because a missed frame can't be retaken later. The runner escalates any
   failure with `lab.escalate()`, and the `capture_failed` event names any
@@ -111,6 +115,45 @@ symlink for its hub port, run:
 ```bash
 python scripts/setup_dslr_udev.py --config config/my_run.yaml
 ```
+
+## Remote view and snapshot (`laguna-picam`)
+
+For a human looking at a Pi camera from another machine, with commands going
+client → laguna → pi and image bytes coming back pi → laguna → client over the
+SSH pipes (no ports opened, nothing to configure on the Pi beyond `rpicam-*`
+or `libcamera-*`, which Pi OS ships).
+
+On laguna, `pip install -e .` provides `laguna-picam`:
+
+```bash
+laguna-picam --config config/my_config.yaml list
+laguna-picam --config config/my_config.yaml snap 1 -o shot.jpg   # 1 = first pi_cameras.hosts entry
+laguna-picam --config config/my_config.yaml stream 1 | ffplay -f mjpeg -i -
+```
+
+On the client, `scripts/picam-remote.sh` does the first hop and saves/plays
+locally (needs `ffplay` or `mpv` for `view`):
+
+```bash
+export LAGUNA_SSH_HOST=laguna
+export LAGUNA_PICAM=~/miniforge3/envs/flumelab/bin/laguna-picam   # non-interactive ssh has no conda
+export LAGUNA_CONFIG=~/mysoftware/laguna/config/my_config.yaml
+alias picam='/path/to/laguna/scripts/picam-remote.sh'
+
+picam list
+picam snap 1                 # saves ./<host>_<utc>.jpg on the client
+picam view 1 --framerate 10  # live MJPEG window
+```
+
+Requirements and limits:
+
+- laguna → Pi login must be non-interactive (`BatchMode`): use a key without a
+  passphrase, or load it into an agent on laguna.
+- The Pi camera is **exclusive**. A stream left open when a scheduled capture
+  fires makes that capture fail, and a missed frame cannot be re-taken. Close
+  the view before a scheduled run, or between its capture times.
+- This is for looking, not data collection: nothing is logged to the event log
+  and no timing metadata is recorded.
 
 ## Config, via `setup_run()`
 

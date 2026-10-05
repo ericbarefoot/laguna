@@ -60,10 +60,11 @@ class DslrCameraSubsystem(SubsystemLogging):
                 simulated.
             card_reserve_shots: Default free-card reserve for every camera;
                 a camera's own ``card_reserve_shots`` overrides it.
-            capture_target: Default for every camera: ``"card"`` keeps a
-                backup copy on the memory card, ``"ram"`` is for bodies with
-                no card (the download is then the only copy). A camera's own
-                ``capture_target`` overrides it.
+            capture_target: For every camera: ``"card"`` keeps a backup
+                copy on the memory card, ``"ram"`` is for bodies with no card
+                (the download is then the only copy). Section-wide only —
+                libgphoto2 holds one target for the whole host; see
+                laguna.camera.canon.CAPTURE_TARGETS.
             log_level: Logging level; see laguna.subsystem_logging.
             event_log_verbosity: Event log verbosity; see
                 laguna.subsystem_logging.
@@ -73,7 +74,7 @@ class DslrCameraSubsystem(SubsystemLogging):
 
         Raises:
             ValueError: If a real (non-simulated) camera lacks serial or a
-                complete exposure.
+                complete exposure, or sets its own ``capture_target``.
         """
         self.log_level = log_level
         self.event_log_verbosity = event_log_verbosity
@@ -90,6 +91,12 @@ class DslrCameraSubsystem(SubsystemLogging):
         if simulated:
             return
         for name, cfg in (cameras or {}).items():
+            if "capture_target" in cfg:
+                raise ValueError(
+                    f"dslr_cameras.{name}.capture_target: set capture_target once for "
+                    "the whole dslr_cameras section — libgphoto2 keeps a single target "
+                    "for every camera on the host, so per-camera values clobber each other"
+                )
             if not cfg.get("serial"):
                 raise ValueError(
                     f"dslr_cameras.{name} needs a serial — run "
@@ -103,7 +110,7 @@ class DslrCameraSubsystem(SubsystemLogging):
                 imageformat=cfg.get("imageformat"),
                 device=cfg.get("device"),
                 card_reserve_shots=int(cfg.get("card_reserve_shots", card_reserve_shots)),
-                capture_target=cfg.get("capture_target", capture_target),
+                capture_target=capture_target,
             )
 
     @classmethod

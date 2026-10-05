@@ -11,6 +11,10 @@ them into a dated release section when you cut a version.
 ## [Unreleased]
 
 ### Added
+- **`laguna-picam` CLI and `scripts/picam-remote.sh`** — snapshot or live-view
+  a Pi camera from a remote client, relayed client → laguna → pi over SSH
+  pipes (no ports opened). See `docs/subsystems/camera.md`. The Pi camera is
+  exclusive, so don't leave a view open when a scheduled capture is due.
 - **DSLR control is now part of laguna** (`laguna.camera.canon`, issue
   #60). It is vendored from Minsik's (@yukms)
   [dualcam-timelapse](https://github.com/yukms/dualcam-timelapse), which no
@@ -24,7 +28,9 @@ them into a dated release section when you cut a version.
     deleted (oldest first, verified files only) once free space drops below
     `card_reserve_shots`. A failed download is retried once.
   - `capture_target: ram` supports bodies with no SD card. The verified
-    download is then the only copy.
+    download is then the only copy. It applies to every camera, because
+    libgphoto2 holds one capture target for the whole computer; a
+    per-camera value is an error.
   - A failed capture escalates to a lab-wide pause.
   - `scripts/setup_dslr_udev.py` lists cameras by serial and installs
     `/dev/dslr_<name>` symlinks.
