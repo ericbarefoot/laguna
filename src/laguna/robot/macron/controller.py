@@ -36,7 +36,7 @@ from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChe
 from .gcode import GCodeExecutor
 from .halt import HaltLatch, HaltLevel, MotionGuard, MotionHalted
 from .homing import AxisHomingConfig, HomingConfig, HomingProcedure
-from ..motion_arbiter import DEFAULT_ARBITER
+from ..motion_arbiter import DEFAULT_ARBITER, MotionBusyError
 from .move_handle import MoveHandle
 from .pi_bridge import PiGantryConnection
 from .position_store import GantryPositionStore
@@ -165,6 +165,10 @@ class GantryController:
         # Latched by pause()/stop()/estop(); refuses every motion path and
         # cancels in-flight moves until resume()/rearm(). See halt.py.
         self._halt = HaltLatch()
+        # Axes left jogging by jog_unfenced(). A jog runs with no thread and
+        # no arbiter hold, so this is the only thing that knows about it —
+        # see _require_motion_allowed().
+        self._jogging: set = set()
         # See position_store.py / restore_last_position() — off (None) unless
         # a path is configured. Useful any time a power cycle wipes the
         # PLC's ACP registers and a fresh home() isn't wanted right away.
@@ -712,8 +716,8 @@ class GantryController:
     # directly reachable for anything these don't cover.
     # ------------------------------------------------------------------
 
-    def _require_motion_allowed(self, description: str) -> None:
-        """Refuse motion unless connected, out of safe_mode, and not halted.
+    def _require_motion_allowed(self, description: str, allow_jogging: bool = False) -> None:
+        """Refuse motion unless connected, out of safe_mode, not halted, and nothing jogging.
 
         Checked client-side for every motion path, whatever the transport —
         RS232Connection/EthernetConnection have no gate of their own, so
@@ -722,6 +726,10 @@ class GantryController:
         Raises:
             SnapMotionError: If not connected, or safe_mode is on.
             MotionHalted: If pause()/stop()/estop() has latched the halt.
+            MotionBusyError: If an axis is still jogging (and `allow_jogging`
+                is False) — the controller would refuse the move anyway
+                (escape 24, "Axis Is Busy"), and a move planned from a
+                position that's still changing is wrong.
         """
         if not self._is_connected:
             raise SnapMotionError(
@@ -732,6 +740,11 @@ class GantryController:
                 0, f"{description} blocked by safe_mode — no-motion restriction active"
             )
         self._halt.require_clear(description)
+        if self._jogging and not allow_jogging:
+            raise MotionBusyError(
+                f"{description} refused: {sorted(self._jogging)} still jogging — stop it with "
+                "jog_unfenced(axis, 0) or pause() first"
+            )
 
     def _run_motion(
         self, description: str, prepare: Callable[[MotionGuard], Callable[[], Any]]
@@ -1009,11 +1022,19 @@ class GantryController:
     def jog_unfenced(self, axis: "Axis | AxisHandle | str", speed: float) -> None:
         """Start ONE axis jogging at `speed` mm/s WITHOUT any fence check; 0 stops it.
 
-        Open-ended motion: it runs until jog_unfenced(axis, 0), pause(), a
-        limit, or the controller's soft limits stop it, so nothing can
-        fence-check it in advance. safe_mode and the halt latch still apply
+        Open-ended motion: it runs until jog_unfenced(axis, 0), pause(),
+        stop()/estop(), or a hardware limit switch. Nothing fence-checks it,
+        and per the vendor manual (AsciiHelp, "Jog") **jogging is not
+        protected by the controller's soft limits (NLT/PLT)** either — so
+        keep jogs slow and short. safe_mode and the halt latch still apply
         to starting a jog (never to stopping one), and it refuses while
-        another motion operation holds the gantry. Logged at WARNING.
+        another motion operation holds the gantry. While any axis is
+        jogging, every other motion call is refused. Logged at WARNING.
+
+        Stopping sends BST and waits for the axis to decelerate, not
+        ``JOG 0``: the controller treats a zero-speed jog as a move still in
+        progress, so the axis stayed "busy" and the next move failed with
+        escape 24 ("Axis Is Busy").
 
         Raises:
             ValueError: Unknown axis, or a non-finite speed.
@@ -1025,16 +1046,21 @@ class GantryController:
         if not math.isfinite(speed):
             raise ValueError(f"jog_unfenced(): speed must be finite, got {speed!r}")
         if speed == 0:
-            self.cmd._jog(target, 0)
-            self._sync_position_after_direct_motion("jog_unfenced(0)")
+            try:
+                self.cmd.begin_stop(target)
+                self._wait_for_axis_move_finished(target)
+            finally:
+                self._jogging.discard(target.name)
+                self._sync_position_after_direct_motion("jog_unfenced(0)")
             return
         description = f"jog_unfenced({target.name}, {speed} mm/s)"
-        self._require_motion_allowed(description)
-        logger.warning("%s — NO FENCE CHECK; stop with jog_unfenced(%r, 0) or pause()",
+        self._require_motion_allowed(description, allow_jogging=True)
+        logger.warning("%s — NO FENCE CHECK, NO SOFT LIMITS; stop with jog_unfenced(%r, 0) or pause()",
                        description, target.name)
         with self.arbiter.hold(description, timeout_s=0):
             guard = self._halt.guard(description)
             with guard.issuing():
+                self._jogging.add(target.name)
                 self.cmd._jog(target, speed)
 
     def plan_scan_move(self, axis: "Axis | AxisHandle | str", end_mm: float) -> MotionGuard:
@@ -1169,6 +1195,7 @@ class GantryController:
         for axis in self._axes:
             try:
                 self.cmd.begin_stop(axis)
+                self._jogging.discard(axis.name)  # BST ends a jog
             except Exception as exc:
                 logger.error("Error soft-stopping %s: %s", axis.name, exc)
         # Best-effort: BST isn't blocking, so this reads position while
@@ -1269,6 +1296,7 @@ class GantryController:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry emergency stop: %s", exc)
+        self._jogging.clear()  # ABT ends a jog
         return note
 
     def rearm(self) -> bool:

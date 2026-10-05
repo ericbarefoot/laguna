@@ -393,10 +393,38 @@ class TestUnfencedMotion:
         assert "NO FENCE CHECK" in caplog.text
 
     def test_jog_unfenced_zero_always_stops_even_when_halted(self):
-        gantry, conn = _gantry({"A1 JOG 0": "0"})
+        gantry, conn = _gantry()
         gantry.estop()
+        conn.sent.clear()
         gantry.jog_unfenced("X", 0)
-        assert "A1 JOG 0" in conn.sent
+        assert "A1 BST" in conn.sent
+
+    def test_stopping_a_jog_sends_bst_not_jog_zero(self):
+        """Hardware regression: JOG 0 leaves the jog "active" at zero speed,
+        so the next move failed with escape 24, Axis Is Busy."""
+        gantry, conn = _gantry({"A1 JOG 5": "5"})
+        gantry.jog_unfenced("X", 5.0)
+        conn.sent.clear()
+        gantry.jog_unfenced("X", 0)
+        assert "A1 BST" in conn.sent
+        assert not any("JOG" in c for c in conn.sent)
+        assert conn.sent.index("A1 BST") < conn.sent.index("A1 MIF")
+
+    def test_other_motion_is_refused_while_an_axis_jogs(self):
+        gantry, conn = _gantry({"A1 JOG 5": "5", "C1 BMT 10 0": "0"})
+        gantry.jog_unfenced("X", 5.0)
+        with pytest.raises(MotionBusyError, match="jogging"):
+            gantry.move_to(X=10.0)
+        gantry.jog_unfenced("X", 0)
+        gantry.move_to(X=10.0).wait(timeout=2)
+        assert "C1 BMT 10 0" in conn.sent
+
+    @pytest.mark.parametrize("verb", ["pause", "stop", "estop"])
+    def test_halting_ends_the_jog_bookkeeping(self, verb):
+        gantry, _ = _gantry({"A1 JOG 5": "5"})
+        gantry.jog_unfenced("X", 5.0)
+        getattr(gantry, verb)()
+        assert gantry._jogging == set()
 
     def test_jog_unfenced_refuses_while_another_motion_holds_the_gantry(self):
         arbiter = MotionArbiter()

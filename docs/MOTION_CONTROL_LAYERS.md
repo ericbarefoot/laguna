@@ -23,7 +23,7 @@ bug.
 | `lab.gantry.gcode.plan()` / `.execute()` | **Yes** — the one fenced path underneath all of the above | Transport only¹ | Only if you pass a `guard` | **No** | Yes | Yes (its own cache) |
 | `lab.gantry.home()` / `.home_axis()` / `.locate_limit_switch()` | **No — by design**: until homing finishes there's no frame for fences to mean anything in | Yes | Yes | Yes | **No** — `MoveHandle`; `.result` has the position | Yes |
 | `lab.gantry.move_to_unfenced(axis, position)` | **No — by name**. For locating fences, or recovering an axis a (stale) fence won't let `move_to()` touch. Logged at WARNING | Yes | Yes | Yes | **No** | Yes |
-| `lab.gantry.jog_unfenced(axis, speed)` | **No — by name**. Open-ended, so nothing *can* check it in advance. `speed=0` stops it | Yes (to start) | Yes (to start) | Refuses if held | Starts and returns | On `jog_unfenced(axis, 0)` |
+| `lab.gantry.jog_unfenced(axis, speed)` | **No — by name**. Open-ended, so nothing *can* check it in advance — and **the controller's soft limits don't apply to jogs either** (vendor manual, "Jog"). `speed=0` stops it (BST). While any axis jogs, every other motion call is refused | Yes (to start) | Yes (to start) | Refuses if held | Starts and returns | On `jog_unfenced(axis, 0)` |
 
 ¹ `gcode` is the engine the gated entry points drive; calling it directly
 skips the controller's client-side safe_mode/halt/arbiter checks. Use
