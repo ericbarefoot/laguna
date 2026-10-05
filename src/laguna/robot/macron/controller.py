@@ -169,6 +169,13 @@ class GantryController:
         # no arbiter hold, so this is the only thing that knows about it —
         # see _require_motion_allowed().
         self._jogging: set = set()
+        # Axes whose motor *this process* turned off (estop(), disable()),
+        # not yet turned back on. With the motor off the controller still
+        # accepts BMT/JOG and its position tracker (ACP) follows the
+        # commanded profile, but nothing physically moves — a move "succeeds"
+        # and the recorded position goes wrong. Found on hardware: X stayed
+        # off after an estop and homing jogged nowhere.
+        self._motors_off: set = set()
         # See position_store.py / restore_last_position() — off (None) unless
         # a path is configured. Useful any time a power cycle wipes the
         # PLC's ACP registers and a fresh home() isn't wanted right away.
@@ -473,7 +480,13 @@ class GantryController:
             logger.warning("Soft limits did not validate after being set: %s", exc)
 
     def _enable_and_release_brakes(self) -> None:
-        """Turn each brake-equipped axis's motor on, then release its brake.
+        """Turn every axis's motor on, then release Y/Z's brakes.
+
+        Every axis, not just the braked ones: estop() turns *all* motors
+        off, and X/Theta have no brake for this to be about, so only
+        turning Y/Z back on left X dead after an estop — commanded moves
+        tracked in ACP while nothing moved. Re-sending MTR 1 to a motor the
+        controller's DSM program already enabled at power-up is harmless.
 
         Once the motor is on, its own torque holds the axis, so a
         still-engaged brake serves no purpose — and worse, it is a hazard:
@@ -498,13 +511,15 @@ class GantryController:
         no output-setting commands" guarantee has to cover.
         """
         for axis in self._axes:
-            if axis not in (Y_AXIS, Z_AXIS):
-                continue
             handle = self._axis_handles[axis.name]
             try:
                 handle.enable()
             except SnapMotionError as exc:
                 logger.warning("Could not turn on %s's motor: %s", axis.name, exc)
+                continue
+            self._motors_off.discard(axis.name)
+            if axis not in (Y_AXIS, Z_AXIS):
+                logger.info("%s: motor on", axis.name)
                 continue
             try:
                 handle.disengage_brake()
@@ -553,6 +568,7 @@ class GantryController:
             "is_connected": self._is_connected,
             "safe_mode": self._safe_mode,
             "halted": self._halt.level.name.lower() if self._halt.level else None,
+            "motors_off": sorted(self._motors_off),
         }
         if not self._is_connected:
             return status
@@ -740,6 +756,13 @@ class GantryController:
                 0, f"{description} blocked by safe_mode — no-motion restriction active"
             )
         self._halt.require_clear(description)
+        if self._motors_off:
+            raise SnapMotionError(
+                0,
+                f"{description} refused: motors off for {sorted(self._motors_off)} (after "
+                "estop()/disable()) — the axis would not move but its position would update. "
+                "set_safe_mode(False) or enable() turns them back on.",
+            )
         if self._jogging and not allow_jogging:
             raise MotionBusyError(
                 f"{description} refused: {sorted(self._jogging)} still jogging — stop it with "
@@ -1297,6 +1320,8 @@ class GantryController:
         except Exception as exc:
             logger.error("Error during gantry emergency stop: %s", exc)
         self._jogging.clear()  # ABT ends a jog
+        # Recorded even if some MTR 0 failed: assume off until turned on again.
+        self._motors_off.update(axis.name for axis in self._axes)
         return note
 
     def rearm(self) -> bool:
@@ -1475,14 +1500,17 @@ class GantryController:
         """
         for axis in self._axes:
             self.cmd.set_motor(axis, True)
+            self._motors_off.discard(axis.name)
 
     def disable(self) -> None:
         """Turn motor drive off for all configured axes.
 
         Allows manual repositioning (MTR only). Does NOT send ENA — see
-        enable().
+        enable(). Motion is refused until enable() or set_safe_mode(False)
+        turns them back on.
         """
         for axis in self._axes:
+            self._motors_off.add(axis.name)
             self.cmd.set_motor(axis, False)
 
     def wait_for_move(self, timeout: Optional[float] = None, predicted_s: float = 0.0) -> None:

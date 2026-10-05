@@ -1038,7 +1038,9 @@ class TestConnectBrakeRelease:
     feedback on 2026-07-30."""
 
     RESPONSES = {
+        "A1 MTR 1": "1",                   # X: motor on (no brake)
         "A2 MTR 1": "1", "SOB 4 1": "0",   # Y: motor on, brake released
+        "A6 MTR 1": "1",                   # Theta: motor on (no brake)
         "A5 MTR 1": "1", "SOB 5 1": "0",   # Z: motor on, brake released
         # connect()'s own _current_pos resync (sync_position_from_hardware):
         "A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
@@ -1053,7 +1055,7 @@ class TestConnectBrakeRelease:
         assert controller.connect() is True
         assert conn.sent == [
             "A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP",  # _current_pos resync
-            "A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1",
+            "A1 MTR 1", "A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1", "A6 MTR 1",
         ]
 
     def test_motor_on_strictly_before_brake_release(self):
@@ -1077,16 +1079,21 @@ class TestConnectBrakeRelease:
         assert controller.connect() is True
         assert conn.sent == ["A1 ACP", "A2 ACP", "A5 ACP", "A6 ACP"]  # _current_pos resync only
 
-    def test_only_touches_braked_axes(self):
+    def test_turns_every_motor_on_but_releases_only_braked_axes(self):
+        """X/Theta used to be skipped, so after an estop (which turns every
+        motor off) X stayed dead: moves updated its position tracker while
+        nothing moved, and homing jogged nowhere."""
         controller, conn = self._make_controller(safe_mode=False)
         controller.connect()
-        assert not any(c.startswith(("A1 ", "A6 ")) and "ACP" not in c for c in conn.sent)
+        assert {"A1 MTR 1", "A2 MTR 1", "A5 MTR 1", "A6 MTR 1"} <= set(conn.sent)
+        assert [c for c in conn.sent if c.startswith("SOB")] == ["SOB 4 1", "SOB 5 1"]
 
     def test_a_failing_axis_does_not_block_the_other(self):
         """A faulted axis is logged and skipped, not allowed to abort the
         whole connect — the other axis still gets its brake released."""
         from laguna.robot.macron.connection import SnapMotionError
         responses = {
+            "A1 MTR 1": "1", "A6 MTR 1": "1",
             "A2 MTR 1": SnapMotionError(70),   # Y's motor won't come on
             "A5 MTR 1": "1", "SOB 5 1": "0",
             "A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
@@ -1105,6 +1112,7 @@ class TestConnectSoftLimits:
     brake-release step."""
 
     BRAKE_RESPONSES = {
+        "A1 MTR 1": "1", "A6 MTR 1": "1",
         "A2 MTR 1": "1", "SOB 4 1": "0", "A5 MTR 1": "1", "SOB 5 1": "0",
         "A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0",
     }
@@ -1189,6 +1197,7 @@ class TestSetSafeMode:
 
     def _make_controller(self, safe_mode=True, responses=None):
         conn = FakeSnapConnection(responses or {
+            "A1 MTR 1": "1", "A6 MTR 1": "1",
             "A2 MTR 1": "1", "SOB 4 1": "0", "A5 MTR 1": "1", "SOB 5 1": "0",
             "SOB 4 0": "0", "SOB 5 0": "0",
             # connect()'s own _current_pos resync (sync_position_from_hardware):
@@ -1201,7 +1210,7 @@ class TestSetSafeMode:
         controller.connect()
         conn.sent.clear()
         assert controller.set_safe_mode(False) is True
-        assert conn.sent == ["A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1"]
+        assert conn.sent == ["A1 MTR 1", "A2 MTR 1", "SOB 4 1", "A5 MTR 1", "SOB 5 1", "A6 MTR 1"]
 
     def test_enabling_engages_brakes_and_leaves_motors_on(self):
         controller, conn = self._make_controller(safe_mode=False)

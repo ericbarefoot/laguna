@@ -497,6 +497,36 @@ class TestScanMoves:
 # ---------------------------------------------------------------------------
 
 
+class TestMotorsOff:
+    def test_estop_then_rearm_then_enable_turns_every_motor_back_on(self):
+        """Hardware regression: estop() turned X's motor off and nothing
+        turned it back on, so homing X jogged nowhere."""
+        gantry, conn = _gantry()
+        gantry.estop()
+        gantry.rearm()
+        conn.sent.clear()
+        gantry.set_safe_mode(False)
+        assert {"A1 MTR 1", "A2 MTR 1", "A5 MTR 1", "A6 MTR 1"} <= set(conn.sent)
+        assert gantry.get_status()["motors_off"] == []
+
+    def test_motion_refused_while_a_motor_is_off(self):
+        """With the motor off the controller still accepts BMT and its
+        position tracker follows — the move would "succeed" without moving."""
+        gantry, conn = _gantry()
+        gantry.disable()
+        conn.sent.clear()
+        for call in (
+            lambda: gantry.move_to(X=10.0),
+            lambda: gantry.home_axis("X"),
+            lambda: gantry.jog_unfenced("X", 5.0),
+        ):
+            with pytest.raises(SnapMotionError, match="motors off"):
+                call()
+        assert _bmt_sent(conn) == []
+        gantry.enable()
+        assert gantry.get_status()["motors_off"] == []
+
+
 class TestEstop:
     def test_does_not_read_positions_before_returning(self):
         """FlumeLab estops the gantry first; position reads here delayed the
