@@ -34,16 +34,22 @@ from __future__ import annotations
 
 import time
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
 
 from .commands import (
     MMCCommands, Axis, IOMap, X_AXIS, Y_AXIS, Z_AXIS, THETA_AXIS,
-    poll_until_move_finished, predicted_move_s,
+    _sleep_checking_halt, poll_until_move_finished, predicted_move_s,
 )
 from .connection import SnapMotionError
+from .halt import MotionGuard, MotionHalted
 
 logger = logging.getLogger(__name__)
+
+#: Seconds to wait after commanding a brake release before moving the axis.
+#: Matches the 0.5 s the old status-readback loop waited at most.
+BRAKE_RELEASE_SETTLE_S = 0.5
 
 
 @dataclass
@@ -52,6 +58,11 @@ class AxisHomingConfig:
     input_index: int                    # INB index of this axis's home/limit switch
     trip_on_high: bool = True           # True = switch reads HIGH when triggered; False = LOW
     homing_direction: float = -1.0      # -1 = jog toward negative limit (usual); +1 if inverted
+    # Longest distance the switch search could have to cover, mm — the
+    # axis's full throw. Sets the search timeout (see
+    # HomingConfig.search_timeout_s); None falls back to
+    # HomingConfig.default_timeout_s.
+    max_travel_mm: Optional[float] = None
 
 
 @dataclass
@@ -60,7 +71,19 @@ class HomingConfig:
     homing_speed: float = 10.0          # mm/s — slow enough to stop cleanly
     standoff_distance: float = 5.0      # mm to back off after zeroing
     poll_interval_s: float = 0.05       # 50 ms between switch polls
-    timeout_s: float = 60.0             # per-axis timeout
+    # Reply timeout for each switch read during a search. The connection's
+    # default (5 s) let a single stalled read leave the jog running unwatched
+    # for 5 s — 50 mm at 10 mm/s (hardware, 2026-10-05). A normal read
+    # answers in ~50 ms; a timeout aborts the axis (see _stop_on_failure).
+    switch_read_timeout_s: float = 0.3
+    # Switch-search timeout = timeout_margin * max_travel_mm / homing_speed
+    # + timeout_slack_s. A flat 60 s used to time out before the switch on
+    # any long axis: X's ~8000 mm throw takes ~800 s at 10 mm/s. A long
+    # timeout only delays giving up — it adds no travel, since the switch
+    # (and the controller's own limits) still stop the axis.
+    timeout_margin: float = 1.5
+    timeout_slack_s: float = 30.0
+    default_timeout_s: float = 60.0     # for an axis with no max_travel_mm configured
     backoff_timeout_s: float = 10.0     # timeout when backing away from a pre-tripped switch
     home_order: tuple[Axis, ...] = field(
         default_factory=lambda: (Z_AXIS, X_AXIS, Y_AXIS)
@@ -81,6 +104,19 @@ class HomingConfig:
             The AxisHomingConfig for this axis, or None if not configured.
         """
         return self.axis_configs.get(axis)
+
+    def search_timeout_s(self, axis_config: AxisHomingConfig) -> float:
+        """How long a switch search on this axis may take before it's declared a failure."""
+        if axis_config.max_travel_mm is None or self.homing_speed <= 0:
+            return self.default_timeout_s
+        return (
+            self.timeout_margin * abs(axis_config.max_travel_mm) / self.homing_speed
+            + self.timeout_slack_s
+        )
+
+
+class HomingFailed(RuntimeError):
+    """Homing did not complete; the message names the axis and the cause."""
 
 
 @dataclass
@@ -117,6 +153,9 @@ class HomingProcedure:
         self._cmd = cmd
         self._config = config
         self._io_map = io_map or IOMap()
+        # Set by GantryController for the duration of one homing run — see
+        # _issue()/_check_halt() and laguna.robot.macron.halt.
+        self._guard: Optional[MotionGuard] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -144,11 +183,17 @@ class HomingProcedure:
 
         self._disengage_brake_if_needed(axis)
 
+        with self._stop_on_failure(axis):
+            return self._home_axis_moving(axis, ax_cfg, is_tripped)
+
+    def _home_axis_moving(self, axis: Axis, ax_cfg: AxisHomingConfig, is_tripped) -> float:
+        """The motion part of home_axis(); any failure in here stops the axis."""
+        cfg = self._config
         self._backoff_if_already_tripped(axis, is_tripped, ax_cfg.homing_direction)
 
-        self._cmd.jog(axis, ax_cfg.homing_direction * cfg.homing_speed)
+        self._issue(lambda: self._cmd._jog(axis, ax_cfg.homing_direction * cfg.homing_speed))
 
-        trip_pos = self._wait_for_switch_trip(axis, is_tripped)
+        trip_pos = self._wait_for_switch_trip(axis, is_tripped, cfg.search_timeout_s(ax_cfg))
 
         # Controlled stop — gives a clean decel instead of a hard cut
         self._cmd.begin_stop(axis)
@@ -176,7 +221,7 @@ class HomingProcedure:
         # move_to() (blocking MVT) is banned; see commands.py. Distance is
         # measured from the just-rezeroed frame, in which the trip point is
         # 0 and we're sitting `current_pos - trip_pos` past it.
-        self._cmd.begin_move_to(axis, cfg.standoff_distance)
+        self._issue(lambda: self._cmd._begin_move_to(axis, cfg.standoff_distance))
         self._wait_for_move_finished(
             axis, cfg.backoff_timeout_s,
             predicted_s=predicted_move_s(
@@ -222,11 +267,19 @@ class HomingProcedure:
 
         self._disengage_brake_if_needed(axis)
 
+        with self._stop_on_failure(axis):
+            return self._locate_limit_switch_moving(axis, direction, is_tripped, ax_cfg)
+
+    def _locate_limit_switch_moving(
+        self, axis: Axis, direction: float, is_tripped, ax_cfg: AxisHomingConfig
+    ) -> float:
+        """The motion part of locate_limit_switch(); any failure in here stops the axis."""
+        cfg = self._config
         self._backoff_if_already_tripped(axis, is_tripped, direction)
 
-        self._cmd.jog(axis, direction * cfg.homing_speed)
+        self._issue(lambda: self._cmd._jog(axis, direction * cfg.homing_speed))
 
-        trip_pos = self._wait_for_switch_trip(axis, is_tripped)
+        trip_pos = self._wait_for_switch_trip(axis, is_tripped, cfg.search_timeout_s(ax_cfg))
 
         # Controlled stop — gives a clean decel instead of a hard cut
         self._cmd.begin_stop(axis)
@@ -237,7 +290,7 @@ class HomingProcedure:
         # left resting against the hard stop. Relative move, unlike
         # home_axis()'s absolute one — there is no rezeroed frame here to
         # measure an absolute target from.
-        self._cmd.begin_move_by(axis, -direction * cfg.standoff_distance)
+        self._issue(lambda: self._cmd._begin_move_by(axis, -direction * cfg.standoff_distance))
         self._wait_for_move_finished(
             axis, cfg.backoff_timeout_s,
             predicted_s=predicted_move_s(cfg.standoff_distance, cfg.homing_speed),
@@ -255,6 +308,10 @@ class HomingProcedure:
             try:
                 pos = self.home_axis(axis)
                 results[axis.name] = pos
+            except MotionHalted:
+                # A pause/stop/estop isn't a homing failure to report and
+                # move past — it has to reach the caller as what it is.
+                raise
             except Exception as exc:
                 logger.error("Homing failed on axis %s: %s", axis.name, exc)
                 return HomingResult(success=False, axis_results=results, error=str(exc))
@@ -264,18 +321,67 @@ class HomingProcedure:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _disengage_brake_if_needed(self, axis: Axis) -> None:
-        """Disengage brake for Y/Z axes before homing motion.
+    def _check_halt(self) -> None:
+        if self._guard is not None:
+            self._guard.check()
 
-        Waits up to 0.5s for brake feedback to confirm disengagement, where
-        that feedback is reachable at all. Z's brake status input lives on
-        the responder node's own input bank and cannot be read via ASCII
-        (see IOMap in commands.py) — for axes in that situation, this
-        trusts the just-issued SOB command instead of trying to read it
-        back, the same way engage_brake()/disengage_brake() are trusted
-        everywhere else they're called without a confirm step. Logs a
-        warning (not the same as raising) if a *readable* status input
-        does not confirm within 0.5s, but continues anyway.
+    @contextmanager
+    def _stop_on_failure(self, axis: Axis) -> Iterator[None]:
+        """Abort `axis` if anything goes wrong while it may be moving, then re-raise.
+
+        Found on hardware 2026-10-05: one ``INB 3`` read timed out mid-search
+        (the controller went quiet for 5 s), the SnapMotionError escaped the
+        polling loop, home_all() recorded a failure and returned — and the
+        jog kept running, because nothing had told the axis to stop. A jog
+        is not bounded by the soft limits, so only a person stopped it.
+
+        A halt (MotionHalted) is left alone: the halt verb already sent its
+        own stop. Anything else gets ABT, retried, because the most likely
+        cause is the very link that has to carry it.
+        """
+        try:
+            yield
+        except MotionHalted:
+            raise
+        except BaseException:
+            self._abort_until_acknowledged(axis)
+            raise
+
+    def _abort_until_acknowledged(self, axis: Axis, attempts: int = 3) -> None:
+        for attempt in range(1, attempts + 1):
+            try:
+                self._cmd.abort(axis)
+                logger.error("Axis %s: homing failed mid-motion — axis aborted", axis.name)
+                return
+            except Exception as exc:
+                logger.critical(
+                    "Axis %s: homing failed mid-motion and ABORT attempt %d/%d failed: %s",
+                    axis.name, attempt, attempts, exc,
+                )
+                time.sleep(0.2)
+        logger.critical(
+            "Axis %s MAY STILL BE MOVING — could not confirm an abort. Stop it by hand "
+            "(physical e-stop) and check the link to the controller.", axis.name,
+        )
+
+    def _issue(self, send) -> None:
+        """Send one motion-starting command under the halt guard, if one is set."""
+        if self._guard is None:
+            send()
+            return
+        with self._guard.issuing():
+            send()
+
+    def _disengage_brake_if_needed(self, axis: Axis) -> None:
+        """Release Y/Z's brake before homing motion, then give it time to open.
+
+        Trusts the SOB output command — there is no status readback. Y's
+        status input (INB 8) proved unreliable on hardware (2026-10-05: six
+        reads of 0 after SOB 4 1 while Y moved freely), and Z's is
+        unreachable over ASCII entirely, so neither is read any more. The
+        fixed settle keeps the jog from starting against a brake that's
+        still opening — a stall against an engaged brake is what corrupted
+        Y's encoder on 2026-07-30.
 
         Args:
             axis: Target axis (no-op for axes without brakes).
@@ -283,33 +389,20 @@ class HomingProcedure:
         if axis not in (Y_AXIS, Z_AXIS):
             return
         self._cmd.disengage_brake(axis, self._io_map)
-        # Wait up to 0.5 s for brake feedback to confirm release
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
-            try:
-                if self._cmd.brake_is_disengaged(axis, self._io_map):
-                    return
-            except NotImplementedError:
-                logger.info(
-                    "Axis %s: brake status input is not reachable via ASCII — "
-                    "trusting the SOB command just issued instead of a live readback",
-                    axis.name,
-                )
-                return
-            time.sleep(0.05)
-        logger.warning(
-            "Axis %s: brake release feedback did not confirm within 0.5 s — continuing anyway",
-            axis.name,
-        )
+        time.sleep(BRAKE_RELEASE_SETTLE_S)
 
     def _switch_is_tripped(self, axis: Axis, ax_cfg: AxisHomingConfig) -> bool:
         """Read this axis's configured (home or limit) switch and check its trip polarity."""
-        state = self._cmd.read_input_bit(ax_cfg.input_index)
+        state = self._cmd.read_input_bit(
+            ax_cfg.input_index, timeout=self._config.switch_read_timeout_s
+        )
         return state if ax_cfg.trip_on_high else not state
 
     def _limit_switch_is_tripped(self, axis: Axis, trip_on_high: bool) -> bool:
         """Read this axis's limit switch (IOMap, not AxisHomingConfig) and check trip polarity."""
-        state = self._cmd.read_limit_switch(axis, self._io_map)
+        state = self._cmd.read_limit_switch(
+            axis, self._io_map, timeout=self._config.switch_read_timeout_s
+        )
         return state if trip_on_high else not state
 
     def _backoff_if_already_tripped(self, axis: Axis, is_tripped, direction: float) -> None:
@@ -333,13 +426,13 @@ class HomingProcedure:
             "Axis %s: switch already tripped at start, backing off %.1f mm",
             axis.name, backoff,
         )
-        self._cmd.begin_move_by(axis, backoff)
+        self._issue(lambda: self._cmd._begin_move_by(axis, backoff))
         self._wait_for_move_finished(
             axis, self._config.backoff_timeout_s,
             predicted_s=predicted_move_s(backoff, self._config.homing_speed),
         )
 
-    def _wait_for_switch_trip(self, axis: Axis, is_tripped) -> float:
+    def _wait_for_switch_trip(self, axis: Axis, is_tripped, timeout_s: float) -> float:
         """Poll `is_tripped` until it trips. Returns the axis position at detection.
 
         Aborts axis motion if timeout elapses before the switch trips. The
@@ -351,22 +444,26 @@ class HomingProcedure:
             axis: Target axis.
             is_tripped: Callable returning whether the target switch is
                 currently tripped.
+            timeout_s: Give up (and abort the jog) after this long — see
+                HomingConfig.search_timeout_s.
 
         Raises:
-            SnapMotionError: If the switch does not trip within the
-                configured timeout.
+            SnapMotionError: If the switch does not trip within `timeout_s`.
+            MotionHalted: If a pause/stop/estop fires during the search.
         """
         cfg = self._config
-        deadline = time.monotonic() + cfg.timeout_s
+        deadline = time.monotonic() + timeout_s
         while not is_tripped():
             if time.monotonic() > deadline:
                 self._cmd.abort(axis)
                 raise SnapMotionError(
                     0,
-                    f"Homing timeout on axis {axis.name} after {cfg.timeout_s:.0f} s "
-                    f"— switch not reached. Check wiring and input_index.",
+                    f"Homing timeout on axis {axis.name} after {timeout_s:.0f} s "
+                    f"— switch not reached. Check wiring, input_index, and that "
+                    f"max_travel_mm covers the axis's full throw.",
                 )
-            time.sleep(cfg.poll_interval_s)
+            _sleep_checking_halt(cfg.poll_interval_s, self._check_halt if self._guard else None)
+            self._check_halt()
         return self._cmd.get_actual_position(axis)
 
     def _wait_for_move_finished(self, axis: Axis, timeout_s: float, predicted_s: float = 0.0) -> None:
@@ -380,7 +477,8 @@ class HomingProcedure:
         (after BST) leaves it at 0.0 since decel time isn't known here.
         """
         if not poll_until_move_finished(
-            lambda: self._cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout_s
+            lambda: self._cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout_s,
+            check_halt=self._check_halt if self._guard else None,
         ):
             self._cmd.abort(axis)
             logger.warning(

@@ -3,6 +3,7 @@
 import pytest
 
 from laguna.robot.macron import commands as _macron_commands
+from laguna.robot.macron import homing as _macron_homing
 
 
 @pytest.fixture(autouse=True)
@@ -19,3 +20,4 @@ def _no_real_move_polling_sleeps(monkeypatch):
     """
     monkeypatch.setattr(_macron_commands, "SPARSE_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(_macron_commands, "PREDICTED_SLEEP_FRACTION", 0.0)
+    monkeypatch.setattr(_macron_homing, "BRAKE_RELEASE_SETTLE_S", 0.0)

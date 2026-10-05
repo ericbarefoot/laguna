@@ -1,215 +1,160 @@
 # Motion control layers & guards
 
-There are several different entry points that can put the gantry in
-motion. They do **not** all carry the same guards — some skip fence
-checking entirely, some rely on a guard that only exists on one transport,
-and one path skips keeping two position caches in sync (see the gotcha
-below). This page is the map: which layer you're calling, what actually
-protects you when you call it, and what doesn't.
+Every way of putting the gantry in motion, and exactly which guards each one
+passes through. The design rule is short:
 
-Read this before reaching past `GantryController`'s verbs
-(`move_to()`/`home()`/`home_axis()`/`locate_limit_switch()`/etc.) into
-`.gcode`, `.homing`, `.cmd`, or a per-axis `.x`/`.y`/`.z`/`.theta` handle
-directly — those are all real, supported entry points, but each drops a
-different subset of the guards described here.
+> **Every move is fence-checked, except homing (no reference frame yet) and
+> the two explicitly named `*_unfenced` calls.** Everything else — safe_mode,
+> the halt latch, the motion arbiter — applies to *every* path, unfenced ones
+> included.
 
-## The layers
+If you find a way to move the gantry that isn't in the table below, that's a
+bug.
 
-```mermaid
-flowchart TD
-    User(["Human — REPL / script"])
+## The public motion entry points
 
-    GC["<b>GantryController</b> verbs<br/>move_to · home · home_axis<br/>locate_limit_switch · set_position<br/>stop / soft_stop / pause / resume / estop"]
+| Call | Fence-checked? | `safe_mode` | Halt latch | Arbiter | Blocks? | Position resynced after? |
+|---|---|---|---|---|---|---|
+| `lab.move_to(...)` / `lab.gantry.move_to(...)` | **Yes** — X/Y/Z as a ribbon (see below); Theta not (#62) | Yes | Yes | Yes | **No** — returns a `MoveHandle` | Yes |
+| `lab.place(instrument, point)` | **Yes** (it's `move_to()`) | Yes | Yes | Yes | **No** | Yes |
+| `lab.acquire_scan(...)` (Pi-agent rangefinder pass) | **Yes** — reposition via `move_to()`, the pass as a straight segment | Yes, client **and** agent side | Yes | Yes | Yes (it's a whole acquisition) | Yes |
+| `lab.gocator.scan_with_gantry(...)` / `.acquire(...)` | **Yes** — the pass as a straight segment (`begin_scan_move`) | Yes | Yes | Yes | Yes | Yes |
+| `SurveyRunner.run()` | **Yes** — every reposition and every pass | Yes | Yes | Yes, across each whole pass | Yes | Yes |
+| `lab.gantry.gcode.plan()` / `.execute()` | **Yes** — the one fenced path underneath all of the above | Transport only¹ | Only if you pass a `guard` | **No** | Yes | Yes (its own cache) |
+| `lab.gantry.home()` / `.home_axis()` / `.locate_limit_switch()` | **No — by design**: until homing finishes there's no frame for fences to mean anything in | Yes | Yes | Yes | **No** — `MoveHandle`; `.result` has the position | Yes |
+| `lab.gantry.move_to_unfenced(axis, position)` | **No — by name**. For locating fences, or recovering an axis a (stale) fence won't let `move_to()` touch. Logged at WARNING | Yes | Yes | Yes | **No** | Yes |
+| `lab.gantry.jog_unfenced(axis, speed)` | **No — by name**. Open-ended, so nothing *can* check it in advance — and **the controller's soft limits don't apply to jogs either** (vendor manual, "Jog"). `speed=0` stops it (BST). While any axis jogs, every other motion call is refused | Yes (to start) | Yes (to start) | Refuses if held | Starts and returns | On `jog_unfenced(axis, 0)` |
 
-    GCode["<b>GCodeExecutor</b><br/>lab.gantry.gcode"]
-    Homing["<b>HomingProcedure</b><br/>lab.gantry.homing"]
-    AxisH["<b>AxisHandle</b><br/>lab.gantry.x / .y / .z / .theta"]
-    Cmd["<b>MMCCommands</b><br/>lab.gantry.cmd"]
+¹ `gcode` is the engine the gated entry points drive; calling it directly
+skips the controller's client-side safe_mode/halt/arbiter checks. Use
+`move_to()`.
 
-    Fence{{"Fence check<br/>TrajectoryChecker<br/>pure Python, no hardware"}}
-    RejectF(["FenceViolation raised —<br/>nothing reaches the wire"])
+**Not motion entry points:** `lab.gantry.cmd` (`MMCCommands`) keeps every
+read, setting and *stop* public, but its motion-starting primitives
+(`_begin_move_to`, `_begin_move_by`, `_jog`, `_group_begin_move_to`, …) are
+private. The only callers are the layers in the table above.
 
-    Transport["<b>Connection</b><br/>PiGantryConnection: safe_mode built in<br/>RS232/Ethernet: dumb passthrough, no gate"]
-    Agent["<b>gantry_agent.py</b> (Pi-side)<br/>independent SAFE_COMMANDS copy"]
-    Wire(("Snap2Motion controller"))
+The per-axis handles (`lab.gantry.x`, `.y`, …) likewise have reads,
+speed/ramp settings, brakes, switches and stops, but no motion methods.
 
-    Arbiter[["MotionArbiter lock<br/>DEFAULT_ARBITER, re-entrant"]]
-    NoArbiter(["NOT arbiter-held:<br/>home · home_axis · locate_limit_switch<br/>set_position · soft_stop · estop<br/>AxisHandle · HomingProcedure · MMCCommands"])
+## Non-blocking moves
 
-    User --> GC
-    User -. direct access .-> GCode
-    User -. direct access .-> Homing
-    User -. direct access .-> AxisH
-    User -. lowest-level direct access .-> Cmd
+`move_to()`, `place()`, `home*()`, `locate_limit_switch()` and
+`move_to_unfenced()` do every check that can refuse the move — validation,
+a live position read, the fence check, safe_mode, the halt latch, "motion in
+progress" — **on your thread, before returning**. A refusal raises right
+there, with nothing sent. Only then does the traverse start, on a background
+thread, and you get a `MoveHandle` back:
 
-    GC -->|move_to| Arbiter
-    Arbiter --> GCode
-    GC -.->|"every other verb"| NoArbiter
+```python
+h = lab.move_to(X=1200, speed=50)   # returns as soon as the move has started
+lab.pause()                          # works immediately — no Ctrl-C needed
+h.wait()                             # raises MotionHalted: the pause cancelled it
 
-    GC -->|"home / home_axis / locate_limit_switch"| Homing
-    GC -->|"set_position, stop family"| Cmd
-
-    GCode --> Fence
-    Fence -->|clear| Cmd
-    Fence -->|violation| RejectF
-
-    Homing -->|no fence check| Cmd
-    AxisH -->|client-side safe_mode check| Cmd
-
-    Cmd -->|"ENA and blocking-move refused outright"| Transport
-    Transport -->|"safe_mode allowlist, bare reads only"| Agent
-    Agent --> Wire
+lab.move_to(X=0).wait()              # scripts: .wait() to sequence
+pos = lab.gantry.home_axis("X").wait().result
 ```
 
-| Layer | Reached via | Fence-checked? | `safe_mode`-gated? | Arbiter-held? | Position caches synced? |
-|---|---|---|---|---|---|
-| `GCodeExecutor` | `lab.gantry.move_to()`, `lab.gantry.gcode.plan()/execute()` | **Yes** — the only path that is | Yes, via transport (below) | Yes — the only layer that is (`move_to()` specifically; direct `.gcode.plan()/execute()` calls skip it) | Yes — own `_current_pos`/`_current_theta`, always current for its own moves |
-| `HomingProcedure` | `lab.gantry.home()`, `.home_axis()`, `.locate_limit_switch()` (`GantryController` wrappers) | **No** | Yes, via transport (below) | **No** | Yes — the wrapper calls `_sync_position_after_direct_motion()` after |
-| `HomingProcedure` | `lab.gantry.homing.home_axis()` / `.locate_limit_switch()` **directly** | **No** | Yes, via transport (below) | **No** | **No** — nothing resyncs gcode's cache or the checkpoint file; do this and your next `move_to()` can plan against a stale position |
-| `AxisHandle` | `lab.gantry.x.move_to()` etc. | **No** | Yes — transport, **plus** its own client-side check (the only gate at all on RS232/Ethernet) | **No** | **No** |
-| `MMCCommands` | `lab.gantry.cmd.begin_move_to()` etc. | **No** | Yes, via transport only — **no client-side check at all** | **No** | **No** |
-| Safety verbs | `stop()`/`soft_stop()`/`pause()`/`resume()`/`estop()` | N/A (never start motion) | Stop commands aren't on the `safe_mode` allowlist either — see the gotcha below | **No** | Yes — all four sync after |
+- A second motion call while one is running raises `MotionBusyError` at
+  once — it doesn't queue.
+- A `MoveHandle` refuses to be used as a bool (`if gantry.home():` raises),
+  because `move_to()`/`home()` used to return `True`/`False` and a handle is
+  always truthy.
+- An error on the background thread is logged at ERROR the moment it
+  happens, and re-raised by `.wait()`.
+- Library code that already holds the arbiter (a survey pass, `acquire_scan`)
+  gets the move run inline instead — a background thread would wait forever
+  on the hold its caller is sitting in.
 
-## Guard-by-guard
+## Guard by guard
 
-### Fences — `TrajectoryChecker` / `CheckedTrajectory`
+### Fences — `TrajectoryChecker`
 
-Pure in-memory, no hardware needed. `GCodeExecutor.execute()` only accepts
-a `CheckedTrajectory` produced by its own `plan()` call (checked by
-identity), so a fence check can never be silently skipped for **G-code-
-driven** motion — see `fences.py` and `docs/MACRON_GANTRY.md`'s safety
-model section.
+Pure Python, exact (analytic, not sampled — a fence thinner than the old
+0.5 mm step, or a short chord through a post, is caught). NaN/inf
+coordinates raise `ValueError` instead of passing.
 
-**This is the one guard that doesn't apply everywhere.** `HomingProcedure`,
-`AxisHandle`, and raw `MMCCommands` calls all move hardware with axis-
-prefixed ASCII commands (`JOG`, `BMT`, `BMB`) sent straight to `MMCCommands`
-— none of that passes through `TrajectoryChecker` at all. A fence defined
-in config protects `move_to()`/`acquire_scan()`; it does **not** protect a
-homing jog or a bare `lab.gantry.x.move_to(...)` call.
+Two swept shapes:
 
-### `safe_mode` — the `SAFE_COMMANDS` allowlist
+- **Ribbon** (`check_ribbon`) for `move_to()`/G-code moves: X/Y follow their
+  straight line (one coordinated group), but Z runs as an independent leg on
+  the other PLC node, so Z may be anywhere in its start–end range at any
+  point along the line. The old check tested only the two "elbow" corner
+  paths, which missed the straight diagonal itself.
+- **Segment** (`check_segment`) for single-axis scan passes, which really
+  are straight lines.
 
-The one guard that *is* structurally universal, given the default
-transport. `PiGantryConnection.send()` (and any connection wrapped in
-`SafeModeConnection`) checks every outgoing command's mnemonic against
-`SAFE_COMMANDS` in `pi_bridge.py` — a bare-read-only allowlist (`INB`,
-`ACP`, `SPD`, `CAB`/`CAP`/`CAT`, etc.) — **before a single byte reaches the
-wire**. Motion mnemonics (`JOG`, `BMT`, `BMB`) simply aren't on it, so
-while `safe_mode=True` (the default everywhere), no motion can be
-commanded through this transport regardless of which higher layer issued
-it — `GCodeExecutor`, `HomingProcedure`, `AxisHandle`, and raw
-`MMCCommands` calls are all caught the same way, because they all end up
-calling the same `connection.send()`. `gantry_agent.py` keeps an
-independent copy of the same table on the Pi side as defense in depth.
+Checked from the **live** position, read just before planning — never from a
+cached one.
 
-**Gotcha: stop commands are blocked too.** `BST`/`ABT`/`STP` aren't on
-`SAFE_COMMANDS` either, so `soft_stop()`/`estop()` would also be refused
-by the transport while `safe_mode=True`. This is fine, not a bug — under
-`safe_mode=True` no motion could have started in the first place, so
-there's structurally nothing to stop. It only becomes relevant once
-`safe_mode=False`.
+### `safe_mode`
 
-**Gotcha: `RS232Connection`/`EthernetConnection` have no allowlist at
-all** — they're deliberately dumb passthroughs (see `pi_bridge.py`'s
-`SafeModeConnection` docstring). On those transports, `AxisHandle`'s own
-client-side check (`_check_motion_allowed()`, gating `move_to`/`move_by`/
-`begin_move_to`/`begin_move_by`/non-zero `jog`) is the **only** thing
-stopping motion — and it only exists on `AxisHandle`. `HomingProcedure`
-and raw `MMCCommands` calls go straight to `MMCCommands`, which has no
-gate of its own, so **on these transports, homing and raw `cmd` calls have
-no `safe_mode` protection whatsoever.** Use `PiGantryConnection` (the
-default) or wrap the connection in `SafeModeConnection` if you're on
-RS232/Ethernet and want this to actually hold.
+Checked client-side by `GantryController` for every entry point above,
+whatever the transport — so `rs232`/`ethernet`, which have no gate of their
+own, are covered too. On `pi_agent`, `PiGantryConnection` and
+`gantry_agent.py` each enforce the `SAFE_COMMANDS` allowlist independently
+as well.
 
-### `ENA` ban and blocking-motion ban
+**Stop-class commands always pass the gate:** `BST`, `ABT`, `STP` (bare),
+and `SOB <n> 0` (output off — on this machine, engaging a brake). They also
+skip the "scan in progress" refusal and the request lock, and never trigger
+a reconnect, so a halt can't be blocked or delayed by any of those.
+`MTR 0` is deliberately *not* stop-class: cutting a motor with its brake
+released drops Z.
 
-Structural, in `MMCCommands` itself — no transport involved, so these
-apply no matter which layer calls in. `ENA` on a responder-node axis
-crashes the controller (confirmed directly on hardware); it's refused at
-three independent layers (`MMCCommands` construction, `PiGantryConnection
-.send()`, `gantry_agent.py`). Blocking motion primitives (`MVT`/`MVB`,
-blocking group forms) are refused outright the same way — they hold a
-wire round trip open for an unbounded time; every caller uses the non-
-blocking `begin_move_to`/`begin_move_by` + poll instead.
+`set_safe_mode(True)` stops and brakes *before* closing the gate.
+`set_safe_mode(False)` turns motors on, releases brakes, and writes the
+configured soft limits (NLT/PLT) — whichever way motion got enabled.
 
-### Position-cache sync — `GCodeExecutor._current_pos`/`_current_theta` + the on-disk checkpoint
+### Halt latch — `halt.py`
 
-`GCodeExecutor` keeps its own cached idea of where the gantry is, and only
-refreshes it when *it* commands a move. `HomingProcedure`,
-`AxisHandle.move_to()`, and raw `MMCCommands` calls all move real hardware
-without going anywhere near that cache. Left unhandled, this is exactly
-the shape of bug this asymmetry produces: homing an axis, then calling
-`move_to()`, can produce **SnapMotion error 16** ("0 Or Negative" accel) —
-the executor plans a leg against a stale cached position, and the
-resulting distance mis-scales `ACL`/`DCL` down to 0. See
-`GCodeExecutor._sync_position_from_hardware`'s docstring for the full
-mechanism.
+`pause()` / `stop()` / `estop()` latch a halt:
 
-Fixed for the `GantryController` wrapper verbs — `home()`, `home_axis()`,
-`locate_limit_switch()`, `set_position()`, `soft_stop()`, `estop()` all
-call `_sync_position_after_direct_motion()` afterward, which refreshes
-**both** the in-memory gcode cache and the on-disk position checkpoint
-file (`position_store.py`, used by `restore_last_position()` after a power
-cycle). **Not fixed, and not fixable in general**, for direct
-`lab.gantry.homing.home_axis()`/`.locate_limit_switch()` calls, or for
-`AxisHandle`/raw `MMCCommands` motion — those bypass `GantryController`
-entirely, so nothing resyncs anything. If you call any of those directly,
-call `lab.gantry.gcode.sync_position_from_hardware()` yourself before your
-next `move_to()`.
-
-### Motion arbiter — `laguna.robot.motion_arbiter`
-
-Orthogonal to everything above: a re-entrant lock over a whole motion
-*operation* (not a per-command lock), held via `arbiter.hold(description,
-timeout_s)`. Guards against two threads issuing motion at once, not
-against any particular command being unsafe. `GantryController.arbiter`
-defaults to a process-wide singleton (`DEFAULT_ARBITER`).
-
-**It is not held nearly as broadly as you'd guess.** Grepping for
-`arbiter.hold(` turns up exactly two call sites in this codebase:
-`GantryController.move_to()` ([controller.py:704](https://github.com/ericbarefoot/laguna/blob/develop/src/laguna/robot/macron/controller.py))
-and `TopographicProfiler.scan_with_gantry()` — the re-entrancy exists
-specifically so a scheduled scan can call `move_to()` from inside its own
-held arbiter without deadlocking. **Every other `GantryController` verb —
-`home()`, `home_axis()`, `locate_limit_switch()`, `set_position()`,
-`soft_stop()`, `estop()` — runs without acquiring it at all**, and neither
-`AxisHandle`, `HomingProcedure`, nor raw `MMCCommands` calls ever touch it.
-Two threads homing an axis and running a scan at the same time have
-**nothing** serializing them against each other.
-
-### Safety verbs — `pause`/`resume`/`stop`/`estop`
-
-The cross-subsystem vocabulary from `safety.py`, distinct from the guards
-above — these are what you call to *stop* something, not what stops you
-from *starting* something. `stop()` decelerates cleanly (safe to
-disconnect from); `estop()` is the hardest halt (zero-decel abort, brakes
-engaged, motors disabled, requires an explicit re-arm). See `safety.py`'s
-module docstring for the full vocabulary and why `GantryController.stop()`
-changed meaning.
-
-## Which layer should I actually call?
-
-| I want to... | Use | Not this |
+| Tier | Cleared by | Effect on a move in flight |
 |---|---|---|
-| Move to a coordinate, fence-checked | `lab.gantry.move_to(...)` | `lab.gantry.x.move_to(...)` — no fence check |
-| Home every configured axis | `lab.gantry.home()` | `lab.gantry.homing.home_all()` directly — skips the position-cache resync |
-| Home/test one axis interactively | `lab.gantry.home_axis(axis)` | `lab.gantry.homing.home_axis(axis)` directly — same resync gap |
-| Find a limit switch's position | `lab.gantry.locate_limit_switch(axis)` | `lab.gantry.homing.locate_limit_switch(axis)` directly — same gap |
-| Declare position without moving | `lab.gantry.set_position(...)` | manually poking `cmd.set_actual_position()` — skips the resync |
-| Run a custom G-code program | `lab.gantry.gcode.plan()`/`.execute()` | fine as-is — this *is* the fence-checked path |
-| Poke one axis for debugging/tuning (e.g. `get_speed()`, `read_axis_state()`) | `lab.gantry.x` (read-only methods) | — |
-| Jog one axis by hand outside any of the above | `lab.gantry.x.move_to()`/`.jog()`, **knowing there's no fence check**, then call `lab.gantry.gcode.sync_position_from_hardware()` before your next `move_to()` | leaving the cache stale |
-| Stop everything right now | `lab.gantry.stop()` (controlled) or `.estop()` (hardest halt) | — |
+| pause | `resume()` | cancelled — its next leg is never issued |
+| stop | `rearm()`, or a fresh `connect()` (new run) | cancelled |
+| estop | `rearm()` only | cancelled |
+
+While latched, every entry point above raises `MotionHalted`. A halt during
+a Pi-agent scan also sends `scan_stop`; the partial profile is kept and the
+pass raises, so it gets re-run rather than counted.
+
+**`rearm()` never re-enables motion.** It clears the latch and leaves the
+gantry in `safe_mode`; motion needs a separate, explicit
+`set_safe_mode(False)`.
+
+### Motion arbiter — `motion_arbiter.py`
+
+One re-entrant lock over a whole motion *operation*. Every entry point in
+the table takes it; interactive calls refuse immediately if it's held
+(`MotionBusyError`), scheduled scans wait up to its timeout. Safety verbs
+never take it — stopping is never queued behind a move.
+
+### Position cache
+
+`GCodeExecutor` plans from a cached position. Every entry point resyncs it
+from hardware before planning and after finishing, however it ends — so
+there's nothing to call by hand any more. (`resync_position()` remains for
+anything that moved the gantry from outside this process.)
+
+## Which call do I want?
+
+| I want to... | Use |
+|---|---|
+| Move to a coordinate | `lab.move_to(...)` — add `.wait()` in a script |
+| Put an instrument's measuring point somewhere | `lab.place(instrument, point)` |
+| Stop *now*, resumably | `lab.pause()` — then `lab.resume()` |
+| Find where a fence should go | `lab.gantry.move_to_unfenced(axis, pos)` or `jog_unfenced(axis, speed)` |
+| Home | `lab.gantry.home()` / `home_axis(axis)` |
+| Declare position without moving | `lab.gantry.set_position(...)` |
+| Run a G-code program | `lab.gantry.gcode.plan()` then `.execute(trajectory)` — but prefer `move_to()`, which adds the gates |
 
 ## See also
 
-- [`docs/guides/gantry-motion.md`](guides/gantry-motion.md) — the
-  `move_to()`/fence/`safe_mode` walkthrough this page assumes as
-  background.
-- [`docs/MACRON_GANTRY.md`](MACRON_GANTRY.md) — protocol/wiring reference,
-  including the "Safety model (defense in depth)" section this page
-  expands on.
+- [`docs/guides/gantry-motion.md`](guides/gantry-motion.md) — the worked
+  walkthrough.
 - [`src/laguna/safety.py`](https://github.com/ericbarefoot/laguna/blob/develop/src/laguna/safety.py)
-  — the `pause`/`resume`/`stop`/`estop` vocabulary.
-- [`examples/example_09_gantry_home_axis_test.py`](https://github.com/ericbarefoot/laguna/blob/develop/examples/example_09_gantry_home_axis_test.py)
-  — a worked per-axis homing script using the resync-safe wrappers.
+  — the `pause`/`resume`/`stop`/`estop` vocabulary across every subsystem.
+- [`src/laguna/robot/macron/halt.py`](https://github.com/ericbarefoot/laguna/blob/develop/src/laguna/robot/macron/halt.py)
+  — why the latch takes a lock, not just a counter.

@@ -123,11 +123,14 @@ class TestGantryUsesTheArbiter:
         from tests.macron_fixtures import FakeSnapConnection
         from laguna.robot.macron.controller import GantryController
 
-        return GantryController(
+        controller = GantryController(
             connection=FakeSnapConnection(responses or {}),
             mm_per_unit=15.0,
             arbiter=arbiter,
         )
+        controller._is_connected = True
+        controller._safe_mode = False
+        return controller
 
     def test_defaults_to_the_shared_arbiter(self):
         assert self._controller().arbiter is DEFAULT_ARBITER
@@ -143,7 +146,7 @@ class TestGantryUsesTheArbiter:
             "A6 ACP": lambda cmd: seen.append(arbiter.holder) or "0",
         }
         controller = self._controller(responses, arbiter=arbiter)
-        controller.move_to(Theta=0.0)
+        controller.move_to(Theta=0.0).wait()
         assert seen and seen[0] is not None, "move_to ran without holding the gantry"
         assert "move_to" in seen[0]
         assert arbiter.is_held is False, "arbiter not released after the move"

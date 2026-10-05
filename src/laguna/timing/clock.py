@@ -1,6 +1,7 @@
 """Experiment clock — tracks wall time and experiment runtime simultaneously."""
 
 import logging
+import threading
 import time
 from typing import Callable, Optional, Tuple
 
@@ -14,6 +15,13 @@ class ExperimentClock:
     from where it left off after resume(). This lets you distinguish elapsed
     wall time from time spent collecting data. Useful for rehearsals under
     accelerated time via speed_factor > 1.0.
+
+    Thread-safe: the scheduler thread reads elapsed() every poll while
+    pause()/resume() are called from the main thread, the safety monitor,
+    and signal handlers. Each transition updates several fields, and a
+    reader landing between two of them saw either a None pause start (a
+    TypeError that silently killed the scheduler thread) or runtime jumping
+    backwards by the length of the pause.
     """
 
     def __init__(self, speed_factor: float = 1.0) -> None:
@@ -38,9 +46,11 @@ class ExperimentClock:
         #: those intervals and left the saved timeline wrong.
         self.on_pause: Optional[Callable[[], None]] = None
         self.on_resume: Optional[Callable[[], None]] = None
+        self._lock = threading.RLock()
         self._start_wall: Optional[float] = None
         self._pause_offset: float = 0.0      # total seconds spent paused
         self._pause_start: Optional[float] = None
+        self._stop_wall: Optional[float] = None
         self._running: bool = False
         self._paused: bool = False
 
@@ -59,24 +69,33 @@ class ExperimentClock:
         Raises:
             RuntimeError: If the clock is already running.
         """
-        if self._running:
-            raise RuntimeError("Clock is already running. Call stop() first.")
-        self._start_wall = time.time()
-        self._pause_offset = 0.0
-        self._pause_start = None
-        self._running = True
-        self._paused = False
+        with self._lock:
+            if self._running:
+                raise RuntimeError("Clock is already running. Call stop() first.")
+            self._start_wall = time.time()
+            self._pause_offset = 0.0
+            self._pause_start = None
+            self._stop_wall = None
+            self._running = True
+            self._paused = False
 
     def stop(self) -> None:
         """Freeze the clock and finalize runtime.
 
-        After this call, elapsed() returns the final runtime value.
+        After this call, elapsed() returns the final runtime value — frozen
+        at this instant, not still counting (it used to keep growing with
+        wall time, so every runtime logged after the run ended was wrong).
         """
-        if self._paused:
-            self._pause_offset += time.time() - self._pause_start
-            self._pause_start = None
-        self._running = False
-        self._paused = False
+        with self._lock:
+            if not self._running:
+                return
+            now = time.time()
+            if self._paused:
+                self._pause_offset += now - self._pause_start
+                self._pause_start = None
+            self._stop_wall = now
+            self._running = False
+            self._paused = False
 
     def pause(self) -> None:
         """Freeze the runtime counter while wall clock continues.
@@ -84,12 +103,13 @@ class ExperimentClock:
         Raises:
             RuntimeError: If the clock is not running.
         """
-        if not self._running:
-            raise RuntimeError("Clock is not running.")
-        if self._paused:
-            return
-        self._pause_start = time.time()
-        self._paused = True
+        with self._lock:
+            if not self._running:
+                raise RuntimeError("Clock is not running.")
+            if self._paused:
+                return
+            self._pause_start = time.time()
+            self._paused = True
         self._notify(self.on_pause)
 
     def resume(self) -> None:
@@ -98,13 +118,14 @@ class ExperimentClock:
         Raises:
             RuntimeError: If the clock is not running.
         """
-        if not self._running:
-            raise RuntimeError("Clock is not running.")
-        if not self._paused:
-            return
-        self._pause_offset += time.time() - self._pause_start
-        self._pause_start = None
-        self._paused = False
+        with self._lock:
+            if not self._running:
+                raise RuntimeError("Clock is not running.")
+            if not self._paused:
+                return
+            self._pause_offset += time.time() - self._pause_start
+            self._pause_start = None
+            self._paused = False
         self._notify(self.on_resume)
 
     @staticmethod
@@ -125,21 +146,26 @@ class ExperimentClock:
     # Reading time
     # ------------------------------------------------------------------
 
+    def _runtime_at(self, wall: float) -> float:
+        """Runtime at wall time `wall`; caller holds the lock."""
+        if self._start_wall is None:
+            return 0.0
+        if not self._running:
+            end = self._stop_wall if self._stop_wall is not None else wall
+            return (end - self._start_wall - self._pause_offset) * self._speed
+        if self._paused:
+            return (self._pause_start - self._start_wall - self._pause_offset) * self._speed
+        return (wall - self._start_wall - self._pause_offset) * self._speed
+
     def elapsed(self) -> float:
         """Return experiment runtime in seconds (excludes paused intervals).
 
         Returns:
-            Runtime in seconds, multiplied by speed_factor. Frozen if the
-            clock is not running; paused intervals do not contribute.
+            Runtime in seconds, multiplied by speed_factor. Frozen while
+            paused and once stopped; 0.0 before the first start().
         """
-        if not self._running:
-            if self._start_wall is None:
-                return 0.0
-            # clock was stopped — return final value
-            return (time.time() - self._start_wall - self._pause_offset) * self._speed
-        if self._paused:
-            return (self._pause_start - self._start_wall - self._pause_offset) * self._speed
-        return (time.time() - self._start_wall - self._pause_offset) * self._speed
+        with self._lock:
+            return self._runtime_at(time.time())
 
     def wall_time(self) -> float:
         """Return current Unix wall time.
@@ -156,14 +182,9 @@ class ExperimentClock:
             Tuple of (wall_time_unix, runtime_s) sampled atomically to prevent
             drift between the two readings.
         """
-        w = time.time()
-        if not self._running or self._start_wall is None:
-            return w, 0.0
-        if self._paused:
-            rt = (self._pause_start - self._start_wall - self._pause_offset) * self._speed
-        else:
-            rt = (w - self._start_wall - self._pause_offset) * self._speed
-        return w, rt
+        with self._lock:
+            w = time.time()
+            return w, self._runtime_at(w)
 
     @property
     def is_running(self) -> bool:

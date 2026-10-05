@@ -137,10 +137,19 @@ class Config:
                     # whatever the controller's own program has. No
                     # defaults are guessed here — set both once the real
                     # travel envelope is measured.
-                    {"name": "X", "index": 1, "home_switch": "home", "home_trip_on_high": False},
+                    #
+                    # max_travel_mm: the axis's full throw, used only to size
+                    # the homing switch-search timeout (see
+                    # HomingConfig.search_timeout_s). Approximate operator
+                    # estimates, pending measurement — ericbarefoot/laguna#63.
                     {
-                        "name": "Y", "index": 2, "brake_output": 4, "brake_status_input": 8,
+                        "name": "X", "index": 1, "home_switch": "home", "home_trip_on_high": False,
+                        "max_travel_mm": 8000.0,
+                    },
+                    {
+                        "name": "Y", "index": 2, "brake_output": 4,
                         "home_switch": "home", "home_trip_on_high": False,
+                        "max_travel_mm": 1200.0,
                     },
                     # mm_per_unit override: confirmed 13.5 mm/unit on hardware
                     # 2026-08-10 (measured 90mm actual travel for a
@@ -152,6 +161,7 @@ class Config:
                     {
                         "name": "Z", "index": 5, "brake_output": 5, "mm_per_unit": 13.5,
                         "home_switch": "home", "home_trip_on_high": False,
+                        "max_travel_mm": 400.0,
                     },
                     {"name": "Theta", "index": 6},
                 ],

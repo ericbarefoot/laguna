@@ -180,13 +180,17 @@ node's IO in this firmware family is the GUI-configured Named IO block
 feature (which resolves `ModuleNumber` internally on the controller itself)
 or the separate, vendor-encrypted Binary Commands node protocol used for
 responder axis motion — neither is reachable from the ASCII RS232 interpreter
-this driver talks to. `IOMap.z_brake_status_input` / `theta_limit_input`
-therefore default to `None` and are treated as **architecturally
-unimplemented, not just unprobed**: `brake_is_disengaged()` raises
-`NotImplementedError` (not the usual `ValueError`) if asked to use them.
-Getting a real reading on either would need a different mechanism — Named
+this driver talks to. `IOMap.theta_limit_input` therefore defaults to
+`None` and is treated as **architecturally unimplemented, not just
+unprobed**. Getting a real reading would need a different mechanism — Named
 IO config via the Snap2Motion IDE, or a from-scratch Binary Commands client
 — not something to build without deciding it's worth the added complexity.
+
+**Brake status is not read at all.** Z's status input is unreachable for
+the reason above, and Y's (INB 8) proved unreliable on hardware
+(2026-10-05: it read 0 six times after `SOB 4 1` while Y moved freely).
+Brakes are driven by their `SOB` outputs alone; homing waits a fixed 0.5 s
+after releasing a brake before moving.
 
 Everything else in the table above still needs physical toggle-testing
 (diff `INB`/`SOB` snapshots is the validated approach) to fully confirm,
@@ -199,7 +203,12 @@ unreachability.
 **Homing** (`HomingProcedure.home_all()` / `GantryController.home()`) jogs
 each configured axis toward its home switch by default (`INB 1/3/5`),
 configurable per axis to the limit switch instead (`home_switch: limit` in
-config) — see `GantryController._build_homing_config`. See
+config) — see `GantryController._build_homing_config`. Each axis's
+switch-search timeout is `1.5 × max_travel_mm / homing speed + 30 s`
+(`max_travel_mm` per axis in config; a flat 60 s used to time out long
+before X's switch). `GantryController.home()`/`home_axis()` are
+non-blocking (they return a `MoveHandle`) and are cancelled by
+`pause()`/`estop()` like any other move. See
 `examples/example_09_gantry_home_axis_test.py` for a per-axis test script
 with a Ctrl-C safety stop.
 

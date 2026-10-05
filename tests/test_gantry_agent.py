@@ -965,3 +965,99 @@ class TestEnaRefusedAgentSide:
 
     def test_ena_is_not_on_the_agent_allowlist(self):
         assert "ENA" not in ga.SAFE_COMMANDS
+
+
+class TestRunScanFailureMidMove:
+    """A failure after BMT used to leave the axis travelling unwatched,
+    throw away the samples already collected, and leave the poller running."""
+
+    class _FailsOnMif(_ScriptedBridge):
+        def send(self, cmd, timeout):
+            if "MIF" in cmd:
+                self.sent.append(cmd)
+                raise TimeoutError("simulated MIF timeout")
+            return super().send(cmd, timeout)
+
+    def _poll_with_samples(self, monkeypatch, started):
+        def fake_poll(al1342_host, pdin_path, out_queue, stop_event, pdin_port, decode_fn=None):
+            started.set()
+            for i in range(3):
+                out_queue.put({"wall_time": time.time(), "distance_mm": 100.0 + i})
+            stop_event.wait(timeout=2.0)
+
+        monkeypatch.setattr(ga, "_poll_pdin_loop", fake_poll)
+        monkeypatch.setattr(ga, "_set_laser", lambda *a, **kw: True)
+
+    def test_sends_bst_and_keeps_partial_samples(self, tmp_path, monkeypatch):
+        import json as _json
+
+        emitted = []
+        monkeypatch.setattr(ga, "_emit", lambda obj: emitted.append(obj))
+        started = threading.Event()
+        self._poll_with_samples(monkeypatch, started)
+        bridge = self._FailsOnMif()
+        output = str(tmp_path / "profile.csv")
+
+        def run():
+            ga._run_scan(bridge, 9, "A1", 500.0, 5.0, "192.168.1.251", 2, output,
+                         100.0, 10.0, 10.0, tmp_path / "audit.log", threading.Event())
+
+        original_send = bridge.send
+
+        def send_after_poll_started(cmd, timeout):
+            if "MIF" in cmd:
+                started.wait(1.0)
+            return original_send(cmd, timeout)
+
+        bridge.send = send_after_poll_started
+        run()
+
+        assert "A1 BST" in bridge.sent, "the axis was left travelling after the failure"
+        error = next(msg for msg in emitted if "scan_error" in msg)
+        assert error["partial"] is True and error["samples"] == 3
+        assert error["csv_path"] == output
+        assert len((tmp_path / "profile.csv").read_text().splitlines()) == 4
+        meta = _json.loads((tmp_path / "profile_meta.json").read_text())
+        assert meta["partial"] is True and "MIF timeout" in meta["error"]
+        assert not any("scan_done" in msg for msg in emitted)
+
+    def test_a_failure_before_the_move_sends_no_bst(self, tmp_path, monkeypatch, no_network):
+        emitted = []
+        monkeypatch.setattr(ga, "_emit", lambda obj: emitted.append(obj))
+
+        class FailsOnSpd(_ScriptedBridge):
+            def send(self, cmd, timeout):
+                self.sent.append(cmd)
+                raise TimeoutError("SPD timeout")
+
+        bridge = FailsOnSpd()
+        ga._run_scan(bridge, 10, "A1", 500.0, 5.0, "192.168.1.251", 2,
+                     str(tmp_path / "p.csv"), 100.0, 10.0, 10.0, tmp_path / "a.log",
+                     threading.Event())
+        assert not any("BST" in c for c in bridge.sent)
+        assert any("scan_error" in msg for msg in emitted)
+
+
+class TestPdinPollBackoff:
+    def test_an_unreachable_al1342_does_not_spin(self, monkeypatch):
+        """Connection refused returns instantly; retrying with no delay
+        pinned a CPU core for the whole outage."""
+        attempts = []
+
+        class Refusing:
+            def __init__(self, *a, **kw):
+                pass
+
+            def request(self, *a, **kw):
+                attempts.append(time.monotonic())
+                raise ConnectionRefusedError("refused")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(ga.http.client, "HTTPConnection", Refusing)
+        monkeypatch.setattr(ga, "_log", lambda msg: None)
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        ga._poll_pdin_loop("10.0.0.1", "/x", queue.Queue(), stop, 2)
+        assert len(attempts) < 20, f"{len(attempts)} reconnect attempts in 0.3 s"

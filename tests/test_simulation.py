@@ -240,7 +240,7 @@ class TestFlumeLabSimulation:
         lab.add(GantryController.from_config(lab.config))
         assert lab.connect_all() is True
 
-        lab.gantry.move_to(X=150.0)
+        lab.gantry.move_to(X=150.0).wait()
         assert lab.gantry.get_status()["positions"]["X"] == pytest.approx(150.0)
 
     def test_event_log_gets_a_simulated_suffix_by_default(self, tmp_path):

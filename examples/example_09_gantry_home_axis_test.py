@@ -65,8 +65,6 @@ def build_lab() -> FlumeLab:
     gantry_config["remote_serial_device"] = REMOTE_SERIAL_DEVICE
 
     lab.add("gantry")
-    lab.gantry.set_safe_mode(not ALLOW_MOTION)
-
     return lab
 
 
@@ -77,6 +75,9 @@ def main():
     if not lab.connect_all():
         print("Gantry did not connect — see warnings above.")
         return
+    # Disabling safe_mode needs a live connection, so it comes after
+    # connect_all(), and only ever on this explicit, separate flag.
+    lab.gantry.set_safe_mode(not ALLOW_MOTION)
 
     if not ALLOW_MOTION:
         print()
@@ -101,14 +102,16 @@ def main():
 
             print(f"Homing {name}... (Ctrl-C stops motion immediately)")
             # lab.gantry.home_axis(), not lab.gantry.homing.home_axis() —
-            # the wrapper also resyncs GCodeExecutor's cached position
-            # afterward, which move_to() needs to plan correctly next.
-            final_pos = lab.gantry.home_axis(axis)
+            # the wrapper also checks safe_mode and the halt latch, and
+            # resyncs GCodeExecutor's cached position afterward, which
+            # move_to() needs to plan correctly next. It returns at once;
+            # .wait() blocks until homing finishes, .result is the standoff.
+            final_pos = lab.gantry.home_axis(axis).wait().result
             print(f"  {name} homed. Standoff position: {final_pos:.3f} mm")
     except KeyboardInterrupt:
         print()
         print("Ctrl-C — stopping all motion now.")
-        lab.gantry.stop()
+        lab.gantry.pause()
     finally:
         lab.disconnect_all()
         print("Disconnected.")

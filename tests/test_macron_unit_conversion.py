@@ -43,7 +43,7 @@ class TestPositionConversion:
         conn = FakeSnapConnection({"A5 SPD 10": "10", "A5 BMT 10": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0, axis_mm_per_unit={"Z": 13.5})
         assert cmd.set_speed(Z_AXIS, 135.0) == 135.0
-        cmd.begin_move_to(Z_AXIS, 135.0)
+        cmd._begin_move_to(Z_AXIS, 135.0)
         assert conn.sent == ["A5 SPD 10", "A5 BMT 10"]
 
     def test_set_actual_position_converts_mm_to_raw_and_back(self):
@@ -60,21 +60,21 @@ class TestPositionConversion:
         # begin_move_to() (BMT), which shares the same _pos_to_raw plumbing.
         conn = FakeSnapConnection({"A1 BMT 10": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0)
-        cmd.begin_move_to(X_AXIS, 150.0)
+        cmd._begin_move_to(X_AXIS, 150.0)
         assert conn.sent == ["A1 BMT 10"]
 
     def test_begin_move_to_applies_offset_before_scaling(self):
         # world mm 155, offset 5 -> raw position 150, then /15 -> 10 raw units
         conn = FakeSnapConnection({"A1 BMT 10": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0, coordinate_offset_mm={"X": 5.0})
-        cmd.begin_move_to(X_AXIS, 155.0)
+        cmd._begin_move_to(X_AXIS, 155.0)
         assert conn.sent == ["A1 BMT 10"]
 
     def test_begin_move_by_delta_ignores_offset(self):
         # a relative delta must NOT have the offset subtracted — only scale applies
         conn = FakeSnapConnection({"A1 BMB 10": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0, coordinate_offset_mm={"X": 100.0})
-        cmd.begin_move_by(X_AXIS, 150.0)
+        cmd._begin_move_by(X_AXIS, 150.0)
         assert conn.sent == ["A1 BMB 10"]
 
 
@@ -124,7 +124,7 @@ class TestGroupMotionConversion:
     def test_group_begin_move_to_converts_each_axis_by_position(self):
         conn = FakeSnapConnection({"C1 BMT 10 0 0": "0"})
         cmd = MMCCommands(conn, mm_per_unit=15.0, group_axes=(X_AXIS, Y_AXIS, Z_AXIS))
-        cmd.group_begin_move_to(150.0, 0.0, 0.0)
+        cmd._group_begin_move_to(150.0, 0.0, 0.0)
         assert conn.sent == ["C1 BMT 10 0 0"]
 
     def test_group_begin_move_by_is_scale_only(self):
@@ -133,7 +133,7 @@ class TestGroupMotionConversion:
             conn, mm_per_unit=15.0, coordinate_offset_mm={"X": 1000.0},
             group_axes=(X_AXIS, Y_AXIS, Z_AXIS),
         )
-        cmd.group_begin_move_by(150.0, 0.0, 0.0)
+        cmd._group_begin_move_by(150.0, 0.0, 0.0)
         assert conn.sent == ["C1 BMB 10 0 0"]
 
     def test_group_set_speed_uses_first_group_axis_scale(self):
@@ -148,5 +148,5 @@ class TestGroupMotionConversion:
         # 1010; see GCodeExecutor's "Z/XY node split" note in gcode.py).
         conn = FakeSnapConnection({"C1 BMT 1 1": "0"})
         cmd = MMCCommands(conn)  # defaults: mm_per_unit=1.0, group_axes=(X,Y)
-        cmd.group_begin_move_to(1.0, 1.0)
+        cmd._group_begin_move_to(1.0, 1.0)
         assert conn.sent == ["C1 BMT 1 1"]

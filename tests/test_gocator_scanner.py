@@ -1057,9 +1057,9 @@ class TestScanLifecycle:
 class FakeAxisHandle:
     """Stand-in for macron.commands.AxisHandle (gantry.axis("X")).
 
-    Mirrors the real one's safe_mode gating on motion-starting calls, which
-    is the whole reason the scanner drives axes through AxisHandle rather
-    than the ungated raw `gantry.cmd` path.
+    The real AxisHandle has no motion methods; begin_move_to here only
+    records the BMT that FakeGantry.begin_scan_move stands in for, gated
+    on safe_mode the way GantryController.begin_scan_move is.
     """
 
     def __init__(self, name, calls, safe_mode=False, position=0.0):
@@ -1067,9 +1067,15 @@ class FakeAxisHandle:
         self._calls = calls
         self._safe_mode = safe_mode
         self._position = position
+        self._order: list = []   # replaced by FakeGantry so poll/resync order is visible
 
     def get_position(self):
         return self._position
+
+    def is_move_finished(self):
+        self.finished_polls = getattr(self, "finished_polls", 0) + 1
+        self._order.append("is_move_finished")
+        return True
 
     def set_speed(self, value):
         self._calls.append(("set_speed", self.name, value))
@@ -1083,6 +1089,11 @@ class FakeAxisHandle:
         self._calls.append(("begin_move_to", self.name, position))
 
 
+class _NeverHaltedGuard:
+    def check(self):
+        pass
+
+
 class FakeGantry:
     def __init__(self, safe_mode=False, positions=None):
         from laguna.robot.macron.commands import Axis
@@ -1094,6 +1105,23 @@ class FakeGantry:
             for name in ("X", "Y")
         }
         self._axes = [Axis(name, i + 1) for i, name in enumerate(self._handles)]
+        #: Order of post-pass housekeeping: "is_move_finished" polls, then "resync".
+        self.order: list = []
+        for handle in self._handles.values():
+            handle._order = self.order
+        self.resync_error = None
+
+    def resync_position(self, source):
+        self.order.append("resync")
+        if self.resync_error is not None:
+            raise self.resync_error
+
+    def begin_scan_move(self, axis, end_mm, feed_rate_mm_s):
+        """Mirror of GantryController.begin_scan_move: gated, then non-blocking."""
+        handle = self.axis(axis)
+        handle.set_speed(feed_rate_mm_s)
+        handle.begin_move_to(end_mm)
+        return _NeverHaltedGuard()
 
     def axis(self, name):
         try:
@@ -1108,8 +1136,8 @@ class FakeGantry:
     @property
     def cmd(self):
         raise AssertionError(
-            "scan_with_gantry must drive axes via gantry.axis(...) (AxisHandle), "
-            "not the ungated gantry.cmd path — see AxisHandle's safe_mode gate"
+            "scan_with_gantry must start the pass via gantry.begin_scan_move() "
+            "(fence-checked, safe_mode- and halt-gated), not the raw gantry.cmd path"
         )
 
 
@@ -1225,6 +1253,43 @@ class TestScanWithGantry:
             )
         # And acquisition is left stopped, not running.
         assert scanner.get_status()["is_running"] is False
+
+    def test_the_pass_is_fence_checked_before_anything_moves(self, scanner):
+        """scan_with_gantry() used to start the pass with no fence check."""
+        from laguna.robot.macron.controller import GantryController
+        from laguna.robot.macron.fences import BoxFence, FenceViolation
+        from tests.macron_fixtures import FakeSnapConnection
+
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        conn = FakeSnapConnection({"A1 ACP": "0", "A2 ACP": "0", "A5 ACP": "0", "A6 ACP": "0"})
+        gantry = GantryController(
+            connection=conn, mm_per_unit=1.0,
+            fences=[BoxFence("post", 100, 110, -5, 5, -5, 5)],
+        )
+        gantry._is_connected = True
+        gantry._safe_mode = False
+        with pytest.raises(FenceViolation):
+            scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+            )
+        assert not any("BMT" in c for c in conn.sent)
+        assert scanner.get_status()["is_running"] is False
+
+    def test_a_halt_during_settle_skips_the_trigger(self, scanner):
+        from laguna.robot.macron.halt import MotionHalted
+
+        class HaltedGuard:
+            def check(self):
+                raise MotionHalted("paused")
+
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry()
+        gantry.begin_scan_move = lambda axis, end_mm, feed: HaltedGuard()
+        with pytest.raises(MotionHalted):
+            scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+            )
+        assert "GoSensor_Trigger" not in scanner._fake.call_names()
 
     def test_stops_acquisition_when_scan_fails(self, scanner):
         scanner._fake.go.datasets = []
@@ -2287,3 +2352,189 @@ class TestAcquireDispatch:
         change surface mode's existing no-spec/no-gantry behavior."""
         with pytest.raises(ScanNotPossibleError, match="scan:"):
             scanner.acquire()
+
+
+# ---------------------------------------------------------------------------
+# refresh(): the SDK serves get_* from a local cache loaded at connect()
+# ---------------------------------------------------------------------------
+
+
+def _gui_edits_on_refresh(scanner, **area):
+    """Make the fake sensor apply `area` (mm) to its cache on GoSensor_Refresh.
+
+    Stands in for a change made in the web GUI after connect(): invisible to
+    the SDK's cached copy until GoSensor_Refresh re-reads it.
+    """
+    go = scanner._fake.go
+
+    def refresh(sensor):
+        scanner._fake.calls.append(("GoSensor_Refresh", (sensor,)))
+        go.active_area.update(area)
+        return g.kOK
+
+    go.GoSensor_Refresh = refresh
+
+
+class TestRefresh:
+    """Public get_*/set_* re-sync from the sensor first; internals never do."""
+
+    def _count(self, scanner, name="GoSensor_Refresh"):
+        return scanner._fake.call_names().count(name)
+
+    def test_get_active_area_sees_a_gui_change_made_after_connect(self, scanner):
+        _gui_edits_on_refresh(scanner, height=321.0)
+        assert scanner.get_active_area()["height_mm"] == pytest.approx(321.0)
+
+    @pytest.mark.parametrize(
+        "getter",
+        ["get_active_area", "get_subsampling", "get_spacing_interval",
+         "get_filters", "get_frame_rate"],
+    )
+    def test_every_get_refreshes_before_reading(self, scanner, getter):
+        scanner._fake.calls.clear()
+        getattr(scanner, getter)()
+        names = scanner._fake.call_names()
+        assert names[0] == "GoSensor_Refresh"
+        assert names.count("GoSensor_Refresh") == 1
+
+    def test_set_refreshes_once_at_the_start_not_in_its_own_readback(self, scanner):
+        """set_*'s post-write read-back must not refresh: that would discard
+        the write it is reporting on (flush=False has not pushed it yet)."""
+        scanner._fake.calls.clear()
+        scanner.set_active_area(height=200.0)
+        names = scanner._fake.call_names()
+        assert names.count("GoSensor_Refresh") == 1
+        assert names.index("GoSensor_Refresh") < names.index("GoSetup_SetActiveAreaHeight")
+        assert scanner._fake.go.active_area["height"] == pytest.approx(200.0)
+
+    def test_staged_unflushed_edits_are_not_discarded_by_a_get(self, scanner, caplog):
+        scanner.set_active_area(height=200.0, flush=False)
+        scanner._fake.calls.clear()
+        with caplog.at_level(logging.WARNING):
+            area = scanner.get_active_area()
+        assert self._count(scanner) == 0
+        assert area["height_mm"] == pytest.approx(200.0)
+        assert "unflushed" in caplog.text
+
+    def test_discard_unflushed_forces_the_refresh(self, scanner):
+        scanner.set_active_area(height=200.0, flush=False)
+        scanner._fake.calls.clear()
+        assert scanner.refresh() is False
+        assert scanner.refresh(discard_unflushed=True) is True
+        assert self._count(scanner) == 1
+        assert scanner._unflushed is False
+
+    def test_flush_clears_the_pending_flag(self, scanner):
+        scanner.set_active_area(height=200.0, flush=False)
+        assert scanner._unflushed is True
+        scanner.set_active_area(width=1000.0)          # flush=True pushes both
+        assert scanner._unflushed is False
+
+    def test_no_refresh_while_acquiring(self, scanner):
+        scanner._is_running = True
+        scanner._fake.calls.clear()
+        assert scanner.refresh() is False
+        scanner.get_active_area()
+        assert self._count(scanner) == 0
+
+    def test_refresh_requires_a_connection(self):
+        s = GocatorScanner({"ip": "192.168.1.10"})
+        with pytest.raises(RuntimeError):
+            s.refresh()
+
+    def test_configure_refreshes_once_before_its_first_write(self, scanner):
+        scanner._fake.calls.clear()
+        scanner.configure(active_area={"height": 300.0}, frame_rate_hz=100.0)
+        names = scanner._fake.call_names()
+        assert names.count("GoSensor_Refresh") == 1
+        first_write = min(i for i, n in enumerate(names) if n.startswith("GoSetup_Set"))
+        assert names.index("GoSensor_Refresh") < first_write
+        assert scanner._unflushed is False
+
+    def test_configure_is_authoritative_over_a_gui_edit_it_specifies(self, scanner):
+        """A GUI edit to a field the config sets is overwritten by the config;
+        a field the config leaves alone keeps the sensor's (GUI) value."""
+        _gui_edits_on_refresh(scanner, height=999.0, width=777.0)
+        scanner.configure(active_area={"height": 200.0})
+        area = scanner._fake.go.active_area
+        assert area["height"] == pytest.approx(200.0)   # config wins
+        assert area["width"] == pytest.approx(777.0)    # untouched: GUI value survives
+
+    def test_a_failed_configure_discards_its_partial_edits(self, scanner):
+        scanner._fake.calls.clear()
+        with pytest.raises(ValueError, match="outside the sensor's current supported"):
+            scanner.configure(active_area={"height": 200.0}, frame_rate_hz=1e9)
+        assert scanner._unflushed is False
+        # once at the start, once to discard the half-applied cache
+        assert self._count(scanner) == 2
+
+    def test_configure_argument_errors_still_raise_when_disconnected(self):
+        s = GocatorScanner({"ip": "192.168.1.10"})
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            s.configure(frame_rate_hz=100.0, frame_rate_max=True)
+
+
+class TestGetStatusRefreshes:
+    def test_status_reflects_a_gui_change_made_after_connect(self, scanner):
+        _gui_edits_on_refresh(scanner, height=321.0)
+        area = scanner.get_status()["sensor_active_area_mm"]
+        assert area["height"] == pytest.approx(321.0)
+
+    def test_status_refreshes_before_taking_handles(self, scanner):
+        scanner._fake.calls.clear()
+        scanner.get_status()
+        names = scanner._fake.call_names()
+        assert names.index("GoSensor_Refresh") < names.index("GoSensor_Setup") if "GoSensor_Setup" in names else True
+        assert names[0] == "GoSensor_Refresh"
+
+    def test_status_does_not_refresh_mid_scan(self, scanner):
+        scanner._is_running = True
+        scanner._fake.calls.clear()
+        scanner.get_status()
+        assert "GoSensor_Refresh" not in scanner._fake.call_names()
+
+
+class TestScanResyncsGantryPosition:
+    """scan_with_gantry() moves the axis directly, bypassing the G-code
+    executor that keeps the gantry's planning position honest — so the next
+    move_to() used to plan from the pre-scan position (a move back to the
+    start silently no-opped, and was fence-checked along the wrong path)."""
+
+    def _scan(self, scanner, gantry, **kw):
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        return scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0, **kw
+        )
+
+    def test_waits_for_the_move_then_resyncs(self, scanner):
+        gantry = FakeGantry()
+        self._scan(scanner, gantry)
+        assert gantry.order == ["is_move_finished", "resync"]
+
+    def test_resyncs_even_when_the_scan_fails(self, scanner):
+        gantry = FakeGantry()
+        scanner._fake.go.datasets = []            # nothing to receive -> times out
+        with pytest.raises(Exception):
+            scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0,
+                settle_s=0.0, timeout_s=0.05,
+            )
+        assert gantry.order[-1] == "resync"
+
+    def test_a_failed_resync_does_not_mask_the_scan(self, scanner, caplog):
+        gantry = FakeGantry()
+        gantry.resync_error = RuntimeError("link down")
+        with caplog.at_level(logging.WARNING):
+            scan = self._scan(scanner, gantry)
+        assert scan is not None
+        assert "Could not resync gantry position" in caplog.text
+
+    def test_a_gantry_without_resync_still_scans(self, scanner):
+        """Not every gantry double (or older gantry) has resync_position()."""
+
+        class NoResyncGantry(FakeGantry):
+            @property
+            def resync_position(self):
+                raise AttributeError("resync_position")
+
+        assert self._scan(scanner, NoResyncGantry()) is not None

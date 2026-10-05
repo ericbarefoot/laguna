@@ -114,12 +114,40 @@ class TestCheckSafeMode:
             "A1 AIC",        # arm hardware capture
             "A1 MVT 5",      # blocking move
             "C1 INI 1 2 3",  # group init
-            "A1 ABT",        # abort — not on the read-only list at all
+            "A1 MTR 0",      # motor off — drops a released Z, so never stop-class
+            "A1 BST 5",      # a stop mnemonic with an argument is not a bare stop
         ],
     )
     def test_blocks_motion_and_set_commands(self, cmd):
         with pytest.raises(SnapMotionError):
             check_safe_mode(cmd)
+
+    @pytest.mark.parametrize("cmd", ["A1 ABT", "A2 BST", "C1 BST", "C2 ABT", "A5 STP", "SOB 4 0", "SOB 5 0"])
+    def test_allows_stop_class_commands(self, cmd):
+        """Stopping and engaging a brake must work under safe_mode — it is
+        what set_safe_mode(True) and every halt verb send."""
+        check_safe_mode(cmd)  # must not raise
+
+    @pytest.mark.parametrize(
+        "cmd",
+        ["A1 ABT", "C1 BST", "A5 STP", "SOB 4 0", "SOB 4 1", "A1 MTR 0", "A1 BMT 5", "A1 BST 5", "A1 ACP"],
+    )
+    def test_agent_copy_agrees_with_the_pc_side(self, cmd):
+        """gantry_agent.py keeps its own copy of both tables (it runs
+        standalone on the Pi); the two must never drift apart."""
+        from laguna.robot.macron import gantry_agent
+
+        try:
+            check_safe_mode(cmd)
+            pc_allows = True
+        except SnapMotionError:
+            pc_allows = False
+        try:
+            gantry_agent.check_safe_mode(cmd)
+            agent_allows = True
+        except PermissionError:
+            agent_allows = False
+        assert pc_allows == agent_allows
 
     def test_unknown_mnemonic_blocked(self):
         with pytest.raises(SnapMotionError):
@@ -223,6 +251,59 @@ class TestIsConnected:
     def test_false_when_never_connected(self):
         conn = PiGantryConnection(host="red", ssh_user="oak", remote_serial_device="/dev/x")
         assert conn.is_connected is False
+
+
+class TestNoImplicitConnect:
+    """send()/start_scan() must not open a link nobody asked for: launching
+    the agent fixes its --allow-motion gate, so a lazy first connect used to
+    bake in whatever safe_mode was set at that instant."""
+
+    def _never_connected(self, **overrides):
+        kwargs = dict(host="red", ssh_user="oak", remote_serial_device="/dev/x")
+        kwargs.update(overrides)
+        conn = PiGantryConnection(**kwargs)
+        conn.connect = lambda: pytest.fail("send() must not call connect()")
+        return conn
+
+    def test_send_before_connect_raises_without_connecting(self):
+        conn = self._never_connected(safe_mode=False)
+        with pytest.raises(SnapMotionError, match="call connect"):
+            conn.send("A1 ACP")
+
+    def test_start_scan_before_connect_raises_without_connecting(self):
+        conn = self._never_connected(safe_mode=False)
+        with pytest.raises(SnapMotionError, match="call connect"):
+            conn.start_scan(
+                axis="X", end_mm=10.0, feed_rate_mm_s=5.0,
+                al1342_host="h", pdin_port=1, output="o.csv",
+            )
+
+    def test_send_after_disconnect_raises_without_reconnecting(self):
+        conn, _ = _make_connection(safe_mode=False)
+        conn._connect_requested = True
+        conn.disconnect()
+        conn.connect = lambda: pytest.fail("send() must not call connect()")
+        with pytest.raises(SnapMotionError, match="call connect"):
+            conn.send("A1 ACP")
+
+    def test_dropped_link_after_explicit_connect_still_reconnects(self):
+        conn, channel = _make_connection(safe_mode=False)
+        conn._connect_requested = True
+        channel.closed = True
+        calls = []
+        conn._reconnect = lambda: calls.append("reconnect") or (_ for _ in ()).throw(
+            SnapMotionError(0, "stop here")
+        )
+        with pytest.raises(SnapMotionError, match="stop here"):
+            conn.send("A1 ACP")
+        assert calls == ["reconnect"]
+
+    def test_reconnect_disabled_raises_plain_not_connected(self):
+        conn, channel = _make_connection(reconnect_on_failure=False)
+        conn._connect_requested = True
+        channel.closed = True
+        with pytest.raises(SnapMotionError, match="Not connected"):
+            conn.send("A1 ACP")
 
 
 class TestSafeModeConnection:
@@ -436,6 +517,34 @@ class TestSendBlockedDuringScan:
         with pytest.raises(SnapMotionError, match="scan in progress"):
             conn.send("A1 ACP")
 
+    @pytest.mark.parametrize("cmd", ["A1 BST", "A1 ABT", "SOB 4 0"])
+    def test_stop_commands_still_go_through_during_a_scan(self, cmd):
+        """A halt during a Pi-agent scan used to be refused here, so estop
+        couldn't stop the traverse."""
+        conn, channel = _make_connection(safe_mode=False)
+        channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
+                             "accel_mm_s2": 1.0, "decel_mm_s2": 1.0})
+        conn.start_scan("A1", 500.0, 5.0, "192.168.1.251", 2, "/tmp/out.csv")
+        channel.queue_line({"id": 2, "raw": "0 0.000 >"})
+        conn.send(cmd)
+        assert json.loads(channel.sent[-1].decode("ascii"))["cmd"] == cmd
+
+    def test_stop_commands_do_not_wait_behind_an_in_flight_request(self):
+        """An ordinary request holds the lock for its whole round trip; a
+        stop must not queue behind it."""
+        conn, channel = _make_connection(safe_mode=True, timeout=5.0)
+        channel.queue_line({"id": 1, "raw": "0 0.000 >"})
+        with conn._lock:  # as if a MIF poll were mid-round-trip
+            assert conn.send("A1 BST") == "0.000"
+
+    def test_stop_commands_never_reconnect(self):
+        conn, channel = _make_connection(safe_mode=False)
+        channel.closed = True
+        conn._connect_requested = True
+        conn._reconnect = lambda: pytest.fail("a stop must not relaunch the agent")
+        with pytest.raises(SnapMotionError, match="not connected"):
+            conn.send("A1 ABT")
+
     def test_send_allowed_again_after_scan_completes(self):
         conn, channel = _make_connection(safe_mode=False)
         channel.queue_line({"id": 1, "scan_started": True, "start_pos_mm": 0.0,
@@ -594,3 +703,24 @@ class TestSshKeyTildeExpansion:
     def test_absolute_path_is_unchanged(self, monkeypatch):
         monkeypatch.setenv("HOME", "/home/testuser")
         assert os.path.expanduser("/etc/keys/id_ed25519") == "/etc/keys/id_ed25519"
+
+
+class TestPerCommandTimeout:
+    def test_a_short_timeout_reaches_the_agent_and_bounds_the_wait(self):
+        import time as _time
+
+        conn, channel = _make_connection(timeout=5.0)
+        start = _time.monotonic()
+        with pytest.raises(SnapMotionError) as exc_info:
+            conn.send("INB 3", timeout=0.1)
+        assert _time.monotonic() - start < 1.0
+        assert exc_info.value.code == COMM_TIMEOUT_CODE
+        assert json.loads(channel.sent[0].decode("ascii"))["timeout"] == 0.1
+
+    def test_read_input_bit_rejects_a_command_string(self):
+        """read_input_bit("INB 3") used to send "INB INB 3" — escape 31."""
+        from laguna.robot.macron.commands import MMCCommands
+
+        cmd = MMCCommands(FakeSnapConnection({}))
+        with pytest.raises(TypeError, match="input number"):
+            cmd.read_input_bit("INB 3")

@@ -11,8 +11,9 @@ laguna.weir.SaflWeirController for the established pattern this mirrors).
 from __future__ import annotations
 
 import logging
+import math
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from ...config import Config
@@ -33,8 +34,10 @@ from .commands import (
 from .connection import EthernetConnection, RS232Connection, SnapConnection, SnapMotionError
 from .fences import BoxFence, CylinderFence, Fence, FenceRegistry, TrajectoryChecker
 from .gcode import GCodeExecutor
-from .homing import AxisHomingConfig, HomingConfig, HomingProcedure
-from ..motion_arbiter import DEFAULT_ARBITER
+from .halt import HaltLatch, HaltLevel, MotionGuard, MotionHalted
+from .homing import AxisHomingConfig, HomingConfig, HomingFailed, HomingProcedure
+from ..motion_arbiter import DEFAULT_ARBITER, MotionBusyError
+from .move_handle import MoveHandle
 from .pi_bridge import PiGantryConnection
 from .position_store import GantryPositionStore
 
@@ -159,6 +162,20 @@ class GantryController:
         self._safe_mode = safe_mode
         self._is_connected = False
         self._soft_limits = soft_limits or {}
+        # Latched by pause()/stop()/estop(); refuses every motion path and
+        # cancels in-flight moves until resume()/rearm(). See halt.py.
+        self._halt = HaltLatch()
+        # Axes left jogging by jog_unfenced(). A jog runs with no thread and
+        # no arbiter hold, so this is the only thing that knows about it —
+        # see _require_motion_allowed().
+        self._jogging: set = set()
+        # Axes whose motor *this process* turned off (estop(), disable()),
+        # not yet turned back on. With the motor off the controller still
+        # accepts BMT/JOG and its position tracker (ACP) follows the
+        # commanded profile, but nothing physically moves — a move "succeeds"
+        # and the recorded position goes wrong. Found on hardware: X stayed
+        # off after an estop and homing jogged nowhere.
+        self._motors_off: set = set()
         # See position_store.py / restore_last_position() — off (None) unless
         # a path is configured. Useful any time a power cycle wipes the
         # PLC's ACP registers and a fresh home() isn't wanted right away.
@@ -194,13 +211,12 @@ class GantryController:
 
         # Per-axis convenience handles — lab.gantry.axis("Y") always works;
         # lab.gantry.y (etc.) is set dynamically below for whatever axes are
-        # actually configured. See AxisHandle in commands.py for what these
-        # wrap and how the safe_mode gate applies to their motion methods.
+        # actually configured. See AxisHandle in commands.py — reads,
+        # settings, brakes and stops only; per-axis motion is
+        # move_to_unfenced()/jog_unfenced() below.
         self._axis_handles: Dict[str, AxisHandle] = {}
         for axis in self._axes:
-            handle = AxisHandle(
-                self.cmd, axis, is_safe_mode=lambda: self._safe_mode, io_map=self._io_map
-            )
+            handle = AxisHandle(self.cmd, axis, io_map=self._io_map)
             self._axis_handles[axis.name] = handle
             attr_name = axis.name.lower()
             if hasattr(self, attr_name):
@@ -296,13 +312,6 @@ class GantryController:
         """
         self._resolve_axis_handle(axis).disengage_brake()
 
-    def brake_is_disengaged(self, axis: "Axis | AxisHandle | str") -> bool:
-        """True if the given axis's brake is currently disengaged (released).
-
-        See engage_brake() above for accepted `axis` forms.
-        """
-        return self._resolve_axis_handle(axis).brake_is_disengaged()
-
     def read_home_switch(self, axis: "Axis | AxisHandle | str") -> bool:
         """Read the given axis's home switch state.
 
@@ -392,6 +401,9 @@ class GantryController:
         if self._is_connected and self._connection.is_connected:
             logger.info("connect() called while already connected — no-op")
             return True
+        # A fresh connection is a new run: a clean stop() from the last one
+        # no longer applies. An estop does — that still needs rearm().
+        self._halt.clear(up_to=HaltLevel.STOP)
         try:
             self._connection.connect()
             self._is_connected = self._connection.is_connected
@@ -425,10 +437,9 @@ class GantryController:
         NLT/PLT writes are on the safe_mode allowlist as bare reads only
         (see SAFE_COMMANDS in pi_bridge.py) — actually setting a limit is
         blocked exactly like any other motion-adjacent write while
-        safe_mode is True. Called by connect() only after that check
-        already passed. Not called by set_safe_mode(False) — a later
-        transition to motion-permitted while already connected does not
-        currently reapply configured limits.
+        safe_mode is True. Called by connect() and set_safe_mode(False),
+        only once that check has passed — so limits are in place before
+        any motion is possible, whichever way motion got enabled.
 
         After writing, reads them back via validate_soft_limits() to
         confirm the values actually took, catching a wiring/unit mistake
@@ -462,7 +473,13 @@ class GantryController:
             logger.warning("Soft limits did not validate after being set: %s", exc)
 
     def _enable_and_release_brakes(self) -> None:
-        """Turn each brake-equipped axis's motor on, then release its brake.
+        """Turn every axis's motor on, then release Y/Z's brakes.
+
+        Every axis, not just the braked ones: estop() turns *all* motors
+        off, and X/Theta have no brake for this to be about, so only
+        turning Y/Z back on left X dead after an estop — commanded moves
+        tracked in ACP while nothing moved. Re-sending MTR 1 to a motor the
+        controller's DSM program already enabled at power-up is harmless.
 
         Once the motor is on, its own torque holds the axis, so a
         still-engaged brake serves no purpose — and worse, it is a hazard:
@@ -487,13 +504,15 @@ class GantryController:
         no output-setting commands" guarantee has to cover.
         """
         for axis in self._axes:
-            if axis not in (Y_AXIS, Z_AXIS):
-                continue
             handle = self._axis_handles[axis.name]
             try:
                 handle.enable()
             except SnapMotionError as exc:
                 logger.warning("Could not turn on %s's motor: %s", axis.name, exc)
+                continue
+            self._motors_off.discard(axis.name)
+            if axis not in (Y_AXIS, Z_AXIS):
+                logger.info("%s: motor on", axis.name)
                 continue
             try:
                 handle.disengage_brake()
@@ -541,6 +560,8 @@ class GantryController:
             "subsystem": self.subsystem_name,
             "is_connected": self._is_connected,
             "safe_mode": self._safe_mode,
+            "halted": self._halt.level.name.lower() if self._halt.level else None,
+            "motors_off": sorted(self._motors_off),
         }
         if not self._is_connected:
             return status
@@ -570,7 +591,12 @@ class GantryController:
         says it belongs (see laguna.safety). stop() is the tier below —
         controlled deceleration into a state safe to disconnect from, with
         no stall against a brake and no encoder disturbance.
+
+        Latches the halt (see halt.py): further motion is refused until
+        rearm(), or a fresh connect() for a new run.
         """
+        self._halt.trip(HaltLevel.STOP, "stop()")
+        note = self._stop_agent_scan("stop()")
         self.soft_stop()
         for axis in self._axes:
             if axis not in (Y_AXIS, Z_AXIS):
@@ -583,7 +609,25 @@ class GantryController:
                 # aborting the rest of the shutdown for.
                 logger.warning("Could not park %s's brake: %s", axis.name, exc)
         self._persist_position()
-        return None
+        return note
+
+    def _stop_agent_scan(self, verb: str) -> Optional[str]:
+        """Cancel a topographic scan running on the Pi agent, if there is one.
+
+        The agent runs the scan's BMT itself, so the controller's own stop
+        commands alone don't tell it to stop reading samples. Returns a note
+        for the event log: the profile acquired so far is kept, but it is
+        partial.
+        """
+        is_running = getattr(self._connection, "is_scan_running", False)
+        if not is_running:
+            return None
+        try:
+            self._connection.stop_scan()
+        except Exception as exc:
+            logger.error("%s: could not cancel the running topographic scan: %s", verb, exc)
+            return f"topographic scan may still be running — cancel failed: {exc}"
+        return "topographic scan cut short — the partial profile is kept, but the pass must be re-run"
 
     def _persist_position(self) -> None:
         """Snapshot every axis's live position to the position checkpoint file.
@@ -681,103 +725,119 @@ class GantryController:
     # directly reachable for anything these don't cover.
     # ------------------------------------------------------------------
 
-    def move_to(
-        self,
-        vector: Optional[List[float]] = None,
-        *,
-        X: Optional[float] = None,
-        Y: Optional[float] = None,
-        Z: Optional[float] = None,
-        Theta: Optional[float] = None,
-        speed: Optional[float] = None,
-    ) -> bool:
-        """Move to an absolute position, in real mm (and degrees/units for Theta).
+    def _require_motion_allowed(self, description: str, allow_jogging: bool = False) -> None:
+        """Refuse motion unless connected, out of safe_mode, not halted, and nothing jogging.
 
-        Both forms are fence-checked wherever they touch X/Y/Z, routed
-        through the coordinated gcode path (GCodeExecutor.plan/execute) —
-        the same path a hand-written G-code program would use, so a
-        FenceViolation is raised before anything moves.
-
-          - ``move_to([x, y, z, theta])`` — one value per configured axis,
-            in the same order as ``self._axes`` (X, Y, Z, Theta by
-            default).
-          - ``move_to(X=100)`` / ``move_to(X=100, Z=5)`` — move only the
-            given axes. Any configured Cartesian axis *not* given is
-            backfilled with its real current position (a live
-            get_actual_position() read) before the fence check runs, so
-            the checked path reflects where the gantry actually is, not
-            an assumed one.
-
-        Theta is outside the Cartesian gcode/fence model (fences.py only
-        checks X/Y/Z) and is always moved as a separate, non-fence-checked
-        single-axis command. A pure Theta-only call (no X/Y/Z given, in
-        either form) skips the gcode path entirely — it doesn't query,
-        move, or otherwise touch X/Y/Z motors or brakes at all.
-
-        For anything this doesn't cover — bypassing the fence check
-        deliberately, non-coordinated per-axis motion — use self.cmd
-        directly.
-
-        Args:
-            vector: Full-length position vector, or None to use keywords.
-            X: Absolute X target in real mm.
-            Y: Absolute Y target in real mm.
-            Z: Absolute Z target in real mm.
-            Theta: Absolute Theta target in whatever unit that axis's
-                raw-to-real conversion yields.
-            speed: Optional feed rate (mm/s) applied to the move(s).
-
-        Returns:
-            True if a move was issued.
+        Checked client-side for every motion path, whatever the transport —
+        RS232Connection/EthernetConnection have no gate of their own, so
+        without this a fenced move_to() reached the wire under safe_mode.
 
         Raises:
-            ValueError: If vector's length doesn't match the configured
-                axes, an axis keyword names an axis not configured on this
-                gantry, or neither vector nor any keyword was given.
-            FenceViolation: If the X/Y/Z path would enter an exclusion zone.
+            SnapMotionError: If not connected, or safe_mode is on.
+            MotionHalted: If pause()/stop()/estop() has latched the halt.
+            MotionBusyError: If an axis is still jogging (and `allow_jogging`
+                is False) — the controller would refuse the move anyway
+                (escape 24, "Axis Is Busy"), and a move planned from a
+                position that's still changing is wrong.
         """
-        target = vector if vector is not None else {
-            axis: value for axis, value in (("X", X), ("Y", Y), ("Z", Z), ("Theta", Theta))
-            if value is not None
-        }
-        # One operational-log line per call, not per tessellated G-code
-        # segment underneath — _move_to()/GCodeExecutor.execute() may issue
-        # many coordinated-group commands for a single arc, but that detail
-        # belongs at DEBUG (see gcode.py), not here. See
-        # laguna.subsystem_logging's module docstring for the tier split.
-        logger.info("move_to(%s) — started", target)
+        if not self._is_connected:
+            raise SnapMotionError(
+                0, f"{description} refused: not connected — call connect() first"
+            )
+        if self._safe_mode:
+            raise SnapMotionError(
+                0, f"{description} blocked by safe_mode — no-motion restriction active"
+            )
+        self._halt.require_clear(description)
+        if self._motors_off:
+            raise SnapMotionError(
+                0,
+                f"{description} refused: motors off for {sorted(self._motors_off)} (after "
+                "estop()/disable()) — the axis would not move but its position would update. "
+                "set_safe_mode(False) or enable() turns them back on.",
+            )
+        if self._jogging and not allow_jogging:
+            raise MotionBusyError(
+                f"{description} refused: {sorted(self._jogging)} still jogging — stop it with "
+                "jog_unfenced(axis, 0) or pause() first"
+            )
 
-        # Serialise whole operations, not just individual commands. The
-        # transport already locks per request/response pair, but a move is
-        # many commands with a physical traverse in between — nothing else
-        # stops a scheduled scan landing in the middle of one. Re-entrant,
-        # so nesting inside scan_with_gantry() is fine. See motion_arbiter.
-        with self.arbiter.hold(f"{type(self).__name__}.move_to"):
-            try:
-                result = self._move_to(vector, X=X, Y=Y, Z=Z, Theta=Theta, speed=speed)
-            except Exception:
-                logger.exception("move_to(%s) — failed", target)
-                raise
-        logger.info("move_to(%s) — completed", target)
-        return result
+    def _run_motion(
+        self, description: str, prepare: Callable[[MotionGuard], Callable[[], Any]]
+    ) -> MoveHandle:
+        """Run one motion operation: checks and planning now, the traverse in the background.
 
-    def _move_to(
+        `prepare` runs with the gantry held and must do everything that can
+        refuse the move (validation, live position read, fence check),
+        returning the callable that actually moves. Anything it raises comes
+        straight back out of the calling method, with nothing sent.
+
+        If the calling thread already holds the arbiter (library code
+        sequencing several moves inside one operation, e.g. acquire_scan()),
+        the whole thing runs inline instead — a background thread would wait
+        forever on the hold its own caller is sitting in.
+        """
+        self._require_motion_allowed(description)
+
+        def _prepare() -> Callable[[], Any]:
+            self._require_motion_allowed(description)
+            guard = self._halt.guard(description)
+            execute = prepare(guard)
+
+            def _execute() -> Any:
+                logger.info("%s — started", description)
+                try:
+                    result = execute()
+                except MotionHalted as exc:
+                    logger.warning("%s — %s", description, exc)
+                    raise
+                except Exception:
+                    logger.exception("%s — failed", description)
+                    # A failed command or poll mid-traverse says nothing about
+                    # whether the axes stopped — a jog or a long leg keeps
+                    # going on its own. Stop everything before reporting.
+                    self._stop_after_failure(description)
+                    raise
+                finally:
+                    self._persist_position()
+                logger.info("%s — completed", description)
+                return result
+
+            return _execute
+
+        if self.arbiter.held_by_current_thread():
+            return MoveHandle.run_inline(description, lambda: _prepare()())
+        # timeout_s=0: a second motion call while one is running is refused
+        # immediately ("motion in progress"), not queued behind it.
+        return MoveHandle.run_in_background(
+            description, _prepare, lambda: self.arbiter.hold(description, timeout_s=0)
+        )
+
+    def _stop_after_failure(self, description: str) -> None:
+        """Best-effort BST on every axis after a motion operation failed mid-flight. Never raises."""
+        logger.error("%s failed mid-motion — stopping every axis", description)
+        try:
+            self.soft_stop()
+        except Exception as exc:  # soft_stop already guards per axis; belt and braces
+            logger.critical(
+                "%s: could not stop the gantry after a failure (%s) — STOP IT BY HAND", description, exc,
+            )
+
+    def _resolve_targets(
         self,
-        vector: Optional[List[float]] = None,
-        *,
-        X: Optional[float] = None,
-        Y: Optional[float] = None,
-        Z: Optional[float] = None,
-        Theta: Optional[float] = None,
-        speed: Optional[float] = None,
-    ) -> bool:
-        """Body of move_to(), with the arbiter already held."""
+        verb: str,
+        vector: Optional[List[float]],
+        X: Optional[float],
+        Y: Optional[float],
+        Z: Optional[float],
+        Theta: Optional[float],
+    ) -> Dict[str, float]:
+        """Turn move_to()/set_position()'s vector-or-keywords forms into {axis name: value}."""
         axes_by_name = {axis.name: axis for axis in self._axes}
-
         if vector is not None:
             if len(vector) != len(self._axes):
                 raise ValueError(
-                    f"move_to(vector=...) expects {len(self._axes)} values "
+                    f"{verb}(vector=...) expects {len(self._axes)} values "
                     f"(one per configured axis: {[a.name for a in self._axes]}), "
                     f"got {len(vector)}"
                 )
@@ -793,47 +853,315 @@ class GantryController:
                     raise ValueError(f"Axis {name!r} is not configured on this gantry")
                 target_by_name[name] = value
             if not target_by_name:
-                raise ValueError("move_to() requires either vector=... or at least one of X=/Y=/Z=/Theta=")
+                raise ValueError(
+                    f"{verb}() requires either vector=... or at least one of X=/Y=/Z=/Theta="
+                )
+        for name, value in target_by_name.items():
+            # A NaN formats as "nan", which the G-code word regex doesn't
+            # match — the axis would silently be backfilled with its current
+            # position and the move would quietly not happen.
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{verb}(): {name} target must be a finite number, got {value!r}")
+        return {name: float(value) for name, value in target_by_name.items()}
 
+    @staticmethod
+    def _require_valid_speed(verb: str, speed: Optional[float]) -> None:
+        if speed is not None and not (isinstance(speed, (int, float)) and math.isfinite(speed) and speed > 0):
+            raise ValueError(f"{verb}(): speed must be a positive finite number, got {speed!r}")
+
+    def move_to(
+        self,
+        vector: Optional[List[float]] = None,
+        *,
+        X: Optional[float] = None,
+        Y: Optional[float] = None,
+        Z: Optional[float] = None,
+        Theta: Optional[float] = None,
+        speed: Optional[float] = None,
+    ) -> MoveHandle:
+        """Move to an absolute position, in real mm (and degrees/units for Theta). Non-blocking.
+
+        Checks and fence-checks on the calling thread — so a
+        FenceViolation, a safe_mode refusal, or "motion in progress" raises
+        right here with nothing sent — then traverses on a background thread
+        and returns a MoveHandle at once. The REPL stays free, so pause()
+        can be called immediately. Call ``.wait()`` on the handle when the
+        next step depends on the move having finished.
+
+          - ``move_to([x, y, z, theta])`` — one value per configured axis,
+            in the same order as ``self._axes`` (X, Y, Z, Theta by
+            default).
+          - ``move_to(X=100)`` / ``move_to(X=100, Z=5)`` — move only the
+            given axes. Any configured Cartesian axis *not* given is
+            backfilled with its real current position (a live
+            get_actual_position() read) before the fence check runs, so
+            the checked path reflects where the gantry actually is, not
+            an assumed one.
+
+        X/Y/Z run through the coordinated gcode path
+        (GCodeExecutor.plan/execute). Theta is outside the Cartesian
+        gcode/fence model (fences.py only checks X/Y/Z — see
+        ericbarefoot/laguna#62) and is moved as a separate single-axis
+        command. A pure Theta-only call skips the gcode path entirely.
+
+        To move one axis without the fence check — deliberately, e.g. to
+        find where a fence should go — use move_to_unfenced().
+
+        Args:
+            vector: Full-length position vector, or None to use keywords.
+            X: Absolute X target in real mm.
+            Y: Absolute Y target in real mm.
+            Z: Absolute Z target in real mm.
+            Theta: Absolute Theta target in whatever unit that axis's
+                raw-to-real conversion yields.
+            speed: Optional feed rate (mm/s) applied to the move(s).
+
+        Returns:
+            A MoveHandle for the move in progress.
+
+        Raises:
+            ValueError: If vector's length doesn't match the configured
+                axes, an axis keyword names an axis not configured on this
+                gantry, neither vector nor any keyword was given, or a
+                target/speed isn't a finite number (speed must be > 0).
+            FenceViolation: If the X/Y/Z path would enter an exclusion zone.
+            SnapMotionError: If not connected, or safe_mode is on.
+            MotionHalted: If the gantry is paused/stopped/estopped.
+            MotionBusyError: If another motion operation is in progress.
+        """
+        target_by_name = self._resolve_targets("move_to", vector, X, Y, Z, Theta)
+        self._require_valid_speed("move_to", speed)
+        return self._run_motion(
+            f"move_to({target_by_name})",
+            lambda guard: self._plan_move_to(target_by_name, speed, guard),
+        )
+
+    def _plan_move_to(
+        self, target_by_name: Dict[str, float], speed: Optional[float], guard: MotionGuard
+    ) -> Callable[[], None]:
+        """Fence-check move_to()'s path from the live position; return the traverse."""
+        target_by_name = dict(target_by_name)
         theta_value = target_by_name.pop("Theta", None)
 
+        trajectory = None
         cartesian_axes = [axis for axis in self._axes if axis.name != "Theta"]
         if any(axis.name in target_by_name for axis in cartesian_axes):
+            # Plan from where the gantry actually is, not from what gcode last
+            # believed. Anything that moved an axis without going through
+            # gcode (a scan pass, move_to_unfenced(), homing) leaves that
+            # cache stale, and a stale start position is used for three
+            # things at once: deciding which legs run (a move to "where the
+            # cache thinks we are" silently no-ops), the fence check's path,
+            # and the leg distances.
+            self.gcode.sync_position_from_hardware()
+            live_by_name = dict(zip(("X", "Y", "Z"), self.gcode.current_position))
             gcode_words: List[str] = []
             for axis in cartesian_axes:
                 value = target_by_name.get(axis.name)
                 if value is None:
-                    value = self.cmd.get_actual_position(axis)  # backfill: real current position
+                    # Backfill from the *same* reading the cache was just synced
+                    # to, never a second read: two reads of a settling axis can
+                    # differ by more than _POSITION_EPSILON_MM, and any such
+                    # difference on an axis nobody asked to move is a phantom
+                    # near-zero leg (see GCodeExecutor._sync_position_from_hardware
+                    # and _apply_scaled_ramp for what those do to ACL/DCL).
+                    value = live_by_name[axis.name]
                 gcode_words.append(f"{axis.name}{value:.6f}")
             if speed is not None:
                 gcode_words.append(f"F{speed * 60:.6f}")  # gcode feed rate is mm/min
-            text = "G90\nG1 " + " ".join(gcode_words)
-            trajectory = self.gcode.plan(text)
-            self.gcode.execute(trajectory)
+            trajectory = self.gcode.plan("G90\nG1 " + " ".join(gcode_words))
 
-        if theta_value is not None:
-            theta_axis = axes_by_name["Theta"]
-            # the
-            # vector move_to() form always passes theta_value (0.0 if the
-            # caller didn't care about Theta at all), so this used to fire
-            # a blocking MVT unconditionally — including when Theta was
-            # already at the target, e.g. every scan-setup move in
-            # example_07. move_to() is now banned outright (see
-            # commands.py); this does a live read first and skips the move
-            # entirely if Theta hasn't actually changed, same as the
-            # X/Y/Z legs in GCodeExecutor._execute_linear.
-            current_theta = self.cmd.get_actual_position(theta_axis)
-            if abs(theta_value - current_theta) > _POSITION_EPSILON_MM:
-                if speed is not None:
-                    self.cmd.set_speed(theta_axis, speed)
-                self.cmd.begin_move_to(theta_axis, theta_value)
-                self._wait_for_axis_move_finished(
-                    theta_axis,
-                    predicted_s=predicted_move_s(theta_value - current_theta, speed),
-                )
+        def _execute() -> None:
+            if trajectory is not None:
+                self.gcode.execute(trajectory, guard=guard)
+            if theta_value is not None:
+                self._move_single_axis(self._axis_by_name("Theta"), theta_value, speed, guard)
 
-        self._persist_position()
-        return True
+        return _execute
+
+    def _axis_by_name(self, name: str) -> Axis:
+        for axis in self._axes:
+            if axis.name == name:
+                return axis
+        raise ValueError(
+            f"No axis named {name!r} configured on this gantry "
+            f"(configured: {[a.name for a in self._axes]})"
+        )
+
+    def _move_single_axis(
+        self, axis: Axis, position: float, speed: Optional[float], guard: MotionGuard
+    ) -> None:
+        """One axis to `position`, under `guard`, waiting for it to finish. No fence check."""
+        current = self.cmd.get_actual_position(axis)
+        # Skip a move to where the axis already is (within rounding of the
+        # raw-unit round trip), same as GCodeExecutor._execute_linear does.
+        if abs(position - current) <= _POSITION_EPSILON_MM:
+            return
+        if speed is not None:
+            self.cmd.set_speed(axis, speed)
+        with guard.issuing():
+            self.cmd._begin_move_to(axis, position)
+        self._wait_for_axis_move_finished(
+            axis,
+            predicted_s=predicted_move_s(position - current, speed),
+            check_halt=guard.check,
+        )
+
+    def move_to_unfenced(
+        self, axis: "Axis | AxisHandle | str", position: float, speed: Optional[float] = None
+    ) -> MoveHandle:
+        """Move ONE axis to an absolute position WITHOUT checking fences. Non-blocking.
+
+        For locating where fences belong, or recovering an axis that a
+        fence (or a stale one) won't let move_to() touch. Everything else
+        still applies: safe_mode, the halt latch, the motion arbiter, and the
+        controller's own soft limits (NLT/PLT). Logged at WARNING so the
+        record shows motion ran unfenced.
+
+        Args:
+            axis: Axis name ("X"), Axis, or AxisHandle.
+            position: Absolute target, real mm (Theta: its own unit).
+            speed: Optional speed for this axis, mm/s.
+
+        Returns:
+            A MoveHandle; ``.wait()`` to block until it finishes.
+
+        Raises:
+            ValueError: Unknown axis, or a non-finite position/speed.
+            SnapMotionError: If not connected, or safe_mode is on.
+            MotionHalted: If the gantry is halted.
+            MotionBusyError: If another motion operation is in progress.
+        """
+        target = self._resolve_axis_handle(axis)._axis
+        if not math.isfinite(position):
+            raise ValueError(f"move_to_unfenced(): position must be finite, got {position!r}")
+        self._require_valid_speed("move_to_unfenced", speed)
+        description = f"move_to_unfenced({target.name}={position})"
+        logger.warning("%s — NO FENCE CHECK", description)
+
+        def _prepare(guard: MotionGuard) -> Callable[[], None]:
+            def _execute() -> None:
+                try:
+                    self._move_single_axis(target, position, speed, guard)
+                finally:
+                    self._sync_position_after_direct_motion(description)
+            return _execute
+
+        return self._run_motion(description, _prepare)
+
+    def jog_unfenced(self, axis: "Axis | AxisHandle | str", speed: float) -> None:
+        """Start ONE axis jogging at `speed` mm/s WITHOUT any fence check; 0 stops it.
+
+        Open-ended motion: it runs until jog_unfenced(axis, 0), pause(),
+        stop()/estop(), or a hardware limit switch. Nothing fence-checks it,
+        and per the vendor manual (AsciiHelp, "Jog") **jogging is not
+        protected by the controller's soft limits (NLT/PLT)** either — so
+        keep jogs slow and short. safe_mode and the halt latch still apply
+        to starting a jog (never to stopping one), and it refuses while
+        another motion operation holds the gantry. While any axis is
+        jogging, every other motion call is refused. Logged at WARNING.
+
+        Stopping sends BST and waits for the axis to decelerate, not
+        ``JOG 0``: the controller treats a zero-speed jog as a move still in
+        progress, so the axis stayed "busy" and the next move failed with
+        escape 24 ("Axis Is Busy").
+
+        Raises:
+            ValueError: Unknown axis, or a non-finite speed.
+            SnapMotionError: If starting a jog while not connected or in safe_mode.
+            MotionHalted: If starting a jog while the gantry is halted.
+            MotionBusyError: If another motion operation is in progress.
+        """
+        target = self._resolve_axis_handle(axis)._axis
+        if not math.isfinite(speed):
+            raise ValueError(f"jog_unfenced(): speed must be finite, got {speed!r}")
+        if speed == 0:
+            try:
+                self.cmd.begin_stop(target)
+                self._wait_for_axis_move_finished(target)
+            finally:
+                self._jogging.discard(target.name)
+                self._sync_position_after_direct_motion("jog_unfenced(0)")
+            return
+        description = f"jog_unfenced({target.name}, {speed} mm/s)"
+        self._require_motion_allowed(description, allow_jogging=True)
+        logger.warning("%s — NO FENCE CHECK, NO SOFT LIMITS; stop with jog_unfenced(%r, 0) or pause()",
+                       description, target.name)
+        with self.arbiter.hold(description, timeout_s=0):
+            guard = self._halt.guard(description)
+            with guard.issuing():
+                self._jogging.add(target.name)
+                self.cmd._jog(target, speed)
+
+    def plan_scan_move(self, axis: "Axis | AxisHandle | str", end_mm: float) -> MotionGuard:
+        """Fence-check a single-axis scan pass from the live position, without moving.
+
+        For scan paths that start the traverse themselves (the Pi agent's
+        scan_start) — the caller issues the start under the returned guard's
+        ``issuing()`` and checks it while waiting. The caller must already
+        hold the motion arbiter for the whole pass.
+
+        Args:
+            axis: Axis name ("X"), its BLC token ("A1"), Axis, or AxisHandle.
+            end_mm: Absolute end position of the pass, real mm.
+
+        Returns:
+            The MotionGuard for this pass.
+
+        Raises:
+            RuntimeError: If the calling thread doesn't hold the arbiter.
+            FenceViolation: If the straight pass would enter an exclusion zone.
+            SnapMotionError: If not connected, or safe_mode is on.
+            MotionHalted: If the gantry is halted.
+        """
+        target = self._resolve_scan_axis(axis)
+        if not math.isfinite(end_mm):
+            raise ValueError(f"scan end_mm must be finite, got {end_mm!r}")
+        description = f"scan pass {target.name} -> {end_mm:.1f}mm"
+        if not self.arbiter.held_by_current_thread():
+            raise RuntimeError(f"{description}: hold gantry.arbiter for the whole pass first")
+        self._require_motion_allowed(description)
+        guard = self._halt.guard(description)
+        if target.name in ("X", "Y", "Z"):
+            self.gcode.sync_position_from_hardware()
+            start = self.gcode.current_position
+            end = list(start)
+            end[("X", "Y", "Z").index(target.name)] = end_mm
+            violations = self.checker.check_segment(start, tuple(end))
+            if violations:
+                raise violations[0]
+        return guard
+
+    def begin_scan_move(
+        self, axis: "Axis | AxisHandle | str", end_mm: float, feed_rate_mm_s: float
+    ) -> MotionGuard:
+        """Fence-check, then start (non-blocking) a constant-speed single-axis scan pass.
+
+        For scan paths that must trigger acquisition while the axis is
+        mid-move (the Gocator). Same contract as plan_scan_move(): hold the
+        arbiter for the whole pass, and poll with the returned guard's
+        ``check()`` so a pause/stop/estop ends the wait.
+
+        Raises:
+            ValueError: If feed_rate_mm_s isn't a positive finite number.
+            Everything plan_scan_move() raises.
+        """
+        self._require_valid_speed("begin_scan_move", feed_rate_mm_s)
+        guard = self.plan_scan_move(axis, end_mm)
+        target = self._resolve_scan_axis(axis)
+        self.cmd.set_speed(target, feed_rate_mm_s)
+        with guard.issuing():
+            self.cmd._begin_move_to(target, end_mm)
+        return guard
+
+    def _resolve_scan_axis(self, axis: "Axis | AxisHandle | str") -> Axis:
+        if isinstance(axis, str) and axis[:1] == "A" and axis[1:].isdigit():
+            index = int(axis[1:])
+            for configured in self._axes:
+                if configured.index == index:
+                    return configured
+            raise ValueError(f"No configured axis has BLC token {axis!r}")
+        return self._resolve_axis_handle(axis)._axis
 
     def set_position(
         self,
@@ -876,30 +1204,7 @@ class GantryController:
                 gantry, or neither vector nor any keyword was given.
         """
         axes_by_name = {axis.name: axis for axis in self._axes}
-
-        if vector is not None:
-            if len(vector) != len(self._axes):
-                raise ValueError(
-                    f"set_position(vector=...) expects {len(self._axes)} values "
-                    f"(one per configured axis: {[a.name for a in self._axes]}), "
-                    f"got {len(vector)}"
-                )
-            target_by_name: Dict[str, float] = {
-                axis.name: value for axis, value in zip(self._axes, vector)
-            }
-        else:
-            target_by_name = {}
-            for name, value in (("X", X), ("Y", Y), ("Z", Z), ("Theta", Theta)):
-                if value is None:
-                    continue
-                if name not in axes_by_name:
-                    raise ValueError(f"Axis {name!r} is not configured on this gantry")
-                target_by_name[name] = value
-            if not target_by_name:
-                raise ValueError(
-                    "set_position() requires either vector=... or at least one of X=/Y=/Z=/Theta="
-                )
-
+        target_by_name = self._resolve_targets("set_position", vector, X, Y, Z, Theta)
         for name, value in target_by_name.items():
             self.cmd.set_actual_position(axes_by_name[name], value)
         self._sync_position_after_direct_motion("set_position()")
@@ -920,6 +1225,7 @@ class GantryController:
         for axis in self._axes:
             try:
                 self.cmd.begin_stop(axis)
+                self._jogging.discard(axis.name)  # BST ends a jog
             except Exception as exc:
                 logger.error("Error soft-stopping %s: %s", axis.name, exc)
         # Best-effort: BST isn't blocking, so this reads position while
@@ -927,6 +1233,19 @@ class GantryController:
         # _persist_position()'s docstring), but that's still far closer to
         # reality than the stale pre-move state.
         self._sync_position_after_direct_motion("soft_stop()")
+
+    def resync_position(self, source: str) -> None:
+        """Re-read every axis into the planning cache and the position checkpoint.
+
+        Call after moving an axis directly — through an AxisHandle, self.cmd, or
+        anything else that bypasses move_to()'s gcode path — once that motion
+        has finished. move_to() also resyncs on its own before planning, so
+        this mainly keeps the on-disk checkpoint honest. Never raises.
+
+        Args:
+            source: Caller name, for the log message if the resync fails.
+        """
+        self._sync_position_after_direct_motion(source)
 
     def _sync_position_after_direct_motion(self, source: str) -> None:
         """Resync gcode's cached position and the on-disk checkpoint after direct motion.
@@ -968,34 +1287,70 @@ class GantryController:
     def pause(self) -> Optional[str]:
         """Decelerate on each axis's own ramp, leaving brakes and motors alone.
 
-        The gantry is immediately ready to move again with no re-enable
+        Latches a pause (see halt.py): the move in flight is cancelled — its
+        next leg is never issued — and new motion is refused until resume().
+        Brakes and motors are untouched, so resuming needs no re-enable
         cycle, which is what makes a pause cheap enough to use liberally.
         """
+        self._halt.trip(HaltLevel.PAUSE, "pause()")
+        note = self._stop_agent_scan("pause()")
         self.soft_stop()
-        self._persist_position()
-        return None
+        return note
 
     def resume(self) -> Optional[str]:
-        """Nothing to undo — pause() left brakes and motors untouched.
+        """Undo pause(): allow motion again. Never undoes a stop() or estop().
 
         Motion is re-commanded by the caller, not resumed implicitly: the
         gantry has no notion of an interrupted move to pick back up.
         """
+        if not self._halt.clear(up_to=HaltLevel.PAUSE):
+            level = self._halt.level.name.lower()
+            logger.warning("Gantry not resumed: it is %s — call rearm() instead", level)
+            return f"gantry still {level}ped — not resumed; rearm() is required"
         return None
 
     def estop(self) -> Optional[str]:
         """Zero-decel abort, brakes engaged, motors disabled. Never raises.
 
-        This is what stop() used to do. Recovery needs an explicit re-arm
-        (enable() + disengage_brake(), or connect()/set_safe_mode(False),
-        which do both) — see FlumeLab.rearm().
+        This is what stop() used to do. Latches an estop: all motion is
+        refused until rearm(), which leaves safe_mode on — re-enabling
+        motion is a separate, explicit set_safe_mode(False).
+
+        Deliberately does not re-read positions afterwards: estop must
+        finish fast so FlumeLab can move on to the pump and valves.
+        FlumeLab.estop() resyncs (resync_position()) once everything is safe.
         """
+        self._halt.trip(HaltLevel.ESTOP, "estop()")
+        note = self._stop_agent_scan("estop()")
         try:
             self.cmd.shutdown(axes=self._axes, io_map=self._io_map)
         except Exception as exc:
             logger.error("Error during gantry emergency stop: %s", exc)
-        self._sync_position_after_direct_motion("estop()")
-        return None
+        self._jogging.clear()  # ABT ends a jog
+        # Recorded even if some MTR 0 failed: assume off until turned on again.
+        self._motors_off.update(axis.name for axis in self._axes)
+        return note
+
+    def rearm(self) -> bool:
+        """Clear a stop() or estop() latch, leaving the gantry in safe_mode.
+
+        Re-arming never re-enables motion by itself: whoever re-arms has
+        checked the cause is cleared, which is not the same as checking
+        it's safe to move. Motion needs a separate set_safe_mode(False),
+        which turns the motors back on and releases the brakes.
+
+        Returns:
+            True if the latch is clear and safe_mode is on.
+        """
+        self._halt.clear(up_to=HaltLevel.ESTOP)
+        if self._safe_mode:
+            return True
+        return bool(self.set_safe_mode(True))
+
+    @property
+    def halted(self) -> Optional[str]:
+        """The latched halt tier ("pause", "stop", "estop"), or None if motion is allowed."""
+        return self._halt.level.name.lower() if self._halt.level else None
 
     def set_safe_mode(self, enabled: bool) -> bool:
         """Enable or disable safe_mode.
@@ -1019,70 +1374,115 @@ class GantryController:
         (motor on first, brake released second — never leave an axis with
         neither holding it); turning it back on re-engages them, since
         safe_mode's own gate is about to stop motor torque being
-        re-commanded. No-op if not currently connected — connect() applies
-        the release side itself, using whatever safe_mode is set to by then.
+        re-commanded.
+
+        Turning safe_mode *off* requires an explicit connect() first and
+        raises otherwise, changing nothing. Without a live connection there is
+        no agent to relaunch and no brakes to release, so "off" would only
+        flip flags while whatever agent might exist keeps its old gate — the
+        flag would say motion is allowed when it isn't (or, worse, lie about
+        which state the hardware is in). Turning safe_mode *on* while
+        disconnected is always allowed: it can only make things safer, and
+        connect() applies the release side itself using whatever safe_mode is
+        set to by then.
 
         Returns:
             True if the change took effect (including a successful
             reconnect, if one was needed); False if a required reconnect
             failed — check logs and call connect() again once resolved.
+
+        Raises:
+            SnapMotionError: If ``enabled`` is False and connect() has not
+                been called (or the gantry was disconnected).
         """
+        if not enabled and not self._is_connected:
+            raise SnapMotionError(
+                0,
+                "Cannot disable safe_mode while disconnected — call connect() first "
+                "(lab.connect_all() or gantry.connect()). Nothing was changed.",
+            )
+        if enabled and self._is_connected and not self._safe_mode:
+            # Stop and brake *before* the gate closes. Once safe_mode is on,
+            # the transport's allowlist (and the relaunched Pi agent's) would
+            # refuse anything but reads and stop-class commands — this used
+            # to flip the flag first, so the brake commands that followed
+            # were refused and Y/Z were left released with motors on.
+            try:
+                self.soft_stop()
+                self._engage_brakes()
+            except Exception as exc:
+                # Closing the gate matters more than a clean brake park —
+                # never leave motion enabled because a brake write failed.
+                logger.error("set_safe_mode(True): could not stop/brake before gating: %s", exc)
         self._safe_mode = enabled
         if hasattr(self._connection, "safe_mode"):
             self._connection.safe_mode = enabled
         if isinstance(self._connection, PiGantryConnection) and self._is_connected:
             self.disconnect()
-            if not self.connect():
-                return False
-            # connect() already released the brakes if enabled=False (it
-            # checks self._safe_mode itself); it never engages, so that
-            # direction still needs an explicit call here.
-            if enabled:
-                self._engage_brakes()
-            return True
-        if self._is_connected:
-            if enabled:
-                self._engage_brakes()
-            else:
-                self._enable_and_release_brakes()
+            # connect() releases the brakes and applies soft limits itself
+            # when enabled=False (it checks self._safe_mode).
+            return bool(self.connect())
+        if self._is_connected and not enabled:
+            self._enable_and_release_brakes()
+            self._apply_soft_limits()
         return True
 
-    def home(self) -> bool:
-        """Run the homing routine on all configured axes.
+    def _run_homing(self, description: str, body: Callable[[], Any]) -> MoveHandle:
+        """Run a HomingProcedure operation as a non-blocking, halt-aware motion.
+
+        Homing is never fence-checked — until it finishes there is no
+        reference frame for fences to mean anything in. safe_mode, the halt
+        latch and the arbiter still apply, and the planning position and
+        checkpoint are resynced afterwards however it ends.
+        """
+        def _prepare(guard: MotionGuard) -> Callable[[], Any]:
+            def _execute() -> Any:
+                self.homing._guard = guard
+                try:
+                    return body()
+                finally:
+                    self.homing._guard = None
+                    self._sync_position_after_direct_motion(description)
+            return _execute
+
+        return self._run_motion(description, _prepare)
+
+    def home(self) -> MoveHandle:
+        """Run the homing routine on all configured axes. Non-blocking.
 
         Returns:
-            True if homing completed successfully on every axis.
+            A MoveHandle; ``.wait()`` raises HomingFailed (naming the axis
+            and cause) if any axis failed — every axis has been stopped by
+            then. ``result`` is True on success.
         """
-        logger.info("home() — started")
-        try:
+        def _home_all() -> bool:
             result = self.homing.home_all()
-        except Exception:
-            logger.exception("home() — failed")
-            raise
-        finally:
-            self._sync_position_after_direct_motion("home()")
-        logger.info("home() — %s", "completed" if result.success else "did not find home")
-        return result.success
+            if not result.success:
+                raise HomingFailed(
+                    f"home() did not complete — homed {sorted(result.axis_results)} before "
+                    f"failing: {result.error}"
+                )
+            return True
 
-    def home_axis(self, axis: "Axis | AxisHandle | str") -> float:
-        """Home a single axis. Returns the standoff position after homing.
+        return self._run_homing("home()", _home_all)
 
-        Prefer this over calling self.homing.home_axis() directly — homing
-        moves hardware through HomingProcedure/MMCCommands, bypassing
-        GCodeExecutor entirely, so its cached position and the on-disk
-        checkpoint must both be resynced afterward or the next move_to()
-        will plan against a stale cache (see
-        _sync_position_after_direct_motion). See engage_brake() above for
-        accepted `axis` forms.
+    def home_axis(self, axis: "Axis | AxisHandle | str") -> MoveHandle:
+        """Home a single axis. Non-blocking.
+
+        Prefer this over calling self.homing.home_axis() directly — that
+        bypasses safe_mode, the halt latch, the arbiter, and the position
+        resync afterwards. See engage_brake() above for accepted `axis` forms.
+
+        Returns:
+            A MoveHandle; its ``result`` is the standoff position after homing.
         """
-        handle = self._resolve_axis_handle(axis)
-        try:
-            return self.homing.home_axis(handle._axis)
-        finally:
-            self._sync_position_after_direct_motion("home_axis()")
+        target = self._resolve_axis_handle(axis)._axis
+        return self._run_homing(
+            f"home_axis({target.name})", lambda: self.homing.home_axis(target)
+        )
 
-    def locate_limit_switch(self, axis: "Axis | AxisHandle | str") -> float:
-        """Jog toward and record the given axis's limit switch position.
+    def locate_limit_switch(self, axis: "Axis | AxisHandle | str") -> MoveHandle:
+        """Jog toward and record the given axis's limit switch position. Non-blocking.
 
         Unlike home(), this does not redefine the origin — it reports the
         limit switch's position in the current (already-homed) coordinate
@@ -1091,12 +1491,15 @@ class GantryController:
         HomingProcedure.locate_limit_switch for the direction/polarity
         assumptions this reuses from the axis's homing config. See
         engage_brake() above for accepted `axis` forms.
+
+        Returns:
+            A MoveHandle; its ``result`` is the limit switch's position.
         """
-        handle = self._resolve_axis_handle(axis)
-        try:
-            return self.homing.locate_limit_switch(handle._axis)
-        finally:
-            self._sync_position_after_direct_motion("locate_limit_switch()")
+        target = self._resolve_axis_handle(axis)._axis
+        return self._run_homing(
+            f"locate_limit_switch({target.name})",
+            lambda: self.homing.locate_limit_switch(target),
+        )
 
     def enable(self) -> None:
         """Turn motor drive on for all configured axes (MTR only).
@@ -1108,14 +1511,17 @@ class GantryController:
         """
         for axis in self._axes:
             self.cmd.set_motor(axis, True)
+            self._motors_off.discard(axis.name)
 
     def disable(self) -> None:
         """Turn motor drive off for all configured axes.
 
         Allows manual repositioning (MTR only). Does NOT send ENA — see
-        enable().
+        enable(). Motion is refused until enable() or set_safe_mode(False)
+        turns them back on.
         """
         for axis in self._axes:
+            self._motors_off.add(axis.name)
             self.cmd.set_motor(axis, False)
 
     def wait_for_move(self, timeout: Optional[float] = None, predicted_s: float = 0.0) -> None:
@@ -1146,7 +1552,11 @@ class GantryController:
             raise TimeoutError(f"Gantry move did not finish within {effective_timeout:.0f}s")
 
     def _wait_for_axis_move_finished(
-        self, axis: Axis, timeout: Optional[float] = None, predicted_s: float = 0.0
+        self,
+        axis: Axis,
+        timeout: Optional[float] = None,
+        predicted_s: float = 0.0,
+        check_halt: Optional[Callable[[], None]] = None,
     ) -> None:
         """Block until a single axis's move-finished flag is set, aborting on timeout.
 
@@ -1158,7 +1568,8 @@ class GantryController:
         wait_for_move's.
         """
         if not poll_until_move_finished(
-            lambda: self.cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout
+            lambda: self.cmd.move_is_finished(axis), predicted_s=predicted_s, timeout_s=timeout,
+            check_halt=check_halt,
         ):
             self.cmd.abort(axis)
             effective_timeout = resolve_timeout_s(predicted_s, timeout)
@@ -1218,13 +1629,9 @@ def _build_io_map(axes_cfg: List[Dict[str, Any]]) -> IOMap:
         if name == "y":
             if entry.get("brake_output") is not None:
                 kwargs["y_brake_output"] = entry["brake_output"]
-            if entry.get("brake_status_input") is not None:
-                kwargs["y_brake_status_input"] = entry["brake_status_input"]
         elif name == "z":
             if entry.get("brake_output") is not None:
                 kwargs["z_brake_output"] = entry["brake_output"]
-            if entry.get("brake_status_input") is not None:
-                kwargs["z_brake_status_input"] = entry["brake_status_input"]
         elif name == "theta":
             if entry.get("limit_input") is not None:
                 kwargs["theta_limit_input"] = entry["limit_input"]
@@ -1297,6 +1704,7 @@ def _build_homing_config(
             # differs.
             trip_on_high=entry.get("home_trip_on_high", False),
             homing_direction=entry.get("home_direction", -1.0),
+            max_travel_mm=entry.get("max_travel_mm"),
         )
     config.axis_configs = axis_configs
     return config

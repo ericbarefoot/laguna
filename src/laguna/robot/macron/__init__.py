@@ -21,7 +21,7 @@ from .commands import (
     THETA_AXIS,
     ALL_AXES,
 )
-from .homing import HomingConfig, HomingResult, HomingProcedure, AxisHomingConfig
+from .homing import HomingConfig, HomingFailed, HomingResult, HomingProcedure, AxisHomingConfig
 from .fences import (
     BoxFence,
     CylinderFence,
@@ -39,7 +39,15 @@ from .gcode import (
     GCodeParser,
     GCodeProgram,
 )
-from .pi_bridge import PiGantryConnection, SAFE_COMMANDS, SafeModeConnection, check_safe_mode
+from .halt import HaltLevel, MotionHalted
+from .move_handle import MoveHandle
+from .pi_bridge import (
+    PiGantryConnection,
+    SAFE_COMMANDS,
+    SafeModeConnection,
+    check_safe_mode,
+    is_stop_command,
+)
 from .controller import GantryController
 
 __all__ = [
@@ -65,6 +73,7 @@ __all__ = [
     # homing
     "AxisHomingConfig",
     "HomingConfig",
+    "HomingFailed",
     "HomingResult",
     "HomingProcedure",
     # fences
@@ -82,11 +91,16 @@ __all__ = [
     "GCodeMove",
     "GCodeParser",
     "GCodeProgram",
+    # halt / non-blocking moves
+    "HaltLevel",
+    "MotionHalted",
+    "MoveHandle",
     # pi_bridge
     "PiGantryConnection",
     "SAFE_COMMANDS",
     "SafeModeConnection",
     "check_safe_mode",
+    "is_stop_command",
     # controller
     "GantryController",
 ]

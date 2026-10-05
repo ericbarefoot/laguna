@@ -155,8 +155,10 @@ real, commandable axes.
 | `SCS`/`SCT`/`AIC` | configure and arm the hardware capture-latch (not currently used by homing — see `homing.py`) |
 
 `MMCCommands` (`src/laguna/robot/macron/commands.py`) wraps almost all of
-these in typed Python methods (`get_actual_position()`, `begin_move_to()`,
-`disengage_brake()`, etc.) — read its docstrings for the full mapping.
+these in typed Python methods (`get_actual_position()`, `disengage_brake()`,
+etc.) — read its docstrings for the full mapping. Its motion-*starting*
+methods (`_begin_move_to()` and friends) are private: move through
+`GantryController` instead — see [Motion control layers](MOTION_CONTROL_LAYERS.md).
 
 ## Safety model
 
