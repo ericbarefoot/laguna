@@ -880,8 +880,9 @@ class GocatorScanner(GocatorSettingsMixin):
                 computed from the same accel/feed-rate pair as the lead-in
                 distance) rather than an independent guess.
             fixed_length_mm: Surface length to configure on the sensor, mm.
-                Defaults to None, meaning: derive it from the axis's actual
-                position right now and `end_mm` (``abs(end_mm - current)``),
+                Defaults to None, meaning: derive it from `end_mm` and where
+                capture starts (``abs(end_mm - start)``, where start is
+                `cruise_start_mm` if given, else the axis's live position),
                 so the sensor's capture window matches this call's commanded
                 move by construction — it does *not* fall back to a
                 previously-configured ``gocator.fixed_length_mm`` that could
@@ -967,7 +968,13 @@ class GocatorScanner(GocatorSettingsMixin):
         except Exception as e:
             logger.debug("Could not read gantry start position: %s", e)
 
-        distance_mm = abs(end_mm - start_mm) if start_mm is not None else None
+        # The sensor generates fixed_length_mm of surface from the trigger,
+        # and the trigger fires at the cruise start, not where the axis is
+        # now. Measuring from the ramp start would size the capture window
+        # ramp_distance_mm too long, so it would keep stacking profiles
+        # after the axis stopped at end_mm: garbage rows at the far edge.
+        capture_from_mm = cruise_start_mm if cruise_start_mm is not None else start_mm
+        distance_mm = abs(end_mm - capture_from_mm) if capture_from_mm is not None else None
 
         if fixed_length_mm is None:
             if distance_mm is not None:
@@ -990,7 +997,7 @@ class GocatorScanner(GocatorSettingsMixin):
                 "generating the surface after fixed_length_mm regardless of "
                 "how far the gantry actually goes — make sure that's what "
                 "you want.",
-                fixed_length_mm, axis, start_mm, end_mm, distance_mm,
+                fixed_length_mm, axis, capture_from_mm, end_mm, distance_mm,
             )
 
         self.configure(travel_speed_mm_s=feed_rate_mm_s, fixed_length_mm=fixed_length_mm)

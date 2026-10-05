@@ -1188,6 +1188,21 @@ class TestScanWithGantry:
         # is unaffected, since it never moved.
         assert scan.metadata["gantry_start"] == [42.0, 250.0]
 
+    def test_cruise_start_mm_sizes_the_capture_window(self, scanner):
+        """With a lead-in, fixed_length spans cruise start to end only.
+
+        The trigger fires at the cruise start, so measuring from the live
+        ramp-start position would make the sensor keep generating surface
+        for the length of the ramp after the axis has stopped at end_mm.
+        """
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0})  # ramp start
+        scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0,
+            cruise_start_mm=42.0,
+        )
+        assert scanner._fake.go.fixed_length == pytest.approx(158.0)  # not 160
+
     def test_without_cruise_start_mm_behavior_is_unchanged(self, scanner):
         """Omitting cruise_start_mm reproduces pre-#58 behavior exactly.
 
