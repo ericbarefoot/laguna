@@ -37,6 +37,8 @@ start, which has no such constraint and can usually go faster). Pass
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -48,6 +50,18 @@ from .robot.macron.commands import ramp_distance_mm, ramp_time_s
 from .robot.motion_arbiter import DEFAULT_ARBITER
 
 logger = logging.getLogger(__name__)
+
+#: Checkpoint metadata key holding the survey's geometry fingerprint.
+_FINGERPRINT_KEY = "survey_fingerprint"
+
+
+class SurveyCheckpointMismatch(RuntimeError):
+    """A checkpoint on disk describes a different survey than the one being run.
+
+    Resuming anyway would skip passes the *new* geometry never ran, because a
+    checkpoint only records pass indices. Nothing has been deleted.
+    """
+
 
 #: Cartesian axis name -> index into a 3-component [x, y, z] vector. Shared
 #: by Tile and SurveyRunner rather than each keeping its own copy.
@@ -194,6 +208,41 @@ class Survey:
             List of Pass objects.
         """
         raise NotImplementedError
+
+    def fingerprint(self) -> str:
+        """Hash of the geometry this survey measures, for checkpoint safety.
+
+        A checkpoint records only pass *indices*; this is what lets a resume
+        notice that index 3 now means a different strip of bed. It covers what
+        each pass measures — instrument, travel axis, measuring start and end,
+        and swath alignment — and deliberately **not**:
+
+        - speeds, labels: they don't change which ground a completed pass
+          covered;
+        - the commanded ramp start (``Pass.start`` when a lead-in was added):
+          it follows the axis's accel, which can be re-read between runs, yet
+          a pass already measured from a different run-up still covered the
+          same swath.
+
+        Returns:
+            A short hex digest; equal exactly when the measured geometry is.
+        """
+        def _pt(v: Sequence[float]) -> List[float]:
+            return [round(float(c), 6) for c in v]
+
+        rows = [
+            {
+                "instrument": p.instrument,
+                "axis": p.axis,
+                "start": _pt(p.measure_start),
+                "end": _pt(p.end),
+                "edge_align": bool(p.edge_align),
+                "step_axis": p.step_axis,
+            }
+            for p in self.passes()
+        ]
+        blob = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(blob).hexdigest()[:16]
 
     def __iter__(self) -> Iterator[Pass]:
         """Iterate over the passes."""
@@ -738,20 +787,38 @@ class SurveyRunner:
         checkpoint: Optional CheckpointStore. Pass indices are marked
             complete as they finish, so a survey interrupted by a pause
             resumes where it left off rather than starting over. A tile of
-            a wide bed can be the longest thing an experiment does.
+            a wide bed can be the longest thing an experiment does. The
+            survey's geometry fingerprint (:meth:`Survey.fingerprint`) is
+            stored in it, and a checkpoint with completed passes made for a
+            *different* geometry — or by a version that recorded none — is
+            refused rather than trusted (see ``restart``).
+        restart: Start over against `checkpoint` instead of refusing a
+            mismatch. The old checkpoint is moved aside, never deleted
+            (``CheckpointStore.clear()``), so the record of what the earlier
+            plan completed survives.
+
+    Raises:
+        SurveyCheckpointMismatch: At construction, if `checkpoint` has
+            completed passes for a different (or unrecorded) geometry and
+            `restart` is False.
     """
 
-    def __init__(self, lab: Any, survey: Survey, checkpoint: Optional[Any] = None) -> None:
+    def __init__(
+        self, lab: Any, survey: Survey, checkpoint: Optional[Any] = None, restart: bool = False
+    ) -> None:
         """Initialize a survey runner.
 
         Args:
             lab: Connected FlumeLab instance.
             survey: The survey plan to execute.
             checkpoint: Optional CheckpointStore for resumable execution.
+            restart: See the class docstring.
         """
         self.lab = lab
         self.survey = survey
         self.checkpoint = checkpoint
+        if checkpoint is not None:
+            self._bind_checkpoint(restart)
         self.completed: List[int] = []
         #: Acquired SurfaceScan/ProfileResult objects, one per pass that
         #: actually ran — only populated when run(keep_results=True). Empty
@@ -759,6 +826,47 @@ class SurveyRunner:
         #: (a full-resolution Gocator surface is hundreds of MB) is real
         #: cost most callers don't want by default.
         self.results: List[Any] = []
+
+    def _bind_checkpoint(self, restart: bool) -> None:
+        """Tie the checkpoint to this survey's geometry, or refuse a mismatch.
+
+        Checked at construction, before anything moves. A checkpoint with no
+        completed passes carries nothing to protect and is simply stamped.
+
+        Args:
+            restart: Move any existing progress aside and start over.
+
+        Raises:
+            SurveyCheckpointMismatch: See the class docstring.
+        """
+        wanted = self.survey.fingerprint()
+        stored = self.checkpoint.meta.get(_FINGERPRINT_KEY)
+        has_progress = self.checkpoint.last_completed() is not None
+
+        if restart:
+            if has_progress or stored is not None:
+                self.checkpoint.clear()
+            self.checkpoint.set_meta(_FINGERPRINT_KEY, wanted)
+            return
+        if stored == wanted:
+            return
+        if stored is None and not has_progress:
+            self.checkpoint.set_meta(_FINGERPRINT_KEY, wanted)
+            return
+        done = sorted(
+            i for i in range(len(self.survey)) if self.checkpoint.is_complete(i)
+        )
+        if stored is None:
+            why = "it records no survey geometry (written before fingerprints existed)"
+        else:
+            why = f"it was made for a different geometry (fingerprint {stored}, now {wanted})"
+        raise SurveyCheckpointMismatch(
+            f"Refusing to resume: checkpoint has passes {done} complete, but {why}. "
+            "Resuming would skip passes this survey never ran. Nothing was deleted. "
+            "Pass restart=True to move the old checkpoint aside and start over, or, "
+            "if you know the geometry is unchanged, adopt it with "
+            f"checkpoint.set_meta({_FINGERPRINT_KEY!r}, survey.fingerprint())."
+        )
 
     def pending(self) -> List[Pass]:
         """Get the list of passes not yet completed.
@@ -1120,4 +1228,4 @@ class SurveyRunner:
         ]
 
 
-__all__ = ["Pass", "Survey", "Tile", "Traverse", "SurveyRunner"]
+__all__ = ["Pass", "Survey", "SurveyCheckpointMismatch", "Tile", "Traverse", "SurveyRunner"]
