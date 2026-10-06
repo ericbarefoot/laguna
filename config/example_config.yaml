@@ -292,7 +292,8 @@ gocator:
   # interval_s: 600           # scan every 10 minutes
   # trigger_at: [0, 900, 1800]  # scan at these runtime seconds
   # use_schedule: true        # scan at schedule CSV rows with a gocator column set
-  output_dir: ./data/scans
+  # output_dir: ./data/scans  # default. Setting it explicitly overrides timing.run_dir:
+  #                           # scans then stay here instead of under the run directory.
   sdk_lib_dir: null           # dir holding libGoSdk.so/libkApi.so. Omit to use
                                # $LAGUNA_GOSDK_LIB_DIR or a conventional path —
                                # build them first with scripts/build_gosdk.sh

@@ -47,6 +47,54 @@ class TestRunDirectory:
         assert ctx.directory.is_dir()
 
 
+class TestExplicitOutputDirWins:
+    """GH #43: a deliberately configured output_dir must beat the run directory."""
+
+    def test_configured_dir_beats_run_directory(self, tmp_path):
+        ctx = RunContext(root=str(tmp_path / "runs"), run_id="R")
+        elsewhere = tmp_path / "other_drive" / "scans"
+        assert ctx.path_for("gocator", "./data/scans", configured_dir=str(elsewhere)) == elsewhere
+
+    def test_configured_dir_is_not_created_by_path_for(self, tmp_path):
+        ctx = RunContext(root=str(tmp_path / "runs"), run_id="R")
+        elsewhere = tmp_path / "other_drive" / "scans"
+        ctx.path_for("gocator", "./data/scans", configured_dir=str(elsewhere))
+        assert not elsewhere.exists()
+        assert not (ctx.directory / "gocator").exists()
+
+    def test_configured_dir_without_run_directory_is_unchanged(self):
+        assert str(RunContext().path_for("gocator", "./d", configured_dir="./mine")) == "mine"
+
+    def test_unset_configured_dir_still_uses_run_directory(self, tmp_path):
+        ctx = RunContext(root=str(tmp_path), run_id="R")
+        assert ctx.path_for("gocator", "./d", configured_dir=None) == tmp_path / "R" / "gocator"
+
+
+class TestGocatorRunDirectoryRouting:
+    """setup_run() must pass only a *user-set* gocator.output_dir as explicit."""
+
+    def _lab(self, tmp_path, gocator_extra):
+        import yaml
+
+        from laguna.experiment.runner import setup_run
+
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.safe_dump({
+            "timing": {"run_dir": str(tmp_path / "runs")},
+            "gocator": dict(gocator_extra),
+        }))
+        return setup_run(str(path), simulate=True)
+
+    def test_unset_output_dir_goes_under_run_directory(self, tmp_path):
+        lab = self._lab(tmp_path, {})
+        assert lab.gocator._output_dir == lab.run.directory / "gocator"
+
+    def test_explicit_output_dir_is_kept(self, tmp_path):
+        mine = tmp_path / "separate_drive"
+        lab = self._lab(tmp_path, {"output_dir": str(mine)})
+        assert lab.gocator._output_dir == mine
+
+
 class TestTimeline:
     def _ctx(self, tmp_path):
         return RunContext(root=str(tmp_path), run_id="R")
