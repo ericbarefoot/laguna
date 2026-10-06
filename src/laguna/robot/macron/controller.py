@@ -56,6 +56,41 @@ _NAMED_AXES = {
 }
 
 
+#: Coordinated-group numbers the controller firmware accepts (``C<n>``,
+#: see docs/MACRON_GANTRY.md).
+_GROUP_INDEX_RANGE = (1, 10)
+
+
+def _validate_group_indices(group_index: int, theta_group_index: int) -> None:
+    """Reject group indices that would alias or that the firmware can't address.
+
+    X/Y (commander node) and Z/Theta (responder node) each need their own
+    coordinated group. Equal indices would make ``INI`` on one re-define the
+    other, and every concurrent-pair move would then talk to a group whose
+    axes are not the ones it expects.
+
+    Args:
+        group_index: Coordinated group for X/Y.
+        theta_group_index: Coordinated group for Z/Theta.
+
+    Raises:
+        ValueError: If the two are equal or either is outside 1..10.
+    """
+    low, high = _GROUP_INDEX_RANGE
+    for label, value in (("group_index", group_index), ("theta_group_index", theta_group_index)):
+        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+            raise ValueError(
+                f"{label}={value!r} is outside the controller's coordinated-group "
+                f"range {low}..{high}"
+            )
+    if group_index == theta_group_index:
+        raise ValueError(
+            f"group_index and theta_group_index are both {group_index}: X/Y and "
+            "Z/Theta must use different coordinated groups. Change "
+            "theta_group_index in the gantry config (default 2)."
+        )
+
+
 def _resolve_axis(name: str, index: int) -> Axis:
     """Return the known named Axis singleton if name/index match one, else a fresh Axis.
 
@@ -152,7 +187,12 @@ class GantryController:
                 overrides, either value optional. Written to the
                 controller's NLT/PLT registers by connect() — see
                 _apply_soft_limits().
+
+        Raises:
+            ValueError: If `group_index` and `theta_group_index` are equal,
+                or either is outside the firmware's 1..10 group range.
         """
+        _validate_group_indices(group_index, theta_group_index)
         self._connection = connection
         #: Shared gantry lock — see laguna.robot.motion_arbiter.
         self.arbiter = arbiter or DEFAULT_ARBITER
