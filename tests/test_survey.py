@@ -1491,3 +1491,100 @@ class TestScanSpeedResolution:
         with pytest.raises(RuntimeError, match="not connected"):
             SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run()
         assert lab.placed == []
+
+
+class _RawScanScanner(FakeScanner):
+    """Returns a real raw SurfaceScan anchored where the pass starts."""
+
+    def acquire(self, gantry=None, **kw):
+        self.acquired.append(kw)
+        return _raw_scan([0.0, 0.0, 0.0] if len(self.acquired) == 1 else [0.0, 500.0, 0.0])
+
+
+class TestPlaceResults:
+    """GH #46: the runner can hand back results already in the experiment frame."""
+
+    @staticmethod
+    def _tile():
+        return Tile(origin=(0.0, 0.0, 0.0), length_mm=20.0, width_mm=520.0,
+                    swath_mm=500.0, overlap=0.0, scan_speed=20.0)
+
+    def _lab(self):
+        lab = FakeLab()
+        lab.gocator = _RawScanScanner()
+        return lab
+
+    def test_off_by_default(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(keep_results=True)
+        assert runner.placed == []
+
+    def test_placed_results_are_oriented_scans_in_pass_order(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        done = runner.run(place_results=True)
+        assert len(runner.placed) == len(done) == 2
+        # Pass 2 sits 500 mm further along Y in the experiment frame.
+        y0 = runner.placed[0].to_points(drop_invalid=True)[:, 1].min()
+        y1 = runner.placed[1].to_points(drop_invalid=True)[:, 1].min()
+        assert y1 - y0 == pytest.approx(500.0)
+
+    def test_the_raw_results_are_left_untouched(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(keep_results=True, place_results=True)
+        assert runner.results[1].metadata["gantry_start"] == [0.0, 500.0, 0.0]
+        assert runner.results[1].is_uniform is True           # not replaced by the placed copy
+        assert runner.placed[1].is_uniform is False
+
+    def test_placement_is_independent_of_keeping_raw_results(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(place_results=True)
+        assert runner.results == [] and len(runner.placed) == 2
+
+    def test_a_placement_failure_never_aborts_the_survey(self, monkeypatch):
+        import laguna.frames as frames_module
+
+        def broken(*a, **k):
+            raise ValueError("no start position")
+
+        monkeypatch.setattr(frames_module, "orient_scan", broken)
+        lab = self._lab()
+        runner = SurveyRunner(lab, self._tile())
+        done = runner.run(place_results=True)
+        assert len(done) == 2 and runner.completed == [0, 1]    # both passes still ran
+        assert runner.placed == [None, None]
+        assert any(row[0][2] == "survey_place" and "no start position" in row[1]["result"]
+                   for row in lab.event_log.rows)
+
+    def test_dry_run_places_nothing(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(dry_run=True, place_results=True)
+        assert runner.placed == []
+
+    def test_rangefinder_results_go_through_orient_profile(self, monkeypatch):
+        import laguna.robot.macron.profiler as profiler_module
+
+        seen = {}
+
+        def fake_orient(result, *, instrument, frames, config=None, axis=None, **kw):
+            seen.update(result=result, instrument=instrument, axis=axis)
+            return "placed-profile"
+
+        monkeypatch.setattr(profiler_module, "orient_profile", fake_orient)
+        lab = FakeLab()
+        lab.od2000 = object()               # no acquire(): the profiler path
+
+        class _Gantry:
+            _axes = [Axis("X", 1), Axis("Y", 2), Axis("Z", 5), Axis("Theta", 6)]
+
+            class cmd:
+                @staticmethod
+                def get_actual_position(axis):
+                    return 0.0
+
+        lab.gantry = _Gantry()
+        lab.acquire_scan = lambda *a, **k: type("R", (), {"path": "/tmp/x.csv"})()
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000",), scan_speed=10.0)
+        runner = SurveyRunner(lab, survey)
+        runner.run(place_results=True)
+        assert runner.placed == ["placed-profile"]
+        assert seen["instrument"] == "od2000" and seen["axis"] == "X"

@@ -844,6 +844,11 @@ class SurveyRunner:
         #: (a full-resolution Gocator surface is hundreds of MB) is real
         #: cost most callers don't want by default.
         self.results: List[Any] = []
+        #: Each pass's result placed in experiment coordinates — populated only
+        #: when run(place_results=True), same order as the returned passes.
+        #: ``None`` for a pass whose placement failed (the raw result is
+        #: still in ``results`` if kept, and on disk). Never replaces raw data.
+        self.placed: List[Any] = []
 
     def _bind_checkpoint(self, restart: bool) -> None:
         """Tie the checkpoint to this survey's geometry, or refuse a mismatch.
@@ -896,7 +901,9 @@ class SurveyRunner:
             return list(self.survey.passes())
         return [p for p in self.survey.passes() if not self.checkpoint.is_complete(p.index)]
 
-    def run(self, dry_run: bool = False, keep_results: bool = False) -> List[Pass]:
+    def run(
+        self, dry_run: bool = False, keep_results: bool = False, place_results: bool = False
+    ) -> List[Pass]:
         """Execute all pending passes in order.
 
         Args:
@@ -907,6 +914,15 @@ class SurveyRunner:
                 ``done[i]`` measured). Off by default: a long survey holding
                 every scan in memory (a full-resolution Gocator surface is
                 hundreds of MB) is real cost most callers don't want.
+            place_results: If True, also place each pass's result in
+                experiment coordinates through the lab's FrameRegistry
+                (``orient_scan`` for a Gocator surface, ``orient_profile`` for
+                a rangefinder transect) into ``self.placed``. The raw result
+                is never altered or replaced — placement builds a copy, which
+                roughly doubles what's held in memory per pass. A placement
+                that fails is logged to the event log and leaves ``None``
+                for that pass; it never aborts the survey, since the raw data
+                is already captured.
 
         Returns:
             The passes that were executed.
@@ -944,6 +960,8 @@ class SurveyRunner:
             result = self._run_pass(p, reference_point)
             if keep_results:
                 self.results.append(result)
+            if place_results:
+                self.placed.append(self._place_result(p, result))
             done.append(p)
             self.completed.append(p.index)
             if self.checkpoint is not None:
@@ -972,6 +990,46 @@ class SurveyRunner:
         if not hasattr(frames, "gantry_axis_for"):
             return experiment_axis
         return frames.gantry_axis_for(experiment_axis)
+
+    def _place_result(self, p: Pass, result: Any) -> Any:
+        """Place one pass's result in experiment coordinates, or return None on failure.
+
+        Placement is a convenience layered on data that is already acquired,
+        so it must not take the survey down: a failure is recorded and the
+        survey carries on collecting.
+
+        Args:
+            p: The pass that produced `result`.
+            result: A SurfaceScan (instrument has ``acquire()``) or a
+                rangefinder ProfileResult.
+
+        Returns:
+            The placed copy, or None if placement raised.
+        """
+        try:
+            scanner = getattr(self.lab, p.instrument, None)
+            if scanner is not None and hasattr(scanner, "acquire"):
+                from .frames import orient_scan
+
+                return orient_scan(result, instrument=p.instrument, frames=self.lab.frames)
+            from .robot.macron.profiler import orient_profile
+
+            try:
+                config = self.lab.config.get(p.instrument)
+            except Exception:
+                config = None
+            return orient_profile(
+                result, instrument=p.instrument, frames=self.lab.frames, config=config,
+                axis=p.axis,
+            )
+        except Exception as exc:
+            logger.error("Could not place pass %d (%s) in the experiment frame: %s",
+                         p.index, p.instrument, exc)
+            self.lab.event_log.log(
+                self.lab.clock.elapsed(), p.instrument, "survey_place",
+                result=f"error: {exc}", notes=p.label or "",
+            )
+            return None
 
     def _resolve_scan_speeds(self, dry_run: bool) -> None:
         """Pick a scan speed for instruments whose passes don't carry one.
