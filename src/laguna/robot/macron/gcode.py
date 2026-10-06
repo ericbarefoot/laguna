@@ -150,6 +150,16 @@ class GCodeExecutionAborted(Exception):
     """Raised when confirm_cb rejects a motion or control segment during execute()."""
 
 
+class RampRestoreError(RuntimeError):
+    """A scaled ACL/DCL/SPD could not be put back after a concurrent-pair move.
+
+    The controller may still hold the scaled-down values. Because a reduced
+    accel/decel also lengthens how far ``pause()``/``stop()`` coast, the
+    executor refuses to start any further motion until a retry of the
+    restore succeeds (see GCodeExecutor.retry_ramp_restore()).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
@@ -695,6 +705,11 @@ class GCodeExecutor:
         self._theta_group_initialized = False
         # Set only for the duration of one execute() call — see _issue().
         self._guard: Optional[MotionGuard] = None
+        # Ramp/speed restores that failed after a concurrent-pair move, as
+        # (description, write) pairs. Non-empty means the controller may hold
+        # a scaled-down ACL/DCL/SPD: execute() retries them first and refuses
+        # to move while any still fail. See _execute_concurrent_pair.
+        self._pending_restores: List[Tuple[str, Callable[[], None]]] = []
 
     @property
     def dry_run(self) -> bool:
@@ -747,6 +762,10 @@ class GCodeExecutor:
                 "execute() must be called with the exact CheckedTrajectory object "
                 "returned by the most recent plan() call"
             )
+        # Checked before the plan is consumed so a refusal leaves it in place
+        # to re-run once the restore has succeeded — it is raised before any
+        # move starts, so the planned position is still valid.
+        self._require_ramps_restored()
         program = self._pending_program
         # Consumed whether or not the run completes: a program cancelled
         # partway must be re-planned from wherever the gantry actually
@@ -1002,7 +1021,15 @@ class GCodeExecutor:
         logger.debug("%s", self._describe_linear(move, touches_xy, responder))
 
         if touches_xy and responder != "none":
-            self._execute_concurrent_pair(move, responder)
+            try:
+                self._execute_concurrent_pair(move, responder)
+            except RampRestoreError:
+                # The move itself completed; only the ramp restore failed.
+                # The position cache must still follow the gantry, or the
+                # next move (once the restore is retried) plans from a
+                # stale point.
+                self._sync_position_from_hardware(touches_xy, responder)
+                raise
         elif touches_xy:
             self._execute_xy_leg(move)
         elif responder == "z":
@@ -1345,6 +1372,14 @@ class GCodeExecutor:
         this method's own duration-matching intent can silently degrade
         to "both legs run, just not duration-matched" rather than
         failing the move outright.
+
+        Restore failures are never silent (see _finish_ramp_restore and
+        _require_ramps_restored): each restore is attempted independently, a
+        failure raises RampRestoreError if the move itself succeeded (or is
+        attached as a note to the move's own error), and further motion is
+        refused until a retry succeeds. That refuse-until-restored policy is
+        a deliberate, conservative design choice — revisit it if bench use
+        shows these writes fail transiently and harmlessly.
         """
         current_pos = self._current_pos
         current_theta = self._current_theta
@@ -1414,6 +1449,7 @@ class GCodeExecutor:
         # group_abort() (issued by the poll helpers on timeout) are
         # immediate, not ramped, so writing ACL/DCL afterward doesn't fight
         # an in-flight stop.
+        body_exc: Optional[BaseException] = None
         try:
             if responder == "z":
                 self._begin_z_leg(move, speed=responder_speed, ramp=responder_ramp)
@@ -1446,26 +1482,130 @@ class GCodeExecutor:
                 move, current_pos, speed=xy_speed,
                 already_elapsed_s=time.monotonic() - fired_at,
             )
+        except BaseException as exc:
+            body_exc = exc
+            raise
         finally:
-            # Best-effort: if the try block above already failed (e.g. a
-            # poll timeout), that's the failure the caller needs to see —
-            # don't let a second failure here (e.g. a dropped connection)
-            # replace it in the traceback and hide why the move actually
-            # stopped. Log and move on instead of re-raising.
+            restores: List[Tuple[str, Callable[[], None]]] = []
+            if restore_responder_ramp is not None:
+                restores.append((
+                    f"{responder} ACL/DCL -> {restore_responder_ramp}",
+                    lambda: self._set_responder_ramp(responder, *restore_responder_ramp),
+                ))
+            if restore_responder_speed is not None:
+                restores.append((
+                    f"{responder} SPD -> {restore_responder_speed}",
+                    lambda: self._set_responder_speed(responder, restore_responder_speed),
+                ))
+            if restore_xy_ramp is not None:
+                restores.append((
+                    f"X/Y ACL/DCL -> {restore_xy_ramp}",
+                    lambda: self._set_xy_ramp(*restore_xy_ramp),
+                ))
+            if restore_xy_speed is not None:
+                restores.append((
+                    f"X/Y SPD -> {restore_xy_speed}",
+                    lambda: self._set_xy_speed(restore_xy_speed),
+                ))
+            self._finish_ramp_restore(restores, body_exc)
+
+    def _finish_ramp_restore(
+        self,
+        restores: List[Tuple[str, Callable[[], None]]],
+        body_exc: Optional[BaseException],
+    ) -> None:
+        """Run each restore independently; surface any that fail, never hide the move's own error.
+
+        Every restore is attempted even if an earlier one fails — they touch
+        different registers, and stopping at the first would leave later ones
+        scaled for no reason. Whatever still fails is kept in
+        ``_pending_restores`` so the next execute() retries it and, until it
+        succeeds, refuses to move.
+
+        Args:
+            restores: ``(description, write)`` pairs, in restore order.
+            body_exc: The exception the move itself raised, or None if it
+                completed. It stays the primary error: restore failures are
+                logged and attached to it as a note, and not raised over it.
+
+        Raises:
+            RampRestoreError: If the move completed but a restore failed.
+                (Never raised while `body_exc` is propagating.)
+        """
+        failed: List[Tuple[str, Callable[[], None], Exception]] = []
+        for description, write in restores:
             try:
-                if restore_responder_ramp is not None:
-                    self._set_responder_ramp(responder, *restore_responder_ramp)
-                if restore_responder_speed is not None:
-                    self._set_responder_speed(responder, restore_responder_speed)
-                if restore_xy_ramp is not None:
-                    self._set_xy_ramp(*restore_xy_ramp)
-                if restore_xy_speed is not None:
-                    self._set_xy_speed(restore_xy_speed)
-            except Exception:
-                logger.exception(
-                    "Failed to restore ramp/speed after a concurrent-pair move — "
-                    "an axis may be left with a scaled-down ACL/DCL/SPD"
-                )
+                write()
+            except Exception as exc:
+                failed.append((description, write, exc))
+        if not failed:
+            return
+
+        self._pending_restores.extend((d, w) for d, w, _ in failed)
+        detail = "; ".join(f"{d}: {e!r}" for d, _, e in failed)
+        message = (
+            f"could not restore {len(failed)} ramp/speed setting(s) after a "
+            f"concurrent-pair move ({detail}). The controller may still hold a "
+            "scaled-down ACL/DCL/SPD, which lengthens pause()/stop() coasting; "
+            "no further motion will start until a retry succeeds."
+        )
+        logger.error("%s", message)
+        if body_exc is not None:
+            body_exc.add_note(message)
+            return
+        raise RampRestoreError(message) from failed[0][2]
+
+    @property
+    def ramp_restore_pending(self) -> bool:
+        """True while a failed ramp/speed restore is still outstanding.
+
+        While True, execute() refuses to start motion (see
+        retry_ramp_restore()).
+        """
+        return bool(self._pending_restores)
+
+    def retry_ramp_restore(self) -> bool:
+        """Re-send every ramp/speed restore that previously failed.
+
+        Writes controller registers only — it commands no motion, so it is safe
+        to call while halted or from a recovery script. execute() calls it
+        automatically before each run.
+
+        Returns:
+            True if nothing is pending afterwards, False if any write still fails.
+        """
+        still_pending: List[Tuple[str, Callable[[], None]]] = []
+        for description, write in self._pending_restores:
+            try:
+                write()
+            except Exception as exc:
+                logger.warning("retry of %s failed: %r", description, exc)
+                still_pending.append((description, write))
+        self._pending_restores = still_pending
+        return not still_pending
+
+    def _require_ramps_restored(self) -> None:
+        """Refuse to start motion while a ramp/speed restore is unresolved.
+
+        Design choice worth revisiting after hardware use: this *refuses*
+        motion, rather than only warning. It is the conservative reading of
+        the safety hierarchy — a stuck-low ACL/DCL silently lengthens how
+        far pause()/stop() coast — but it also means one dropped write can
+        block a run until retry_ramp_restore() succeeds. If bench use shows
+        such writes are routinely transient and harmless, relaxing this to
+        log-and-retry is a one-line change here.
+
+        Raises:
+            RampRestoreError: If a retry of the outstanding restores fails.
+        """
+        if self._dry_run or not self._pending_restores:
+            return
+        if not self.retry_ramp_restore():
+            pending = "; ".join(d for d, _ in self._pending_restores)
+            raise RampRestoreError(
+                f"refusing to start motion: ramp/speed restore still failing ({pending}). "
+                "Fix the controller connection, then call retry_ramp_restore()."
+            )
 
     def _describe_linear(self, move: GCodeMove, touches_xy: bool, responder: str) -> str:
         """Render the ASCII commands _execute_linear would send, for dry-run logging.
