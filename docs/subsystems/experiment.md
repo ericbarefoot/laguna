@@ -178,6 +178,61 @@ separate concern from an *overlapping firing* — `SurveyRunner.run()`
 re-raises on a pass failure, which propagates out of the closure and
 still needs handling; see `example_14` for one way to do that.)
 
+### Surveys straight from the config file
+
+A multi-pass survey doesn't need a hand-written hook. A `surveys:` section
+makes each entry a scheduled action, validated and registered by
+`setup_run()` the same way as a camera capture:
+
+```yaml
+surveys:
+  bed_tile:
+    kind: tile              # tile | traverse
+    instrument: gocator
+    origin: [0, 0, 0]
+    length_mm: 1000
+    width_mm: 600
+    swath_mm: auto          # a number, or auto = read the live active area each firing
+    scan_speed: 20          # omit to let the scanner choose — see max_scan_speed_mm_s
+    max_scan_speed_mm_s: 40 # ceiling for a speed chosen from solve_scan_rates()
+    interval_s: 1800        # or trigger_at: [0, 900, 1800]
+```
+
+Everything except the scheduling keys is the planner's own constructor
+argument (`Tile` / `Traverse`), so there is one vocabulary. A typo'd key is an
+error, not a silently ignored default. Everything that can be wrong with a plan
+fails at setup, **before anything connects or moves**: bad geometry, an unknown
+key, an instrument the lab doesn't have, no `gantry:` section, no schedule.
+`use_schedule` isn't supported for surveys.
+
+Motion is unchanged: each pass goes through the gantry's `safe_mode`, fence
+checks and the motion arbiter like any other move, and starting the run script
+is the human "go". With `safe_mode` on, setup warns that every pass will be
+refused.
+
+**Each firing runs the whole plan again**, against a fresh checkpoint
+(`<run dir>/surveys/<name>_<NNNN>.checkpoint.json`; kept, never deleted). A
+firing interrupted by a pause is *not* resumed automatically — the checkpoint
+records exactly which passes finished, so resume it by hand with
+`SurveyRunner(lab, survey, checkpoint=CheckpointStore(path, resume=True))`. A
+failed survey escalates to a lab-wide pause naming that checkpoint; a deliberate
+halt (`MotionHalted`) is logged without escalating a second time.
+
+Resuming against a checkpoint made for different geometry is refused
+(`SurveyCheckpointMismatch`): the checkpoint stores a fingerprint of what each
+pass measures, and `SurveyRunner(..., restart=True)` moves the old file aside
+and starts over.
+
+**Scan speed.** A pass with no `scan_speed` takes, in order: the scanner's
+configured `scan.feed_rate_mm_s`, then `solve_scan_rates()` — but never above
+`max_scan_speed_mm_s`, which is required for that automatic choice. The fastest
+rate the sensor can sample isn't necessarily one to drive the gantry at, so a
+person names the limit.
+
+**Experiment-frame results.** `SurveyRunner.run(place_results=True)` also fills
+`runner.placed` with each pass's result in experiment coordinates; the raw
+result is never replaced.
+
 ## `run_blocking()` — pause/resume without dropping hardware connections
 
 Built for interactive CLI use. It writes `.experiment.pid` (removed on
