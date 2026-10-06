@@ -37,6 +37,7 @@ start, which has no such constraint and can usually go faster). Pass
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -792,6 +793,14 @@ class SurveyRunner:
             stored in it, and a checkpoint with completed passes made for a
             *different* geometry — or by a version that recorded none — is
             refused rather than trusted (see ``restart``).
+        max_scan_speed_mm_s: Ceiling for a feed rate the runner chooses itself.
+            A pass with no ``scan_speed`` of its own, on an instrument with no
+            configured rate, gets one from the scanner's
+            ``solve_scan_rates()`` — the fastest feed that still samples as
+            finely along travel as across it — but never above this. Required
+            for that automatic choice: the fastest rate the sensor can
+            sample is not necessarily one the gantry should be driven at, so
+            a person names the limit. Ignored when every pass has a speed.
         restart: Start over against `checkpoint` instead of refusing a
             mismatch. The old checkpoint is moved aside, never deleted
             (``CheckpointStore.clear()``), so the record of what the earlier
@@ -804,7 +813,12 @@ class SurveyRunner:
     """
 
     def __init__(
-        self, lab: Any, survey: Survey, checkpoint: Optional[Any] = None, restart: bool = False
+        self,
+        lab: Any,
+        survey: Survey,
+        checkpoint: Optional[Any] = None,
+        restart: bool = False,
+        max_scan_speed_mm_s: Optional[float] = None,
     ) -> None:
         """Initialize a survey runner.
 
@@ -813,10 +827,14 @@ class SurveyRunner:
             survey: The survey plan to execute.
             checkpoint: Optional CheckpointStore for resumable execution.
             restart: See the class docstring.
+            max_scan_speed_mm_s: See the class docstring.
         """
         self.lab = lab
         self.survey = survey
         self.checkpoint = checkpoint
+        self.max_scan_speed_mm_s = max_scan_speed_mm_s
+        #: instrument -> scan speed this runner resolved for passes that had none.
+        self.resolved_speeds: Dict[str, float] = {}
         if checkpoint is not None:
             self._bind_checkpoint(restart)
         self.completed: List[int] = []
@@ -893,11 +911,13 @@ class SurveyRunner:
         Returns:
             The passes that were executed.
         """
+        self._resolve_scan_speeds(dry_run)
         self._fill_tile_accel()
         for p in self.survey.passes():
             self._gantry_axis_for(p.axis)      # fail before any motion, not mid-survey
         done: List[Pass] = []
         for p in self.pending():
+            p = self._with_resolved_speed(p)
             reference_point = self._resolve_reference_point(p)
             gantry_start = self.lab.frames.gantry_target_for(
                 p.instrument, list(p.start), reference_point=reference_point
@@ -952,6 +972,83 @@ class SurveyRunner:
         if not hasattr(frames, "gantry_axis_for"):
             return experiment_axis
         return frames.gantry_axis_for(experiment_axis)
+
+    def _resolve_scan_speeds(self, dry_run: bool) -> None:
+        """Pick a scan speed for instruments whose passes don't carry one.
+
+        Precedence, highest first: the survey/pass's own ``scan_speed`` (never
+        touched); the scanner's configured ``scan.feed_rate_mm_s`` (what
+        ``acquire()`` would use anyway — read here so a ``Tile`` plans its ramp
+        lead-in around the real rate); then the scanner's
+        ``solve_scan_rates()``, capped at ``max_scan_speed_mm_s``. Only
+        instruments with a ``solve_scan_rates()`` take part: a rangefinder pass
+        with no speed still fails loudly later, as before.
+
+        A ``Tile`` runs a single instrument, so its own ``scan_speed`` is
+        filled in (needed before ``passes()`` is asked for the ramp). Other
+        surveys get the speed applied per pass by :meth:`_with_resolved_speed`.
+        Must run before ``_fill_tile_accel()``/``pending()``.
+
+        Args:
+            dry_run: A dry run with the scanner unreachable logs the gap and
+                leaves the speed unset instead of raising.
+
+        Raises:
+            ValueError: A solved speed is needed but no ceiling was given.
+            RuntimeError: The scanner can't solve (e.g. not connected) on a
+                real run.
+        """
+        instruments = {p.instrument for p in self.survey.passes() if p.scan_speed is None}
+        for instrument in sorted(instruments):
+            scanner = getattr(self.lab, instrument, None)
+            if scanner is None or not hasattr(scanner, "solve_scan_rates"):
+                continue
+            try:
+                speed, source = self._choose_scan_speed(instrument, scanner)
+            except RuntimeError as exc:
+                if not dry_run:
+                    raise
+                logger.warning("dry run: no scan speed for %s yet (%s)", instrument, exc)
+                continue
+            self.resolved_speeds[instrument] = speed
+            logger.info("Scan speed for %s passes: %.3f mm/s (%s)", instrument, speed, source)
+        if (
+            isinstance(self.survey, Tile)
+            and self.survey.scan_speed is None
+            and self.survey.instrument in self.resolved_speeds
+        ):
+            self.survey.scan_speed = self.resolved_speeds[self.survey.instrument]
+
+    def _choose_scan_speed(self, instrument: str, scanner: Any) -> Tuple[float, str]:
+        """The speed to use for `instrument`, and where it came from."""
+        configured = getattr(scanner, "configured_feed_rate_mm_s", None)
+        if configured:
+            return float(configured), "scanner's configured scan.feed_rate_mm_s"
+        if self.max_scan_speed_mm_s is None:
+            raise ValueError(
+                f"{instrument} passes have no scan_speed and the scanner has no configured "
+                "scan.feed_rate_mm_s. Set scan_speed on the survey, or give "
+                "SurveyRunner(max_scan_speed_mm_s=...) to let the scanner's "
+                "solve_scan_rates() choose a rate up to that limit — the fastest "
+                "rate the sensor can sample isn't necessarily one to drive the gantry at."
+            )
+        solved = float(scanner.solve_scan_rates()["feed_rate_mm_s"])
+        if solved <= self.max_scan_speed_mm_s:
+            return solved, "solve_scan_rates()"
+        logger.warning(
+            "%s: solve_scan_rates() suggests %.3f mm/s; capped at max_scan_speed_mm_s=%.3f",
+            instrument, solved, self.max_scan_speed_mm_s,
+        )
+        capped = float(self.max_scan_speed_mm_s)
+        scanner.solve_scan_rates(feed_rate_mm_s=capped)   # logs the frame rate/Y spacing at the cap
+        return capped, f"solve_scan_rates(), capped at {capped:g}"
+
+    def _with_resolved_speed(self, p: Pass) -> Pass:
+        """`p` with this runner's resolved scan speed filled in, if it had none."""
+        if p.scan_speed is not None:
+            return p
+        speed = self.resolved_speeds.get(p.instrument)
+        return p if speed is None else dataclasses.replace(p, scan_speed=speed)
 
     def _fill_tile_accel(self) -> None:
         """Read the travel axis's accel into a Tile survey that didn't set one.

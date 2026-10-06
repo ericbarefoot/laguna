@@ -1380,3 +1380,114 @@ class TestCheckpointStoreMeta:
         path.write_text(json.dumps({"events": [{"id": 3, "runtime_s": 1, "wall_time": 2, "name": ""}]}))
         store = CheckpointStore(str(path), resume=True)
         assert store.is_complete(3) and store.meta == {}
+
+
+class _SolvingScanner(FakeScanner):
+    """FakeScanner with the rate-solving surface GocatorScanner has."""
+
+    def __init__(self, solved=60.0, configured=None, connected=True):
+        super().__init__()
+        self._solved = solved
+        self.configured_feed_rate_mm_s = configured
+        self._connected = connected
+        self.solve_calls = []
+
+    def solve_scan_rates(self, feed_rate_mm_s=None, **kw):
+        self.solve_calls.append(feed_rate_mm_s)
+        if not self._connected:
+            raise RuntimeError("not connected")
+        return {"feed_rate_mm_s": self._solved if feed_rate_mm_s is None else feed_rate_mm_s}
+
+
+class TestScanSpeedResolution:
+    """GH #44: a pass with no speed gets one from the scanner — never an unreviewed fast one."""
+
+    @staticmethod
+    def _tile(**kw):
+        base = dict(origin=(0.0, 0.0, 0.0), length_mm=100.0, width_mm=1000.0,
+                    swath_mm=1000.0, overlap=0.0)
+        base.update(kw)
+        return Tile(**base)
+
+    def _lab(self, **scanner_kw):
+        lab = FakeLab()
+        lab.gocator = _SolvingScanner(**scanner_kw)
+        return lab
+
+    def test_an_explicit_speed_is_never_touched(self):
+        lab = self._lab(solved=99.0)
+        SurveyRunner(lab, self._tile(scan_speed=20.0)).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 20.0
+        assert lab.gocator.solve_calls == []
+
+    def test_a_scanner_configured_rate_beats_the_solver(self):
+        lab = self._lab(solved=99.0, configured=15.0)
+        SurveyRunner(lab, self._tile()).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 15.0
+        assert lab.gocator.solve_calls == []
+
+    def test_without_a_ceiling_the_solver_is_not_trusted_to_pick_alone(self):
+        lab = self._lab(solved=99.0)
+        with pytest.raises(ValueError, match="max_scan_speed_mm_s"):
+            SurveyRunner(lab, self._tile()).run()
+        assert lab.placed == [] and lab.gocator.acquired == []     # nothing moved
+
+    def test_the_solved_rate_is_used_when_under_the_ceiling(self):
+        lab = self._lab(solved=12.0)
+        SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 12.0
+
+    def test_the_solved_rate_is_capped_at_the_ceiling(self, caplog):
+        lab = self._lab(solved=62.0)
+        with caplog.at_level("WARNING"):
+            SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=25.0).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 25.0
+        assert "capped" in caplog.text
+        assert 25.0 in lab.gocator.solve_calls          # re-solved so the frame rate matches
+
+    def test_every_pass_gets_the_resolved_rate(self):
+        lab = self._lab(solved=10.0)
+        survey = self._tile(width_mm=2000.0)
+        runner = SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0)
+        done = runner.run()
+        assert [k["feed_rate_mm_s"] for k in lab.gocator.acquired] == [10.0, 10.0]
+        assert all(p.scan_speed == 10.0 for p in done)
+        assert runner.resolved_speeds == {"gocator": 10.0}
+
+    def test_the_tile_ramp_lead_in_is_planned_around_the_resolved_rate(self):
+        """Without a speed the ramp distance is 0, so resolving it first is what
+        gives an auto-rate tile the #58 lead-in at all."""
+        lab = self._lab(solved=20.0)
+        lab.gantry = TestRampLeadInIntegration.FakeGantryWithAccel(accel_mm_s2=100.0)
+        SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run()
+        assert lab.placed[0][1][0] != lab.gocator.acquired[0]["cruise_start_mm"]
+
+    def test_a_traverse_resolves_per_pass_without_touching_the_plan(self):
+        lab = self._lab(solved=8.0)
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0))
+        SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 8.0
+        assert survey.scan_speed is None
+
+    def test_instruments_without_a_solver_are_left_to_fail_loudly(self):
+        """A rangefinder has no solve_scan_rates(); its existing 'no scan_speed'
+        error must still fire rather than being papered over."""
+        lab = FakeLab()
+        lab.od2000 = object()
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000",))
+        with pytest.raises(Exception):
+            SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0).run()
+        assert SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0).resolved_speeds == {}
+
+    def test_dry_run_with_an_unreachable_scanner_logs_instead_of_raising(self, caplog):
+        lab = self._lab(connected=False)
+        with caplog.at_level("WARNING"):
+            done = SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run(dry_run=True)
+        assert len(done) == 1
+        assert "no scan speed" in caplog.text
+
+    def test_a_real_run_with_an_unreachable_scanner_raises(self):
+        lab = self._lab(connected=False)
+        with pytest.raises(RuntimeError, match="not connected"):
+            SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run()
+        assert lab.placed == []

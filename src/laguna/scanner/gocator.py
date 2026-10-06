@@ -210,6 +210,18 @@ class GocatorScanner(GocatorSettingsMixin):
         return self._trigger_delay_s
 
     @property
+    def configured_feed_rate_mm_s(self) -> Optional[float]:
+        """Feed rate from the ``gocator.scan:`` config block, or None if unset.
+
+        What ``acquire()`` falls back to when a caller gives no
+        ``feed_rate_mm_s``; ``SurveyRunner`` reads it so a pass with no speed
+        of its own plans (e.g. the tile ramp lead-in) around the same rate the
+        scan will actually use.
+        """
+        rate = (self._scan_spec or {}).get("feed_rate_mm_s")
+        return None if rate is None else float(rate)
+
+    @property
     def mounting(self) -> SensorMounting:
         """How this sensor sits on the gantry (from ``gocator.mounting`` config).
 
