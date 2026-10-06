@@ -1,7 +1,7 @@
 """OD2000/WTT12L laser rangefinder subsystem.
 
-Wraps MqttSubscriber to provide a typed interface for SICK OD2000/WTT12L
-distance readings delivered via an ifm AL1342 IO-Link master over MQTT.
+Typed interface for SICK OD2000/WTT12L distance readings, polled over HTTP from
+an ifm AL1342 IO-Link master.
 """
 
 from .decoders import (

@@ -62,7 +62,7 @@ print(list(SUBSYSTEM_REGISTRY))
 ```
 
 `mqtt` is deliberately not in this list even though `MqttSubscriber` has a
-`from_config()` — each rangefinder already builds its own private
+`from_config()` — weir, gauge and flow already build their own private
 `MqttSubscriber` from the shared `mqtt:` config section, so a standalone
 `lab.mqtt` would just be a second, unused connection to the same broker.
 Build one directly if you actually need one:
@@ -85,12 +85,8 @@ class SaflWeirController(WeirController, SubsystemLogging):
 class RangefinderSubsystem:
     @classmethod
     def from_config(cls, config: "Config") -> "RangefinderSubsystem":
-        # Reaches into the *sibling* 'mqtt:' section to build its own
-        # private MqttSubscriber — every rangefinder gets its own client
-        # ID, so several can share one broker without fighting.
-        section = config.get(cls.subsystem_name)
-        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
-        return cls(section, mqtt_subscriber)
+        # Polls the AL1342 over HTTP, so no MQTT client is needed.
+        return cls(config.get(cls.subsystem_name))
 ```
 
 ```python
@@ -261,9 +257,9 @@ simulated backend today — gantry, gocator, weir, flow, gauge,
   is `fences.py`'s job, real in every mode, and a rehearsal that let
   fence-violating scripts through would be worse than no rehearsal.
 - **The rangefinders (`od2000`/`wtt12l`) rehearse too** — `connect()`
-  succeeds with no MQTT broker or AL1342 needed, `activate()`/
+  succeeds with no AL1342 needed, `activate()`/
   `deactivate()` skip the real IO-Link HTTP write, and every reading
-  (`get_distance_mm()`, `read_mm()`, `get_status()`'s numeric fields) comes
+  (`read_mm()`, `get_status()`'s numeric fields) comes
   back `NaN`. Every entry in `laguna.registry.SUBSYSTEM_REGISTRY` has a
   simulated path today — `_NO_SIMULATED_BACKEND` is empty, kept only as
   the fail-closed guard for whatever gets added next without one.

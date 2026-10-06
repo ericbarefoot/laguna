@@ -16,7 +16,7 @@ exhaustive *what* — every public class, method, and parameter.
 | [Camera](camera.md) | `CameraManager`, DSLR, networked Pi array, local capture, Pi-side agent, gvfs recovery |
 | [Weir](weir.md) | Tailgate elevation control |
 | [Gauge](gauge.md) | Ultrasonic water-level sensing |
-| [Rangefinder](rangefinder.md) | OD2000 / WTT12L distance sensors via AL1342, MQTT subscriber |
+| [Rangefinder](rangefinder.md) | OD2000 / WTT12L distance sensors via AL1342 (HTTP polling) |
 | [Scanner](scanner.md) | Gocator 2690 3D laser scanner, simulation stand-in |
 | [Flow](flow.md) | Pump / solenoid flow control |
 | [Reference frames](frames.md) | `FrameRegistry` — one coordinate system for every instrument |

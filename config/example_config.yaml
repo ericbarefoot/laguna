@@ -180,14 +180,13 @@ gantry:                       # Modusystems OEM-2T gantry (Snap2Motion ASCII pro
 # OD2000 / WTT12L PowerProx rangefinders, via an ifm AL1342 IO-Link master.
 # Add one block per sensor in use — od2000 and wtt12l use the same shape,
 # paired with laguna.rangefinder.OD2000Rangefinder / WTT12LRangefinder.
+# Readings are polled over HTTP (no MQTT topic involved) — al1342_host is required.
 # od2000:
-#   topic: laguna/od2000        # MQTT topic for continuous/background monitoring
 #   pdin_port: 2                # IO-Link port — confirmed on hardware 2026-07-28
 #   offset_mm: 0.0               # physical mounting offset
-#   al1342_host: 192.168.1.251  # required for activate()/deactivate()/read_mm() — raw IP, no DNS
+#   al1342_host: 192.168.1.251  # required — raw IP, no DNS. Every read and the laser switch use it
 #   calibration_file: null      # path to a scripts/calibrate_rangefinder.py CSV, if fitted
 # wtt12l:
-#   topic: laguna/wtt12l
 #   pdin_port: 7                # DP4200 analog bridge port — confirmed on hardware 2026-07-28
 #   offset_mm: 0.0
 #   al1342_host: 192.168.1.251
