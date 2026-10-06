@@ -1,17 +1,43 @@
 """Experiment schedule loading and interpolation."""
 
-from typing import Callable, Dict, Optional, Union
-from pathlib import Path
+from __future__ import annotations
 
-try:
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
+
+if TYPE_CHECKING:
     import numpy as np
-    from scipy.interpolate import CubicSpline
     import pandas as pd
-except ImportError as _e:
-    raise ImportError(
-        "laguna.schedule requires numpy, scipy, and pandas. "
-        "Install them with: pip install numpy scipy pandas"
-    ) from _e
+
+
+def _require_deps() -> Tuple["np", "pd", Callable]:
+    """Import numpy, pandas and scipy's CubicSpline, or explain what to install.
+
+    Deferred from module import time so that importing ``laguna.schedule``
+    (which ``laguna.experiment.runner`` does unconditionally) succeeds in a
+    lightweight environment, such as a Raspberry Pi camera node, that never
+    builds a schedule. The failure surfaces only when a schedule is used.
+    numpy is deferred along with the rest for uniformity, but ``import
+    laguna`` itself already requires it (``laguna.frames``), so in practice
+    this guards the heavier scipy and pandas.
+
+    Returns:
+        ``(numpy, pandas, CubicSpline)``.
+
+    Raises:
+        ImportError: If any of numpy, scipy or pandas is missing.
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+        from scipy.interpolate import CubicSpline
+    except ImportError as exc:
+        raise ImportError(
+            "ExperimentSchedule requires numpy, scipy, and pandas. "
+            "Install them with: pip install numpy scipy pandas"
+        ) from exc
+    return np, pd, CubicSpline
+
 
 REQUIRED_COLUMNS = ["time_s"]
 
@@ -48,6 +74,7 @@ class ExperimentSchedule:
                 ('spline', 'linear', or 'step'), merged on top of
                 `INTERP_DEFAULTS`.
         """
+        _require_deps()
         interp_modes = {**self.INTERP_DEFAULTS, **(interpolation or {})}
         times = df["time_s"].to_numpy(dtype=float)
         self._validate(df, times, [col for col in interp_modes if col in df.columns])
@@ -79,6 +106,7 @@ class ExperimentSchedule:
         Raises:
             ValueError: If the file is missing required columns.
         """
+        pd = _require_deps()[1]
         df = pd.read_csv(path)
         return cls.from_dataframe(df, interpolation=interpolation)
 
@@ -98,6 +126,7 @@ class ExperimentSchedule:
         Raises:
             ValueError: If the sheet is missing required columns.
         """
+        pd = _require_deps()[1]
         df = pd.read_excel(path, sheet_name=sheet)
         return cls.from_dataframe(df, interpolation=interpolation)
 
@@ -205,6 +234,7 @@ class ExperimentSchedule:
         Raises:
             ValueError: Naming the offending rows.
         """
+        np = _require_deps()[0]
         bad = np.flatnonzero(~np.isfinite(times))
         if bad.size:
             raise ValueError(f"time_s must be finite; check rows {bad.tolist()}")
@@ -231,7 +261,8 @@ class ExperimentSchedule:
         Returns:
             Callable that evaluates spline at arbitrary time points.
         """
-        cs = CubicSpline(times, values)
+        cubic_spline = _require_deps()[2]
+        cs = cubic_spline(times, values)
         return lambda t: float(cs(t))
 
     @staticmethod
@@ -246,6 +277,7 @@ class ExperimentSchedule:
             Callable that linearly interpolates at arbitrary time points.
                 Values before/after endpoints are clamped (not extrapolated).
         """
+        np = _require_deps()[0]
         return lambda t: float(np.interp(t, times, values))
 
     @staticmethod
@@ -259,6 +291,8 @@ class ExperimentSchedule:
         Returns:
             Callable that returns value most recently set at or before time t.
         """
+        np = _require_deps()[0]
+
         def step_interp(t):
             idx = np.searchsorted(times, t, side="right") - 1
             idx = max(0, min(idx, len(values) - 1))
