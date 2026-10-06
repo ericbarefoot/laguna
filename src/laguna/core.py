@@ -927,6 +927,13 @@ class FlumeLab:
                 continue
             action = getattr(subsystem, verb, None)
             if action is None:
+                # Say so: silently skipping made a halt on a rig with an
+                # un-quiesced subsystem look identical to a clean one (GH #42).
+                logger.warning("%s has no %s() — it was NOT quiesced", name, verb)
+                self.event_log.log(
+                    self.clock.elapsed(), name, verb,
+                    result="skipped", notes=f"{name} does not implement {verb}()",
+                )
                 continue
             try:
                 note = action()

@@ -270,6 +270,32 @@ class CameraArray(SubsystemLogging):
         """No persistent connection to close."""
         pass
 
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+    # Captures are one-shot SSH commands fired by the scheduler, which
+    # FlumeLab halts ahead of these calls; nothing here runs persistently,
+    # and a capture already on the Pis cannot be recalled (it finishes and
+    # its images are still fetched). So there is nothing to quiesce. The
+    # verbs exist so a halt is uniform and a missing verb in the event log
+    # means a real gap.
+
+    def pause(self) -> Optional[str]:
+        """Nothing to quiesce: captures are one-shot and scheduler-driven."""
+        return None
+
+    def resume(self) -> Optional[str]:
+        """Nothing to restore: pause() changed nothing."""
+        return None
+
+    def stop(self) -> Optional[str]:
+        """Nothing to quiesce: captures are one-shot and scheduler-driven."""
+        return None
+
+    def estop(self) -> Optional[str]:
+        """Nothing to quiesce: captures are one-shot. Never raises."""
+        return None
+
     def get_status(self) -> Dict[str, Any]:
         """Return configured state. Does not make SSH connections."""
         return {

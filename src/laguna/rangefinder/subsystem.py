@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
@@ -13,6 +14,13 @@ if TYPE_CHECKING:
 from .al1342 import read_pdin_hex, write_acyclic
 from .calibration import LinearCalibration
 from .decoders import decode_dp4200_wtt12l_analog_pdin, decode_od2000_pdin
+
+logger = logging.getLogger(__name__)
+
+#: HTTP timeout for the laser write a safety verb issues. Short on purpose:
+#: a halt must not sit for the usual 5 s waiting on an unreachable AL1342
+#: while other subsystems wait their turn behind it.
+SAFETY_WRITE_TIMEOUT_S = 2.0
 
 
 class RangefinderSubsystem:
@@ -58,6 +66,11 @@ class RangefinderSubsystem:
         self._sample_count = 0
         self._t_first_sample: Optional[float] = None
         self._is_connected = False
+        #: Whether *this object* last switched the emitter on. The Pi-side
+        #: profiler can also switch it on without telling us, so this only
+        #: decides what resume() restores — never whether a halt acts.
+        self._laser_on = False
+        self._laser_on_before_pause = False
 
     @classmethod
     def from_config(cls, config: "Config") -> "RangefinderSubsystem":
@@ -190,16 +203,71 @@ class RangefinderSubsystem:
                 "on-demand HTTP access (activate/deactivate/read_mm)"
             )
 
-    def activate(self) -> None:
+    def activate(self, timeout: float = 5.0) -> None:
         """Turn on whatever the sensor needs to produce valid readings.
 
         Default is a no-op; override per device (e.g. for laser emitter control).
+
+        Args:
+            timeout: HTTP timeout, seconds, for devices controlled over HTTP.
         """
         pass
 
-    def deactivate(self) -> None:
-        """Undo activate(). Default is a no-op — override per device."""
+    def deactivate(self, timeout: float = 5.0) -> None:
+        """Undo activate(). Default is a no-op — override per device.
+
+        Args:
+            timeout: HTTP timeout, seconds, for devices controlled over HTTP.
+        """
         pass
+
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+    # A rangefinder is a passive sensor: nothing here moves, and a transect
+    # in flight is driven and aborted by the gantry (its pause/stop/estop
+    # stops the Pi-side profiler), not by this object. What it does own is
+    # the emitter, so every tier reduces to "emitter off". There is no data
+    # to discard, so these return a note only when the emitter could not be
+    # confirmed off — which a human reading the event log needs to know.
+
+    def _emitter_off(self) -> Optional[str]:
+        """Switch the emitter off, best-effort and bounded. Never raises."""
+        try:
+            self.deactivate(timeout=SAFETY_WRITE_TIMEOUT_S)
+        except Exception as exc:
+            logger.error("%s: could not switch the emitter off: %s", self.subsystem_name, exc)
+            return f"{self.subsystem_name} emitter state unknown — could not switch it off: {exc}"
+        self._laser_on = False
+        return None
+
+    def pause(self) -> Optional[str]:
+        """Switch the emitter off; resume() restores it if this object had it on."""
+        self._laser_on_before_pause = self._laser_on
+        return self._emitter_off()
+
+    def resume(self) -> Optional[str]:
+        """Switch the emitter back on if it was on when pause() was called."""
+        if not self._laser_on_before_pause:
+            return None
+        self._laser_on_before_pause = False
+        try:
+            self.activate()
+        except Exception as exc:
+            logger.error("%s: could not restore the emitter: %s", self.subsystem_name, exc)
+            return f"{self.subsystem_name} emitter was not restored after pause: {exc}"
+        self._laser_on = True
+        return None
+
+    def stop(self) -> Optional[str]:
+        """Switch the emitter off. Not resumable: start a new run instead."""
+        self._laser_on_before_pause = False
+        return self._emitter_off()
+
+    def estop(self) -> Optional[str]:
+        """Same as stop(): the emitter has no harder halt. Never raises."""
+        self._laser_on_before_pause = False
+        return self._emitter_off()
 
     def read_mm(self, timeout: float = 5.0) -> float:
         """Take a single on-demand HTTP reading with offset and calibration.
@@ -279,19 +347,33 @@ class OD2000Rangefinder(RangefinderSubsystem):
         """Decode OD2000 PDIN hex string."""
         return decode_od2000_pdin(hex_str)
 
-    def activate(self) -> None:
-        """Enable the OD2000 laser emitter."""
-        if self._simulated:
-            return
-        self._require_al1342_host()
-        write_acyclic(self._al1342_host, self._pdin_port, index=97, subindex=0, value="00")
+    def activate(self, timeout: float = 5.0) -> None:
+        """Enable the OD2000 laser emitter.
 
-    def deactivate(self) -> None:
-        """Disable the OD2000 laser emitter."""
-        if self._simulated:
-            return
-        self._require_al1342_host()
-        write_acyclic(self._al1342_host, self._pdin_port, index=97, subindex=0, value="01")
+        Args:
+            timeout: HTTP timeout, seconds.
+        """
+        if not self._simulated:
+            self._require_al1342_host()
+            write_acyclic(
+                self._al1342_host, self._pdin_port, index=97, subindex=0, value="00",
+                timeout=timeout,
+            )
+        self._laser_on = True
+
+    def deactivate(self, timeout: float = 5.0) -> None:
+        """Disable the OD2000 laser emitter.
+
+        Args:
+            timeout: HTTP timeout, seconds.
+        """
+        if not self._simulated:
+            self._require_al1342_host()
+            write_acyclic(
+                self._al1342_host, self._pdin_port, index=97, subindex=0, value="01",
+                timeout=timeout,
+            )
+        self._laser_on = False
 
 
 class WTT12LRangefinder(RangefinderSubsystem):

@@ -441,7 +441,7 @@ class TestOd2000RangefinderOnDemand:
         calls = []
         monkeypatch.setattr(
             rangefinder_module, "write_acyclic",
-            lambda host, port, index, subindex, value: calls.append((host, port, index, subindex, value)),
+            lambda host, port, index, subindex, value, timeout=5.0: calls.append((host, port, index, subindex, value)),
         )
         rf.activate()
         assert calls == [("192.168.1.251", 2, 97, 0, "00")]
@@ -451,7 +451,7 @@ class TestOd2000RangefinderOnDemand:
         calls = []
         monkeypatch.setattr(
             rangefinder_module, "write_acyclic",
-            lambda host, port, index, subindex, value: calls.append(value),
+            lambda host, port, index, subindex, value, timeout=5.0: calls.append(value),
         )
         rf.deactivate()
         assert calls == ["01"]
