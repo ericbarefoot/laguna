@@ -1,6 +1,6 @@
 """Save and reload the intermediate results of a Gocator alignment run.
 
-An alignment run (``examples/example_16_tile_seam_hardware_check.ipynb``)
+An alignment run (``calibration/gocator_alignment_and_seam.ipynb``)
 produces a few expensive-to-get results in sequence: the block's position in
 gantry mm from a slow WTT12L scan, three Gocator passes over it, the corners
 picked on those passes, and finally the solved mounting and translation.
@@ -98,6 +98,7 @@ class AlignmentStore:
         """
         return self._write_json(_BLOCK_FILE, {
             "block_center_gantry_mm": [float(v) for v in block_center_gantry][:2],
+            "reverse_positions_fixed": True,
             "transects": transects or {},
             "block_size_mm": list(block_size_mm) if block_size_mm is not None else None,
             "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -115,8 +116,25 @@ class AlignmentStore:
             data = self._read_json(_SOLUTION_FILE)
             if not data or "B_W" not in data:
                 return None
+            self._warn_if_unfixed(None)
             return np.asarray(data["B_W"], dtype=float)
+        self._warn_if_unfixed(data)
         return np.asarray(data["block_center_gantry_mm"], dtype=float)
+
+    def _warn_if_unfixed(self, block_file: Optional[Dict[str, Any]]) -> None:
+        """Warn about block positions that predate the reverse-scan position fix.
+
+        The WTT12L agent labelled every reverse-direction scan's positions as if
+        the axis had moved forward (fixed 2026-10-08), so the out-and-back
+        average of such a run lands near the reverse scan's start point instead
+        of the block: wrong by roughly one scan half-length in each axis.
+        """
+        if block_file is None or not block_file.get("reverse_positions_fixed"):
+            logger.warning(
+                "block position in %s was saved before the reverse-scan position fix "
+                "(2026-10-08) and is probably off by about half a scan length in each axis; "
+                "re-scan, or give the block centre explicitly (B_W_KNOWN)", self.directory,
+            )
 
     # -- the three Gocator passes --------------------------------------------
 

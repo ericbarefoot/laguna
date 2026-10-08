@@ -36,6 +36,28 @@ class TestBlock:
         np.testing.assert_allclose(store.load_block(), [1200.0, 670.0])
 
 
+class TestPreFixBlockPositions:
+    def test_a_block_saved_now_is_marked_and_loads_quietly(self, tmp_path, caplog):
+        store = AlignmentStore(tmp_path)
+        store.save_block([1.0, 2.0])
+        with caplog.at_level("WARNING"):
+            store.load_block()
+        assert "reverse-scan position fix" not in caplog.text
+
+    def test_an_old_solution_file_warns(self, tmp_path, caplog):
+        store = AlignmentStore(tmp_path)
+        store.save_solution([1200.0, 670.0], {"scan_x": "+Y"}, [0, 0, 0])
+        with caplog.at_level("WARNING"):
+            store.load_block()
+        assert "reverse-scan position fix" in caplog.text
+
+    def test_a_block_file_without_the_marker_warns(self, tmp_path, caplog):
+        (tmp_path / "block_location.json").write_text('{"block_center_gantry_mm": [1.0, 2.0]}')
+        with caplog.at_level("WARNING"):
+            AlignmentStore(tmp_path).load_block()
+        assert "reverse-scan position fix" in caplog.text
+
+
 class TestPasses:
     def test_passes_round_trip_including_numpy_metadata(self, tmp_path):
         store = AlignmentStore(tmp_path)

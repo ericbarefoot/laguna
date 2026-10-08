@@ -316,106 +316,6 @@ class TestPollPdinLoop:
 
 
 # ---------------------------------------------------------------------------
-# Dead-reckoning math (mirrors the formulas inline in gantry_agent._run_scan)
-# ---------------------------------------------------------------------------
-#
-# Reproduced here (not imported) so a logic bug is caught before hardware
-# testing — same approach test_scan_runner_logic.py used for the retired
-# scan_runner.py, since this fusion math is inline in _run_scan, not its
-# own separately importable function.
-
-
-def _fuse_records(records, start_pos_mm, feed_rate_mm_s, accel_mm_s2, decel_mm_s2,
-                  t_move_start, t_move_done):
-    ramp_t_accel = feed_rate_mm_s / accel_mm_s2 if accel_mm_s2 > 0 else 0.0
-    ramp_t_decel = feed_rate_mm_s / decel_mm_s2 if decel_mm_s2 > 0 else 0.0
-    t_slew_start = t_move_start + ramp_t_accel
-    t_slew_end = t_move_done - ramp_t_decel
-
-    rows = []
-    for rec in records:
-        t = rec["wall_time"]
-        in_ramp = not (t_slew_start <= t <= t_slew_end)
-        pos_mm = start_pos_mm + feed_rate_mm_s * (t - t_slew_start)
-        rows.append({
-            "wall_time": t,
-            "pos_mm": pos_mm,
-            "distance_mm": rec.get("distance_mm", 0.0),
-            "in_ramp": in_ramp,
-        })
-    return rows, ramp_t_accel, ramp_t_decel, t_slew_start, t_slew_end
-
-
-class TestDeadReckoningMath:
-    def setup_method(self):
-        self.t0 = 1_000.0
-        self.start_pos = 100.0
-        self.feed_rate = 10.0
-        self.accel = 5.0
-        self.decel = 5.0
-        self.t_move_start = self.t0
-        self.t_move_done = self.t0 + 12.0
-
-    def test_ramp_duration_formula(self):
-        _, ramp_t_accel, ramp_t_decel, _, _ = _fuse_records(
-            [], self.start_pos, self.feed_rate, self.accel, self.decel,
-            self.t_move_start, self.t_move_done
-        )
-        assert ramp_t_accel == pytest.approx(2.0)
-        assert ramp_t_decel == pytest.approx(2.0)
-
-    def test_slew_window_boundaries(self):
-        _, _, _, t_slew_start, t_slew_end = _fuse_records(
-            [], self.start_pos, self.feed_rate, self.accel, self.decel,
-            self.t_move_start, self.t_move_done
-        )
-        assert t_slew_start == pytest.approx(self.t0 + 2.0)
-        assert t_slew_end == pytest.approx(self.t0 + 10.0)
-
-    def test_position_at_slew_start(self):
-        t_slew_start = self.t0 + 2.0
-        records = [{"wall_time": t_slew_start, "distance_mm": 300.0}]
-        rows, *_ = _fuse_records(
-            records, self.start_pos, self.feed_rate, self.accel, self.decel,
-            self.t_move_start, self.t_move_done
-        )
-        assert rows[0]["pos_mm"] == pytest.approx(self.start_pos)
-        assert rows[0]["in_ramp"] is False
-
-    def test_sample_during_accel_ramp_is_in_ramp(self):
-        t_accel = self.t0 + 1.0
-        records = [{"wall_time": t_accel, "distance_mm": 300.0}]
-        rows, *_ = _fuse_records(
-            records, self.start_pos, self.feed_rate, self.accel, self.decel,
-            self.t_move_start, self.t_move_done
-        )
-        assert rows[0]["in_ramp"] is True
-
-    def test_ramp_samples_kept_not_dropped(self):
-        records = [
-            {"wall_time": self.t0 + 0.5, "distance_mm": 310.0},
-            {"wall_time": self.t0 + 3.0, "distance_mm": 305.0},
-            {"wall_time": self.t0 + 11.0, "distance_mm": 295.0},
-        ]
-        rows, *_ = _fuse_records(
-            records, self.start_pos, self.feed_rate, self.accel, self.decel,
-            self.t_move_start, self.t_move_done
-        )
-        assert len(rows) == 3
-        assert [r["in_ramp"] for r in rows] == [True, False, True]
-
-    def test_zero_accel_guard(self):
-        records = [{"wall_time": self.t0 + 5.0, "distance_mm": 300.0}]
-        rows, ramp_t_accel, ramp_t_decel, _, _ = _fuse_records(
-            records, self.start_pos, self.feed_rate, accel_mm_s2=0.0, decel_mm_s2=0.0,
-            t_move_start=self.t0, t_move_done=self.t0 + 10.0
-        )
-        assert ramp_t_accel == 0.0
-        assert ramp_t_decel == 0.0
-        assert rows[0]["in_ramp"] is False
-
-
-# ---------------------------------------------------------------------------
 # SerialBridge — locking is the critical safety property
 # ---------------------------------------------------------------------------
 
@@ -1061,3 +961,64 @@ class TestPdinPollBackoff:
         threading.Timer(0.3, stop.set).start()
         ga._poll_pdin_loop("10.0.0.1", "/x", queue.Queue(), stop, 2)
         assert len(attempts) < 20, f"{len(attempts)} reconnect attempts in 0.3 s"
+
+
+# ---------------------------------------------------------------------------
+# Dead-reckoned position of a scan sample, in either direction
+# ---------------------------------------------------------------------------
+
+
+class TestDeadReckonedPosition:
+    """pos_mm labels every scan sample; a reverse scan used to be mirrored."""
+
+    T0, V, A = 1_000.0, 10.0, 5.0            # ramp 2 s, ramp distance 10 mm
+
+    def pos(self, t, start, end):
+        return ga._dead_reckoned_pos_mm(self.T0 + t, start, end, self.V, self.A, self.T0)
+
+    def test_forward_scan_increases(self):
+        assert self.pos(2.0, 100.0, 400.0) == pytest.approx(110.0)      # start + ramp distance at slew start
+        assert self.pos(12.0, 100.0, 400.0) == pytest.approx(210.0)
+
+    def test_reverse_scan_decreases(self):
+        assert self.pos(2.0, 400.0, 100.0) == pytest.approx(390.0)
+        assert self.pos(12.0, 400.0, 100.0) == pytest.approx(290.0)
+
+    def test_forward_and_reverse_are_mirror_images_about_the_start(self):
+        for t in (0.0, 1.0, 2.0, 7.5, 20.0):
+            assert self.pos(t, 400.0, 100.0) - 400.0 == pytest.approx(-(self.pos(t, 400.0, 700.0) - 400.0))
+
+    def test_acceleration_phase_is_quadratic_and_starts_at_the_start(self):
+        assert self.pos(0.0, 100.0, 400.0) == pytest.approx(100.0)
+        assert self.pos(1.0, 100.0, 400.0) == pytest.approx(100.0 + 0.5 * self.A)
+        assert self.pos(-1.0, 100.0, 400.0) == pytest.approx(100.0)       # before the move: no motion yet
+
+    def test_no_acceleration_means_no_ramp(self):
+        assert ga._dead_reckoned_pos_mm(self.T0 + 3.0, 100.0, 400.0, self.V, 0.0, self.T0) == pytest.approx(130.0)
+
+    def _write(self, tmp_path, offsets, accel):
+        records = [{"wall_time": self.T0 + dt, "distance_mm": 1.0, "current_ma": 13.0} for dt in offsets]
+        out = tmp_path / "scan.csv"
+        ga._write_scan_output(
+            str(out), records, "A1", 400.0, self.V, 100.0, 400.0, accel, accel,
+            self.T0, self.T0 + 40.0, "host", 1, "wtt12l_powerprox", None,
+        )
+        return list(csv.DictReader(open(out)))
+
+    def test_ramp_samples_are_flagged_but_kept(self, tmp_path):
+        rows = self._write(tmp_path, [0.5, 3.0, 39.0], self.A)       # accel ramp 2 s, decel ramp 2 s
+        assert [r["in_ramp"] for r in rows] == ["1", "0", "1"]
+
+    def test_zero_acceleration_has_no_ramp(self, tmp_path):
+        assert self._write(tmp_path, [5.0], 0.0)[0]["in_ramp"] == "0"
+
+    def test_the_written_csv_for_a_reverse_scan_runs_from_the_start_down_toward_the_end(self, tmp_path):
+        records = [{"wall_time": self.T0 + 2.0 + k, "distance_mm": 1.0, "current_ma": 13.0} for k in range(5)]
+        out = tmp_path / "scan.csv"
+        ga._write_scan_output(
+            str(out), records, "A1", 100.0, self.V, 400.0, 100.0, self.A, self.A,
+            self.T0, self.T0 + 40.0, "host", 1, "wtt12l_powerprox", None,
+        )
+        rows = list(csv.DictReader(open(out)))
+        pos = [float(r["pos_mm"]) for r in rows]
+        assert pos[0] == pytest.approx(390.0) and pos == sorted(pos, reverse=True)
