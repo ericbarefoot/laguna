@@ -101,10 +101,12 @@ from laguna.survey import Tile, SurveyRunner
 lab = setup_run("config/my_experiment.yaml")
 
 def tiled_scan():
-    active_area = lab.gocator.get_active_area()
-    tile = Tile(
-        origin=[0, 0, 0], length_mm=1000, width_mm=600,
-        swath_mm=active_area["width_mm"], instrument="gocator", speed=20.0,
+    # Give the region (experiment frame, mm); the swath comes from the live
+    # active area and the passes/overlap are worked out. A region narrower
+    # than one swath becomes a single centred pass.
+    tile = Tile.from_roi(
+        (0, 1000), (0, 600), 0, lab=lab, instrument="gocator", speed=20.0,
+        min_overlap=0.1,
     )
     SurveyRunner(lab, tile).run()
 

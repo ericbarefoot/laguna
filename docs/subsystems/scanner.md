@@ -239,6 +239,14 @@ rotation but never checking which direction *this* pass actually went, so it
 silently assumed positive every time. Fixed in `orient_scan()`, which now
 anchors the first-acquired point to the pass's real starting position and
 orients the rest by the recorded start→end direction — see its docstring.
+The mounting's *sign* on the travel axis plays no part in that placement: a rigid
+mount can force sensor Y → −X (determinant argument above), but row order carries
+no geometric direction, so `orient_scan()` takes the along-travel direction from
+`gantry_start_mm → gantry_end_mm` alone. (Before 2026-10-07 it multiplied the two,
+which put a forward pass *behind* its start point and a reverse pass beyond it
+whenever `scan_y` was negative — both mirrored in the same way, so a symmetric
+block looked fine in each pass but forward and reverse disagreed by twice the
+pass length.)
 `SurfaceScan.to_points()`/`gantry_travel_mm` are unaffected: they only apply
 the fixed mounting rotation, by design (the per-pass travel direction isn't
 knowable from the scan grid alone, only from the gantry-side metadata

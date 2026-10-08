@@ -352,6 +352,15 @@ class FakeGo:
 
     # -- getters ---------------------------------------------------------
 
+    def GoTransform_YAngle(self, transform, role):
+        return 2.0
+
+    def GoTransform_X(self, transform, role):
+        return 10.0
+
+    def GoTransform_Z(self, transform, role):
+        return -20.0
+
     def GoTransform_Speed(self, transform):
         return self.travel_speed
 
@@ -1978,6 +1987,26 @@ class TestSurfaceScan:
         assert "mounting" not in loaded.metadata  # restored to .mounting, not left duplicated
         assert "grid_axes" not in loaded.metadata  # derived, not stored state
 
+    def test_numpy_scalars_in_metadata_survive_a_round_trip(self, tmp_path):
+        """repr(np.float64(1.0)) is 'np.float64(1.0)' on numpy 2, which
+        literal_eval can't read — a scan aimed with array-derived positions
+        (as the notebooks do) must still reload."""
+        scan = make_scan()
+        scan.metadata.update(gantry_start_mm=np.float64(303.5), gantry_end_mm=np.float32(903.0))
+        loaded = SurfaceScan.from_npz(scan.save_npz(tmp_path / "scan.npz"))
+        assert loaded.metadata["gantry_start_mm"] == pytest.approx(303.5)
+        assert loaded.metadata["gantry_end_mm"] == pytest.approx(903.0)
+
+    def test_from_npz_reads_files_saved_with_numpy_scalar_reprs(self, tmp_path):
+        """Scans written before save_npz() converted numpy scalars."""
+        scan = make_scan()
+        path = tmp_path / "old.npz"
+        np.savez_compressed(
+            path, z_mm=scan.z_mm, x_mm=scan.x_mm, y_mm=scan.y_mm, is_uniform=scan.is_uniform,
+            metadata=np.array(["{'gantry_start_mm': np.float64(303.5), 'mounting': None}"], dtype=object),
+        )
+        assert SurfaceScan.from_npz(path).metadata["gantry_start_mm"] == pytest.approx(303.5)
+
     def test_from_npz_default_mounting_round_trips_as_identity(self, tmp_path):
         path = make_scan().save_npz(tmp_path / "scan.npz")
         loaded = SurfaceScan.from_npz(path)
@@ -2553,3 +2582,13 @@ class TestScanResyncsGantryPosition:
                 raise AttributeError("resync_position")
 
         assert self._scan(scanner, NoResyncGantry()) is not None
+
+
+class TestAlignment:
+    """The web UI alignment transform, read back from the sensor."""
+
+    def test_get_alignment_reads_transform_with_go_role_main(self, scanner):
+        al = scanner.get_alignment()
+        assert al["y_angle_deg"] == pytest.approx(2.0)
+        assert al["x_mm"] == pytest.approx(10.0)
+        assert al["z_mm"] == pytest.approx(-20.0)

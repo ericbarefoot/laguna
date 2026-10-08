@@ -574,6 +574,58 @@ class TestSurveyRunner:
         SurveyRunner(lab, self._survey()).run()
         assert lab.placed[0][3] == [0.0, -750.0, 0.0]
 
+    @pytest.mark.parametrize("scan_x, expected_ref", [
+        ("+Y", [0.0, 750.0, 0.0]),    # sensor +X -> gantry +Y -> experiment -Y: near edge is the max X
+        ("-Y", [0.0, 750.0, 0.0]),    # sensor +X -> gantry -Y -> experiment +Y: near edge is the min X
+    ])
+    def test_edge_align_accounts_for_a_rotated_experiment_frame(self, scan_x, expected_ref):
+        """step_axis is an experiment axis; with rotation_deg: 180 the gantry's
+        +Y is experiment -Y, so the same mounting needs the *other* edge than
+        it does with no rotation. Before this was accounted for the tile came
+        out one swath off, past the gantry's soft limits."""
+        from laguna.frames import FrameRegistry
+
+        lab = FakeLab()
+        lab.frames = FrameRegistry.from_config({
+            "experiment": {"translation": [0, 0, 0], "rotation_deg": 180},
+            "instruments": {"gocator": {"translation": [0, 0, 0]}},
+        })
+        scan_y = "-X" if scan_x == "+Y" else "+X"
+        lab.gocator = FakeScannerWithActiveArea(
+            x_mm=-750.0, width_mm=1500.0,
+            mounting=SensorMounting(scan_x=scan_x, scan_y=scan_y, scan_z="+Z"),
+        )
+        SurveyRunner(lab, self._survey()).run()
+        assert lab.placed[0][3] == expected_ref
+
+    def test_the_imaged_swath_lands_on_the_planned_band_with_a_rotated_frame(self):
+        """End to end: put the sensor where the runner says, carry both active
+        area edges through mounting and frames, and the imaged Y interval in
+        the experiment frame must be exactly the band the Tile asked for."""
+        from laguna.frames import FrameRegistry
+
+        lab = FakeLab()
+        lab.frames = FrameRegistry.from_config({
+            "experiment": {"translation": [2200, 670, 0], "rotation_deg": 180},
+            "instruments": {"gocator": {"translation": [597, 312, 0]}},
+        })
+        lab.gocator = FakeScannerWithActiveArea(
+            x_mm=-765.0, width_mm=1500.0,
+            mounting=SensorMounting(scan_x="+Y", scan_y="-X", scan_z="+Z"),
+        )
+        tile = Tile(origin=(700.0, -1052.0, 100.0), length_mm=600.0, width_mm=2100.0,
+                    swath_mm=1500.0, overlap=0.4 - 1e-9, scan_speed=20.0)
+        SurveyRunner(lab, tile).run()
+        for (_, point, _, ref), p in zip(lab.placed, tile.passes()):
+            g = lab.frames.gantry_target_for("gocator", list(point), reference_point=ref)
+            offset = lab.frames.frame_for("gocator").offset
+            ys = []
+            for x in (-765.0, 735.0):
+                delta = lab.gocator.mounting.apply_to_points(np.array([[x, 0.0, 0.0]]))[0]
+                ys.append(lab.frames.gantry_to_experiment(g + offset + delta)[1])
+            assert min(ys) == pytest.approx(p.measure_start[1], abs=1e-6)
+            assert max(ys) == pytest.approx(p.measure_start[1] + 1500.0, abs=1e-6)
+
     def test_edge_align_skipped_when_scanner_has_no_active_area(self):
         """FakeScanner (no get_active_area) is the common case for
         rangefinder-style instruments — must not crash, must fall back to
@@ -864,3 +916,205 @@ class TestRampLeadInIntegration:
         assert survey.accel_mm_s2 is None
         assert "issue #58" in caplog.text or "seam" in caplog.text
         assert "cruise_start_mm" not in lab.gocator.acquired[0]
+
+
+class TestTileFromRoi:
+    """Tile.from_roi(): region in, swath count and overlap out."""
+
+    SWATH = 1000.0
+
+    def _tile(self, y=(0.0, 2400.0), x=(100.0, 700.0), **kw):
+        return Tile.from_roi(x, y, 50.0, swath_mm=self.SWATH, scan_speed=20.0, **kw)
+
+    def _step_edges(self, tile):
+        return [p.start[1] for p in tile.passes()]
+
+    def test_region_wider_than_a_swath_gets_the_fewest_passes_with_even_overlap(self):
+        tile = self._tile(y=(0.0, 2400.0), min_overlap=0.1)
+        edges = self._step_edges(tile)
+        assert len(edges) == 3                     # two swaths cover at most 2000 mm
+        gaps = np.diff(edges)
+        assert gaps == pytest.approx([gaps[0]] * len(gaps))      # evenly spread
+        assert edges[0] == pytest.approx(0.0)
+        assert edges[-1] + self.SWATH == pytest.approx(2400.0)   # last swath ends on the far edge
+        assert 1 - gaps[0] / self.SWATH >= 0.1 - 1e-9            # at least min_overlap
+
+    def test_two_passes_when_that_is_enough(self):
+        tile = self._tile(y=(0.0, 1800.0), min_overlap=0.1)
+        edges = self._step_edges(tile)
+        assert len(edges) == 2 and edges[1] + self.SWATH == pytest.approx(1800.0)
+        assert tile.overlap == pytest.approx(1 - 800.0 / self.SWATH, abs=1e-6)
+
+    def test_exact_cover_never_counts_an_extra_pass_on_float_noise(self):
+        for span in (1900.0, 2800.0, 1234.5678):
+            tile = self._tile(y=(0.0, span), min_overlap=0.1)
+            n = len(tile.passes())
+            assert tile.coverage_mm() == pytest.approx(span)
+            assert n == int(np.ceil((span - self.SWATH) / (self.SWATH * 0.9) - 1e-9)) + 1
+
+    def test_narrow_region_is_one_pass_centered_on_it(self):
+        tile = self._tile(y=(400.0, 700.0))
+        assert len(tile.passes()) == 1
+        edge = tile.passes()[0].start[1]
+        assert edge + self.SWATH / 2 == pytest.approx(550.0)     # swath centred on the region
+
+    def test_narrow_region_can_start_on_the_near_edge_instead(self):
+        tile = self._tile(y=(400.0, 700.0), center_single_pass=False)
+        assert len(tile.passes()) == 1 and tile.passes()[0].start[1] == pytest.approx(400.0)
+
+    def test_region_exactly_one_swath_wide_is_one_pass(self):
+        assert len(self._tile(y=(0.0, self.SWATH)).passes()) == 1
+
+    def test_traverse_covers_the_regions_full_extent(self):
+        p = self._tile(x=(100.0, 700.0)).passes()[0]
+        assert p.measure_start[0] == pytest.approx(100.0) and p.end[0] == pytest.approx(700.0)
+        assert p.measure_start[2] == pytest.approx(50.0)
+
+    def test_axis_y_swaps_the_roles_of_the_ranges(self):
+        tile = Tile.from_roi((0.0, 2400.0), (100.0, 700.0), 0.0, swath_mm=self.SWATH,
+                             axis="Y", scan_speed=20.0)
+        p = tile.passes()[0]
+        assert tile.step_axis == "X" and p.measure_start[1] == pytest.approx(100.0)
+        assert tile.coverage_mm() == pytest.approx(2400.0)
+
+    def test_swath_is_read_from_the_labs_live_active_area(self):
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea(x_mm=-750.0, width_mm=1500.0)
+        tile = Tile.from_roi((0.0, 600.0), (0.0, 2000.0), 0.0, lab=lab, scan_speed=20.0)
+        assert tile.swath_mm == 1500.0 and len(tile.passes()) == 2
+
+    def test_needs_a_swath_from_somewhere(self):
+        with pytest.raises(ValueError, match="swath_mm"):
+            Tile.from_roi((0.0, 1.0), (0.0, 1.0), 0.0)
+        with pytest.raises(ValueError, match="swath_mm"):
+            Tile.from_roi((0.0, 1.0), (0.0, 1.0), 0.0, lab=FakeLab())   # FakeScanner has no active area
+
+    @pytest.mark.parametrize("kw", [dict(min_overlap=1.0), dict(min_overlap=-0.1)])
+    def test_rejects_bad_overlap(self, kw):
+        with pytest.raises(ValueError, match="min_overlap"):
+            self._tile(**kw)
+
+    def test_rejects_empty_or_reversed_ranges(self):
+        with pytest.raises(ValueError, match="roi_y_mm"):
+            self._tile(y=(500.0, 500.0))
+        with pytest.raises(ValueError, match="roi_x_mm"):
+            self._tile(x=(700.0, 100.0))
+
+
+class TestRotatedExperimentFrame:
+    """Passes are planned on experiment axes but the gantry moves on its own.
+
+    A -90 degree experiment frame with swapped ROI ranges and the travel axis
+    swapped to match must be the same physical scan as the unrotated one.
+    """
+
+    ORIGIN = (2200.0, 670.0, 0.0)       # gantry point that is the experiment origin
+
+    def _lab(self, rotation_deg):
+        from laguna.frames import FrameRegistry
+
+        lab = FakeLab()
+        lab.frames = FrameRegistry.from_config({
+            "experiment": {"origin": list(self.ORIGIN), "rotation_deg": rotation_deg},
+            "instruments": {"gocator": {"translation": [597, 312, 0]}},
+        })
+        lab.gocator = FakeScannerWithActiveArea(
+            x_mm=-765.0, width_mm=1500.0,
+            mounting=SensorMounting(scan_x="+Y", scan_y="-X", scan_z="+Z"),
+        )
+        return lab
+
+    def _gantry_plan(self, lab, tile):
+        """Per pass: (gantry start, gantry end, imaged gantry interval across travel), as sets."""
+        runner = SurveyRunner(lab, tile)
+        out = []
+        for p in tile.passes():
+            ref = runner._resolve_reference_point(p)
+            g = [lab.frames.gantry_target_for("gocator", list(q), reference_point=ref) for q in (p.measure_start, p.end)]
+            off = lab.frames.frame_for("gocator").offset
+            edges = [lab.frames.experiment_to_gantry(
+                lab.frames.gantry_to_experiment(g[0] + off + lab.gocator.mounting.apply_to_points(np.array([[x, 0, 0]]))[0]))
+                for x in (-765.0, 735.0)]
+            out.append((sorted(map(tuple, np.round([g[0], g[1]], 3).tolist())),
+                        sorted(np.round([e[1] for e in edges], 3).tolist())))
+        return out
+
+    def test_origin_key_keeps_the_same_physical_point_when_rotation_changes(self):
+        for rot in (0, 90, 180, -90, 270):
+            lab = self._lab(rot)
+            np.testing.assert_allclose(lab.frames.gantry_to_experiment(np.array(self.ORIGIN)), [0, 0, 0], atol=1e-9)
+
+    def test_origin_and_translation_are_mutually_exclusive(self):
+        from laguna.frames import AffineTransform
+
+        with pytest.raises(ValueError, match="either translation or origin"):
+            AffineTransform.from_config({"translation": [0, 0, 0], "origin": [0, 0, 0]})
+
+    @pytest.mark.parametrize("rotation, travel_axis", [(0, "X"), (180, "X"), (90, "Y"), (-90, "Y"), (270, "Y")])
+    def test_the_gantry_axis_follows_the_rotation(self, rotation, travel_axis):
+        lab = self._lab(rotation)
+        survey = Tile(origin=(0.0, 0.0, 0.0), length_mm=100.0, width_mm=500.0, swath_mm=1500.0,
+                      axis=travel_axis, scan_speed=20.0)
+        # an experiment-X traverse is a gantry-X move at 0/180 and a gantry-Y move at +-90
+        assert SurveyRunner(lab, survey)._gantry_axis_for("X") == ("X" if rotation in (0, 180) else "Y")
+        assert SurveyRunner(lab, survey)._gantry_axis_for("Y") == ("Y" if rotation in (0, 180) else "X")
+
+    def test_the_commanded_scan_axis_and_end_are_the_gantrys_not_the_experiments(self):
+        lab = self._lab(-90)
+        tile = Tile.from_roi((0.0, 600.0), (0.0, 800.0), 0.0, swath_mm=1500.0, scan_speed=20.0, axis="X")
+        SurveyRunner(lab, tile).run()
+        acquired = lab.gocator.acquired[0]
+        assert acquired["axis"] == "Y"                                   # experiment X is gantry Y here
+        g = lab.frames.gantry_target_for("gocator", list(tile.passes()[0].end),
+                                         reference_point=lab.placed[0][3])
+        assert acquired["end_mm"] == pytest.approx(g[1])
+
+    def test_a_diagonal_frame_is_refused_before_anything_moves(self):
+        lab = self._lab(45)
+        tile = Tile.from_roi((0.0, 600.0), (0.0, 800.0), 0.0, swath_mm=1500.0, scan_speed=20.0)
+        with pytest.raises(ValueError, match="multiple of 90"):
+            SurveyRunner(lab, tile).run()
+        assert lab.placed == []
+
+    def test_minus_90_with_swapped_axes_is_the_same_scan_plan(self):
+        """ROI (x, y) at rotation 0 travelling X  ==  ROI (y, -x) at -90 travelling Y."""
+        x_rng, y_rng = (200.0, 800.0), (-300.0, 2000.0)
+        a = Tile.from_roi(x_rng, y_rng, 0.0, swath_mm=1500.0, scan_speed=20.0, axis="X", min_overlap=0.1)
+        # x_B = y_A, y_B = -x_A  ->  swap the ranges and negate the one that became Y
+        b = Tile.from_roi(y_rng, (-x_rng[1], -x_rng[0]), 0.0, swath_mm=1500.0, scan_speed=20.0, axis="Y", min_overlap=0.1)
+        plan_a = self._gantry_plan(self._lab(0), a)
+        plan_b = self._gantry_plan(self._lab(-90), b)
+        assert len(plan_a) == len(plan_b)
+        for (ends_a, span_a), (ends_b, span_b) in zip(plan_a, plan_b):
+            np.testing.assert_allclose(ends_a, ends_b, atol=1e-6)
+            np.testing.assert_allclose(span_a, span_b, atol=1e-6)
+
+    @pytest.mark.parametrize("rotation, expected", [(0, "X"), (180, "X"), (90, "Y"), (-90, "Y"), (270, "Y")])
+    def test_gantry_axis_picks_the_experiment_axis_that_scans_on_it(self, rotation, expected):
+        lab = self._lab(rotation)
+        tile = Tile.from_roi((0.0, 600.0), (0.0, 800.0), 0.0, swath_mm=1500.0, lab=lab,
+                             gantry_axis="X", scan_speed=20.0)
+        assert tile.axis == expected
+        SurveyRunner(lab, tile).run()
+        assert lab.gocator.acquired[0]["axis"] == "X"          # always the gantry X, whatever the rotation
+
+    def test_gantry_axis_x_at_minus_90_is_the_same_as_choosing_the_experiment_axis_by_hand(self):
+        lab = self._lab(-90)
+        roi = ((200.0, 800.0), (-300.0, 2000.0))
+        auto = Tile.from_roi(*roi, 0.0, swath_mm=1500.0, frames=lab.frames, gantry_axis="X", scan_speed=20.0)
+        hand = Tile.from_roi(*roi, 0.0, swath_mm=1500.0, axis="Y", scan_speed=20.0)
+        assert [p.to_dict() for p in auto.passes()] == [p.to_dict() for p in hand.passes()]
+
+    def test_axis_and_gantry_axis_together_is_an_error(self):
+        with pytest.raises(ValueError, match="not both"):
+            Tile.from_roi((0.0, 1.0), (0.0, 1.0), 0.0, swath_mm=1.0, axis="X", gantry_axis="X",
+                          frames=self._lab(0).frames)
+
+    def test_gantry_axis_needs_frames(self):
+        with pytest.raises(ValueError, match="frames"):
+            Tile.from_roi((0.0, 1.0), (0.0, 1.0), 0.0, swath_mm=1.0, gantry_axis="X")
+
+    def test_gantry_axis_in_a_diagonal_frame_is_refused(self):
+        with pytest.raises(ValueError, match="multiple of 90"):
+            Tile.from_roi((0.0, 1.0), (0.0, 1.0), 0.0, swath_mm=1.0, gantry_axis="X",
+                          frames=self._lab(30).frames)

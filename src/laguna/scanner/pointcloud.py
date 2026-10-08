@@ -23,6 +23,7 @@ x/y/z raw triple, which is what an un-resampled surface needs.
 from __future__ import annotations
 
 import csv
+import re
 from ctypes import c_void_p
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -353,7 +354,7 @@ class SurfaceScan:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = dict(self.metadata)
+        metadata = _plain(dict(self.metadata))
         metadata.setdefault("mounting", self.mounting.to_dict())
         metadata.setdefault("grid_axes", list(self.grid_axes))
         np.savez_compressed(
@@ -389,7 +390,10 @@ class SurfaceScan:
 
         path = Path(path)
         with np.load(path, allow_pickle=True) as data:
-            metadata = ast.literal_eval(str(data["metadata"][0]))
+            # Files written before save_npz() converted numpy scalars hold
+            # reprs like ``np.float64(303.3)``, which literal_eval rejects.
+            text = re.sub(r"np\.\w+\(([^()]*)\)", r"\1", str(data["metadata"][0]))
+            metadata = ast.literal_eval(text)
             mounting_dict = metadata.pop("mounting", None)
             metadata.pop("grid_axes", None)  # derived from mounting, not stored state
             return cls(
@@ -445,6 +449,25 @@ class SurfaceScan:
 # ----------------------------------------------------------------------
 # Message -> SurfaceScan conversion
 # ----------------------------------------------------------------------
+
+
+def _plain(value: Any) -> Any:
+    """Recursively convert numpy scalars/arrays to builtins, so ``repr`` round-trips.
+
+    ``repr(np.float64(1.0))`` is ``'np.float64(1.0)'`` on numpy 2, which
+    ``ast.literal_eval`` cannot read back — a saved scan whose metadata holds
+    any numpy scalar (e.g. a position taken from an array) would be
+    unreloadable.
+    """
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain(v) for v in value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
 
 
 def _scale(raw: np.ndarray, resolution_nm: int, offset_um: int) -> np.ndarray:

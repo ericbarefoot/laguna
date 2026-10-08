@@ -77,8 +77,10 @@ class Pass:
             surface must be anchored to; see `SurveyRunner._run_pass()`
             and `GocatorScanner`'s `cruise_start_mm` parameter.
         instrument: Which instrument measures this pass.
-        axis: Gantry axis the traverse runs along, resolved from the
-            geometry.
+        axis: Experiment-frame axis the traverse runs along, resolved from
+            the geometry. ``SurveyRunner`` maps it to the gantry axis that
+            actually moves through the experiment frame's rotation (the two
+            differ whenever that rotation is 90 or 270 degrees).
         scan_speed: Measuring traverse speed, if the plan fixed one.
         travel_speed: Speed for the pre-scan repositioning move to `start`,
             if it should differ from `scan_speed`. Defaults to `scan_speed`
@@ -318,6 +320,129 @@ class Tile(Survey):
                 self.scan_speed = self.speed
             if self.travel_speed is None:
                 self.travel_speed = self.speed
+
+    @classmethod
+    def from_roi(
+        cls,
+        roi_x_mm: Sequence[float],
+        roi_y_mm: Sequence[float],
+        z_mm: float,
+        *,
+        swath_mm: Optional[float] = None,
+        lab: Optional[Any] = None,
+        instrument: str = "gocator",
+        min_overlap: float = 0.1,
+        axis: Optional[str] = None,
+        gantry_axis: Optional[str] = None,
+        frames: Optional[Any] = None,
+        center_single_pass: bool = True,
+        **kwargs: Any,
+    ) -> "Tile":
+        """Plan the passes needed to cover a region of interest.
+
+        Give the region as experiment-frame bounds and the planner works out
+        how many swaths it needs and how much they overlap, rather than
+        taking the overlap as a given:
+
+        - **Wider than one swath:** the fewest passes that keep at least
+          `min_overlap` between neighbours, spread *evenly* so every seam
+          has the same overlap and the passes cover the region exactly
+          (first swath starts on the near edge, last ends on the far edge).
+        - **No wider than one swath** (including exactly one): a single
+          pass, not an error. With `center_single_pass` the swath is
+          centred on the region so the sensor sees margin on both sides;
+          otherwise it starts on the near edge.
+
+        The traverse always runs the region's full extent along `axis`.
+
+        Args:
+            roi_x_mm: ``(min, max)`` of the region along experiment X.
+            roi_y_mm: ``(min, max)`` of the region along experiment Y.
+            z_mm: Experiment-frame Z the passes are planned at.
+            swath_mm: How wide one pass images. Omit to read it from `lab`.
+            lab: Connected FlumeLab whose `instrument` reports its live
+                ``get_active_area()["width_mm"]`` — the swath actually
+                imaged, not the datasheet field of view. Only read from.
+            instrument: Instrument whose active area sets the swath.
+            min_overlap: Smallest acceptable fraction of a swath re-imaged
+                by the next pass, in ``[0, 1)``.
+            axis: *Experiment* axis the traverses run along (default ``"X"``);
+                passes step along the other horizontal axis.
+            gantry_axis: Alternatively, the *gantry* axis the scan must run
+                along, whatever the experiment frame's rotation: the matching
+                experiment axis is worked out from `frames` (or `lab.frames`)
+                and used as `axis`. At 0/180 degrees that is the same letter,
+                at ±90 it is the other one. Give this or `axis`, not both.
+            frames: A FrameRegistry, needed with `gantry_axis` when no `lab`
+                is given.
+            center_single_pass: Centre a one-pass swath on the region.
+            **kwargs: Passed to :class:`Tile` (speeds, `accel_mm_s2`,
+                `serpentine`, `instrument`, ...).
+
+        Returns:
+            A Tile whose passes cover the region.
+
+        Raises:
+            ValueError: If neither `swath_mm` nor a `lab` with an active
+                area is given, a range is empty or reversed,
+                `min_overlap` is outside ``[0, 1)``, both `axis` and
+                `gantry_axis` are given, `gantry_axis` has no `frames` to
+                resolve it with, or the experiment frame is not rotated by a
+                multiple of 90 degrees.
+        """
+        if gantry_axis is not None:
+            if axis is not None:
+                raise ValueError("give axis (experiment) or gantry_axis, not both")
+            resolver = frames if frames is not None else getattr(lab, "frames", None)
+            if resolver is None:
+                raise ValueError("gantry_axis needs `frames` or a `lab` to resolve it with")
+            axis = resolver.experiment_axis_for(gantry_axis)
+        elif axis is None:
+            axis = "X"
+        if axis not in ("X", "Y"):
+            raise ValueError(f"axis must be 'X' or 'Y' for a horizontal ROI, got {axis!r}")
+        if not 0.0 <= min_overlap < 1.0:
+            raise ValueError(f"min_overlap must be in [0, 1), got {min_overlap}")
+        if swath_mm is None:
+            scanner = getattr(lab, instrument, None) if lab is not None else None
+            if scanner is None or not hasattr(scanner, "get_active_area"):
+                raise ValueError(
+                    "Tile.from_roi() needs swath_mm, or a lab whose "
+                    f"{instrument!r} reports get_active_area()"
+                )
+            swath_mm = float(scanner.get_active_area()["width_mm"])
+        if swath_mm <= 0:
+            raise ValueError(f"swath_mm must be positive, got {swath_mm}")
+
+        ranges = {"X": tuple(float(v) for v in roi_x_mm), "Y": tuple(float(v) for v in roi_y_mm)}
+        for name, (lo, hi) in ranges.items():
+            if not hi > lo:
+                raise ValueError(f"roi_{name.lower()}_mm must be (min, max) with max > min, got {(lo, hi)}")
+        step = "Y" if axis == "X" else "X"
+        t_lo, t_hi = ranges[axis]
+        s_lo, s_hi = ranges[step]
+        extent = s_hi - s_lo
+
+        if extent <= swath_mm:
+            width = swath_mm if center_single_pass else extent
+            step_origin = (s_lo + s_hi) / 2 - swath_mm / 2 if center_single_pass else s_lo
+            overlap = min_overlap
+        else:
+            count = math.ceil((extent - swath_mm) / (swath_mm * (1.0 - min_overlap)) - 1e-9) + 1
+            pitch = (extent - swath_mm) / (count - 1)
+            # A hair under the exact value, so floating-point noise can't make
+            # passes() count one pass too many; the last swath is clamped onto
+            # the far edge regardless.
+            overlap = max(0.0, 1.0 - pitch * (1.0 + 1e-9) / swath_mm)
+            width, step_origin = extent, s_lo
+
+        origin = [0.0, 0.0, float(z_mm)]
+        origin[_AXIS_INDEX[axis]] = t_lo
+        origin[_AXIS_INDEX[step]] = step_origin
+        return cls(
+            origin=origin, length_mm=t_hi - t_lo, width_mm=width, swath_mm=swath_mm,
+            overlap=overlap, axis=axis, instrument=instrument, **kwargs,
+        )
 
     @property
     def pitch_mm(self) -> float:
@@ -625,6 +750,8 @@ class SurveyRunner:
             The passes that were executed.
         """
         self._fill_tile_accel()
+        for p in self.survey.passes():
+            self._gantry_axis_for(p.axis)      # fail before any motion, not mid-survey
         done: List[Pass] = []
         for p in self.pending():
             reference_point = self._resolve_reference_point(p)
@@ -660,6 +787,26 @@ class SurveyRunner:
                 )
         return done
 
+    def _gantry_axis_for(self, experiment_axis: str) -> str:
+        """Get the gantry axis that drives a straight pass along an experiment axis.
+
+        Passes are planned along an experiment axis but the gantry moves along
+        its own; see :meth:`FrameRegistry.gantry_axis_for`.
+
+        Args:
+            experiment_axis: ``"X"``, ``"Y"`` or ``"Z"``.
+
+        Returns:
+            The gantry axis name.
+
+        Raises:
+            ValueError: If the experiment axis is diagonal in gantry axes.
+        """
+        frames = getattr(self.lab, "frames", None)
+        if not hasattr(frames, "gantry_axis_for"):
+            return experiment_axis
+        return frames.gantry_axis_for(experiment_axis)
+
     def _fill_tile_accel(self) -> None:
         """Read the travel axis's accel into a Tile survey that didn't set one.
 
@@ -681,7 +828,7 @@ class SurveyRunner:
         if gantry is None:
             return
         try:
-            self.survey.accel_mm_s2 = gantry.axis(self.survey.axis).get_accel()
+            self.survey.accel_mm_s2 = gantry.axis(self._gantry_axis_for(self.survey.axis)).get_accel()
         except Exception as e:
             logger.warning(
                 "Could not read %s accel for tile-scan ramp lead-in — "
@@ -755,7 +902,8 @@ class SurveyRunner:
             end_gantry = self.lab.frames.gantry_target_for(
                 p.instrument, list(p.end), reference_point=reference_point
             )
-            axis_index = _AXIS_INDEX[p.axis]
+            gantry_axis = self._gantry_axis_for(p.axis)
+            axis_index = _AXIS_INDEX[gantry_axis]
             overrides: Dict[str, Any] = {}
             if p.scan_speed:
                 overrides["feed_rate_mm_s"] = p.scan_speed
@@ -777,7 +925,7 @@ class SurveyRunner:
                 overrides["settle_s"] = ramp_time_s(p.scan_speed, self.survey.accel_mm_s2)
             scan = scanner.acquire(
                 gantry=gantry,
-                axis=p.axis,
+                axis=gantry_axis,
                 end_mm=float(end_gantry[axis_index]),
                 **overrides,
             )
@@ -801,7 +949,7 @@ class SurveyRunner:
                 start=None,
                 end=self._acquire_scan_end(p, reference_point),
                 feed_rate_mm_s=p.scan_speed,
-                axis=p.axis,
+                axis=self._gantry_axis_for(p.axis),
             )
             result_note = f"file={result.path}"
         self.lab.event_log.log(
@@ -811,8 +959,9 @@ class SurveyRunner:
         return scan if scanner is not None and hasattr(scanner, "acquire") else result
 
     def _resolve_reference_point(self, p: Pass) -> Optional[List[float]]:
-        """The reference point `place()` should use for `p`, or None for the
-        instrument's usual (configured) one.
+        """Get the reference point `place()` should use for `p`.
+
+        None means the instrument's usual (configured) one.
 
         Shared by ``run()``'s per-pass log line and ``_run_pass()``'s actual
         placement, so the logged gantry target — dry-run or real — is always
@@ -849,7 +998,9 @@ class SurveyRunner:
         Which physical boundary (the active area's min or max X) counts
         as "near" depends on the mount's rotation between sensor and
         gantry axes — read live off the scanner's own ``mounting`` (see
-        ``laguna.scanner.mounting``) rather than re-deriving the sign here.
+        ``laguna.scanner.mounting``) rather than re-deriving the sign here
+        — **and** on the experiment frame's rotation relative to the
+        gantry, since the pass's ``step_axis`` is an experiment axis.
 
         Rotated here, not left to ``place()``: ``frames.instruments.gocator``
         is deliberately translation-only (``orient_scan()`` refuses to run
@@ -874,11 +1025,23 @@ class SurveyRunner:
         area = scanner.get_active_area()
         mounting = scanner.mounting
         step_i = _AXIS_INDEX[p.step_axis]
-        # matrix[:3, :3] column 0 is where sensor +X (across the laser)
-        # points in gantry/experiment space; its component along step_axis
-        # says whether increasing sensor X moves toward or away from the
-        # pass's near (offset) edge.
-        sign_along_step = mounting.matrix[step_i, 0]
+        # Column 0 of the mounting matrix is where sensor +X (across the
+        # laser) points in *gantry* axes, but step_axis is an *experiment*
+        # axis. With a rotated experiment frame (e.g. rotation_deg: 180)
+        # the two disagree in sign, so carry the direction through the
+        # experiment-from-gantry rotation before asking which way
+        # increasing sensor X moves along step_axis: toward or away from
+        # the pass's near (offset) edge. Skipping this picked the far edge
+        # and offset a whole tile by one swath.
+        across_in_gantry = mounting.matrix[:3, 0]
+        frames = getattr(self.lab, "frames", None)
+        experiment_from_gantry = getattr(frames, "experiment_from_gantry", None)
+        rotation = (
+            experiment_from_gantry.matrix[:3, :3]
+            if experiment_from_gantry is not None
+            else np.eye(3)
+        )
+        sign_along_step = (rotation @ across_in_gantry)[step_i]
         if sign_along_step >= 0:
             edge_x = area["x_mm"]
         else:

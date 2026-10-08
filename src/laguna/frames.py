@@ -65,6 +65,14 @@ logger = logging.getLogger(__name__)
 _RIGID_TOL = 1e-6
 
 
+def _axis_index(name: str) -> int:
+    """Index of a Cartesian axis name, with a clear error for anything else."""
+    try:
+        return "XYZ".index(name)
+    except ValueError:
+        raise ValueError(f"axis must be 'X', 'Y' or 'Z', got {name!r}") from None
+
+
 class AffineTransform:
     """A rigid 4x4 homogeneous transform, mapping points from one frame to another.
 
@@ -187,9 +195,14 @@ class AffineTransform:
         Args:
             config: Config block with recognized keys applied in this order:
                 matrix (4x4, overrides all), axes (sensor map), rotation_deg
-                (about Z), translation ([x, y, z] in mm). Rotation is applied
-                first, then translation, so translation is always read in the
-                target frame.
+                (about Z), then either translation or origin ([x, y, z] in
+                mm). Rotation is applied first, then translation, so
+                translation is read in the *target* frame: it is where the
+                source frame's origin lands, and it changes whenever the
+                rotation does. ``origin`` states the same offset the other
+                way round — the *source-frame* point that becomes the target
+                origin (translation = -rotation @ origin) — so changing
+                rotation_deg leaves that physical point where it was.
 
         Returns:
             Transform from the config.
@@ -199,11 +212,16 @@ class AffineTransform:
         """
         if not config:
             return cls.identity()
-        unknown = set(config) - {"matrix", "axes", "rotation_deg", "translation"}
+        unknown = set(config) - {"matrix", "axes", "rotation_deg", "translation", "origin"}
         if unknown:
             raise ValueError(
                 f"unknown transform key(s) {sorted(unknown)}; expected any of "
-                "matrix, axes, rotation_deg, translation"
+                "matrix, axes, rotation_deg, translation, origin"
+            )
+        if config.get("translation") is not None and config.get("origin") is not None:
+            raise ValueError(
+                "give either translation or origin, not both: origin is the same "
+                "thing stated the other way round (translation = -rotation @ origin)"
             )
         if "matrix" in config:
             return cls(np.asarray(config["matrix"], dtype=float))
@@ -215,6 +233,11 @@ class AffineTransform:
             transform = cls.from_rotation_z(float(config["rotation_deg"])) @ transform
         if config.get("translation") is not None:
             transform = cls.from_translation(config["translation"]) @ transform
+        elif config.get("origin") is not None:
+            origin = np.asarray(config["origin"], dtype=float).ravel()
+            if origin.size != 3:
+                raise ValueError(f"origin must have 3 values, got {origin.size}")
+            transform = cls.from_translation(-(transform.matrix[:3, :3] @ origin)) @ transform
         return transform
 
     # -- algebra --------------------------------------------------------
@@ -493,6 +516,57 @@ class FrameRegistry:
         )
         return self.experiment_from_gantry.apply(gantry_points)
 
+    def gantry_axis_for(self, experiment_axis: str) -> str:
+        """Get the gantry axis that moves along an experiment axis.
+
+        They coincide when the experiment frame is rotated 0 or 180 degrees
+        about Z, and swap at 90 or 270 (experiment X is then gantry Y).
+
+        Args:
+            experiment_axis: ``"X"``, ``"Y"`` or ``"Z"``.
+
+        Returns:
+            The gantry axis name.
+
+        Raises:
+            ValueError: If the experiment axis is diagonal in gantry axes,
+                so no single gantry axis follows it.
+        """
+        i = _axis_index(experiment_axis)
+        # experiment = R @ gantry + t: experiment axis i's gantry direction is row i of R.
+        return "XYZ"[self._axis_of(self.experiment_from_gantry.matrix[i, :3], f"experiment {experiment_axis}")]
+
+    def experiment_axis_for(self, gantry_axis: str) -> str:
+        """Get the experiment axis a gantry axis moves along.
+
+        The inverse of :meth:`gantry_axis_for`; use it to plan a survey that
+        always scans on a chosen gantry axis, whatever the experiment frame's
+        rotation.
+
+        Args:
+            gantry_axis: ``"X"``, ``"Y"`` or ``"Z"``.
+
+        Returns:
+            The experiment axis name.
+
+        Raises:
+            ValueError: If the gantry axis is diagonal in experiment axes.
+        """
+        j = _axis_index(gantry_axis)
+        # gantry axis j moves along column j of R in experiment coordinates.
+        return "XYZ"[self._axis_of(self.experiment_from_gantry.matrix[:3, j], f"gantry {gantry_axis}")]
+
+    @staticmethod
+    def _axis_of(direction: np.ndarray, name: str) -> int:
+        idx = int(np.argmax(np.abs(direction)))
+        if not np.isclose(abs(direction[idx]), 1.0, atol=1e-6):
+            raise ValueError(
+                f"{name} is diagonal in the other frame (direction {np.round(direction, 3).tolist()}): "
+                "the experiment frame is rotated by something other than a multiple of 90 "
+                "degrees, and a single-axis scan can only follow one axis. Use a multiple of 90."
+            )
+        return idx
+
     def gantry_to_experiment(self, points: np.ndarray) -> np.ndarray:
         """Map points from gantry coordinates to experiment frame.
 
@@ -658,7 +732,9 @@ def orient_scan(
     offset — silently mirrors the travel axis for any pass that travels in
     the negative direction along its axis, since acquisition order no
     longer matches increasing position; see ``docs/subsystems/scanner.md``,
-    "Sensor axes are not gantry axes."
+    "Sensor axes are not gantry axes." The mounting's own sign on the travel
+    axis is deliberately *not* part of this: row order has no geometric
+    direction, so only the recorded start→end direction sets it.
 
     **Returned shape.** The transform can rotate (the experiment frame's
     ``rotation_deg``, or an instrument mount's ``axes``), which a uniform
@@ -772,9 +848,20 @@ def orient_scan(
             anchor = float(valid_points[0, travel_col])
         else:
             anchor = float(full_points[0, travel_col])
+        # The mounting's sign on the travel axis must not leak into the
+        # direction: sensor Y is acquisition order, so how far along the pass
+        # a row sits is (Y - Y_first), and which way that points is the
+        # gantry's start->end direction alone. The mount is a rigid rotation,
+        # so a physical mount can force sensor Y -> -X (see mounting.py's
+        # determinant argument); applying that -1 here as well would put a
+        # forward pass *behind* its start point and a reverse pass beyond it.
+        mount_sign = 1.0
+        mounting = getattr(scan, "mounting", None)
+        if mounting is not None and mounting.matrix[travel_col, 1] != 0:
+            mount_sign = float(np.sign(mounting.matrix[travel_col, 1]))
         full_points[:, travel_col] = (
             float(gantry_start[travel_col])
-            + travel_sign * (full_points[:, travel_col] - anchor)
+            + travel_sign * mount_sign * (full_points[:, travel_col] - anchor)
         )
         # This axis is now fully resolved above — the flat offset below
         # must not add gantry_start[travel_col] a second time.

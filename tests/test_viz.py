@@ -14,8 +14,10 @@ matplotlib.use("Agg")
 
 from laguna.robot.macron.profiler import ProfileResult  # noqa: E402
 from laguna.scanner.pointcloud import SurfaceScan  # noqa: E402
-from laguna.survey import Pass, Traverse  # noqa: E402
-from laguna.viz import Landmark, plot_acquisition, plot_trajectory  # noqa: E402
+from laguna.frames import AffineTransform, FrameRegistry, InstrumentFrame  # noqa: E402
+from laguna.scanner.mounting import SensorMounting  # noqa: E402
+from laguna.survey import Pass, Tile, Traverse  # noqa: E402
+from laguna.viz import Landmark, plot_acquisition, plot_survey_plan, plot_trajectory  # noqa: E402
 
 
 def make_uniform_scan(**meta):
@@ -348,3 +350,85 @@ class TestPlotTrajectory:
         assert table is not None
         rows = {r for (r, c) in table.get_celld()}
         assert len(rows) == 3  # header + 2 passes
+
+
+# plot_survey_plan()
+# ---------------------------------------------------------------------------
+
+
+def make_plan_frames():
+    return FrameRegistry(
+        experiment_from_gantry=AffineTransform.from_config(
+            {"translation": [2200, 670, 0], "rotation_deg": 180}),
+        instruments={"gocator": InstrumentFrame(
+            "gocator", AffineTransform.from_translation([597.0, 312.0, 0.0]))},
+    )
+
+
+def make_plan_tile():
+    swath, span = 1500.0, 2100.0
+    return Tile(origin=[700.0, -1052.0, 100.0], length_mm=600.0, width_mm=span, swath_mm=swath,
+                overlap=2 - span / swath - 1e-9, axis="X", scan_speed=100.0, travel_speed=100.0,
+                accel_mm_s2=1500.0)
+
+
+class FakePlanScanner:
+    mounting = SensorMounting(scan_x="+Y", scan_y="-X", scan_z="+Z")
+
+    def get_active_area(self):
+        return {"x_mm": -765.0, "width_mm": 1500.0}
+
+
+class FakePlanLab:
+    def __init__(self):
+        import types
+
+        self.frames = make_plan_frames()
+        self.gocator = FakePlanScanner()
+        self.config = types.SimpleNamespace(get=lambda key: {"axes": [
+            {"name": "X", "soft_negative_limit_mm": -5, "soft_positive_limit_mm": 2130},
+            {"name": "Y", "soft_negative_limit_mm": -5, "soft_positive_limit_mm": 1200},
+        ]})
+
+
+class TestPlotSurveyPlan:
+    def test_planned_swaths_and_origins_without_a_lab(self):
+        fig, ax = plot_survey_plan(make_plan_tile(), make_plan_frames())
+        assert "2 passes" in ax.get_title()
+        # two swath bands, no soft limits or footprints without a lab
+        assert len(ax.patches) == 2
+
+    def test_gantry_origin_is_mapped_through_the_experiment_frame(self):
+        fig, ax = plot_survey_plan(make_plan_tile(), make_plan_frames())
+        marks = [ln.get_xydata()[0] for ln in ax.lines if ln.get_marker() == "x"]
+        np.testing.assert_allclose(marks[0], [2200.0, 670.0])  # 180 deg frame: gantry 0,0 is the far corner
+
+    def test_with_a_lab_adds_limits_footprints_and_carriage_paths(self):
+        fig, ax = plot_survey_plan(make_plan_tile(), lab=FakePlanLab())
+        # 2 swath bands + soft-limit envelope + 2 actual footprints
+        assert len(ax.patches) == 5
+        assert sum(ln.get_linestyle() == "--" for ln in ax.lines) == 2  # one carriage path per pass
+
+    def test_explicit_limits_without_a_lab(self):
+        fig, ax = plot_survey_plan(make_plan_tile(), make_plan_frames(),
+                                   gantry_limits={"X": (-5, 2130), "Y": (-5, 1200)})
+        assert len(ax.patches) == 3
+
+    def test_draws_into_a_given_axes(self):
+        import matplotlib.pyplot as plt
+
+        _, existing = plt.subplots()
+        fig, ax = plot_survey_plan(make_plan_tile(), make_plan_frames(), ax=existing, title="mine")
+        assert ax is existing and ax.get_title() == "mine"
+
+    def test_traverse_without_a_swath_draws_only_paths(self):
+        fig, ax = plot_survey_plan(make_survey(), make_plan_frames())
+        assert len(ax.patches) == 0
+
+    def test_empty_passes_raises(self):
+        with pytest.raises(ValueError, match="no passes"):
+            plot_survey_plan([], make_plan_frames())
+
+    def test_needs_frames_or_a_lab(self):
+        with pytest.raises(ValueError, match="frames"):
+            plot_survey_plan(make_plan_tile())
