@@ -121,13 +121,39 @@ class RunContext:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def path_for(self, subsystem: str, default_dir: str) -> Path:
+    def path_for(
+        self, subsystem: str, default_dir: str, configured_dir: Optional[str] = None
+    ) -> Path:
         """Where `subsystem` should write.
 
-        Returns a subdirectory of the run directory when one is configured,
-        and otherwise the subsystem's own ``default_dir`` unchanged — so
-        enabling run directories is opt-in and reversible.
+        Resolution order:
+
+        1. `configured_dir` — an ``output_dir`` the user set on purpose (a
+           separate drive, say) — wins over everything, run directory
+           included. The caller must pass ``None`` unless the value came from
+           the user's own config, not from a constructor fallback: this method
+           can't tell the two apart from the value alone.
+        2. The run directory's ``<subsystem>`` subdirectory, when one is
+           configured.
+        3. `default_dir` unchanged, so enabling run directories stays opt-in
+           and reversible.
+
+        Args:
+            subsystem: Subsystem name, used as the run-directory subfolder.
+            default_dir: The subsystem's own fallback directory.
+            configured_dir: The user's explicit ``output_dir``, or None.
+
+        Returns:
+            The directory to write to. Only the run-directory case is created
+            here; a configured or default directory is left to the subsystem.
         """
+        if configured_dir is not None:
+            if self.directory is not None:
+                logger.info(
+                    "[%s] keeping configured output_dir %s instead of the run directory",
+                    subsystem, configured_dir,
+                )
+            return Path(configured_dir)
         directory = self.directory
         if directory is None:
             return Path(default_dir)

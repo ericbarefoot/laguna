@@ -1291,3 +1291,35 @@ class TestSetSafeMode:
             controller.move_to_unfenced("Y", 1)
         controller.set_safe_mode(False)
         controller._require_motion_allowed("test")   # no longer raises
+
+
+class TestGroupIndexValidation:
+    def test_equal_indices_rejected(self):
+        cfg = dict(BASE_CONFIG, group_index=2, theta_group_index=2)
+        with pytest.raises(ValueError, match="different coordinated groups"):
+            GantryController.from_config(_cfg(cfg))
+
+    def test_default_theta_index_collides_with_group_two(self):
+        cfg = dict(BASE_CONFIG, group_index=2)
+        with pytest.raises(ValueError, match="theta_group_index"):
+            GantryController.from_config(_cfg(cfg))
+
+    @pytest.mark.parametrize("bad", [0, 11, -1, 2.0, True])
+    def test_out_of_range_theta_index_rejected(self, bad):
+        cfg = dict(BASE_CONFIG, theta_group_index=bad)
+        with pytest.raises(ValueError, match="theta_group_index"):
+            GantryController.from_config(_cfg(cfg))
+
+    def test_out_of_range_group_index_rejected(self):
+        cfg = dict(BASE_CONFIG, group_index=11)
+        with pytest.raises(ValueError, match="group_index"):
+            GantryController.from_config(_cfg(cfg))
+
+    def test_direct_construction_validates_too(self):
+        with pytest.raises(ValueError, match="different coordinated groups"):
+            GantryController(object(), group_index=3, theta_group_index=3)
+
+    def test_distinct_in_range_indices_accepted(self):
+        cfg = dict(BASE_CONFIG, group_index=3, theta_group_index=4)
+        controller = GantryController.from_config(_cfg(cfg))
+        assert controller._group_index == 3

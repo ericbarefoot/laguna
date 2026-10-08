@@ -197,7 +197,8 @@ gocator:
   exposure_us: 200           # laser exposure; omit to leave the sensor's setting
   uniform_spacing: null       # true/false to force X resampling on/off; omit to
                                # leave as-is. Disabling it raises the max scan rate.
-  output_dir: ./data/scans
+  # output_dir: ./data/scans  # default. Setting it explicitly overrides timing.run_dir:
+  #                           # scans then stay here instead of under the run directory.
   sdk_lib_dir: null           # dir holding libGoSdk.so/libkApi.so. Omit to use
                                # $LAGUNA_GOSDK_LIB_DIR or a conventional path —
                                # build them first with scripts/build_gosdk.sh

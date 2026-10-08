@@ -99,6 +99,23 @@ class TestSimulateConfig:
                         "od2000", "wtt12l"):
             assert out[section]["simulated"] is True
 
+    def test_every_registered_subsystem_is_simulated_or_explicitly_dropped(self):
+        """The guard behind GH #48: a registry entry in *neither* list would
+        reach simulate=True untouched and connect to real hardware during a
+        rehearsal. Adding a subsystem to the registry must force a decision —
+        give it a simulated backend, or list it in _NO_SIMULATED_BACKEND (which
+        drops it, with a warning naming it)."""
+        from laguna.registry import SUBSYSTEM_REGISTRY
+        from laguna.simulation import _NO_SIMULATED_BACKEND, _SIMULATED_SECTIONS
+
+        unclassified = set(SUBSYSTEM_REGISTRY) - set(_SIMULATED_SECTIONS) - set(_NO_SIMULATED_BACKEND)
+        assert not unclassified, (
+            f"{sorted(unclassified)} would run against real hardware under "
+            "simulate=True: add to _SIMULATED_SECTIONS (with a simulated "
+            "backend) or _NO_SIMULATED_BACKEND"
+        )
+        assert not set(_SIMULATED_SECTIONS) & set(_NO_SIMULATED_BACKEND)
+
     def test_unknown_sections_with_no_simulated_backend_are_dropped(self, monkeypatch):
         """_NO_SIMULATED_BACKEND is empty today (every registered subsystem
         has a simulated path), but the drop mechanism itself must still

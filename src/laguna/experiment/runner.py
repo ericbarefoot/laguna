@@ -264,10 +264,14 @@ def setup_run(
     lab.add_all()
 
     if "gocator" in lab._subsystems and lab.run.root is not None:
-        # Route scans under the run directory rather than the bare
-        # configured output_dir, so a run's whole output tree is one
-        # self-contained artifact — see laguna.run_context.
-        lab.gocator._output_dir = lab.run.path_for("gocator", str(lab.gocator._output_dir))
+        # Route scans under the run directory so a run's whole output tree is
+        # one self-contained artifact — unless the user set gocator.output_dir
+        # on purpose, which wins (see laguna.run_context.RunContext.path_for).
+        lab.gocator._output_dir = lab.run.path_for(
+            "gocator",
+            str(lab.gocator._output_dir),
+            configured_dir=lab.config.get("gocator").get("output_dir"),
+        )
 
     if "dslr_cameras" in lab._subsystems and lab.run.root is not None:
         lab.dslr_cameras.set_output_root(lab.run.path_for("dslr_cameras", "."))

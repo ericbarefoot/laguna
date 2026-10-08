@@ -254,8 +254,11 @@ def simulate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         gocator = dict(out["gocator"])
         gocator["simulated"] = True
         out["gocator"] = gocator
-    for section in ("weir", "flow", "gauge", "pi_cameras", "dslr_cameras",
-                     "od2000", "wtt12l"):
+    # gantry and gocator are handled above; each remaining section marks itself
+    # simulated through its own flag.
+    for section in _SIMULATED_SECTIONS:
+        if section in ("gantry", "gocator"):
+            continue
         if section in out:
             sub = dict(out[section])
             sub["simulated"] = True
