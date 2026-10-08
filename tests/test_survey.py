@@ -1118,3 +1118,79 @@ class TestRotatedExperimentFrame:
         with pytest.raises(ValueError, match="multiple of 90"):
             Tile.from_roi((0.0, 1.0), (0.0, 1.0), 0.0, swath_mm=1.0, gantry_axis="X",
                           frames=self._lab(30).frames)
+
+
+class TestLeadOut:
+    """The mirror of the lead-in: stop one ramp past the swath end."""
+
+    def _tile(self, accel=150.0, **kw):
+        base = dict(origin=(0.0, 0.0, 0.0), length_mm=600.0, width_mm=2000.0, swath_mm=1500.0,
+                    overlap=0.4, scan_speed=100.0, accel_mm_s2=accel, axis="X")
+        base.update(kw)
+        return Tile(**base)
+
+    def test_each_pass_stops_one_ramp_past_its_end_in_its_own_direction(self):
+        ramp = 100.0**2 / (2 * 150.0)                              # 33.3 mm
+        fwd, rev = self._tile().passes()
+        assert fwd.end[0] == 600.0 and fwd.overrun_end[0] == pytest.approx(600.0 + ramp)
+        assert rev.end[0] == 0.0 and rev.overrun_end[0] == pytest.approx(0.0 - ramp)
+        assert fwd.overrun_end[1:] == fwd.end[1:]                  # only the travel coordinate moves
+
+    def test_the_lead_out_matches_the_lead_in(self):
+        ramp = 100.0**2 / (2 * 150.0)
+        for p in self._tile().passes():
+            lead_in = abs(p.cruise_start[0] - p.start[0])
+            lead_out = abs(p.overrun_end[0] - p.end[0])
+            assert lead_in == pytest.approx(lead_out) == pytest.approx(ramp)
+
+    def test_no_accel_means_no_lead_out_and_nothing_changes(self):
+        for accel in (None, 0.0):
+            for p in self._tile(accel=accel).passes():
+                assert p.overrun_end is None and p.commanded_end == p.end
+
+    def test_the_measured_stretch_is_unchanged(self):
+        with_ramp, without = self._tile().passes(), self._tile(accel=None).passes()
+        for a, b in zip(with_ramp, without):
+            assert a.end == b.end and a.measure_start == b.measure_start
+            assert a.length_mm == pytest.approx(b.length_mm)
+
+    def test_it_is_recorded_in_the_pass_dict_and_the_description(self):
+        tile = self._tile()
+        assert tile.passes()[0].to_dict()["overrun_end"] == list(tile.passes()[0].overrun_end)
+        assert "stops at" in tile.describe()
+
+    def test_the_runner_sends_the_axis_to_the_stop_and_captures_only_to_the_end(self):
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea(x_mm=-750.0, width_mm=1500.0)
+        SurveyRunner(lab, self._tile()).run()
+        ramp = 100.0**2 / 300.0
+        for kw, p, placed in zip(lab.gocator.acquired, self._tile().passes(), lab.placed):
+            ref = placed[3]
+            end = lab.frames.gantry_target_for("gocator", list(p.end), reference_point=ref)[0]
+            sign = 1.0 if p.end[0] > p.measure_start[0] else -1.0
+            assert kw["capture_end_mm"] == pytest.approx(end)                 # the capture ends at the swath end
+            assert kw["end_mm"] == pytest.approx(end + sign * ramp)           # the axis is sent one ramp past it
+
+    def test_without_a_lead_out_the_runner_passes_nothing_extra(self):
+        lab = FakeLab()
+        lab.gocator = FakeScannerWithActiveArea(x_mm=-750.0, width_mm=1500.0)
+        SurveyRunner(lab, self._tile(accel=None)).run()
+        assert all("capture_end_mm" not in kw for kw in lab.gocator.acquired)
+
+    def test_the_stop_lands_on_the_gantry_axis_in_a_rotated_frame(self):
+        """-90 degrees: an experiment-X pass is a gantry-Y move, so the stop is read off gantry Y."""
+        from laguna.frames import FrameRegistry
+
+        lab = FakeLab()
+        lab.frames = FrameRegistry.from_config({"experiment": {"origin": [2200, 670, 0], "rotation_deg": -90},
+                                                "instruments": {"gocator": {"translation": [597, 312, 0]}}})
+        lab.gocator = FakeScannerWithActiveArea(x_mm=-750.0, width_mm=1500.0)
+        tile = self._tile()
+        SurveyRunner(lab, tile).run()
+        p0 = tile.passes()[0]
+        ref = lab.placed[0][3]
+        g_end = lab.frames.gantry_target_for("gocator", list(p0.end), reference_point=ref)
+        g_stop = lab.frames.gantry_target_for("gocator", list(p0.overrun_end), reference_point=ref)
+        kw = lab.gocator.acquired[0]
+        assert kw["axis"] == "Y"
+        assert kw["capture_end_mm"] == pytest.approx(g_end[1]) and kw["end_mm"] == pytest.approx(g_stop[1])

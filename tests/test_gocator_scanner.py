@@ -1164,6 +1164,48 @@ class TestScanWithGantry:
         assert scan.metadata["gantry_axis"] == "X"
         assert scan.metadata["gantry_feed_rate_mm_s"] == pytest.approx(20.0)
 
+    def _sleeps(self, scanner, monkeypatch, **kw):
+        slept = []
+        monkeypatch.setattr("laguna.scanner.gocator.time.sleep", lambda d: slept.append(d))
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        scan = scanner.scan_with_gantry(
+            FakeGantry(), axis="X", end_mm=200.0, feed_rate_mm_s=20.0, **kw
+        )
+        return slept, scan
+
+    def test_the_trigger_waits_for_the_settle_plus_the_configured_delay(self, scanner, monkeypatch):
+        """The command-to-motion latency the settle time can't know about: without
+        it the trigger fires early and forward/reverse passes are displaced in
+        opposite directions along travel."""
+        scanner._trigger_delay_s = 0.066
+        slept, scan = self._sleeps(scanner, monkeypatch, settle_s=0.667)
+        assert slept[0] == pytest.approx(0.667 + 0.066)
+        assert scan.metadata["trigger_settle_s"] == pytest.approx(0.667)
+        assert scan.metadata["trigger_delay_s"] == pytest.approx(0.066)
+
+    def test_the_default_delay_is_zero_so_nothing_changes_until_calibrated(self, scanner, monkeypatch):
+        slept, scan = self._sleeps(scanner, monkeypatch, settle_s=0.5)
+        assert scanner.trigger_delay_s == 0.0 and slept[0] == pytest.approx(0.5)
+        assert scan.metadata["trigger_delay_s"] == 0.0
+
+    def test_a_per_call_delay_overrides_the_configured_one(self, scanner, monkeypatch):
+        scanner._trigger_delay_s = 0.066
+        slept, _ = self._sleeps(scanner, monkeypatch, settle_s=0.5, trigger_delay_s=0.0)
+        assert slept[0] == pytest.approx(0.5)
+
+    @pytest.mark.parametrize("bad", [-0.01, 1.5])
+    def test_an_out_of_range_delay_is_refused_before_anything_moves(self, scanner, monkeypatch, bad):
+        gantry = FakeGantry()
+        with pytest.raises(ValueError, match="trigger_delay_s"):
+            scanner.scan_with_gantry(gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0,
+                                     settle_s=0.0, trigger_delay_s=bad)
+        assert gantry.calls == []
+
+    def test_the_config_key_is_read_and_validated(self):
+        assert GocatorScanner({"trigger_delay_s": 0.07}).trigger_delay_s == pytest.approx(0.07)
+        with pytest.raises(ValueError, match="trigger_delay_s"):
+            GocatorScanner({"trigger_delay_s": 5.0})
+
     def test_metadata_records_full_gantry_position(self, scanner):
         """gantry_start_mm alone only records the travel axis — orient_scan()
         otherwise has no way to know the static axis's real position and
@@ -1211,6 +1253,39 @@ class TestScanWithGantry:
             cruise_start_mm=42.0,
         )
         assert scanner._fake.go.fixed_length == pytest.approx(158.0)  # not 160
+
+    def test_capture_end_sizes_the_window_to_the_region_while_the_axis_runs_on(self, scanner, caplog):
+        """Lead-out: the axis is sent past the region of interest so it is still at
+        speed at the region's end, but the surface covers only the region."""
+        import logging
+
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0})                    # ramp start
+        with caplog.at_level(logging.WARNING, logger="laguna.scanner.gocator"):
+            scan = scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=220.0, capture_end_mm=200.0, feed_rate_mm_s=20.0,
+                settle_s=0.0, cruise_start_mm=42.0,
+            )
+        assert ("begin_move_to", "X", 220.0) in gantry.calls            # the axis goes to the stop...
+        assert scanner._fake.go.fixed_length == pytest.approx(158.0)    # ...the capture ends at the region's end
+        assert scan.metadata["gantry_end_mm"] == pytest.approx(200.0)   # where the surface ends (orient_scan's direction)
+        assert scan.metadata["gantry_stop_mm"] == pytest.approx(220.0)  # where the axis was sent
+        assert "fixed_length_mm" not in caplog.text                     # not the "you gave a mismatching length" warning
+
+    def test_without_capture_end_the_stop_is_the_end(self, scanner):
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        scan = scanner.scan_with_gantry(FakeGantry(), axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0)
+        assert scan.metadata["gantry_end_mm"] == scan.metadata["gantry_stop_mm"] == pytest.approx(200.0)
+
+    def test_the_receive_timeout_covers_the_whole_run_not_just_the_capture(self, scanner, monkeypatch):
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        seen = {}
+        orig = scanner.receive_surface
+        monkeypatch.setattr(scanner, "receive_surface",
+                            lambda timeout_s=None, metadata=None: seen.setdefault("t", timeout_s) and orig(timeout_s=timeout_s, metadata=metadata))
+        scanner.scan_with_gantry(FakeGantry(positions={"X": 0.0}), axis="X", end_mm=1000.0, capture_end_mm=10.0,
+                                 feed_rate_mm_s=10.0, settle_s=0.0)
+        assert seen["t"] >= 1000.0 / 10.0 * 1.5            # 100 s of travel, not the 1 s the capture needs
 
     def test_without_cruise_start_mm_behavior_is_unchanged(self, scanner):
         """Omitting cruise_start_mm reproduces pre-#58 behavior exactly.

@@ -94,6 +94,14 @@ class Pass:
             has no swath edge to align).
         step_axis: Axis the swath is offset across, required when
             `edge_align` is True — see :attr:`Tile.step_axis`.
+        overrun_end: [x, y, z] where the gantry is *commanded* to stop, past
+            `end` along the travel axis — the mirror image of the lead-in.
+            The axis decelerates over its last ``v^2 / 2a`` before this
+            point, so stopping exactly at `end` would put the end of the
+            swath in the slowdown, where a sensor writing rows at a fixed
+            spacing misplaces them. Moving the stop past `end` by that
+            distance keeps the whole measured stretch (`measure_start` to
+            `end`) in the constant-speed slew. None means no lead-out.
     """
 
     index: int
@@ -107,6 +115,17 @@ class Pass:
     label: str = ""
     edge_align: bool = False
     step_axis: Optional[str] = None
+    overrun_end: Optional[Tuple[float, float, float]] = None
+
+    @property
+    def commanded_end(self) -> Tuple[float, float, float]:
+        """`overrun_end` if set, else `end` — where the gantry is told to stop.
+
+        Returns:
+            The point the move is commanded to, which lies past `end` when a
+            lead-out was planned so the axis is still at speed at `end`.
+        """
+        return self.overrun_end if self.overrun_end is not None else self.end
 
     @property
     def measure_start(self) -> Tuple[float, float, float]:
@@ -159,6 +178,7 @@ class Pass:
             "scan_speed": self.scan_speed,
             "travel_speed": self.travel_speed,
             "label": self.label,
+            "overrun_end": list(self.overrun_end) if self.overrun_end is not None else None,
             "edge_align": self.edge_align,
             "step_axis": self.step_axis,
         }
@@ -218,6 +238,8 @@ class Survey:
                 if p.cruise_start is not None and p.cruise_start != p.start
                 else ""
             )
+            if p.overrun_end is not None:
+                ramp_note += f" (stops at {tuple(round(v, 1) for v in p.overrun_end)})"
             rows.append(
                 f"  [{p.index}] {p.label or p.instrument}: "
                 f"{tuple(round(v, 1) for v in p.measure_start)} -> "
@@ -272,6 +294,12 @@ class Tile(Survey):
             from the live axis's ``get_accel()`` when a ``Tile`` leaves it
             unset — set it explicitly only for planning/dry-run use before
             a gantry is connected.
+
+            The same distance is added past the end of each pass
+            (``Pass.overrun_end``): the axis is commanded to stop one ramp
+            *beyond* the survey edge, assuming it decelerates at the rate it
+            accelerates, so the swath is covered entirely at constant speed
+            and the slowdown happens outside the region of interest.
 
     Each pass's ``step_axis`` coordinate names the swath's **near edge**,
     not its centerline — ``SurveyRunner`` reads the instrument's live
@@ -490,7 +518,14 @@ class Tile(Survey):
             else:
                 start[travel_i] += self.length_mm
             cruise_start = tuple(float(v) for v in start)
+            overrun_end = None
             if ramp_mm > 0:
+                # Mirror of the lead-in below: stop one ramp past the swath
+                # end, so the axis is still at scan_speed when the measured
+                # stretch ends and decelerates outside it.
+                stop = list(end)
+                stop[travel_i] += (1.0 if forward else -1.0) * ramp_mm
+                overrun_end = tuple(float(v) for v in stop)
                 # Extend the commanded start opposite the travel direction,
                 # so the axis is already at scan_speed — not still
                 # ramping — when it reaches the true swath boundary
@@ -504,6 +539,7 @@ class Tile(Survey):
                     start=tuple(float(v) for v in start),
                     end=tuple(float(v) for v in end),
                     cruise_start=cruise_start if ramp_mm > 0 else None,
+                    overrun_end=overrun_end,
                     instrument=self.instrument,
                     axis=self.axis,
                     scan_speed=self.scan_speed,
@@ -764,6 +800,8 @@ class SurveyRunner:
             ramp_note = ""
             if p.cruise_start is not None and p.cruise_start != p.start:
                 ramp_note = f" (ramp start {tuple(round(v, 1) for v in p.start)})"
+            if p.overrun_end is not None:
+                ramp_note += f" (stops at {tuple(round(v, 1) for v in p.overrun_end)})"
             logger.info(
                 "Survey pass %d/%d — %s | experiment %s -> %s | gantry %s -> %s%s",
                 p.index + 1, len(self.survey), p.label or p.instrument,
@@ -905,6 +943,15 @@ class SurveyRunner:
             gantry_axis = self._gantry_axis_for(p.axis)
             axis_index = _AXIS_INDEX[gantry_axis]
             overrides: Dict[str, Any] = {}
+            end_mm = float(end_gantry[axis_index])
+            if p.overrun_end is not None:
+                # Lead-out: send the axis one ramp past the swath end so it is
+                # still at speed there, but end the capture at the swath end.
+                stop_gantry = self.lab.frames.gantry_target_for(
+                    p.instrument, list(p.overrun_end), reference_point=reference_point
+                )
+                overrides["capture_end_mm"] = end_mm
+                end_mm = float(stop_gantry[axis_index])
             if p.scan_speed:
                 overrides["feed_rate_mm_s"] = p.scan_speed
             if p.cruise_start is not None:
@@ -926,7 +973,7 @@ class SurveyRunner:
             scan = scanner.acquire(
                 gantry=gantry,
                 axis=gantry_axis,
-                end_mm=float(end_gantry[axis_index]),
+                end_mm=end_mm,
                 **overrides,
             )
             result_note = f"points={scan.valid_count}" if scan is not None else "no data"

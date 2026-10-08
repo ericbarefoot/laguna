@@ -235,7 +235,7 @@ def plot_survey_plan(
       in different places and X/Y may run opposite ways);
     - the gantry's **soft-limit envelope**, if limits are known;
     - each pass's **sensor path** (solid, arrowed, numbered) and its
-      acceleration **lead-in** (dotted) when the plan has one;
+      acceleration **lead-in** and **lead-out** (dotted) when the plan has them;
     - each pass's planned **swath** (filled band).
 
     Given a connected `lab` it also draws what the plan will really do, from
@@ -243,8 +243,9 @@ def plot_survey_plan(
     ``SurveyRunner`` commands with:
 
     - the **gantry carriage path** (dashed): where the gantry itself travels
-      to put the sensor on each pass, offset from the sensor path by the
-      instrument translation and any edge reference;
+      to put the sensor on each pass, from the lead-in start to the lead-out
+      stop, offset from the sensor path by the instrument translation and
+      any edge reference;
     - the **actual swath footprint** (outline): the active area's two X edges
       carried through the mounting and the frames. It should coincide with
       the planned band; if it lands on the wrong side of the sensor path, a
@@ -349,6 +350,9 @@ def plot_survey_plan(
         if not np.allclose(st, ms):
             lead = st.copy(); lead[si] = centre
             ax.plot([lead[0], a[0]], [lead[1], a[1]], ":", c=c, lw=1.5)
+        if p.overrun_end is not None:
+            out = np.array(p.overrun_end[:2], dtype=float); out[si] = centre
+            ax.plot([b[0], out[0]], [b[1], out[1]], ":", c=c, lw=1.5)
         ax.annotate("", xy=b, xytext=a, arrowprops=dict(arrowstyle="->", color=c, lw=1.8))
         mid = (a + b) / 2
         ax.annotate(str(p.index), mid, textcoords="offset points", xytext=(0, 6), ha="center",
@@ -359,7 +363,8 @@ def plot_survey_plan(
             def gantry_pos(point):
                 return frames.gantry_target_for(p.instrument, list(point), reference_point=ref)
             gs, gm, ge = gantry_pos(p.start), gantry_pos(p.measure_start), gantry_pos(p.end)
-            carriage = np.array([to_exp(gs[:2]), to_exp(ge[:2])])
+            gstop = gantry_pos(p.commanded_end)
+            carriage = np.array([to_exp(gs[:2]), to_exp(gstop[:2])])
             ax.plot(carriage[:, 0], carriage[:, 1], "--", c=c, lw=1, alpha=0.8)
             scanner = getattr(lab, p.instrument, None)
             if scanner is not None and hasattr(scanner, "get_active_area"):
@@ -373,7 +378,7 @@ def plot_survey_plan(
                 ax.add_patch(Polygon(quad, closed=True, fill=False, ec=c, lw=1.4))
 
     legend += [Line2D([], [], c="0.2", lw=1.8, label="sensor path (numbered)"),
-               Line2D([], [], c="0.2", ls=":", lw=1.5, label="lead-in ramp"),
+               Line2D([], [], c="0.2", ls=":", lw=1.5, label="lead-in / lead-out ramp"),
                Patch(fc="0.5", alpha=0.25, label="planned swath")]
     if runner is not None:
         legend += [Line2D([], [], c="0.2", ls="--", lw=1, label="gantry carriage path"),
@@ -388,6 +393,93 @@ def plot_survey_plan(
     ax.legend(handles=legend, loc="best", fontsize=8)
     ax.set_title(title or f"survey plan — {len(passes)} passes")
     return fig, ax
+
+
+def plot_trigger_delay(
+    speeds_mm_s: Sequence[float],
+    offsets_mm: Sequence[float],
+    *,
+    tol_mm: float = 2.0,
+    title: Optional[str] = None,
+) -> Tuple["Figure", Any]:
+    """Plot forward/reverse seam offsets against speed, and the delay they imply.
+
+    Takes the raw measurements of a trigger-delay calibration (one
+    reverse-minus-forward block offset per forward/reverse pair, at any mix of
+    speeds, with repeats) and shows:
+
+    - **left:** every offset against scan speed, the fitted trend
+      (``-2 * v * delay + constant``) and the pure-delay line through the
+      origin at the mean delay, with the seam tolerance band;
+    - **right:** the delay each measurement implies (ms) at each speed, its
+      mean and one standard deviation, so the scatter is visible and the
+      value to configure is the mean at the speed you will scan at. The 1-sigma
+      seam left by that mean is written under each speed.
+
+    Args:
+        speeds_mm_s: Scan speed of each measurement, mm/s.
+        offsets_mm: Reverse-minus-forward block offset of each, mm.
+        tol_mm: Seam tolerance to shade, mm.
+        title: Figure title.
+
+    Returns:
+        ``(fig, (ax_offsets, ax_delays))``.
+
+    Raises:
+        ImportError: If matplotlib isn't installed.
+        ValueError: If the inputs are empty or of different length.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "laguna.viz.plot_trigger_delay() needs matplotlib, an optional "
+            "dependency: pip install 'laguna[viz]'"
+        ) from e
+    from .scanner.trigger_delay import fit_trigger_delay, summarize_trigger_delay
+
+    v, d = np.asarray(speeds_mm_s, dtype=float), np.asarray(offsets_mm, dtype=float)
+    if v.shape != d.shape or v.size == 0:
+        raise ValueError("speeds_mm_s and offsets_mm must be equal-length and non-empty")
+    ok = np.isfinite(d)
+    v, d = v[ok], d[ok]
+    fit = fit_trigger_delay(v, d)
+    uniq = np.unique(v)
+    stats = {u: summarize_trigger_delay(u, d[v == u]) for u in uniq}
+    mean_delay = float(np.mean(-d / (2.0 * v)))
+
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(12, 4.4))
+    vv = np.linspace(0, v.max() * 1.1, 100)
+    ax.axhspan(-tol_mm, tol_mm, color="g", alpha=0.12, label=f"±{tol_mm:g} mm tolerance")
+    ax.plot(v, d, "o", ms=7, alpha=0.8, label=f"measured, n={v.size}")
+    if uniq.size > 1:
+        ax.plot(vv, -2 * vv * fit["delay_s"] + fit["constant_mm"], "-", c="C1",
+                label=f"fit: {fit['delay_s'] * 1000:.1f} ms, {fit['constant_mm']:+.2f} mm")
+    ax.plot(vv, -2 * vv * mean_delay, "--", c="gray", label=f"mean delay {mean_delay * 1000:.1f} ms")
+    ax.axhline(0, c="k", lw=0.5)
+    ax.set_xlabel("scan speed, mm/s"); ax.set_ylabel("block shift, reverse − forward, mm")
+    ax.set_title("seam offset vs speed"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    rng = np.random.default_rng(0)
+    for k, u in enumerate(uniq):
+        st = stats[u]
+        ys = np.asarray(st["samples_s"]) * 1000
+        ax_x = k + rng.uniform(-0.12, 0.12, ys.size)
+        bx.plot(ax_x, ys, "o", c="C0", alpha=0.7)
+        sd = 0.0 if np.isnan(st["std_s"]) else st["std_s"] * 1000
+        bx.errorbar([k], [st["delay_s"] * 1000], yerr=[sd], fmt="s", c="C3", capsize=6, ms=8, zorder=3)
+        note = (f"mean {st['delay_s'] * 1000:.1f} ms\n±{sd:.1f} ms (1σ)\nseam ±{st['seam_sigma_mm']:.1f} mm"
+                if st["n"] > 1 else f"{st['delay_s'] * 1000:.1f} ms\n(n=1)")
+        bx.annotate(note, (k, ys.min()), textcoords="offset points", xytext=(0, -42), ha="center", fontsize=8)
+    bx.set_xticks(range(uniq.size)); bx.set_xticklabels([f"{u:g}" for u in uniq])
+    bx.set_xlim(-0.6, uniq.size - 0.4)
+    lo, hi = bx.get_ylim(); bx.set_ylim(lo - (hi - lo) * 0.35, hi)
+    bx.set_xlabel("scan speed, mm/s"); bx.set_ylabel("implied trigger delay, ms")
+    bx.set_title("delay each pair implies (calibrate at your scan speed)"); bx.grid(alpha=0.3, axis="y")
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig, (ax, bx)
 
 
 def plot_trajectory(

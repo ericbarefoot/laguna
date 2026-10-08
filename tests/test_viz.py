@@ -17,7 +17,7 @@ from laguna.scanner.pointcloud import SurfaceScan  # noqa: E402
 from laguna.frames import AffineTransform, FrameRegistry, InstrumentFrame  # noqa: E402
 from laguna.scanner.mounting import SensorMounting  # noqa: E402
 from laguna.survey import Pass, Tile, Traverse  # noqa: E402
-from laguna.viz import Landmark, plot_acquisition, plot_survey_plan, plot_trajectory  # noqa: E402
+from laguna.viz import Landmark, plot_acquisition, plot_survey_plan, plot_trajectory, plot_trigger_delay  # noqa: E402
 
 
 def make_uniform_scan(**meta):
@@ -414,6 +414,16 @@ class TestPlotSurveyPlan:
                                    gantry_limits={"X": (-5, 2130), "Y": (-5, 1200)})
         assert len(ax.patches) == 3
 
+    def test_lead_in_and_lead_out_are_drawn_as_dotted_segments(self):
+        fig, ax = plot_survey_plan(make_plan_tile(), make_plan_frames())
+        dotted = [ln for ln in ax.lines if ln.get_linestyle() == ":" and len(ln.get_xdata()) == 2]
+        assert len(dotted) == 4                      # one lead-in and one lead-out per pass
+
+    def test_no_accel_means_no_dotted_segments(self):
+        tile = make_plan_tile(); tile.accel_mm_s2 = None
+        fig, ax = plot_survey_plan(tile, make_plan_frames())
+        assert not [ln for ln in ax.lines if ln.get_linestyle() == ":" and len(ln.get_xdata()) == 2]
+
     def test_draws_into_a_given_axes(self):
         import matplotlib.pyplot as plt
 
@@ -432,3 +442,32 @@ class TestPlotSurveyPlan:
     def test_needs_frames_or_a_lab(self):
         with pytest.raises(ValueError, match="frames"):
             plot_survey_plan(make_plan_tile())
+
+
+# plot_trigger_delay()
+# ---------------------------------------------------------------------------
+
+
+class TestPlotTriggerDelay:
+    def test_repeats_at_one_speed(self):
+        fig, (ax, bx) = plot_trigger_delay([100.0] * 5, [-12.0, -13.0, -14.0, -13.0, -13.0])
+        assert len(ax.lines) >= 3 and "n=5" in " ".join(t.get_text() for t in ax.get_legend().get_texts())
+        assert "mean 65.0 ms" in " ".join(t.get_text() for t in bx.texts)
+
+    def test_several_speeds_adds_the_fit_line(self):
+        v = [50.0, 50.0, 100.0, 100.0, 150.0, 150.0]
+        fig, (ax, bx) = plot_trigger_delay(v, [-2 * s * 0.06 for s in v])
+        assert any("fit:" in t.get_text() for t in ax.get_legend().get_texts())
+
+    def test_a_single_measurement_still_plots(self):
+        fig, _ = plot_trigger_delay([100.0], [-13.0])
+        assert fig.get_axes()
+
+    def test_nan_offsets_are_dropped(self):
+        fig, (ax, _) = plot_trigger_delay([100.0, 100.0], [-13.0, float("nan")])
+        assert "n=1" in " ".join(t.get_text() for t in ax.get_legend().get_texts())
+
+    @pytest.mark.parametrize("v, d", [([], []), ([1.0, 2.0], [1.0])])
+    def test_bad_input_is_rejected(self, v, d):
+        with pytest.raises(ValueError):
+            plot_trigger_delay(v, d)

@@ -253,6 +253,47 @@ knowable from the scan grid alone, only from the gantry-side metadata
 `orient_scan()` also has). If you place scans some other way (bypassing
 `orient_scan()`), you need this same correction yourself.
 
+### Lead-out: keep the slowdown outside the swath
+
+The ramp lead-in makes the axis reach speed before the swath starts. The end needs the mirror image: the
+axis decelerates over its last `v² / 2a` before the commanded stop, and the sensor, writing rows at a
+fixed spacing for a fixed time, places those rows as if the speed were constant. They land ahead of where
+the axis really was, by up to `v² / 8a` at the end of the capture window (about 2, 8 and 19 mm at 50, 100
+and 150 mm/s with a = 150 mm/s²), so a feature near the end of a pass is stretched and shifted, in the
+direction of travel, differently in a forward and a reverse pass.
+
+A `Tile` with `accel_mm_s2` therefore sends each pass one ramp **past** its swath end
+(`Pass.overrun_end`, assuming the axis decelerates at the rate it accelerates), and
+`scan_with_gantry(..., end_mm=<stop>, capture_end_mm=<swath end>)` ends the capture at the swath end. The
+whole captured stretch is then constant-speed slew; the slowdown happens beyond it. The stop is
+fence-checked like any other end point, and it extends the commanded travel past the planned region by one
+ramp, so the soft limits and fences must allow it (the `calibration/gocator_alignment_and_seam.ipynb` §2a dry run and `plot_survey_plan` both
+include it). Metadata records `gantry_end_mm` (where the surface ends) and `gantry_stop_mm` (where the axis
+was sent).
+
+### Trigger delay: the start latency behind the residual forward/reverse seam
+
+`scan_with_gantry()` commands the move, waits `settle_s` (the axis kinematics: `speed / accel`, so the
+axis is at speed at the swath boundary), then fires the trigger. That wait assumes the axis starts moving
+the instant it is commanded. It doesn't: the command goes over the link to the controller and the ramp
+starts a little later. The trigger fires that much early, the surface is anchored to a position the axis
+has not reached yet, and the whole scan is displaced along its travel direction by `speed × latency`. A
+forward and a reverse pass are displaced in opposite directions, so the same feature appears
+`2 × speed × latency` apart between them. On this rig, after the ramp lead-in fix of issue #58, that was
+about 13 mm at 100 mm/s (about 66 ms), the same in both the old and the fixed run.
+
+`gocator.trigger_delay_s` (default `0.0`: nothing changes until it is calibrated) is added to the wait.
+**Calibrate it at the speed you will scan at, with repeats.** The implied delay is not the same at every
+speed (on this rig about 74 ms at 50 mm/s, 65 ms at 100, 59 ms at 150), and one forward/reverse pair
+scatters by 1–2 mm. So the calibration notebook's default (`calibration/gocator_alignment_and_seam.ipynb`
+§2e) is `CAL_REPEATS` (5) pairs at the planned scan speed: `summarize_trigger_delay()` in
+`laguna.scanner.trigger_delay` returns the mean (the value to configure), its standard deviation and 95%
+confidence interval, and the seam one pair would still show with that mean applied (`2 × speed × σ`).
+Several speeds (`fit_trigger_delay()`) check that the offset scales with speed; a constant left in that fit
+is a position error a delay cannot remove. `plot_trigger_delay()` in `laguna.viz` draws both. A per-pass
+`trigger_delay_s=` argument on `scan_with_gantry()` overrides the configured value, and the delay depends
+on the axis acceleration, so recalibrate if that changes.
+
 ## Matching feed rate to frame rate
 
 `solve_scan_rates()` ties together the three quantities locked by
