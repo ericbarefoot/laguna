@@ -19,6 +19,7 @@ from laguna.robot.macron.gcode import (
     GCodeExecutionAborted,
     GCodeExecutor,
     GCodeParser,
+    RampRestoreError,
 )
 from laguna.robot.macron.commands import IOMap
 from laguna.robot.macron.homing import AxisHomingConfig, HomingConfig, HomingProcedure
@@ -1179,3 +1180,129 @@ class TestDwellIsHaltable:
             executor.execute(trajectory, guard=guard)
         with pytest.raises(RuntimeError, match="most recent plan"):
             executor.execute(trajectory)
+
+
+class TestConcurrentPairRampRestoreFailure:
+    """GH #53: a failed ACL/DCL/SPD restore must be loud, independent, and blocking.
+
+    ACL/DCL are safety-relevant: a ramp left scaled-down lengthens how far
+    pause()/stop() coast. Z travels 3 mm against X/Y's 10 mm here, so Z is the
+    short leg and its original ramp (A5 ACL/DCL/SPD = 25/20/8) is what gets
+    restored.
+    """
+
+    BASE = {
+        "C1 INI 1 2": "0", "C1 ACL": "50", "C1 DCL": "40",
+        "A5 ACL": "25", "A5 DCL": "20", "A5 SPD": "8",
+        "A5 ACL 15": "15", "A5 DCL 12": "12", "A5 SPD 3": "3",
+        "A5 BMT 3": "0", "A5 MIF": "1",
+        "C1 SPD 10": "10", "C1 BMT 10 0": "0", "C1 MIF": "1",
+        "A5 ACL 25": "25", "A5 DCL 20": "20", "A5 SPD 8": "8",
+        "A1 ACP": "10", "A2 ACP": "0", "A5 ACP": "3",
+        # a plain X/Y follow-up move, used to prove motion is (not) allowed
+        "C1 BMT 20 0": "0",
+    }
+
+    def _executor(self, **overrides):
+        executor, conn = _make_executor({**self.BASE, **overrides})
+        return executor, conn
+
+    @staticmethod
+    def _flaky(fail_times: int, value: str = "ok"):
+        """A scripted response that raises `fail_times` times, then succeeds."""
+        state = {"left": fail_times}
+
+        def respond(_command: str) -> str:
+            if state["left"] > 0:
+                state["left"] -= 1
+                raise ConnectionError("serial dropped")
+            return value
+
+        return respond
+
+    def test_happy_path_leaves_nothing_pending(self):
+        executor, _ = self._executor()
+        executor.execute(executor.plan("G1 X10 Z3 F600"))
+        assert executor.ramp_restore_pending is False
+
+    def test_restore_failure_after_a_good_move_raises(self):
+        executor, _ = self._executor(**{"A5 DCL 20": ConnectionError("serial dropped")})
+        with pytest.raises(RampRestoreError, match="A5|responder|z DCL|z ACL/DCL"):
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        assert executor.ramp_restore_pending is True
+
+    def test_position_cache_still_follows_a_move_whose_restore_failed(self):
+        """The gantry moved; only the restore failed. A stale cache would make
+        the next move plan from the wrong point once the restore is retried."""
+        executor, _ = self._executor(**{"A5 DCL 20": ConnectionError("serial dropped")})
+        with pytest.raises(RampRestoreError):
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        assert executor.current_position == pytest.approx((10.0, 0.0, 3.0))
+
+    def test_every_restore_is_attempted_even_when_an_earlier_one_fails(self):
+        executor, conn = self._executor(**{"A5 ACL 25": ConnectionError("serial dropped")})
+        with pytest.raises(RampRestoreError):
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        # ACL and DCL are one restore step (ACL failed, so DCL is not sent);
+        # the speed restore is a separate step and must still be attempted.
+        assert "A5 SPD 8" in conn.sent
+
+    def test_the_moves_own_error_is_not_masked_by_a_restore_failure(self):
+        """Body fails (XY leg refused) and the restore fails too: the caller
+        must see the original error, with the restore failure attached."""
+        class MoveBroke(Exception):
+            pass
+
+        executor, _ = self._executor(**{
+            "C1 SPD 10": MoveBroke("xy leg refused"),
+            "A5 ACL 25": ConnectionError("serial dropped"),
+        })
+        with pytest.raises(MoveBroke) as info:
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        notes = " ".join(getattr(info.value, "__notes__", []))
+        assert "could not restore" in notes
+        assert executor.ramp_restore_pending is True
+
+    def test_motion_is_refused_while_the_restore_is_still_failing(self):
+        executor, conn = self._executor(**{"A5 DCL 20": ConnectionError("serial dropped")})
+        with pytest.raises(RampRestoreError):
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        sent_before = len(conn.sent)
+
+        follow_up = executor.plan("G1 X20 F600")
+        with pytest.raises(RampRestoreError, match="refusing to start motion.*gantry.gcode"):
+            executor.execute(follow_up)
+        new_commands = conn.sent[sent_before:]
+        assert not any("BMT" in c or "BMB" in c or "JOG" in c for c in new_commands), new_commands
+
+    def test_refusal_leaves_the_plan_in_place_to_rerun_after_recovery(self):
+        executor, _ = self._executor(**{"A5 DCL 20": self._flaky(2, "20")})
+        with pytest.raises(RampRestoreError):               # initial restore fails
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        follow_up = executor.plan("G1 X20 F600")
+        with pytest.raises(RampRestoreError):               # retry fails (2nd failure)
+            executor.execute(follow_up)
+        executor.execute(follow_up)                          # retry now succeeds: runs
+        assert executor.ramp_restore_pending is False
+
+    def test_a_recovered_restore_unblocks_motion_without_manual_steps(self):
+        executor, conn = self._executor(**{"A5 DCL 20": self._flaky(1, "20")})
+        with pytest.raises(RampRestoreError):
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        executor.execute(executor.plan("G1 X20 F600"))
+        assert executor.ramp_restore_pending is False
+        assert "C1 BMT 20 0" in conn.sent
+
+    def test_retry_ramp_restore_reports_success_and_failure(self):
+        executor, _ = self._executor(**{"A5 DCL 20": self._flaky(2, "20")})
+        with pytest.raises(RampRestoreError):
+            executor.execute(executor.plan("G1 X10 Z3 F600"))
+        assert executor.retry_ramp_restore() is False
+        assert executor.ramp_restore_pending is True
+        assert executor.retry_ramp_restore() is True
+        assert executor.ramp_restore_pending is False
+
+    def test_dry_run_is_never_blocked(self):
+        executor, _ = _make_executor({}, dry_run=True)
+        executor._pending_restores.append(("stale", lambda: (_ for _ in ()).throw(RuntimeError())))
+        executor.execute(executor.plan("G1 X10 Z3 F600"))

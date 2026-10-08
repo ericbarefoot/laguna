@@ -54,6 +54,31 @@ class WaterLevelSensor(ABC):
         """
         ...
 
+    # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+    # A water-level sensor is passive: it drives nothing and starts nothing.
+    # Scheduled reads stop when FlumeLab halts the scheduler ahead of these
+    # calls, and an in-flight read is a single bounded request with no state
+    # worth discarding. The verbs exist so a halt is uniform across the rig
+    # and so a missing verb in the event log means a real gap, not this.
+
+    def pause(self) -> Optional[str]:
+        """Nothing to quiesce: the sensor is passive."""
+        return None
+
+    def resume(self) -> Optional[str]:
+        """Nothing to restore: pause() changed nothing."""
+        return None
+
+    def stop(self) -> Optional[str]:
+        """Nothing to quiesce: the sensor is passive."""
+        return None
+
+    def estop(self) -> Optional[str]:
+        """Nothing to quiesce: the sensor is passive. Never raises."""
+        return None
+
 
 class SaflWaterLevelSensor(WaterLevelSensor, SubsystemLogging):
     """Water level sensor backed by a Massa ultrasonic sensor, via MQTT.

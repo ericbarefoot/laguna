@@ -162,6 +162,30 @@ class MqttSubscriber:
         }
 
     # ------------------------------------------------------------------
+    # Safety verbs (see laguna.safety)
+    # ------------------------------------------------------------------
+    # The subscriber only listens: it drives nothing and starts nothing, and
+    # buffered messages are data worth keeping through a halt, so there is
+    # nothing to quiesce or discard. The verbs exist so that adding one bare
+    # with lab.add() doesn't log a false "NOT quiesced" on every halt.
+
+    def pause(self) -> Optional[str]:
+        """Nothing to quiesce: the subscriber is passive."""
+        return None
+
+    def resume(self) -> Optional[str]:
+        """Nothing to restore: pause() changed nothing."""
+        return None
+
+    def stop(self) -> Optional[str]:
+        """Nothing to quiesce: the subscriber is passive."""
+        return None
+
+    def estop(self) -> Optional[str]:
+        """Nothing to quiesce: the subscriber is passive. Never raises."""
+        return None
+
+    # ------------------------------------------------------------------
     # Topic management and message access
     # ------------------------------------------------------------------
 
