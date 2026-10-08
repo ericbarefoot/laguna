@@ -1,6 +1,6 @@
 """Quick-look plots for scans, profiles, and planned trajectories.
 
-Two entry points, both experiment-frame only, both returning ``(fig, axes)``:
+Three entry points, all experiment-frame only, both returning ``(fig, axes)``:
 
 :func:`plot_acquisition` — dispatches on input type (a Gocator
 :class:`~laguna.scanner.pointcloud.SurfaceScan`, a rangefinder
@@ -13,6 +13,13 @@ random) to a shared budget — ``max_points`` (a count) or ``sample_fraction``
 (a proportion, and the one to reach for on a huge scan you just want a quick
 look at) — so a multi-million-point ``Tile.stitch()`` merge plots as fast
 as a single small pass.
+
+:func:`plot_survey_plan` — one top-down panel for a planned
+:class:`~laguna.survey.Tile`/:class:`~laguna.survey.Survey`: experiment and
+gantry origins, the gantry's soft-limit envelope, each pass's sensor path
+and swath, and (given a connected lab) where the gantry carriage itself
+goes and the swath footprint the live mounting and active area will really
+image. For checking a plan against the frames before anything moves.
 
 :func:`plot_trajectory` — the same XY/XZ/YZ layout, but for a **planned**
 :class:`~laguna.survey.Survey`/list of :class:`~laguna.survey.Pass` instead
@@ -206,6 +213,273 @@ def plot_acquisition(
     fig.suptitle(title or _default_title(data, points))
     fig.tight_layout()
     return fig, axes
+
+
+def plot_survey_plan(
+    survey: Union["Survey", Iterable["Pass"]],
+    frames: Optional[Any] = None,
+    *,
+    lab: Optional[Any] = None,
+    swath_mm: Optional[float] = None,
+    gantry_limits: Optional[dict] = None,
+    landmarks: Optional[Sequence[Landmark]] = None,
+    ax: Optional[Any] = None,
+    title: Optional[str] = None,
+) -> Tuple["Figure", Any]:
+    """Top-down view of a planned survey, in the experiment frame.
+
+    Draws, in experiment coordinates (X right, Y up):
+
+    - the **experiment origin** and the **gantry origin** (gantry 0, 0 mapped
+      into the experiment frame — with a rotated experiment frame these sit
+      in different places and X/Y may run opposite ways);
+    - the gantry's **soft-limit envelope**, if limits are known;
+    - each pass's **sensor path** (solid, arrowed, numbered) and its
+      acceleration **lead-in** and **lead-out** (dotted) when the plan has them;
+    - each pass's planned **swath** (filled band).
+
+    Given a connected `lab` it also draws what the plan will really do, from
+    the live instrument frame, mounting and active area — the same numbers
+    ``SurveyRunner`` commands with:
+
+    - the **gantry carriage path** (dashed): where the gantry itself travels
+      to put the sensor on each pass, from the lead-in start to the lead-out
+      stop, offset from the sensor path by the instrument translation and
+      any edge reference;
+    - the **actual swath footprint** (outline): the active area's two X edges
+      carried through the mounting and the frames. It should coincide with
+      the planned band; if it lands on the wrong side of the sensor path, a
+      mounting or frame sign is wrong. Nothing moves and nothing is
+      commanded.
+
+    Args:
+        survey: A Survey (e.g. a Tile), or any iterable of Pass.
+        frames: A FrameRegistry. Taken from `lab.frames` when omitted.
+        lab: Optional connected FlumeLab, for the carriage path, the actual
+            footprint and the gantry soft limits. Only read from.
+        swath_mm: Swath width for passes that don't carry one (a Tile's
+            passes use its own `swath_mm`; a Traverse has none).
+        gantry_limits: ``{"X": (lo, hi), "Y": (lo, hi)}`` soft limits in
+            gantry mm. Read from `lab`'s gantry config when omitted.
+        landmarks: Optional boxes, see :class:`Landmark`.
+        ax: Existing Axes to draw into. Omit to create a new figure.
+        title: Axes title. Defaults to a pass-count summary.
+
+    Returns:
+        ``(fig, ax)``.
+
+    Raises:
+        ImportError: If matplotlib isn't installed.
+        ValueError: If `survey` has no passes, or neither `frames` nor `lab`
+            was given.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import colormaps
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch, Polygon
+    except ImportError as e:
+        raise ImportError(
+            "laguna.viz.plot_survey_plan() needs matplotlib, an optional "
+            "dependency: pip install 'laguna[viz]'"
+        ) from e
+
+    passes = list(survey)
+    if not passes:
+        raise ValueError("plot_survey_plan(): no passes to plot")
+    if frames is None and lab is not None:
+        frames = lab.frames
+    if frames is None:
+        raise ValueError("plot_survey_plan() needs `frames` or a `lab` to take them from")
+
+    swath = getattr(survey, "swath_mm", None) or swath_mm
+    runner = None
+    if lab is not None:
+        from .survey import SurveyRunner
+
+        runner = SurveyRunner(lab, survey)
+        if gantry_limits is None:
+            gantry_limits = {
+                a["name"]: (a.get("soft_negative_limit_mm", -np.inf),
+                            a.get("soft_positive_limit_mm", np.inf))
+                for a in lab.config.get("gantry")["axes"]
+            }
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(10, 7))
+    fig = ax.figure
+    colors = colormaps["tab10"](np.arange(len(passes)) % 10)
+    legend: list = []
+
+    def to_exp(gantry_xy) -> np.ndarray:
+        return frames.gantry_to_experiment(np.array([*gantry_xy, 0.0]))[:2]
+
+    # -- origins and gantry envelope ------------------------------------
+    ax.plot(0, 0, "k+", ms=14, mew=2)
+    ax.annotate("experiment origin", (0, 0), textcoords="offset points", xytext=(8, 8), fontsize=9)
+    g0 = to_exp((0.0, 0.0))
+    ax.plot(*g0, "kx", ms=11, mew=2)
+    ax.annotate("gantry origin (0, 0)", g0, textcoords="offset points", xytext=(8, -14), fontsize=9)
+    legend += [Line2D([], [], marker="+", c="k", ls="", ms=10, label="experiment origin"),
+               Line2D([], [], marker="x", c="k", ls="", ms=9, label="gantry origin")]
+
+    if gantry_limits and all(np.isfinite(gantry_limits.get(a, (np.nan,))[0]) and
+                             np.isfinite(gantry_limits.get(a, (np.nan, np.nan))[1]) for a in "XY"):
+        (xl, xh), (yl, yh) = gantry_limits["X"], gantry_limits["Y"]
+        env = np.array([to_exp(c) for c in ((xl, yl), (xh, yl), (xh, yh), (xl, yh))])
+        ax.add_patch(Polygon(env, closed=True, fill=False, ec="0.45", ls="--", lw=1))
+        legend.append(Line2D([], [], c="0.45", ls="--", label="gantry soft limits"))
+
+    # -- passes -----------------------------------------------------------
+    for p, c in zip(passes, colors):
+        ti = {"X": 0, "Y": 1}[p.axis]
+        si = 1 - ti
+        ms, end, st = np.array(p.measure_start[:2]), np.array(p.end[:2]), np.array(p.start[:2])
+        edge = p.edge_align and p.step_axis is not None
+        if swath:
+            # edge_align: the step coordinate names the near edge, swath runs +step.
+            lo, hi = (ms[si], ms[si] + swath) if edge else (ms[si] - swath / 2, ms[si] + swath / 2)
+            t0, t1 = sorted((ms[ti], end[ti]))
+            corners = [(t0, lo), (t1, lo), (t1, hi), (t0, hi)] if ti == 0 else [(lo, t0), (hi, t0), (hi, t1), (lo, t1)]
+            ax.add_patch(Polygon(corners, closed=True, fc=c, ec=c, alpha=0.18, lw=0.5))
+            centre = (lo + hi) / 2
+        else:
+            centre = ms[si]
+        a = np.array([ms[0], ms[1]]); b = np.array([end[0], end[1]])
+        a[si] = b[si] = centre
+        if not np.allclose(st, ms):
+            lead = st.copy(); lead[si] = centre
+            ax.plot([lead[0], a[0]], [lead[1], a[1]], ":", c=c, lw=1.5)
+        if p.overrun_end is not None:
+            out = np.array(p.overrun_end[:2], dtype=float); out[si] = centre
+            ax.plot([b[0], out[0]], [b[1], out[1]], ":", c=c, lw=1.5)
+        ax.annotate("", xy=b, xytext=a, arrowprops=dict(arrowstyle="->", color=c, lw=1.8))
+        mid = (a + b) / 2
+        ax.annotate(str(p.index), mid, textcoords="offset points", xytext=(0, 6), ha="center",
+                    fontsize=10, color=c, fontweight="bold")
+
+        if runner is not None:
+            ref = runner._resolve_reference_point(p)
+            def gantry_pos(point):
+                return frames.gantry_target_for(p.instrument, list(point), reference_point=ref)
+            gs, gm, ge = gantry_pos(p.start), gantry_pos(p.measure_start), gantry_pos(p.end)
+            gstop = gantry_pos(p.commanded_end)
+            carriage = np.array([to_exp(gs[:2]), to_exp(gstop[:2])])
+            ax.plot(carriage[:, 0], carriage[:, 1], "--", c=c, lw=1, alpha=0.8)
+            scanner = getattr(lab, p.instrument, None)
+            if scanner is not None and hasattr(scanner, "get_active_area"):
+                area = scanner.get_active_area()
+                frame = frames.frame_for(p.instrument)
+                x_a, x_b = area["x_mm"], area["x_mm"] + area["width_mm"]
+                quad = []
+                for g, x in ((gm, x_a), (ge, x_a), (ge, x_b), (gm, x_b)):
+                    delta = scanner.mounting.apply_to_points(np.array([[x, 0.0, 0.0]]))[0]
+                    quad.append(to_exp((g + frame.offset + delta)[:2]))
+                ax.add_patch(Polygon(quad, closed=True, fill=False, ec=c, lw=1.4))
+
+    legend += [Line2D([], [], c="0.2", lw=1.8, label="sensor path (numbered)"),
+               Line2D([], [], c="0.2", ls=":", lw=1.5, label="lead-in / lead-out ramp"),
+               Patch(fc="0.5", alpha=0.25, label="planned swath")]
+    if runner is not None:
+        legend += [Line2D([], [], c="0.2", ls="--", lw=1, label="gantry carriage path"),
+                   Patch(fc="none", ec="0.2", label="actual footprint (live mounting + active area)")]
+
+    _draw_landmarks(ax, landmarks, "xy")
+    ax.set_aspect("equal")
+    ax.autoscale_view()
+    ax.set_xlabel("experiment X (mm)")
+    ax.set_ylabel("experiment Y (mm)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(handles=legend, loc="best", fontsize=8)
+    ax.set_title(title or f"survey plan — {len(passes)} passes")
+    return fig, ax
+
+
+def plot_trigger_delay(
+    speeds_mm_s: Sequence[float],
+    offsets_mm: Sequence[float],
+    *,
+    tol_mm: float = 2.0,
+    title: Optional[str] = None,
+) -> Tuple["Figure", Any]:
+    """Plot forward/reverse seam offsets against speed, and the delay they imply.
+
+    Takes the raw measurements of a trigger-delay calibration (one
+    reverse-minus-forward block offset per forward/reverse pair, at any mix of
+    speeds, with repeats) and shows:
+
+    - **left:** every offset against scan speed, the fitted trend
+      (``-2 * v * delay + constant``) and the pure-delay line through the
+      origin at the mean delay, with the seam tolerance band;
+    - **right:** the delay each measurement implies (ms) at each speed, its
+      mean and one standard deviation, so the scatter is visible and the
+      value to configure is the mean at the speed you will scan at. The 1-sigma
+      seam left by that mean is written under each speed.
+
+    Args:
+        speeds_mm_s: Scan speed of each measurement, mm/s.
+        offsets_mm: Reverse-minus-forward block offset of each, mm.
+        tol_mm: Seam tolerance to shade, mm.
+        title: Figure title.
+
+    Returns:
+        ``(fig, (ax_offsets, ax_delays))``.
+
+    Raises:
+        ImportError: If matplotlib isn't installed.
+        ValueError: If the inputs are empty or of different length.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "laguna.viz.plot_trigger_delay() needs matplotlib, an optional "
+            "dependency: pip install 'laguna[viz]'"
+        ) from e
+    from .scanner.trigger_delay import fit_trigger_delay, summarize_trigger_delay
+
+    v, d = np.asarray(speeds_mm_s, dtype=float), np.asarray(offsets_mm, dtype=float)
+    if v.shape != d.shape or v.size == 0:
+        raise ValueError("speeds_mm_s and offsets_mm must be equal-length and non-empty")
+    ok = np.isfinite(d)
+    v, d = v[ok], d[ok]
+    fit = fit_trigger_delay(v, d)
+    uniq = np.unique(v)
+    stats = {u: summarize_trigger_delay(u, d[v == u]) for u in uniq}
+    mean_delay = float(np.mean(-d / (2.0 * v)))
+
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(12, 4.4))
+    vv = np.linspace(0, v.max() * 1.1, 100)
+    ax.axhspan(-tol_mm, tol_mm, color="g", alpha=0.12, label=f"±{tol_mm:g} mm tolerance")
+    ax.plot(v, d, "o", ms=7, alpha=0.8, label=f"measured, n={v.size}")
+    if uniq.size > 1:
+        ax.plot(vv, -2 * vv * fit["delay_s"] + fit["constant_mm"], "-", c="C1",
+                label=f"fit: {fit['delay_s'] * 1000:.1f} ms, {fit['constant_mm']:+.2f} mm")
+    ax.plot(vv, -2 * vv * mean_delay, "--", c="gray", label=f"mean delay {mean_delay * 1000:.1f} ms")
+    ax.axhline(0, c="k", lw=0.5)
+    ax.set_xlabel("scan speed, mm/s"); ax.set_ylabel("block shift, reverse − forward, mm")
+    ax.set_title("seam offset vs speed"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    rng = np.random.default_rng(0)
+    for k, u in enumerate(uniq):
+        st = stats[u]
+        ys = np.asarray(st["samples_s"]) * 1000
+        ax_x = k + rng.uniform(-0.12, 0.12, ys.size)
+        bx.plot(ax_x, ys, "o", c="C0", alpha=0.7)
+        sd = 0.0 if np.isnan(st["std_s"]) else st["std_s"] * 1000
+        bx.errorbar([k], [st["delay_s"] * 1000], yerr=[sd], fmt="s", c="C3", capsize=6, ms=8, zorder=3)
+        note = (f"mean {st['delay_s'] * 1000:.1f} ms\n±{sd:.1f} ms (1σ)\nseam ±{st['seam_sigma_mm']:.1f} mm"
+                if st["n"] > 1 else f"{st['delay_s'] * 1000:.1f} ms\n(n=1)")
+        bx.annotate(note, (k, ys.min()), textcoords="offset points", xytext=(0, -42), ha="center", fontsize=8)
+    bx.set_xticks(range(uniq.size)); bx.set_xticklabels([f"{u:g}" for u in uniq])
+    bx.set_xlim(-0.6, uniq.size - 0.4)
+    lo, hi = bx.get_ylim(); bx.set_ylim(lo - (hi - lo) * 0.35, hi)
+    bx.set_xlabel("scan speed, mm/s"); bx.set_ylabel("implied trigger delay, ms")
+    bx.set_title("delay each pair implies (calibrate at your scan speed)"); bx.grid(alpha=0.3, axis="y")
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig, (ax, bx)
 
 
 def plot_trajectory(

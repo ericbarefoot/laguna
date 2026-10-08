@@ -762,6 +762,38 @@ def _run_scan(bridge: SerialBridge, request_id, axis: str, end_mm: float, feed_r
     })
 
 
+def _dead_reckoned_pos_mm(t, start_pos_mm, end_mm, feed_rate_mm_s, accel_mm_s2, t_move_start):
+    """Estimate the axis position at wall time `t` during a straight scan move.
+
+    Trapezoidal motion from `t_move_start`: constant acceleration up to
+    `feed_rate_mm_s`, then constant speed. Only the acceleration and slew
+    phases are modelled; a deceleration tail is extrapolated linearly (those
+    samples are flagged ``in_ramp`` by the caller).
+
+    The direction of travel is the sign of ``end_mm - start_pos_mm``. A scan
+    toward lower positions must *decrease* position with time; assuming
+    positive travel mirrored every reverse scan about its start point.
+
+    Args:
+        t: Wall time of the sample, seconds.
+        start_pos_mm: Axis position when the move was commanded.
+        end_mm: Commanded end position (sets the direction only).
+        feed_rate_mm_s: Slew speed.
+        accel_mm_s2: Acceleration; 0 or less means "no ramp".
+        t_move_start: Wall time the move was commanded.
+
+    Returns:
+        Estimated position, mm.
+    """
+    sign = 1.0 if end_mm >= start_pos_mm else -1.0
+    ramp_t = feed_rate_mm_s / accel_mm_s2 if accel_mm_s2 > 0 else 0.0
+    if ramp_t > 0 and t < t_move_start + ramp_t:
+        tau = max(0.0, t - t_move_start)
+        return start_pos_mm + sign * 0.5 * accel_mm_s2 * tau * tau
+    ramp_dist = 0.5 * feed_rate_mm_s * ramp_t
+    return start_pos_mm + sign * (ramp_dist + feed_rate_mm_s * (t - (t_move_start + ramp_t)))
+
+
 def _write_scan_output(output, records, ax, end_mm, feed_rate_mm_s, start_pos_mm, actual_end_mm,
                        accel_mm_s2, decel_mm_s2, t_move_start, t_move_done, al1342_host,
                        pdin_port, sensor, error):
@@ -779,7 +811,9 @@ def _write_scan_output(output, records, ax, end_mm, feed_rate_mm_s, start_pos_mm
     for rec in records:
         t = rec["wall_time"]
         in_ramp = not (t_slew_start <= t <= t_slew_end)
-        pos_mm = start_pos_mm + feed_rate_mm_s * (t - t_slew_start)
+        pos_mm = _dead_reckoned_pos_mm(
+            t, start_pos_mm, end_mm, feed_rate_mm_s, accel_mm_s2, t_move_start
+        )
         wall_iso = (
             datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
             .isoformat()

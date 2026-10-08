@@ -300,6 +300,29 @@ class TestOrientScan:
         pts = orient_scan(scan, frames=registry, gantry_start=[0.0, 0.0, 0.0]).to_points()
         assert pts[:, 0].min() == pytest.approx(500.0)
 
+    @pytest.mark.parametrize("start, end", [(700.0, 1000.0), (1000.0, 700.0)])
+    def test_pass_lies_between_its_start_and_end_whatever_the_mount_sign(self, start, end):
+        """A rigid mount can force sensor Y -> -X (see mounting.py), but sensor Y is
+        acquisition order: the scan must sit on the stretch the gantry actually
+        travelled, forward or reverse, not behind the start point."""
+        mounting = SensorMounting(scan_x="+Y", scan_y="-X", scan_z="+Z")
+        y_mm = np.linspace(-150.0, 150.0, 7)
+        scan = make_scan(mounting, y_mm=y_mm, gantry_axis="X",
+                         gantry_start_mm=start, gantry_end_mm=end)
+        pts = orient_scan(scan, frames=FrameRegistry()).to_points()
+        assert min(start, end) - 1e-6 <= pts[:, 0].min() and pts[:, 0].max() <= max(start, end) + 1e-6
+        assert pts[:, 0][0] == pytest.approx(start)  # first-acquired point sits at the pass start
+
+    def test_forward_and_reverse_passes_over_the_same_feature_agree(self):
+        mounting = SensorMounting(scan_x="+Y", scan_y="-X", scan_z="+Z")
+        y_mm = np.linspace(-150.0, 150.0, 7)
+        fwd = make_scan(mounting, y_mm=y_mm, gantry_axis="X", gantry_start_mm=700.0, gantry_end_mm=1000.0)
+        rev = make_scan(mounting, y_mm=y_mm, gantry_axis="X", gantry_start_mm=1000.0, gantry_end_mm=700.0)
+        a = orient_scan(fwd, frames=FrameRegistry()).to_points()
+        b = orient_scan(rev, frames=FrameRegistry()).to_points()
+        # Row k is acquired k frames into the pass: 50 mm per row here.
+        np.testing.assert_allclose(sorted(a[:, 0]), sorted(b[:, 0]))
+
     def test_missing_start_position_raises(self):
         with pytest.raises(ValueError, match="needs the gantry position"):
             orient_scan(make_scan(), frames=FrameRegistry.from_config(RIG))
@@ -550,3 +573,31 @@ class TestOrientGocatorProfile:
         profile = make_profile(gantry_position={"X": 0.0, "Y": 0.0, "Z": 0.0})
         with pytest.raises(ValueError, match="unknown output format"):
             orient_gocator_profile(profile, frames=registry, output=tmp_path / "oriented.txt")
+
+
+class TestAxisCorrespondence:
+    def _frames(self, rotation_deg):
+        return FrameRegistry.from_config({"experiment": {"rotation_deg": rotation_deg}})
+
+    @pytest.mark.parametrize("rotation, swapped", [(0, False), (180, False), (90, True), (-90, True), (270, True)])
+    def test_axes_match_or_swap_with_the_rotation(self, rotation, swapped):
+        f = self._frames(rotation)
+        assert f.gantry_axis_for("X") == ("Y" if swapped else "X")
+        assert f.gantry_axis_for("Y") == ("X" if swapped else "Y")
+        assert f.gantry_axis_for("Z") == "Z"
+
+    @pytest.mark.parametrize("rotation", [0, 90, 180, -90, 270])
+    def test_the_two_lookups_are_inverses(self, rotation):
+        f = self._frames(rotation)
+        for axis in "XYZ":
+            assert f.experiment_axis_for(f.gantry_axis_for(axis)) == axis
+
+    def test_diagonal_frame_has_no_single_axis(self):
+        with pytest.raises(ValueError, match="multiple of 90"):
+            self._frames(45).gantry_axis_for("X")
+        with pytest.raises(ValueError, match="multiple of 90"):
+            self._frames(45).experiment_axis_for("X")
+
+    def test_unknown_axis_name_is_an_error(self):
+        with pytest.raises(ValueError, match="'X', 'Y' or 'Z'"):
+            self._frames(0).gantry_axis_for("W")

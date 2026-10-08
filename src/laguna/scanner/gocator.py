@@ -66,6 +66,11 @@ from .settings import (  # noqa: F401  (re-exported for backwards compatibility)
 
 logger = logging.getLogger(__name__)
 
+#: Upper bound accepted for ``trigger_delay_s``. Real motion-start latencies are
+#: tens to a few hundred ms; anything near a second is a settle time mistaken
+#: for a latency and would silently shift every scan by a hundred mm.
+_MAX_TRIGGER_DELAY_S = 1.0
+
 #: Default poll timeout for GoSystem_ReceiveData, in seconds. The SDK samples
 #: use 20 s; a scan pass is bounded by the gantry move, so callers normally
 #: pass an explicit timeout derived from distance/feed rate.
@@ -170,6 +175,16 @@ class GocatorScanner(GocatorSettingsMixin):
         self._filters = config.get("filters") or None
         #: Scan spec for the zero-arg acquire() entry point — see that method.
         self._scan_spec = config.get("scan") or None
+        #: Extra wait before the software trigger of a gantry pass, covering the
+        #: time between commanding the move and the axis actually moving. See
+        #: ``scan_with_gantry()``; calibrate it with
+        #: :func:`laguna.scanner.trigger_delay.fit_trigger_delay`.
+        self._trigger_delay_s = float(config.get("trigger_delay_s", 0.0))
+        if not 0.0 <= self._trigger_delay_s <= _MAX_TRIGGER_DELAY_S:
+            raise ValueError(
+                f"gocator trigger_delay_s={self._trigger_delay_s} — must be between 0 and "
+                f"{_MAX_TRIGGER_DELAY_S} s (a measured motion-start latency, not a settle time)"
+            )
         self._data_capacity_bytes = config.get("data_capacity_bytes")
         self._sdk_lib_dir = config.get("sdk_lib_dir")
         #: Rehearsal mode — synthetic surfaces, no SDK and no sensor.
@@ -188,6 +203,11 @@ class GocatorScanner(GocatorSettingsMixin):
         #: Run id / runtime injected by FlumeLab so saved scans can be tied
         #: back to the experiment that produced them — see laguna.run_context.
         self._run_stamp: Dict[str, Any] = {}
+
+    @property
+    def trigger_delay_s(self) -> float:
+        """Extra delay before a gantry pass's trigger, seconds (``gocator.trigger_delay_s``)."""
+        return self._trigger_delay_s
 
     @property
     def mounting(self) -> SensorMounting:
@@ -836,6 +856,9 @@ class GocatorScanner(GocatorSettingsMixin):
         fixed_length_mm: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
         timeout_s: Optional[float] = None,
+        cruise_start_mm: Optional[float] = None,
+        trigger_delay_s: Optional[float] = None,
+        capture_end_mm: Optional[float] = None,
     ) -> SurfaceScan:
         """Coordinate a gantry pass and a triggered surface capture.
 
@@ -853,6 +876,18 @@ class GocatorScanner(GocatorSettingsMixin):
         under safe_mode or a halt, exactly like ``move_to()``; a halt during
         the settle delay skips the trigger.
 
+        A caller that commanded this move from further back than where it
+        actually wants the surface anchored — a ramp lead-in, so the axis is
+        already at `feed_rate_mm_s` rather than still accelerating when it
+        crosses the region it cares about — should pass `cruise_start_mm`
+        for that true starting point. Without one, `settle_s` is a blind
+        guess uncorrelated with the axis's actual ramp kinematics, and the
+        recorded surface ends up anchored to wherever the axis happened to
+        be *before* motion was even commanded — the mechanism behind the
+        travel-direction seam described in issue #58. ``Tile``/
+        ``SurveyRunner`` (see `laguna.survey`) already do this; prefer that
+        path over calling this method directly when the seam matters.
+
         Args:
             gantry: A connected GantryController.
             axis: Configured axis *name*, e.g. "X" or "Y".
@@ -861,10 +896,15 @@ class GocatorScanner(GocatorSettingsMixin):
                 sensor as travel speed.
             settle_s: Delay between commanding motion and triggering, to skip
                 the acceleration ramp. Increase if the leading edge of scans
-                looks compressed along Y.
+                looks compressed along Y. When `cruise_start_mm` is also
+                given, this should be the time to cover the lead-in at
+                `feed_rate_mm_s` (``laguna.robot.macron.commands.ramp_time_s``
+                computed from the same accel/feed-rate pair as the lead-in
+                distance) rather than an independent guess.
             fixed_length_mm: Surface length to configure on the sensor, mm.
-                Defaults to None, meaning: derive it from the axis's actual
-                position right now and `end_mm` (``abs(end_mm - current)``),
+                Defaults to None, meaning: derive it from `end_mm` and where
+                capture starts (``abs(end_mm - start)``, where start is
+                `cruise_start_mm` if given, else the axis's live position),
                 so the sensor's capture window matches this call's commanded
                 move by construction — it does *not* fall back to a
                 previously-configured ``gocator.fixed_length_mm`` that could
@@ -876,6 +916,37 @@ class GocatorScanner(GocatorSettingsMixin):
             metadata: Extra context merged into the result's metadata.
             timeout_s: Receive budget in seconds. Defaults to computed value
                 based on configured fixed length and travel speed.
+            cruise_start_mm: The true starting position to record as
+                ``scan.metadata["gantry_start_mm"]`` — the point dead
+                reckoning should anchor to — when it differs from wherever
+                the axis physically is right now (e.g. because motion was
+                commanded from a ramp lead-in behind it). None (the default)
+                keeps today's behavior: the live pre-motion position is
+                used, under both ``gantry_start_mm`` and
+                ``ramp_start_measured_mm``.
+
+            trigger_delay_s: Extra wait added to `settle_s` before the
+                trigger, for the measured time between *commanding* the move
+                and the axis actually *moving*. Without it the trigger fires
+                that much too early, the surface is anchored to a point the
+                axis hasn't reached yet, and every scan is displaced along
+                the travel direction by ``feed_rate * delay`` — in opposite
+                directions for forward and reverse passes, which is the
+                residual forward/reverse seam. None (the default) uses the
+                configured ``gocator.trigger_delay_s`` (0.0 unless
+                calibrated).
+            capture_end_mm: Where the surface should end, when that is short
+                of `end_mm` — the lead-out. The sensor writes rows at a fixed
+                spacing assuming constant speed, so a capture window that
+                reaches into the axis's final deceleration misplaces those
+                rows. Commanding the move to `end_mm`, past the region of
+                interest by one ramp, and capturing only to `capture_end_mm`
+                keeps every captured row in the constant-speed stretch. The
+                capture length is ``|capture_end_mm - start|`` (so
+                `fixed_length_mm` should be left to follow it), and
+                ``gantry_end_mm`` in the metadata is this point, since that
+                is where the surface ends; ``gantry_stop_mm`` records where
+                the axis was sent. None (the default) captures to `end_mm`.
 
         Returns:
             The captured :class:`SurfaceScan`, with gantry context in
@@ -898,6 +969,11 @@ class GocatorScanner(GocatorSettingsMixin):
             feed_rate_mm_s if feed_rate_mm_s is not None else spec.get("feed_rate_mm_s")
         )
         settle_s = settle_s if settle_s is not None else float(spec.get("settle_s", 0.5))
+        trigger_delay_s = self._trigger_delay_s if trigger_delay_s is None else float(trigger_delay_s)
+        if not 0.0 <= trigger_delay_s <= _MAX_TRIGGER_DELAY_S:
+            raise ValueError(
+                f"trigger_delay_s={trigger_delay_s} — must be between 0 and {_MAX_TRIGGER_DELAY_S} s"
+            )
         missing = [
             n for n, v in (("axis", axis), ("end_mm", end_mm),
                            ("feed_rate_mm_s", feed_rate_mm_s)) if v is None
@@ -918,7 +994,8 @@ class GocatorScanner(GocatorSettingsMixin):
         with arbiter.hold(f"gocator scan {axis} -> {end_mm:.1f}mm"):
             return self._scan_with_gantry(
                 gantry, axis, end_mm, feed_rate_mm_s, settle_s,
-                fixed_length_mm, metadata, timeout_s,
+                fixed_length_mm, metadata, timeout_s, cruise_start_mm, trigger_delay_s,
+                capture_end_mm,
             )
 
     def _scan_with_gantry(
@@ -931,6 +1008,9 @@ class GocatorScanner(GocatorSettingsMixin):
         fixed_length_mm: Optional[float],
         metadata: Optional[Dict[str, Any]],
         timeout_s: Optional[float],
+        cruise_start_mm: Optional[float] = None,
+        trigger_delay_s: float = 0.0,
+        capture_end_mm: Optional[float] = None,
     ) -> SurfaceScan:
         """Body of scan_with_gantry(), with the gantry already held."""
         handle = gantry.axis(axis)
@@ -941,7 +1021,15 @@ class GocatorScanner(GocatorSettingsMixin):
         except Exception as e:
             logger.debug("Could not read gantry start position: %s", e)
 
-        distance_mm = abs(end_mm - start_mm) if start_mm is not None else None
+        # The sensor generates fixed_length_mm of surface from the trigger,
+        # and the trigger fires at the cruise start, not where the axis is
+        # now. Measuring from the ramp start would size the capture window
+        # ramp_distance_mm too long, so it would keep stacking profiles
+        # after the axis stopped at end_mm: garbage rows at the far edge.
+        capture_from_mm = cruise_start_mm if cruise_start_mm is not None else start_mm
+        capture_to_mm = end_mm if capture_end_mm is None else float(capture_end_mm)
+        distance_mm = abs(capture_to_mm - capture_from_mm) if capture_from_mm is not None else None
+        run_distance_mm = abs(end_mm - capture_from_mm) if capture_from_mm is not None else None
 
         if fixed_length_mm is None:
             if distance_mm is not None:
@@ -950,12 +1038,12 @@ class GocatorScanner(GocatorSettingsMixin):
                 fixed_length_mm = self._fixed_length_mm
                 logger.warning(
                     "Could not read %s's current position, so fixed_length_mm "
-                    "can't be derived from end_mm=%.3f — falling back to the "
+                    "can't be derived from the capture end %.3f — falling back to the "
                     "already-configured value (%s mm). If that doesn't match "
                     "the actual travel distance, the sensor will stop "
                     "generating the surface before (or long after) the move "
                     "finishes.",
-                    axis, end_mm, self._fixed_length_mm,
+                    axis, capture_to_mm, self._fixed_length_mm,
                 )
         elif distance_mm is not None and abs(fixed_length_mm - distance_mm) > 1e-6:
             logger.warning(
@@ -964,22 +1052,33 @@ class GocatorScanner(GocatorSettingsMixin):
                 "generating the surface after fixed_length_mm regardless of "
                 "how far the gantry actually goes — make sure that's what "
                 "you want.",
-                fixed_length_mm, axis, start_mm, end_mm, distance_mm,
+                fixed_length_mm, axis, capture_from_mm, capture_to_mm, distance_mm,
             )
 
         self.configure(travel_speed_mm_s=feed_rate_mm_s, fixed_length_mm=fixed_length_mm)
 
         if timeout_s is None:
             timeout_s = self._default_timeout_s()
-            if distance_mm and feed_rate_mm_s > 0:
-                timeout_s = max(timeout_s, distance_mm / feed_rate_mm_s * 1.5 + 5.0)
+            run_mm = run_distance_mm if run_distance_mm is not None else distance_mm
+            if run_mm and feed_rate_mm_s > 0:
+                timeout_s = max(timeout_s, run_mm / feed_rate_mm_s * 1.5 + 5.0)
 
         meta: Dict[str, Any] = {
             "gantry_axis": axis,
-            "gantry_start_mm": start_mm,
-            "gantry_end_mm": end_mm,
+            # The true anchor for dead reckoning: the caller's cruise_start_mm
+            # when given (the swath boundary a ramp lead-in was planned
+            # around), else the live pre-motion read — today's behavior.
+            # The live read is always preserved separately below, never
+            # discarded, even when overridden.
+            "gantry_start_mm": start_mm if cruise_start_mm is None else cruise_start_mm,
+            "ramp_start_measured_mm": start_mm,
+            # Where the surface ends. The axis may have been sent further (a
+            # lead-out past the region of interest): that is gantry_stop_mm.
+            "gantry_end_mm": capture_to_mm,
+            "gantry_stop_mm": end_mm,
             "gantry_feed_rate_mm_s": feed_rate_mm_s,
             "trigger_settle_s": settle_s,
+            "trigger_delay_s": trigger_delay_s,
         }
         # Full commanded position, not just the travel axis — orient_scan()
         # otherwise has no way to know the two static axes' real position
@@ -990,6 +1089,11 @@ class GocatorScanner(GocatorSettingsMixin):
         try:
             axis_names = [a.name for a in gantry._axes]
             positions = {n: gantry.axis(n).get_position() for n in axis_names}
+            if cruise_start_mm is not None:
+                # Only the travel axis is wrong pre-substitution — the two
+                # static axes didn't move, so their live read is already
+                # accurate.
+                positions[axis] = cruise_start_mm
             meta["gantry_start"] = [
                 float(positions[n]) for n in ("X", "Y", "Z") if n in axis_names
             ]
@@ -1007,7 +1111,7 @@ class GocatorScanner(GocatorSettingsMixin):
                 feed_rate_mm_s,
             )
             guard = gantry.begin_scan_move(axis, end_mm, feed_rate_mm_s)
-            time.sleep(settle_s)
+            time.sleep(settle_s + trigger_delay_s)
             guard.check()
             self.trigger()
             return self.receive_surface(timeout_s=timeout_s, metadata=meta)
@@ -1175,12 +1279,16 @@ class GocatorScanner(GocatorSettingsMixin):
         # the return move starts.
         arbiter = getattr(gantry, "arbiter", DEFAULT_ARBITER)
         with arbiter.hold(f"gocator acquire {spec['axis']} -> {spec['end_mm']}"):
+            cruise_start_mm = spec.get("cruise_start_mm")
             scan = self.scan_with_gantry(
                 gantry,
                 axis=spec["axis"],
                 end_mm=float(spec["end_mm"]),
                 feed_rate_mm_s=float(spec["feed_rate_mm_s"]),
                 settle_s=float(spec.get("settle_s", 0.5)),
+                cruise_start_mm=float(cruise_start_mm) if cruise_start_mm is not None else None,
+                **({"trigger_delay_s": float(spec["trigger_delay_s"])} if "trigger_delay_s" in spec else {}),
+                **({"capture_end_mm": float(spec["capture_end_mm"])} if spec.get("capture_end_mm") is not None else {}),
             )
             if formats:
                 self.save_scan(scan, formats=formats)

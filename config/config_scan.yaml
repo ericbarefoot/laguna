@@ -187,12 +187,12 @@ gocator:
                                # sensor can't deliver the requested rate —
                                # see docs/subsystems/scanner.md.
   active_area:
-    x: -722.0        # origin, across-laser
+    x: -765        # origin, across-laser
     # y: 0.0        # origin, along travel
-    z: -130.0        # origin, range/standoff
-    width: 1422.0 # extent in X (across laser)
+    z: -180.0        # origin, range/standoff
+    width: 1500.0 # extent in X (across laser)
     # length: 200.0 # extent in Y (along travel)
-    height: 200.0 # extent in Z (range/standoff) — cutting this helps frame rate most
+    height: 260.0 # extent in Z (range/standoff) — cutting this helps frame rate most
   # fixed_length_mm: 200.0      # surface length along travel; cover the scan distance
   exposure_us: 200           # laser exposure; omit to leave the sensor's setting
   uniform_spacing: null       # true/false to force X resampling on/off; omit to

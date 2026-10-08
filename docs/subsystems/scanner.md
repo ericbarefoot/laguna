@@ -57,6 +57,24 @@ gantry **X** — see "Sensor axes are not gantry axes".) So:
 - If you later measure the true velocity, `SurfaceScan.rescale_y()` fixes
   the travel axis without re-scanning.
 
+**`gantry_start_mm` is the dead-reckoning anchor, and it must be the point
+the trigger actually fired at — not wherever the axis was *before* motion
+was commanded.** A `settle_s` that's just a guess (rather than derived from
+the axis's real accel/feed-rate kinematics) and a `gantry_start_mm` read
+before `begin_scan_move()` combine into a travel-direction seam between
+overlapping tile-scan swaths — see issue #58. `Tile`/`SurveyRunner` (see
+`laguna.survey`) fix this by commanding motion from a **ramp start** —
+computed from the axis's configured accel and `scan_speed`
+(`laguna.robot.macron.commands.ramp_distance_mm`/`ramp_time_s`) — set back
+from the true swath boundary (the **cruise start**), so the axis is already
+at speed when it crosses the boundary. `scan_with_gantry()`'s
+`cruise_start_mm` parameter is what makes this possible: pass it and
+`gantry_start_mm` records the true boundary, not a live read (kept
+separately as `ramp_start_measured_mm`). Prefer `Tile`/`SurveyRunner` over
+calling `scan_with_gantry()` directly when the seam matters. The lead-in is
+not an unchecked detour: `place()` fence-checks the move to the ramp start,
+and `begin_scan_move()` fence-checks the whole ramp-start-to-end pass.
+
 **Settings are served from a cache — `refresh()` re-syncs it.** The SDK loads
 the sensor's configuration once, at `connect()`, and every `get_*` reads that
 local copy, not the sensor. A change made afterwards in the web GUI, by the
@@ -221,11 +239,60 @@ rotation but never checking which direction *this* pass actually went, so it
 silently assumed positive every time. Fixed in `orient_scan()`, which now
 anchors the first-acquired point to the pass's real starting position and
 orients the rest by the recorded start→end direction — see its docstring.
+The mounting's *sign* on the travel axis plays no part in that placement: a rigid
+mount can force sensor Y → −X (determinant argument above), but row order carries
+no geometric direction, so `orient_scan()` takes the along-travel direction from
+`gantry_start_mm → gantry_end_mm` alone. (Before 2026-10-07 it multiplied the two,
+which put a forward pass *behind* its start point and a reverse pass beyond it
+whenever `scan_y` was negative — both mirrored in the same way, so a symmetric
+block looked fine in each pass but forward and reverse disagreed by twice the
+pass length.)
 `SurfaceScan.to_points()`/`gantry_travel_mm` are unaffected: they only apply
 the fixed mounting rotation, by design (the per-pass travel direction isn't
 knowable from the scan grid alone, only from the gantry-side metadata
 `orient_scan()` also has). If you place scans some other way (bypassing
 `orient_scan()`), you need this same correction yourself.
+
+### Lead-out: keep the slowdown outside the swath
+
+The ramp lead-in makes the axis reach speed before the swath starts. The end needs the mirror image: the
+axis decelerates over its last `v² / 2a` before the commanded stop, and the sensor, writing rows at a
+fixed spacing for a fixed time, places those rows as if the speed were constant. They land ahead of where
+the axis really was, by up to `v² / 8a` at the end of the capture window (about 2, 8 and 19 mm at 50, 100
+and 150 mm/s with a = 150 mm/s²), so a feature near the end of a pass is stretched and shifted, in the
+direction of travel, differently in a forward and a reverse pass.
+
+A `Tile` with `accel_mm_s2` therefore sends each pass one ramp **past** its swath end
+(`Pass.overrun_end`, assuming the axis decelerates at the rate it accelerates), and
+`scan_with_gantry(..., end_mm=<stop>, capture_end_mm=<swath end>)` ends the capture at the swath end. The
+whole captured stretch is then constant-speed slew; the slowdown happens beyond it. The stop is
+fence-checked like any other end point, and it extends the commanded travel past the planned region by one
+ramp, so the soft limits and fences must allow it (the `calibration/gocator_alignment_and_seam.ipynb` §2a dry run and `plot_survey_plan` both
+include it). Metadata records `gantry_end_mm` (where the surface ends) and `gantry_stop_mm` (where the axis
+was sent).
+
+### Trigger delay: the start latency behind the residual forward/reverse seam
+
+`scan_with_gantry()` commands the move, waits `settle_s` (the axis kinematics: `speed / accel`, so the
+axis is at speed at the swath boundary), then fires the trigger. That wait assumes the axis starts moving
+the instant it is commanded. It doesn't: the command goes over the link to the controller and the ramp
+starts a little later. The trigger fires that much early, the surface is anchored to a position the axis
+has not reached yet, and the whole scan is displaced along its travel direction by `speed × latency`. A
+forward and a reverse pass are displaced in opposite directions, so the same feature appears
+`2 × speed × latency` apart between them. On this rig, after the ramp lead-in fix of issue #58, that was
+about 13 mm at 100 mm/s (about 66 ms), the same in both the old and the fixed run.
+
+`gocator.trigger_delay_s` (default `0.0`: nothing changes until it is calibrated) is added to the wait.
+**Calibrate it at the speed you will scan at, with repeats.** The implied delay is not the same at every
+speed (on this rig about 74 ms at 50 mm/s, 65 ms at 100, 59 ms at 150), and one forward/reverse pair
+scatters by 1–2 mm. So the calibration notebook's default (`calibration/gocator_alignment_and_seam.ipynb`
+§2e) is `CAL_REPEATS` (5) pairs at the planned scan speed: `summarize_trigger_delay()` in
+`laguna.scanner.trigger_delay` returns the mean (the value to configure), its standard deviation and 95%
+confidence interval, and the seam one pair would still show with that mean applied (`2 × speed × σ`).
+Several speeds (`fit_trigger_delay()`) check that the offset scales with speed; a constant left in that fit
+is a position error a delay cannot remove. `plot_trigger_delay()` in `laguna.viz` draws both. A per-pass
+`trigger_delay_s=` argument on `scan_with_gantry()` overrides the configured value, and the delay depends
+on the axis acceleration, so recalibrate if that changes.
 
 ## Matching feed rate to frame rate
 

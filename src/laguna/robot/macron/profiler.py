@@ -29,6 +29,8 @@ from .halt import MotionHalted
 
 if TYPE_CHECKING:
     from .controller import GantryController
+    import pandas as pd
+
     from ...frames import FrameRegistry
     from ...rangefinder.calibration import LinearCalibration
 
@@ -293,6 +295,59 @@ class TopographicProfiler:
                 sftp.close()
         finally:
             client.close()
+
+
+def recompute_positions(
+    csv_path: Union[str, Path], meta_path: Union[str, Path, None] = None
+) -> "pd.DataFrame":
+    """Re-derive a saved scan's ``pos_mm`` from its raw timestamps and sidecar.
+
+    Scans written before 2026-10-08 labelled every sample as if the axis had
+    moved in the positive direction, so any scan toward *lower* positions has a
+    ``pos_mm`` column mirrored about its start point (it increased from the
+    start instead of decreasing). The raw samples and their timestamps were
+    recorded correctly, and the ``_meta.json`` sidecar holds the start, end,
+    speed, acceleration and move-start time, so the positions can be rebuilt
+    exactly as the agent now computes them. Nothing is overwritten: the
+    corrected frame is returned and the file on disk is left alone.
+
+    Forward scans come back unchanged, apart from the sub-millimetre
+    acceleration-ramp offset the old formula also left out.
+
+    Args:
+        csv_path: A profile CSV written by the gantry agent.
+        meta_path: Its sidecar. Defaults to the CSV path with ``.csv`` replaced
+            by ``_meta.json``.
+
+    Returns:
+        The CSV as a DataFrame with ``pos_mm`` recomputed.
+
+    Raises:
+        FileNotFoundError: If the CSV or its sidecar is missing.
+        ValueError: If the sidecar lacks a field the position needs.
+    """
+    import json
+
+    import pandas as pd
+
+    from .gantry_agent import _dead_reckoned_pos_mm
+
+    csv_path = Path(csv_path)
+    meta_path = Path(meta_path) if meta_path is not None else csv_path.with_name(csv_path.stem + "_meta.json")
+    meta = json.loads(meta_path.read_text())
+    needed = ("actual_start_mm", "end_mm", "feed_rate_mm_s", "accel_mm_s2", "t_move_start")
+    missing = [k for k in needed if k not in meta]
+    if missing:
+        raise ValueError(f"{meta_path} lacks {missing}; cannot recompute positions")
+    df = pd.read_csv(csv_path)
+    df["pos_mm"] = [
+        _dead_reckoned_pos_mm(
+            t, meta["actual_start_mm"], meta["end_mm"], meta["feed_rate_mm_s"],
+            meta["accel_mm_s2"], meta["t_move_start"],
+        )
+        for t in df["wall_time_unix"].to_numpy(dtype=float)
+    ]
+    return df
 
 
 def orient_profile(

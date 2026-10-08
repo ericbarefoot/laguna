@@ -383,8 +383,6 @@ class TestRearm:
 class TestEstopMonitorIntegration:
     def test_a_sentinel_file_fires_an_estop_end_to_end(self, tmp_path):
         """The headline path: touch a file from anywhere, everything halts."""
-        import time
-
         sentinel = tmp_path / "ESTOP"
         subsystem = RecordingSubsystem("gantry")
         lab = FlumeLab()
@@ -392,11 +390,10 @@ class TestEstopMonitorIntegration:
         lab.safety_monitor._poll_s = 0.01
         lab.watch_for_safety(sentinels={"estop": str(sentinel)})
         try:
+            before = _live_threads()
             sentinel.touch()
-            deadline = time.time() + 2.0
-            while lab.safety_state is not SafetyState.ESTOPPED and time.time() < deadline:
-                time.sleep(0.01)
-            assert lab.safety_state is SafetyState.ESTOPPED
+            assert _wait(lambda: lab.safety_state is SafetyState.ESTOPPED)
+            assert _wait_for_handlers(before)
             assert subsystem.calls == ["estop"]
         finally:
             lab.safety_monitor.stop()
@@ -511,8 +508,10 @@ class TestAllTiersArePollable:
         sub = RecordingSubsystem("gocator")
         lab = self._lab(tmp_path, sub)
         try:
+            before = _live_threads()
             (tmp_path / "PAUSE").touch()
             assert self._wait(lab, SafetyState.PAUSED)
+            assert _wait_for_handlers(before)
             assert sub.calls == ["pause"]
         finally:
             lab.safety_monitor.stop()
@@ -521,8 +520,10 @@ class TestAllTiersArePollable:
         sub = RecordingSubsystem("flow")
         lab = self._lab(tmp_path, sub)
         try:
+            before = _live_threads()
             (tmp_path / "STOP").touch()
             assert self._wait(lab, SafetyState.STOPPED)
+            assert _wait_for_handlers(before)
             assert sub.calls == ["stop"]
         finally:
             lab.safety_monitor.stop()
@@ -531,8 +532,10 @@ class TestAllTiersArePollable:
         sub = RecordingSubsystem("gantry")
         lab = self._lab(tmp_path, sub)
         try:
+            before = _live_threads()
             (tmp_path / "ESTOP").touch()
             assert self._wait(lab, SafetyState.ESTOPPED)
+            assert _wait_for_handlers(before)
             assert sub.calls == ["estop"]
         finally:
             lab.safety_monitor.stop()
@@ -596,8 +599,10 @@ class TestAllTiersArePollable:
             ],
         )
         try:
+            before = _live_threads()
             failing["healthy"] = False
             assert self._wait(lab, SafetyState.PAUSED)
+            assert _wait_for_handlers(before)
             assert sub.calls == ["pause"]
         finally:
             lab.safety_monitor.stop()
@@ -733,3 +738,29 @@ def _wait(predicate, timeout=2.0):
             return True
         time.sleep(0.01)
     return False
+
+
+def _live_threads():
+    import threading
+
+    return set(threading.enumerate())
+
+
+def _wait_for_handlers(before, timeout=2.0):
+    """Wait for safety handlers started since `before` to finish.
+
+    The monitor runs each handler on its own ``safety-<tier>`` thread, and a
+    verb publishes its SafetyState before it reaches the subsystems. Seeing
+    the state change therefore doesn't mean the subsystems have been called
+    yet. Waiting for the handler itself keeps an exact ``calls`` assertion
+    exact, so a duplicate call still fails, which polling until ``calls``
+    matches would miss. Threads alive in `before` are ignored, so a handler
+    left running by another test can't hold this one up.
+    """
+    def finished():
+        return not any(
+            t.name.startswith("safety-") and t.is_alive()
+            for t in _live_threads() - before
+        )
+
+    return _wait(finished, timeout)

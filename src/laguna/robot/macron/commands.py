@@ -122,6 +122,37 @@ def predicted_move_s(distance: float, speed: Optional[float]) -> float:
     return abs(distance) / speed
 
 
+def ramp_distance_mm(feed_rate_mm_s: Optional[float], accel_mm_s2: Optional[float]) -> float:
+    """Distance covered while accelerating from rest to feed_rate_mm_s.
+
+    v^2 / (2a) — the complement to ``predicted_move_s``'s deliberate
+    omission of ramp time: this is exactly the distance that omission
+    ignores. Used to plan a lead-in so a trigger fired after a fixed delay
+    (or once ``poll_until_move_finished`` reports constant velocity) lands
+    where the caller actually meant it to, not partway into the ramp.
+
+    Returns 0.0 when either input is unknown or non-positive, so a caller
+    with no accel figure gets "no lead-in needed" rather than a
+    ZeroDivisionError.
+
+    Units only have to be consistent between the two arguments (mm/s and
+    mm/s^2).
+    """
+    if not feed_rate_mm_s or feed_rate_mm_s <= 0 or not accel_mm_s2 or accel_mm_s2 <= 0:
+        return 0.0
+    return (feed_rate_mm_s**2) / (2.0 * accel_mm_s2)
+
+
+def ramp_time_s(feed_rate_mm_s: Optional[float], accel_mm_s2: Optional[float]) -> float:
+    """Time to accelerate from rest to feed_rate_mm_s. v / a.
+
+    See :func:`ramp_distance_mm` — same inputs, same zero-guard behavior.
+    """
+    if not feed_rate_mm_s or feed_rate_mm_s <= 0 or not accel_mm_s2 or accel_mm_s2 <= 0:
+        return 0.0
+    return feed_rate_mm_s / accel_mm_s2
+
+
 def poll_until_move_finished(
     is_finished: Callable[[], bool],
     predicted_s: float = 0.0,

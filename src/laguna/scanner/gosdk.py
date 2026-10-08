@@ -394,6 +394,11 @@ class GoSdkLib:
         sig(go, "GoTransform_SetEncoderResolution", kStatus, kObject, k64f)
         sig(go, "GoTransform_EncoderResolution", k64f, kObject)
 
+        # Alignment transform written by the web UI's alignment calibration.
+        # Offsets in mm, angles in degrees; all take a GoRole.
+        for _comp in ("X", "Y", "Z", "XAngle", "YAngle", "ZAngle"):
+            sig(go, f"GoTransform_{_comp}", k64f, kObject, k32s)
+
         # --- GoSurfaceGeneration.h ---
         sig(go, "GoSurfaceGeneration_SetGenerationType", kStatus, kObject, k32s)
         sig(go, "GoSurfaceGeneration_GenerationType", k32s, kObject)

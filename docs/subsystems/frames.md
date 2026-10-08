@@ -77,6 +77,32 @@ same form as `gocator.mounting`), `matrix` (an explicit 4×4), and
 origin. `rotation` is applied before `translation`, so a translation always
 reads in the target frame — "move the origin over there".
 
+### Rotating the experiment frame: use `origin`, not `translation`
+
+`experiment.translation` is where the **gantry's** origin lands in experiment
+coordinates *after* the rotation. It therefore changes whenever
+`rotation_deg` changes: a `translation` that puts the experiment origin on a
+flume corner at 180° puts it somewhere else entirely at −90°, and every ROI
+you wrote lands on the wrong ground.
+
+State the offset the other way round instead, as the gantry-frame point that
+is the experiment origin:
+
+```yaml
+frames:
+  experiment:
+    origin: [2200, 670, 0]   # this gantry point is experiment (0, 0, 0)
+    rotation_deg: -90        # change this freely; the origin stays put
+```
+
+`origin` and `translation` are the same quantity (`translation = −R · origin`);
+give one. With `origin`, changing the rotation only turns the axes about that
+corner. A survey is still planned on experiment axes, so rotating by ±90°
+swaps which gantry axis a traverse runs along (an experiment-X pass is a
+gantry-Y move). `SurveyRunner` maps this for you, and refuses an experiment
+frame that is not a multiple of 90°, since a straight gantry axis can't follow
+a diagonal.
+
 > **Don't put the Gocator's axis map in both places.** `SurfaceScan` already
 > rotates its points into gantry orientation using `gocator.mounting`. If
 > `frames.instruments.gocator` also carries `axes` or `rotation_deg`, the

@@ -12,12 +12,14 @@ failure on hardware reveals which step in the sequence went wrong.
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from laguna.frames import FrameRegistry
 from laguna.rangefinder.calibration import LinearCalibration
 from laguna.robot.macron.connection import SnapMotionError
-from laguna.robot.macron.profiler import ProfileResult, TopographicProfiler, orient_profile
+from laguna.robot.macron.profiler import ProfileResult, TopographicProfiler, orient_profile, recompute_positions
 
 
 # ---------------------------------------------------------------------------
@@ -589,3 +591,59 @@ class TestOrientProfile:
         calibration = LinearCalibration(device="od2000", slope=1.0, intercept=0.0, r_squared=1.0)
         df = orient_profile(result, instrument="od2000", frames=self._frames(), calibration=calibration)
         assert list(df["height_mm"]) == [5.0, 6.0, 7.0]
+
+
+# recompute_positions()
+# ---------------------------------------------------------------------------
+
+
+class TestRecomputePositions:
+    """Scans toward lower positions were saved with pos_mm mirrored about the start."""
+
+    T0, V, A = 1_000.0, 10.0, 5.0
+
+    def _save(self, tmp_path, start, end, old_formula):
+        import json
+
+        import pandas as pd
+
+        times = self.T0 + 2.0 + np.arange(0, 30.0, 1.0)
+        t_slew_start = self.T0 + self.V / self.A
+        pos = start + self.V * (times - t_slew_start) if old_formula else start * np.ones_like(times)
+        csv_path = tmp_path / "scan.csv"
+        pd.DataFrame({"wall_time_unix": times, "pos_mm": pos, "current_ma": 13.0}).to_csv(csv_path, index=False)
+        (tmp_path / "scan_meta.json").write_text(json.dumps({
+            "actual_start_mm": start, "end_mm": end, "feed_rate_mm_s": self.V,
+            "accel_mm_s2": self.A, "t_move_start": self.T0,
+        }))
+        return csv_path
+
+    def test_a_reverse_scan_is_unmirrored(self, tmp_path):
+        path = self._save(tmp_path, 400.0, 100.0, old_formula=True)
+        old = pd.read_csv(path)["pos_mm"].to_numpy()
+        new = recompute_positions(path)["pos_mm"].to_numpy()
+        assert old[-1] > old[0] and new[-1] < new[0]              # was rising; now falls toward the end
+        assert new[0] == pytest.approx(390.0)                      # 10 mm ramp distance behind the start
+
+    def test_a_forward_scan_only_gains_the_ramp_offset(self, tmp_path):
+        path = self._save(tmp_path, 100.0, 400.0, old_formula=True)
+        diff = recompute_positions(path)["pos_mm"].to_numpy() - pd.read_csv(path)["pos_mm"].to_numpy()
+        np.testing.assert_allclose(diff, 0.5 * self.V * (self.V / self.A))
+
+    def test_the_file_on_disk_is_left_alone(self, tmp_path):
+        path = self._save(tmp_path, 400.0, 100.0, old_formula=True)
+        before = path.read_bytes()
+        recompute_positions(path)
+        assert path.read_bytes() == before
+
+    def test_missing_sidecar_or_field_is_an_error(self, tmp_path):
+        import json
+
+        path = self._save(tmp_path, 400.0, 100.0, old_formula=True)
+        meta = tmp_path / "scan_meta.json"
+        meta.write_text(json.dumps({"end_mm": 100.0}))
+        with pytest.raises(ValueError, match="actual_start_mm"):
+            recompute_positions(path)
+        meta.unlink()
+        with pytest.raises(FileNotFoundError):
+            recompute_positions(path)

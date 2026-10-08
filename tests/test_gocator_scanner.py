@@ -352,6 +352,15 @@ class FakeGo:
 
     # -- getters ---------------------------------------------------------
 
+    def GoTransform_YAngle(self, transform, role):
+        return 2.0
+
+    def GoTransform_X(self, transform, role):
+        return 10.0
+
+    def GoTransform_Z(self, transform, role):
+        return -20.0
+
     def GoTransform_Speed(self, transform):
         return self.travel_speed
 
@@ -1155,6 +1164,48 @@ class TestScanWithGantry:
         assert scan.metadata["gantry_axis"] == "X"
         assert scan.metadata["gantry_feed_rate_mm_s"] == pytest.approx(20.0)
 
+    def _sleeps(self, scanner, monkeypatch, **kw):
+        slept = []
+        monkeypatch.setattr("laguna.scanner.gocator.time.sleep", lambda d: slept.append(d))
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        scan = scanner.scan_with_gantry(
+            FakeGantry(), axis="X", end_mm=200.0, feed_rate_mm_s=20.0, **kw
+        )
+        return slept, scan
+
+    def test_the_trigger_waits_for_the_settle_plus_the_configured_delay(self, scanner, monkeypatch):
+        """The command-to-motion latency the settle time can't know about: without
+        it the trigger fires early and forward/reverse passes are displaced in
+        opposite directions along travel."""
+        scanner._trigger_delay_s = 0.066
+        slept, scan = self._sleeps(scanner, monkeypatch, settle_s=0.667)
+        assert slept[0] == pytest.approx(0.667 + 0.066)
+        assert scan.metadata["trigger_settle_s"] == pytest.approx(0.667)
+        assert scan.metadata["trigger_delay_s"] == pytest.approx(0.066)
+
+    def test_the_default_delay_is_zero_so_nothing_changes_until_calibrated(self, scanner, monkeypatch):
+        slept, scan = self._sleeps(scanner, monkeypatch, settle_s=0.5)
+        assert scanner.trigger_delay_s == 0.0 and slept[0] == pytest.approx(0.5)
+        assert scan.metadata["trigger_delay_s"] == 0.0
+
+    def test_a_per_call_delay_overrides_the_configured_one(self, scanner, monkeypatch):
+        scanner._trigger_delay_s = 0.066
+        slept, _ = self._sleeps(scanner, monkeypatch, settle_s=0.5, trigger_delay_s=0.0)
+        assert slept[0] == pytest.approx(0.5)
+
+    @pytest.mark.parametrize("bad", [-0.01, 1.5])
+    def test_an_out_of_range_delay_is_refused_before_anything_moves(self, scanner, monkeypatch, bad):
+        gantry = FakeGantry()
+        with pytest.raises(ValueError, match="trigger_delay_s"):
+            scanner.scan_with_gantry(gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0,
+                                     settle_s=0.0, trigger_delay_s=bad)
+        assert gantry.calls == []
+
+    def test_the_config_key_is_read_and_validated(self):
+        assert GocatorScanner({"trigger_delay_s": 0.07}).trigger_delay_s == pytest.approx(0.07)
+        with pytest.raises(ValueError, match="trigger_delay_s"):
+            GocatorScanner({"trigger_delay_s": 5.0})
+
     def test_metadata_records_full_gantry_position(self, scanner):
         """gantry_start_mm alone only records the travel axis — orient_scan()
         otherwise has no way to know the static axis's real position and
@@ -1166,6 +1217,90 @@ class TestScanWithGantry:
             gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
         )
         assert scan.metadata["gantry_start"] == [100.0, 250.0]
+
+    def test_cruise_start_mm_becomes_gantry_start_mm_not_the_live_read(self, scanner):
+        """Issue #58 fix: cruise_start_mm, not a live read, anchors the scan.
+
+        A caller with a ramp lead-in tells the scanner where the true
+        swath boundary is (cruise_start_mm) — that value, not the live
+        pre-motion position, becomes gantry_start_mm, the anchor
+        orient_scan() uses for dead reckoning. The live read is preserved
+        separately, not discarded.
+        """
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0, "Y": 250.0})  # ramp start
+        scan = scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0,
+            cruise_start_mm=42.0,  # the true swath boundary, ahead of the ramp start
+        )
+        assert scan.metadata["gantry_start_mm"] == pytest.approx(42.0)
+        assert scan.metadata["ramp_start_measured_mm"] == pytest.approx(40.0)
+        # Only the travel axis substitutes — the static Y axis's live read
+        # is unaffected, since it never moved.
+        assert scan.metadata["gantry_start"] == [42.0, 250.0]
+
+    def test_cruise_start_mm_sizes_the_capture_window(self, scanner):
+        """With a lead-in, fixed_length spans cruise start to end only.
+
+        The trigger fires at the cruise start, so measuring from the live
+        ramp-start position would make the sensor keep generating surface
+        for the length of the ramp after the axis has stopped at end_mm.
+        """
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0})  # ramp start
+        scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0,
+            cruise_start_mm=42.0,
+        )
+        assert scanner._fake.go.fixed_length == pytest.approx(158.0)  # not 160
+
+    def test_capture_end_sizes_the_window_to_the_region_while_the_axis_runs_on(self, scanner, caplog):
+        """Lead-out: the axis is sent past the region of interest so it is still at
+        speed at the region's end, but the surface covers only the region."""
+        import logging
+
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0})                    # ramp start
+        with caplog.at_level(logging.WARNING, logger="laguna.scanner.gocator"):
+            scan = scanner.scan_with_gantry(
+                gantry, axis="X", end_mm=220.0, capture_end_mm=200.0, feed_rate_mm_s=20.0,
+                settle_s=0.0, cruise_start_mm=42.0,
+            )
+        assert ("begin_move_to", "X", 220.0) in gantry.calls            # the axis goes to the stop...
+        assert scanner._fake.go.fixed_length == pytest.approx(158.0)    # ...the capture ends at the region's end
+        assert scan.metadata["gantry_end_mm"] == pytest.approx(200.0)   # where the surface ends (orient_scan's direction)
+        assert scan.metadata["gantry_stop_mm"] == pytest.approx(220.0)  # where the axis was sent
+        assert "fixed_length_mm" not in caplog.text                     # not the "you gave a mismatching length" warning
+
+    def test_without_capture_end_the_stop_is_the_end(self, scanner):
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        scan = scanner.scan_with_gantry(FakeGantry(), axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0)
+        assert scan.metadata["gantry_end_mm"] == scan.metadata["gantry_stop_mm"] == pytest.approx(200.0)
+
+    def test_the_receive_timeout_covers_the_whole_run_not_just_the_capture(self, scanner, monkeypatch):
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        seen = {}
+        orig = scanner.receive_surface
+        monkeypatch.setattr(scanner, "receive_surface",
+                            lambda timeout_s=None, metadata=None: seen.setdefault("t", timeout_s) and orig(timeout_s=timeout_s, metadata=metadata))
+        scanner.scan_with_gantry(FakeGantry(positions={"X": 0.0}), axis="X", end_mm=1000.0, capture_end_mm=10.0,
+                                 feed_rate_mm_s=10.0, settle_s=0.0)
+        assert seen["t"] >= 1000.0 / 10.0 * 1.5            # 100 s of travel, not the 1 s the capture needs
+
+    def test_without_cruise_start_mm_behavior_is_unchanged(self, scanner):
+        """Omitting cruise_start_mm reproduces pre-#58 behavior exactly.
+
+        Every non-Tile caller today omits it — gantry_start_mm stays the
+        live pre-motion read, same as ramp_start_measured_mm.
+        """
+        scanner._fake.go.datasets = [[make_surface_msg()]]
+        gantry = FakeGantry(positions={"X": 40.0, "Y": 250.0})
+        scan = scanner.scan_with_gantry(
+            gantry, axis="X", end_mm=200.0, feed_rate_mm_s=20.0, settle_s=0.0
+        )
+        assert scan.metadata["gantry_start_mm"] == pytest.approx(40.0)
+        assert scan.metadata["ramp_start_measured_mm"] == pytest.approx(40.0)
+        assert scan.metadata["gantry_start"] == [40.0, 250.0]
 
     def test_feed_rate_becomes_sensor_travel_speed(self, scanner):
         """The whole scheme depends on these two matching."""
@@ -1927,6 +2062,26 @@ class TestSurfaceScan:
         assert "mounting" not in loaded.metadata  # restored to .mounting, not left duplicated
         assert "grid_axes" not in loaded.metadata  # derived, not stored state
 
+    def test_numpy_scalars_in_metadata_survive_a_round_trip(self, tmp_path):
+        """repr(np.float64(1.0)) is 'np.float64(1.0)' on numpy 2, which
+        literal_eval can't read — a scan aimed with array-derived positions
+        (as the notebooks do) must still reload."""
+        scan = make_scan()
+        scan.metadata.update(gantry_start_mm=np.float64(303.5), gantry_end_mm=np.float32(903.0))
+        loaded = SurfaceScan.from_npz(scan.save_npz(tmp_path / "scan.npz"))
+        assert loaded.metadata["gantry_start_mm"] == pytest.approx(303.5)
+        assert loaded.metadata["gantry_end_mm"] == pytest.approx(903.0)
+
+    def test_from_npz_reads_files_saved_with_numpy_scalar_reprs(self, tmp_path):
+        """Scans written before save_npz() converted numpy scalars."""
+        scan = make_scan()
+        path = tmp_path / "old.npz"
+        np.savez_compressed(
+            path, z_mm=scan.z_mm, x_mm=scan.x_mm, y_mm=scan.y_mm, is_uniform=scan.is_uniform,
+            metadata=np.array(["{'gantry_start_mm': np.float64(303.5), 'mounting': None}"], dtype=object),
+        )
+        assert SurfaceScan.from_npz(path).metadata["gantry_start_mm"] == pytest.approx(303.5)
+
     def test_from_npz_default_mounting_round_trips_as_identity(self, tmp_path):
         path = make_scan().save_npz(tmp_path / "scan.npz")
         loaded = SurfaceScan.from_npz(path)
@@ -2502,3 +2657,13 @@ class TestScanResyncsGantryPosition:
                 raise AttributeError("resync_position")
 
         assert self._scan(scanner, NoResyncGantry()) is not None
+
+
+class TestAlignment:
+    """The web UI alignment transform, read back from the sensor."""
+
+    def test_get_alignment_reads_transform_with_go_role_main(self, scanner):
+        al = scanner.get_alignment()
+        assert al["y_angle_deg"] == pytest.approx(2.0)
+        assert al["x_mm"] == pytest.approx(10.0)
+        assert al["z_mm"] == pytest.approx(-20.0)

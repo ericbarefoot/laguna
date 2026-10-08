@@ -212,6 +212,31 @@ class GocatorSettingsMixin:
         self.refresh()
         return self._read_active_area()
 
+    def get_alignment(self) -> Dict[str, Any]:
+        """Read the alignment transform the web UI calibration stored on the sensor.
+
+        Returns:
+            Dict with ``x_mm``/``y_mm``/``z_mm`` offsets and
+            ``x_angle_deg``/``y_angle_deg``/``z_angle_deg``. Profiles and
+            surfaces arrive in this *aligned* frame, and the active area
+            is applied in it too.
+
+        Raises:
+            RuntimeError: If not connected.
+            GoSdkError: If any SDK call fails.
+        """
+        self.refresh()
+        lib = self._require_connected()
+        transform = lib.handle("GoSensor_Transform", self._sensor)
+        role = _g.k32s(_g.GO_ROLE_MAIN)
+
+        out: Dict[str, Any] = {}
+        for comp, key in (("X", "x_mm"), ("Y", "y_mm"), ("Z", "z_mm"),
+                          ("XAngle", "x_angle_deg"), ("YAngle", "y_angle_deg"),
+                          ("ZAngle", "z_angle_deg")):
+            out[key] = float(getattr(lib.go, f"GoTransform_{comp}")(transform, role))
+        return out
+
     def _read_active_area(self) -> Dict[str, Any]:
         """Read from the SDK's local cache without refreshing first.
 

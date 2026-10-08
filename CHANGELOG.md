@@ -10,6 +10,25 @@ them into a dated release section when you cut a version.
 
 ## [Unreleased]
 
+### Fixed
+- **Reverse WTT12L scans were mislabelled.** The Pi agent computed every sample's `pos_mm` as if the axis moved in
+  the positive direction, so any scan toward lower positions had its positions mirrored about its start point. An
+  out-and-back average (the alignment notebook's block position) then landed near the reverse scan's start instead
+  of the block, wrong by about half a scan length per axis (about 166 mm and 106 mm in the saved runs), and so was
+  the Gocator translation solved from it. The agent now takes the direction from start versus end and includes the
+  acceleration ramp distance. `laguna.robot.macron.profiler.recompute_positions()` rebuilds `pos_mm` for saved scans
+  from their raw timestamps and sidecar (the file is left untouched).
+- **`orient_scan` mirrored passes whenever `scan_y` was negative.** It multiplied the gantry's start-to-end direction
+  by the mounting's sign on the travel axis, putting a forward pass behind its start and a reverse pass beyond it.
+  The direction along travel now comes from start versus end alone.
+- **`SurveyRunner` offset a tile by one swath in a rotated experiment frame.** The sensor edge placed on a pass's
+  near edge was chosen from the gantry-axis mounting matrix although the tile steps along an experiment axis; it now
+  goes through the frame's rotation. A rotated frame also scanned along the wrong gantry axis at 90/270 degrees: the
+  runner now maps each experiment axis to the gantry axis that moves along it (`FrameRegistry.gantry_axis_for` /
+  `experiment_axis_for`) and refuses a rotation that is not a multiple of 90 degrees before anything moves.
+- `SurfaceScan.save_npz` wrote numpy scalars as `np.float64(...)` in its metadata, which `from_npz` could not read
+  back, so such scans could not be reloaded. `save_npz` now writes plain values and `from_npz` reads the old files.
+
 ### Added
 - **`laguna-picam` CLI and `scripts/picam-remote.sh`** — snapshot or live-view
   a Pi camera from a remote client, relayed client → laguna → pi over SSH
@@ -36,6 +55,26 @@ them into a dated release section when you cut a version.
     `/dev/dslr_<name>` symlinks.
   - Pre-flight sets each camera's clock from the PC (`syncdatetime`), so
     EXIF times are correct. On the lab T7s they come out in UTC.
+- **Tile scan lead-out.** A `Tile` with `accel_mm_s2` now sends each pass one ramp past its swath end
+  (`Pass.overrun_end`), mirroring the lead-in, so the swath is covered entirely at constant speed and the slowdown
+  happens outside it; `scan_with_gantry(capture_end_mm=...)` ends the capture at the swath end. The stop is
+  fence-checked like any other end point, and it extends commanded travel by `v^2 / 2a` per pass.
+- **`gocator.trigger_delay_s`** (default `0.0`, so nothing changes until calibrated), added to the wait before a
+  gantry pass's trigger to cover the command-to-motion latency. `laguna.scanner.trigger_delay` fits it from
+  forward/reverse block offsets, including `summarize_trigger_delay()` for repeats at one speed, and
+  `laguna.viz.plot_trigger_delay()` plots them. Calibrate at the speed you will scan at.
+- `Tile.from_roi()`: plan a tile from experiment-frame ROI bounds, with the swath read from the live active area;
+  passes and overlap are solved (fewest passes keeping `min_overlap`, spread evenly), a region no wider than one
+  swath is a single centred pass, and `gantry_axis=` fixes the gantry axis scanned on whatever the frame's rotation.
+- `frames.experiment.origin`, an alternative to `translation` that names the gantry point which is the experiment
+  origin, so changing `rotation_deg` does not move it.
+- `laguna.viz.plot_survey_plan()`: top-down plan with origins, soft limits, sensor paths, swaths and, given a lab,
+  the carriage path and the footprint the live mounting and active area will image.
+- `laguna.scanner.block_finder.find_block()`: a local-bed block detector for uneven beds.
+  `laguna.alignment_store.AlignmentStore` saves and reloads the intermediate results of an alignment run, so a rerun
+  can skip a scan. `GocatorScanner.get_alignment()` reads the sensor's alignment transform.
+- `calibration/gocator_alignment_and_seam.ipynb` (alignment, tile planning, seam analysis, trigger-delay
+  calibration), moved here from `examples/` because it is a procedure that gets re-run.
 - **`simulate=True` now rehearses every subsystem in
   `laguna.registry.SUBSYSTEM_REGISTRY`** — weir, flow, gauge, both camera
   subsystems, and both AL1342 rangefinders (`od2000`/`wtt12l`), not just
