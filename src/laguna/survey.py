@@ -37,6 +37,9 @@ start, which has no such constraint and can usually go faster). Pass
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -48,6 +51,18 @@ from .robot.macron.commands import ramp_distance_mm, ramp_time_s
 from .robot.motion_arbiter import DEFAULT_ARBITER
 
 logger = logging.getLogger(__name__)
+
+#: Checkpoint metadata key holding the survey's geometry fingerprint.
+_FINGERPRINT_KEY = "survey_fingerprint"
+
+
+class SurveyCheckpointMismatch(RuntimeError):
+    """A checkpoint on disk describes a different survey than the one being run.
+
+    Resuming anyway would skip passes the *new* geometry never ran, because a
+    checkpoint only records pass indices. Nothing has been deleted.
+    """
+
 
 #: Cartesian axis name -> index into a 3-component [x, y, z] vector. Shared
 #: by Tile and SurveyRunner rather than each keeping its own copy.
@@ -194,6 +209,41 @@ class Survey:
             List of Pass objects.
         """
         raise NotImplementedError
+
+    def fingerprint(self) -> str:
+        """Hash of the geometry this survey measures, for checkpoint safety.
+
+        A checkpoint records only pass *indices*; this is what lets a resume
+        notice that index 3 now means a different strip of bed. It covers what
+        each pass measures — instrument, travel axis, measuring start and end,
+        and swath alignment — and deliberately **not**:
+
+        - speeds, labels: they don't change which ground a completed pass
+          covered;
+        - the commanded ramp start (``Pass.start`` when a lead-in was added):
+          it follows the axis's accel, which can be re-read between runs, yet
+          a pass already measured from a different run-up still covered the
+          same swath.
+
+        Returns:
+            A short hex digest; equal exactly when the measured geometry is.
+        """
+        def _pt(v: Sequence[float]) -> List[float]:
+            return [round(float(c), 6) for c in v]
+
+        rows = [
+            {
+                "instrument": p.instrument,
+                "axis": p.axis,
+                "start": _pt(p.measure_start),
+                "end": _pt(p.end),
+                "edge_align": bool(p.edge_align),
+                "step_axis": p.step_axis,
+            }
+            for p in self.passes()
+        ]
+        blob = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(blob).hexdigest()[:16]
 
     def __iter__(self) -> Iterator[Pass]:
         """Iterate over the passes."""
@@ -738,20 +788,55 @@ class SurveyRunner:
         checkpoint: Optional CheckpointStore. Pass indices are marked
             complete as they finish, so a survey interrupted by a pause
             resumes where it left off rather than starting over. A tile of
-            a wide bed can be the longest thing an experiment does.
+            a wide bed can be the longest thing an experiment does. The
+            survey's geometry fingerprint (:meth:`Survey.fingerprint`) is
+            stored in it, and a checkpoint with completed passes made for a
+            *different* geometry — or by a version that recorded none — is
+            refused rather than trusted (see ``restart``).
+        max_scan_speed_mm_s: Ceiling for a feed rate the runner chooses itself.
+            A pass with no ``scan_speed`` of its own, on an instrument with no
+            configured rate, gets one from the scanner's
+            ``solve_scan_rates()`` — the fastest feed that still samples as
+            finely along travel as across it — but never above this. Required
+            for that automatic choice: the fastest rate the sensor can
+            sample is not necessarily one the gantry should be driven at, so
+            a person names the limit. Ignored when every pass has a speed.
+        restart: Start over against `checkpoint` instead of refusing a
+            mismatch. The old checkpoint is moved aside, never deleted
+            (``CheckpointStore.clear()``), so the record of what the earlier
+            plan completed survives.
+
+    Raises:
+        SurveyCheckpointMismatch: At construction, if `checkpoint` has
+            completed passes for a different (or unrecorded) geometry and
+            `restart` is False.
     """
 
-    def __init__(self, lab: Any, survey: Survey, checkpoint: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        lab: Any,
+        survey: Survey,
+        checkpoint: Optional[Any] = None,
+        restart: bool = False,
+        max_scan_speed_mm_s: Optional[float] = None,
+    ) -> None:
         """Initialize a survey runner.
 
         Args:
             lab: Connected FlumeLab instance.
             survey: The survey plan to execute.
             checkpoint: Optional CheckpointStore for resumable execution.
+            restart: See the class docstring.
+            max_scan_speed_mm_s: See the class docstring.
         """
         self.lab = lab
         self.survey = survey
         self.checkpoint = checkpoint
+        self.max_scan_speed_mm_s = max_scan_speed_mm_s
+        #: instrument -> scan speed this runner resolved for passes that had none.
+        self.resolved_speeds: Dict[str, float] = {}
+        if checkpoint is not None:
+            self._bind_checkpoint(restart)
         self.completed: List[int] = []
         #: Acquired SurfaceScan/ProfileResult objects, one per pass that
         #: actually ran — only populated when run(keep_results=True). Empty
@@ -759,6 +844,52 @@ class SurveyRunner:
         #: (a full-resolution Gocator surface is hundreds of MB) is real
         #: cost most callers don't want by default.
         self.results: List[Any] = []
+        #: Each pass's result placed in experiment coordinates — populated only
+        #: when run(place_results=True), same order as the returned passes.
+        #: ``None`` for a pass whose placement failed (the raw result is
+        #: still in ``results`` if kept, and on disk). Never replaces raw data.
+        self.placed: List[Any] = []
+
+    def _bind_checkpoint(self, restart: bool) -> None:
+        """Tie the checkpoint to this survey's geometry, or refuse a mismatch.
+
+        Checked at construction, before anything moves. A checkpoint with no
+        completed passes carries nothing to protect and is simply stamped.
+
+        Args:
+            restart: Move any existing progress aside and start over.
+
+        Raises:
+            SurveyCheckpointMismatch: See the class docstring.
+        """
+        wanted = self.survey.fingerprint()
+        stored = self.checkpoint.meta.get(_FINGERPRINT_KEY)
+        has_progress = self.checkpoint.last_completed() is not None
+
+        if restart:
+            if has_progress or stored is not None:
+                self.checkpoint.clear()
+            self.checkpoint.set_meta(_FINGERPRINT_KEY, wanted)
+            return
+        if stored == wanted:
+            return
+        if stored is None and not has_progress:
+            self.checkpoint.set_meta(_FINGERPRINT_KEY, wanted)
+            return
+        done = sorted(
+            i for i in range(len(self.survey)) if self.checkpoint.is_complete(i)
+        )
+        if stored is None:
+            why = "it records no survey geometry (written before fingerprints existed)"
+        else:
+            why = f"it was made for a different geometry (fingerprint {stored}, now {wanted})"
+        raise SurveyCheckpointMismatch(
+            f"Refusing to resume: checkpoint has passes {done} complete, but {why}. "
+            "Resuming would skip passes this survey never ran. Nothing was deleted. "
+            "Pass restart=True to move the old checkpoint aside and start over, or, "
+            "if you know the geometry is unchanged, adopt it with "
+            f"checkpoint.set_meta({_FINGERPRINT_KEY!r}, survey.fingerprint())."
+        )
 
     def pending(self) -> List[Pass]:
         """Get the list of passes not yet completed.
@@ -770,7 +901,9 @@ class SurveyRunner:
             return list(self.survey.passes())
         return [p for p in self.survey.passes() if not self.checkpoint.is_complete(p.index)]
 
-    def run(self, dry_run: bool = False, keep_results: bool = False) -> List[Pass]:
+    def run(
+        self, dry_run: bool = False, keep_results: bool = False, place_results: bool = False
+    ) -> List[Pass]:
         """Execute all pending passes in order.
 
         Args:
@@ -781,15 +914,26 @@ class SurveyRunner:
                 ``done[i]`` measured). Off by default: a long survey holding
                 every scan in memory (a full-resolution Gocator surface is
                 hundreds of MB) is real cost most callers don't want.
+            place_results: If True, also place each pass's result in
+                experiment coordinates through the lab's FrameRegistry
+                (``orient_scan`` for a Gocator surface, ``orient_profile`` for
+                a rangefinder transect) into ``self.placed``. The raw result
+                is never altered or replaced — placement builds a copy, which
+                roughly doubles what's held in memory per pass. A placement
+                that fails is logged to the event log and leaves ``None``
+                for that pass; it never aborts the survey, since the raw data
+                is already captured.
 
         Returns:
             The passes that were executed.
         """
+        self._resolve_scan_speeds(dry_run)
         self._fill_tile_accel()
         for p in self.survey.passes():
             self._gantry_axis_for(p.axis)      # fail before any motion, not mid-survey
         done: List[Pass] = []
         for p in self.pending():
+            p = self._with_resolved_speed(p)
             reference_point = self._resolve_reference_point(p)
             gantry_start = self.lab.frames.gantry_target_for(
                 p.instrument, list(p.start), reference_point=reference_point
@@ -816,6 +960,8 @@ class SurveyRunner:
             result = self._run_pass(p, reference_point)
             if keep_results:
                 self.results.append(result)
+            if place_results:
+                self.placed.append(self._place_result(p, result))
             done.append(p)
             self.completed.append(p.index)
             if self.checkpoint is not None:
@@ -844,6 +990,123 @@ class SurveyRunner:
         if not hasattr(frames, "gantry_axis_for"):
             return experiment_axis
         return frames.gantry_axis_for(experiment_axis)
+
+    def _place_result(self, p: Pass, result: Any) -> Any:
+        """Place one pass's result in experiment coordinates, or return None on failure.
+
+        Placement is a convenience layered on data that is already acquired,
+        so it must not take the survey down: a failure is recorded and the
+        survey carries on collecting.
+
+        Args:
+            p: The pass that produced `result`.
+            result: A SurfaceScan (instrument has ``acquire()``) or a
+                rangefinder ProfileResult.
+
+        Returns:
+            The placed copy, or None if placement raised.
+        """
+        try:
+            scanner = getattr(self.lab, p.instrument, None)
+            if scanner is not None and hasattr(scanner, "acquire"):
+                from .frames import orient_scan
+
+                return orient_scan(result, instrument=p.instrument, frames=self.lab.frames)
+            from .robot.macron.profiler import orient_profile
+
+            try:
+                config = self.lab.config.get(p.instrument)
+            except Exception:
+                config = None
+            return orient_profile(
+                result, instrument=p.instrument, frames=self.lab.frames, config=config,
+                axis=p.axis,
+            )
+        except Exception as exc:
+            logger.error("Could not place pass %d (%s) in the experiment frame: %s",
+                         p.index, p.instrument, exc)
+            self.lab.event_log.log(
+                self.lab.clock.elapsed(), p.instrument, "survey_place",
+                result=f"error: {exc}", notes=p.label or "",
+            )
+            return None
+
+    def _resolve_scan_speeds(self, dry_run: bool) -> None:
+        """Pick a scan speed for instruments whose passes don't carry one.
+
+        Precedence, highest first: the survey/pass's own ``scan_speed`` (never
+        touched); the scanner's configured ``scan.feed_rate_mm_s`` (what
+        ``acquire()`` would use anyway — read here so a ``Tile`` plans its ramp
+        lead-in around the real rate); then the scanner's
+        ``solve_scan_rates()``, capped at ``max_scan_speed_mm_s``. Only
+        instruments with a ``solve_scan_rates()`` take part: a rangefinder pass
+        with no speed still fails loudly later, as before.
+
+        A ``Tile`` runs a single instrument, so its own ``scan_speed`` is
+        filled in (needed before ``passes()`` is asked for the ramp). Other
+        surveys get the speed applied per pass by :meth:`_with_resolved_speed`.
+        Must run before ``_fill_tile_accel()``/``pending()``.
+
+        Args:
+            dry_run: A dry run with the scanner unreachable logs the gap and
+                leaves the speed unset instead of raising.
+
+        Raises:
+            ValueError: A solved speed is needed but no ceiling was given.
+            RuntimeError: The scanner can't solve (e.g. not connected) on a
+                real run.
+        """
+        instruments = {p.instrument for p in self.survey.passes() if p.scan_speed is None}
+        for instrument in sorted(instruments):
+            scanner = getattr(self.lab, instrument, None)
+            if scanner is None or not hasattr(scanner, "solve_scan_rates"):
+                continue
+            try:
+                speed, source = self._choose_scan_speed(instrument, scanner)
+            except RuntimeError as exc:
+                if not dry_run:
+                    raise
+                logger.warning("dry run: no scan speed for %s yet (%s)", instrument, exc)
+                continue
+            self.resolved_speeds[instrument] = speed
+            logger.info("Scan speed for %s passes: %.3f mm/s (%s)", instrument, speed, source)
+        if (
+            isinstance(self.survey, Tile)
+            and self.survey.scan_speed is None
+            and self.survey.instrument in self.resolved_speeds
+        ):
+            self.survey.scan_speed = self.resolved_speeds[self.survey.instrument]
+
+    def _choose_scan_speed(self, instrument: str, scanner: Any) -> Tuple[float, str]:
+        """The speed to use for `instrument`, and where it came from."""
+        configured = getattr(scanner, "configured_feed_rate_mm_s", None)
+        if configured:
+            return float(configured), "scanner's configured scan.feed_rate_mm_s"
+        if self.max_scan_speed_mm_s is None:
+            raise ValueError(
+                f"{instrument} passes have no scan_speed and the scanner has no configured "
+                "scan.feed_rate_mm_s. Set scan_speed on the survey, or give "
+                "SurveyRunner(max_scan_speed_mm_s=...) to let the scanner's "
+                "solve_scan_rates() choose a rate up to that limit — the fastest "
+                "rate the sensor can sample isn't necessarily one to drive the gantry at."
+            )
+        solved = float(scanner.solve_scan_rates()["feed_rate_mm_s"])
+        if solved <= self.max_scan_speed_mm_s:
+            return solved, "solve_scan_rates()"
+        logger.warning(
+            "%s: solve_scan_rates() suggests %.3f mm/s; capped at max_scan_speed_mm_s=%.3f",
+            instrument, solved, self.max_scan_speed_mm_s,
+        )
+        capped = float(self.max_scan_speed_mm_s)
+        scanner.solve_scan_rates(feed_rate_mm_s=capped)   # logs the frame rate/Y spacing at the cap
+        return capped, f"solve_scan_rates(), capped at {capped:g}"
+
+    def _with_resolved_speed(self, p: Pass) -> Pass:
+        """`p` with this runner's resolved scan speed filled in, if it had none."""
+        if p.scan_speed is not None:
+            return p
+        speed = self.resolved_speeds.get(p.instrument)
+        return p if speed is None else dataclasses.replace(p, scan_speed=speed)
 
     def _fill_tile_accel(self) -> None:
         """Read the travel axis's accel into a Tile survey that didn't set one.
@@ -1120,4 +1383,4 @@ class SurveyRunner:
         ]
 
 
-__all__ = ["Pass", "Survey", "Tile", "Traverse", "SurveyRunner"]
+__all__ = ["Pass", "Survey", "SurveyCheckpointMismatch", "Tile", "Traverse", "SurveyRunner"]

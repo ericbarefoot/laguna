@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class CheckpointStore:
         """
         self._path = Path(path)
         self._events: List[dict] = []
+        self._meta: dict = {}
         self._lock = threading.Lock()
 
         if resume and self._path.exists():
@@ -61,6 +62,10 @@ class CheckpointStore:
                 if not isinstance(events, list):
                     raise TypeError(f"'events' is a {type(events).__name__}, not a list")
                 self._events = events
+                meta = data.get("meta", {})
+                if not isinstance(meta, dict):
+                    raise TypeError(f"'meta' is a {type(meta).__name__}, not a dict")
+                self._meta = meta
             except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
                 kept = self._set_aside("corrupt")
                 raise CheckpointCorruptError(
@@ -95,6 +100,28 @@ class CheckpointStore:
             )
             self._write()
 
+    @property
+    def meta(self) -> dict:
+        """A copy of the free-form metadata stored alongside the events.
+
+        Used to record what the events *mean* — e.g. ``SurveyRunner`` stores
+        a fingerprint of the survey geometry so a resume against a changed
+        plan is caught instead of trusting stale pass indices.
+        """
+        with self._lock:
+            return dict(self._meta)
+
+    def set_meta(self, key: str, value: Any) -> None:
+        """Store a JSON-serializable metadata value and persist to disk.
+
+        Args:
+            key: Metadata key.
+            value: JSON-serializable value.
+        """
+        with self._lock:
+            self._meta[key] = value
+            self._write()
+
     def is_complete(self, event_id: int) -> bool:
         """Check if event_id has already been marked complete.
 
@@ -121,6 +148,7 @@ class CheckpointStore:
         """Forget all checkpoint state, moving the file aside rather than deleting it."""
         with self._lock:
             self._events = []
+            self._meta = {}
             if self._path.exists():
                 kept = self._set_aside("bak")
                 logger.warning("Checkpoint cleared; the previous one was moved to %s", kept)
@@ -141,7 +169,7 @@ class CheckpointStore:
         tmp = self._path.with_name(self._path.name + ".tmp")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w") as f:
-            f.write(json.dumps({"events": self._events}, indent=2))
+            f.write(json.dumps({"events": self._events, "meta": self._meta}, indent=2))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self._path)

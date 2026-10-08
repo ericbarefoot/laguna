@@ -11,6 +11,8 @@ them into a dated release section when you cut a version.
 ## [Unreleased]
 
 ### Fixed
+- `examples/example_14_scheduled_tiled_scan_hook.py` reused one checkpoint across firings, so every firing after
+  the first was a silent no-op; it now makes one per firing.
 - **Reverse WTT12L scans were mislabelled.** The Pi agent computed every sample's `pos_mm` as if the axis moved in
   the positive direction, so any scan toward lower positions had its positions mirrored about its start point. An
   out-and-back average (the alignment notebook's block position) then landed near the reverse scan's start instead
@@ -30,6 +32,24 @@ them into a dated release section when you cut a version.
   back, so such scans could not be reloaded. `save_npz` now writes plain values and `from_npz` reads the old files.
 
 ### Added
+- **Surveys can be scheduled from config.** A `surveys:` section (`laguna.survey_config`) takes `kind: tile` or
+  `traverse` entries, the `Tile`/`Traverse` constructor arguments plus `interval_s`/`trigger_at` and
+  `max_scan_speed_mm_s`; `swath_mm: auto` reads the live active area at each firing. Unknown keys are an error and
+  `setup_run()` validates everything before anything connects or moves. Each firing plans afresh against a new, kept
+  checkpoint under `<run dir>/surveys/`; a firing interrupted by a pause is not resumed automatically. Motion still
+  goes through `safe_mode`, fences and the motion arbiter.
+- **Survey checkpoints carry a geometry fingerprint.** `Survey.fingerprint()` hashes what each pass measures
+  (instrument, travel axis, measuring start and end, swath alignment; not speeds, labels or the ramp start).
+  `SurveyRunner` stamps it into the checkpoint's new `meta` and, at construction, refuses a checkpoint with completed
+  passes for different geometry, or recorded without a fingerprint, with `SurveyCheckpointMismatch`. Nothing is
+  deleted: `restart=True` moves the old file aside via `CheckpointStore.clear()`. Older checkpoints still load.
+- **A survey pass with no `scan_speed` takes one from the scanner:** its configured `scan.feed_rate_mm_s`
+  (`GocatorScanner.configured_feed_rate_mm_s`), else `solve_scan_rates()` capped at
+  `SurveyRunner(max_scan_speed_mm_s=...)`, which is required for the automatic choice. An explicit speed is never
+  overridden, and instruments without a solver (rangefinders) still fail loudly.
+- **`SurveyRunner.run(place_results=True)`** fills `runner.placed` with each pass's result in experiment
+  coordinates (`orient_scan` / `orient_profile`). The raw result is kept; a placement failure is logged to the
+  event log (`survey_place`) and never aborts the survey.
 - **`laguna-picam` CLI and `scripts/picam-remote.sh`** — snapshot or live-view
   a Pi camera from a remote client, relayed client → laguna → pi over SSH
   pipes (no ports opened). See `docs/subsystems/camera.md`. The Pi camera is

@@ -22,6 +22,8 @@ regardless of config. Read through it, then point CONFIG_FILE at a real
 rig's config and flip SIMULATE = False yourself when ready.
 """
 
+import itertools
+
 from laguna.experiment import run_blocking, schedule_action, setup_run
 from laguna.survey import SurveyRunner, Tile
 from laguna.timing.checkpoint import CheckpointStore
@@ -39,9 +41,14 @@ def make_tiled_scan_hook(lab):
     the CheckpointStore/escalate() plumbing in one place, next to the
     Tile spec it belongs to, instead of scattered across the call site.
     """
-    checkpoint = CheckpointStore("tmp/tiled_scan_checkpoint.json", resume=True)
+    firings = itertools.count(1)
 
     def tiled_scan():
+        # A fresh checkpoint per firing: one shared across firings would find
+        # every pass already "complete" after the first and scan nothing again.
+        # Kept on disk afterwards — if a firing is interrupted it records which
+        # passes finished (resume by hand with resume=True).
+        checkpoint = CheckpointStore(f"tmp/tiled_scan_{next(firings):04d}.checkpoint.json")
         active_area = lab.gocator.get_active_area()
         tile = Tile(
             origin=[0, 0, 0],

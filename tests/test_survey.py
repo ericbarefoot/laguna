@@ -422,6 +422,36 @@ class FakeScannerWithActiveArea(FakeScanner):
         return dict(self._active_area)
 
 
+class _FakeStore:
+    """CheckpointStore double: completion set plus the metadata API."""
+
+    def __init__(self, done=(), fingerprint=None):
+        self.done = set(done)
+        self.marked = []
+        self._meta = {} if fingerprint is None else {"survey_fingerprint": fingerprint}
+
+    @property
+    def meta(self):
+        return dict(self._meta)
+
+    def set_meta(self, key, value):
+        self._meta[key] = value
+
+    def is_complete(self, i):
+        return i in self.done
+
+    def last_completed(self):
+        return max(self.done) if self.done else None
+
+    def mark_complete(self, i, **kw):
+        self.done.add(i)
+        self.marked.append(i)
+
+    def clear(self):
+        self.done = set()
+        self._meta = {}
+
+
 class FakeLab:
     def __init__(self):
         from laguna.frames import FrameRegistry
@@ -647,33 +677,15 @@ class TestSurveyRunner:
         """A tile of a wide bed can be the longest thing an experiment
         does; an interruption must not restart it."""
 
-        class Store:
-            def __init__(self):
-                self.done = {0}
-
-            def is_complete(self, i):
-                return i in self.done
-
-            def mark_complete(self, i, **kw):
-                self.done.add(i)
-
+        survey = self._survey()
+        store = _FakeStore(done={0}, fingerprint=survey.fingerprint())
         lab = FakeLab()
-        runner = SurveyRunner(lab, self._survey(), checkpoint=Store())
+        runner = SurveyRunner(lab, survey, checkpoint=store)
         done = runner.run()
         assert [p.index for p in done] == [1]
 
     def test_completed_passes_are_checkpointed(self):
-        class Store:
-            def __init__(self):
-                self.marked = []
-
-            def is_complete(self, i):
-                return False
-
-            def mark_complete(self, i, **kw):
-                self.marked.append(i)
-
-        store = Store()
+        store = _FakeStore()
         SurveyRunner(FakeLab(), self._survey(), checkpoint=store).run()
         assert store.marked == [0, 1]
 
@@ -1194,3 +1206,385 @@ class TestLeadOut:
         kw = lab.gocator.acquired[0]
         assert kw["axis"] == "Y"
         assert kw["capture_end_mm"] == pytest.approx(g_end[1]) and kw["end_mm"] == pytest.approx(g_stop[1])
+
+
+class TestGeometryFingerprint:
+    """GH #45: a checkpoint keyed only on pass index must not resume a different survey."""
+
+    @staticmethod
+    def _tile(**kw):
+        base = dict(
+            origin=(0.0, 0.0, 0.0), length_mm=100.0, width_mm=2000.0,
+            swath_mm=1000.0, overlap=0.0, scan_speed=20.0,
+        )
+        base.update(kw)
+        return Tile(**base)
+
+    def test_identical_plans_share_a_fingerprint(self):
+        assert self._tile().fingerprint() == self._tile().fingerprint()
+
+    @pytest.mark.parametrize("change", [
+        {"origin": (5.0, 0.0, 0.0)},
+        {"length_mm": 120.0},
+        {"width_mm": 1500.0},
+        {"swath_mm": 800.0},
+        {"overlap": 0.1},
+        {"axis": "Y"},
+        {"serpentine": False},
+        {"instrument": "od2000"},
+    ])
+    def test_any_geometry_change_changes_the_fingerprint(self, change):
+        assert self._tile(**change).fingerprint() != self._tile().fingerprint()
+
+    def test_speeds_do_not_change_it(self):
+        """Which ground a completed pass covered doesn't depend on how fast."""
+        assert self._tile(scan_speed=5.0).fingerprint() == self._tile(scan_speed=40.0).fingerprint()
+
+    def test_ramp_lead_in_does_not_change_it(self):
+        """accel moves the commanded start, not the swath that was measured."""
+        slow = self._tile(accel_mm_s2=50.0).fingerprint()
+        fast = self._tile(accel_mm_s2=500.0).fingerprint()
+        assert slow == fast == self._tile().fingerprint()
+
+    def test_traverse_geometry_is_fingerprinted_too(self):
+        a = Traverse(start=(0, 0, 0), end=(100, 0, 0))
+        assert a.fingerprint() == Traverse(start=(0, 0, 0), end=(100, 0, 0)).fingerprint()
+        assert a.fingerprint() != Traverse(start=(0, 0, 0), end=(200, 0, 0)).fingerprint()
+        assert a.fingerprint() != Traverse(start=(0, 0, 0), end=(100, 0, 0), repeats=2).fingerprint()
+
+
+class TestResumeRefusesAChangedSurvey:
+    @staticmethod
+    def _tile(**kw):
+        return TestGeometryFingerprint._tile(**kw)
+
+    @staticmethod
+    def _store(tmp_path, resume):
+        from laguna.timing import CheckpointStore
+
+        return CheckpointStore(str(tmp_path / "cp.json"), resume=resume)
+
+    def _interrupted(self, tmp_path):
+        """A checkpoint with pass 0 complete, as left by an interrupted run."""
+        store = self._store(tmp_path, resume=False)
+        SurveyRunner(FakeLab(), self._tile(), checkpoint=store)      # stamps the fingerprint
+        store.mark_complete(0, runtime_s=1.0, wall_time=2.0)
+
+    def test_a_fresh_checkpoint_is_stamped_with_the_fingerprint(self, tmp_path):
+        store = self._store(tmp_path, resume=False)
+        tile = self._tile()
+        SurveyRunner(FakeLab(), tile, checkpoint=store)
+        assert store.meta["survey_fingerprint"] == tile.fingerprint()
+
+    def test_the_stamp_survives_a_reload(self, tmp_path):
+        self._interrupted(tmp_path)
+        assert self._store(tmp_path, resume=True).meta["survey_fingerprint"] == self._tile().fingerprint()
+
+    def test_same_geometry_resumes_where_it_left_off(self, tmp_path):
+        self._interrupted(tmp_path)
+        runner = SurveyRunner(FakeLab(), self._tile(), checkpoint=self._store(tmp_path, resume=True))
+        assert [p.index for p in runner.pending()] == [1]
+
+    def test_changed_geometry_is_refused_not_silently_resumed(self, tmp_path):
+        from laguna.survey import SurveyCheckpointMismatch
+
+        self._interrupted(tmp_path)
+        store = self._store(tmp_path, resume=True)
+        with pytest.raises(SurveyCheckpointMismatch, match="different geometry"):
+            SurveyRunner(FakeLab(), self._tile(origin=(50.0, 0.0, 0.0)), checkpoint=store)
+
+    def test_refusal_names_the_completed_passes_and_the_way_out(self, tmp_path):
+        from laguna.survey import SurveyCheckpointMismatch
+
+        self._interrupted(tmp_path)
+        with pytest.raises(SurveyCheckpointMismatch) as info:
+            SurveyRunner(
+                FakeLab(), self._tile(width_mm=1000.0),
+                checkpoint=self._store(tmp_path, resume=True),
+            )
+        assert "[0]" in str(info.value) and "restart=True" in str(info.value)
+
+    def test_refusal_leaves_the_checkpoint_untouched(self, tmp_path):
+        from laguna.survey import SurveyCheckpointMismatch
+
+        self._interrupted(tmp_path)
+        store = self._store(tmp_path, resume=True)
+        with pytest.raises(SurveyCheckpointMismatch):
+            SurveyRunner(FakeLab(), self._tile(length_mm=999.0), checkpoint=store)
+        assert (tmp_path / "cp.json").exists()
+        assert store.is_complete(0)
+        assert list(tmp_path.glob("*.bak")) == []
+
+    def test_restart_moves_the_old_checkpoint_aside_and_starts_over(self, tmp_path):
+        self._interrupted(tmp_path)
+        store = self._store(tmp_path, resume=True)
+        changed = self._tile(origin=(50.0, 0.0, 0.0))
+        runner = SurveyRunner(FakeLab(), changed, checkpoint=store, restart=True)
+        assert len(runner.pending()) == 2                      # nothing counts as done
+        assert len(list(tmp_path.glob("cp.json.*.bak"))) == 1  # evidence preserved
+        assert store.meta["survey_fingerprint"] == changed.fingerprint()
+
+    def test_a_checkpoint_with_progress_but_no_fingerprint_is_refused(self, tmp_path):
+        """Written before fingerprints existed: can't be verified, so isn't trusted."""
+        from laguna.survey import SurveyCheckpointMismatch
+
+        store = self._store(tmp_path, resume=False)
+        store.mark_complete(0, runtime_s=1.0, wall_time=2.0)    # no meta
+        store = self._store(tmp_path, resume=True)
+        with pytest.raises(SurveyCheckpointMismatch, match="no survey geometry"):
+            SurveyRunner(FakeLab(), self._tile(), checkpoint=store)
+
+    def test_an_unfingerprinted_checkpoint_can_be_adopted_explicitly(self, tmp_path):
+        store = self._store(tmp_path, resume=False)
+        store.mark_complete(0, runtime_s=1.0, wall_time=2.0)
+        store = self._store(tmp_path, resume=True)
+        tile = self._tile()
+        store.set_meta("survey_fingerprint", tile.fingerprint())
+        assert [p.index for p in SurveyRunner(FakeLab(), tile, checkpoint=store).pending()] == [1]
+
+    def test_the_refusal_happens_before_anything_moves(self, tmp_path):
+        from laguna.survey import SurveyCheckpointMismatch
+
+        self._interrupted(tmp_path)
+        lab = FakeLab()
+        with pytest.raises(SurveyCheckpointMismatch):
+            SurveyRunner(lab, self._tile(length_mm=5.0), checkpoint=self._store(tmp_path, resume=True))
+        assert lab.placed == [] and lab.gocator.acquired == []
+
+
+class TestCheckpointStoreMeta:
+    def test_meta_round_trips_and_is_cleared_with_the_events(self, tmp_path):
+        from laguna.timing import CheckpointStore
+
+        path = str(tmp_path / "cp.json")
+        store = CheckpointStore(path)
+        store.set_meta("k", {"a": 1})
+        assert CheckpointStore(path, resume=True).meta == {"k": {"a": 1}}
+        store.clear()
+        assert store.meta == {}
+
+    def test_meta_is_a_copy(self, tmp_path):
+        from laguna.timing import CheckpointStore
+
+        store = CheckpointStore(str(tmp_path / "cp.json"))
+        store.set_meta("k", 1)
+        store.meta["k"] = 99
+        assert store.meta["k"] == 1
+
+    def test_a_pre_meta_checkpoint_still_loads(self, tmp_path):
+        import json
+
+        from laguna.timing import CheckpointStore
+
+        path = tmp_path / "cp.json"
+        path.write_text(json.dumps({"events": [{"id": 3, "runtime_s": 1, "wall_time": 2, "name": ""}]}))
+        store = CheckpointStore(str(path), resume=True)
+        assert store.is_complete(3) and store.meta == {}
+
+
+class _SolvingScanner(FakeScanner):
+    """FakeScanner with the rate-solving surface GocatorScanner has."""
+
+    def __init__(self, solved=60.0, configured=None, connected=True):
+        super().__init__()
+        self._solved = solved
+        self.configured_feed_rate_mm_s = configured
+        self._connected = connected
+        self.solve_calls = []
+
+    def solve_scan_rates(self, feed_rate_mm_s=None, **kw):
+        self.solve_calls.append(feed_rate_mm_s)
+        if not self._connected:
+            raise RuntimeError("not connected")
+        return {"feed_rate_mm_s": self._solved if feed_rate_mm_s is None else feed_rate_mm_s}
+
+
+class TestScanSpeedResolution:
+    """GH #44: a pass with no speed gets one from the scanner — never an unreviewed fast one."""
+
+    @staticmethod
+    def _tile(**kw):
+        base = dict(origin=(0.0, 0.0, 0.0), length_mm=100.0, width_mm=1000.0,
+                    swath_mm=1000.0, overlap=0.0)
+        base.update(kw)
+        return Tile(**base)
+
+    def _lab(self, **scanner_kw):
+        lab = FakeLab()
+        lab.gocator = _SolvingScanner(**scanner_kw)
+        return lab
+
+    def test_an_explicit_speed_is_never_touched(self):
+        lab = self._lab(solved=99.0)
+        SurveyRunner(lab, self._tile(scan_speed=20.0)).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 20.0
+        assert lab.gocator.solve_calls == []
+
+    def test_a_scanner_configured_rate_beats_the_solver(self):
+        lab = self._lab(solved=99.0, configured=15.0)
+        SurveyRunner(lab, self._tile()).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 15.0
+        assert lab.gocator.solve_calls == []
+
+    def test_without_a_ceiling_the_solver_is_not_trusted_to_pick_alone(self):
+        lab = self._lab(solved=99.0)
+        with pytest.raises(ValueError, match="max_scan_speed_mm_s"):
+            SurveyRunner(lab, self._tile()).run()
+        assert lab.placed == [] and lab.gocator.acquired == []     # nothing moved
+
+    def test_the_solved_rate_is_used_when_under_the_ceiling(self):
+        lab = self._lab(solved=12.0)
+        SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 12.0
+
+    def test_the_solved_rate_is_capped_at_the_ceiling(self, caplog):
+        lab = self._lab(solved=62.0)
+        with caplog.at_level("WARNING"):
+            SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=25.0).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 25.0
+        assert "capped" in caplog.text
+        assert 25.0 in lab.gocator.solve_calls          # re-solved so the frame rate matches
+
+    def test_every_pass_gets_the_resolved_rate(self):
+        lab = self._lab(solved=10.0)
+        survey = self._tile(width_mm=2000.0)
+        runner = SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0)
+        done = runner.run()
+        assert [k["feed_rate_mm_s"] for k in lab.gocator.acquired] == [10.0, 10.0]
+        assert all(p.scan_speed == 10.0 for p in done)
+        assert runner.resolved_speeds == {"gocator": 10.0}
+
+    def test_the_tile_ramp_lead_in_is_planned_around_the_resolved_rate(self):
+        """Without a speed the ramp distance is 0, so resolving it first is what
+        gives an auto-rate tile the #58 lead-in at all."""
+        lab = self._lab(solved=20.0)
+        lab.gantry = TestRampLeadInIntegration.FakeGantryWithAccel(accel_mm_s2=100.0)
+        SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run()
+        assert lab.placed[0][1][0] != lab.gocator.acquired[0]["cruise_start_mm"]
+
+    def test_a_traverse_resolves_per_pass_without_touching_the_plan(self):
+        lab = self._lab(solved=8.0)
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0))
+        SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0).run()
+        assert lab.gocator.acquired[0]["feed_rate_mm_s"] == 8.0
+        assert survey.scan_speed is None
+
+    def test_instruments_without_a_solver_are_left_to_fail_loudly(self):
+        """A rangefinder has no solve_scan_rates(); its existing 'no scan_speed'
+        error must still fire rather than being papered over."""
+        lab = FakeLab()
+        lab.od2000 = object()
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000",))
+        with pytest.raises(Exception):
+            SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0).run()
+        assert SurveyRunner(lab, survey, max_scan_speed_mm_s=50.0).resolved_speeds == {}
+
+    def test_dry_run_with_an_unreachable_scanner_logs_instead_of_raising(self, caplog):
+        lab = self._lab(connected=False)
+        with caplog.at_level("WARNING"):
+            done = SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run(dry_run=True)
+        assert len(done) == 1
+        assert "no scan speed" in caplog.text
+
+    def test_a_real_run_with_an_unreachable_scanner_raises(self):
+        lab = self._lab(connected=False)
+        with pytest.raises(RuntimeError, match="not connected"):
+            SurveyRunner(lab, self._tile(), max_scan_speed_mm_s=50.0).run()
+        assert lab.placed == []
+
+
+class _RawScanScanner(FakeScanner):
+    """Returns a real raw SurfaceScan anchored where the pass starts."""
+
+    def acquire(self, gantry=None, **kw):
+        self.acquired.append(kw)
+        return _raw_scan([0.0, 0.0, 0.0] if len(self.acquired) == 1 else [0.0, 500.0, 0.0])
+
+
+class TestPlaceResults:
+    """GH #46: the runner can hand back results already in the experiment frame."""
+
+    @staticmethod
+    def _tile():
+        return Tile(origin=(0.0, 0.0, 0.0), length_mm=20.0, width_mm=520.0,
+                    swath_mm=500.0, overlap=0.0, scan_speed=20.0)
+
+    def _lab(self):
+        lab = FakeLab()
+        lab.gocator = _RawScanScanner()
+        return lab
+
+    def test_off_by_default(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(keep_results=True)
+        assert runner.placed == []
+
+    def test_placed_results_are_oriented_scans_in_pass_order(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        done = runner.run(place_results=True)
+        assert len(runner.placed) == len(done) == 2
+        # Pass 2 sits 500 mm further along Y in the experiment frame.
+        y0 = runner.placed[0].to_points(drop_invalid=True)[:, 1].min()
+        y1 = runner.placed[1].to_points(drop_invalid=True)[:, 1].min()
+        assert y1 - y0 == pytest.approx(500.0)
+
+    def test_the_raw_results_are_left_untouched(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(keep_results=True, place_results=True)
+        assert runner.results[1].metadata["gantry_start"] == [0.0, 500.0, 0.0]
+        assert runner.results[1].is_uniform is True           # not replaced by the placed copy
+        assert runner.placed[1].is_uniform is False
+
+    def test_placement_is_independent_of_keeping_raw_results(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(place_results=True)
+        assert runner.results == [] and len(runner.placed) == 2
+
+    def test_a_placement_failure_never_aborts_the_survey(self, monkeypatch):
+        import laguna.frames as frames_module
+
+        def broken(*a, **k):
+            raise ValueError("no start position")
+
+        monkeypatch.setattr(frames_module, "orient_scan", broken)
+        lab = self._lab()
+        runner = SurveyRunner(lab, self._tile())
+        done = runner.run(place_results=True)
+        assert len(done) == 2 and runner.completed == [0, 1]    # both passes still ran
+        assert runner.placed == [None, None]
+        assert any(row[0][2] == "survey_place" and "no start position" in row[1]["result"]
+                   for row in lab.event_log.rows)
+
+    def test_dry_run_places_nothing(self):
+        runner = SurveyRunner(self._lab(), self._tile())
+        runner.run(dry_run=True, place_results=True)
+        assert runner.placed == []
+
+    def test_rangefinder_results_go_through_orient_profile(self, monkeypatch):
+        import laguna.robot.macron.profiler as profiler_module
+
+        seen = {}
+
+        def fake_orient(result, *, instrument, frames, config=None, axis=None, **kw):
+            seen.update(result=result, instrument=instrument, axis=axis)
+            return "placed-profile"
+
+        monkeypatch.setattr(profiler_module, "orient_profile", fake_orient)
+        lab = FakeLab()
+        lab.od2000 = object()               # no acquire(): the profiler path
+
+        class _Gantry:
+            _axes = [Axis("X", 1), Axis("Y", 2), Axis("Z", 5), Axis("Theta", 6)]
+
+            class cmd:
+                @staticmethod
+                def get_actual_position(axis):
+                    return 0.0
+
+        lab.gantry = _Gantry()
+        lab.acquire_scan = lambda *a, **k: type("R", (), {"path": "/tmp/x.csv"})()
+        survey = Traverse(start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000",), scan_speed=10.0)
+        runner = SurveyRunner(lab, survey)
+        runner.run(place_results=True)
+        assert runner.placed == ["placed-profile"]
+        assert seen["instrument"] == "od2000" and seen["axis"] == "X"

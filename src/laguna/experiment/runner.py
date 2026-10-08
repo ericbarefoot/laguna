@@ -1,5 +1,6 @@
 """Experiment setup and blocking-run utilities."""
 
+import itertools
 import logging
 import os
 import signal
@@ -186,6 +187,118 @@ def schedule_action(
     elif "trigger_at" in cfg:
         for t in cfg["trigger_at"]:
             lab.scheduler.at(float(t), _guarded(action), subsystem=subsystem, name=name)
+
+
+def _make_survey_action(lab: FlumeLab, name: str, spec: dict) -> Callable:
+    """Build the zero-arg closure the scheduler fires for one ``surveys:`` entry.
+
+    Each firing plans afresh (``swath_mm: auto`` reads the live active area) and
+    runs against a **new** checkpoint file, so a periodic survey measures the
+    whole plan every time instead of finding every pass already "complete"
+    from the last firing. The checkpoint is kept, never deleted: if a firing is
+    interrupted, it records exactly which passes finished, for a manual resume
+    with ``SurveyRunner(lab, survey, checkpoint=CheckpointStore(path, resume=True))``.
+    A firing interrupted by a pause is deliberately not resumed automatically.
+
+    Like ``_scan_gocator``, the closure never raises: a failed survey must not
+    take down a run that is also driving hydraulics and cameras, but a missed
+    one is a hole in the record, so any failure other than a deliberate halt
+    escalates to a lab-wide pause.
+
+    Args:
+        lab: The lab to run against.
+        name: The survey's key in ``surveys:``.
+        spec: Its config dict.
+
+    Returns:
+        A zero-argument callable suitable for ``schedule_action(action=...)``.
+    """
+    from laguna.robot.macron import MotionHalted
+    from laguna.survey import SurveyRunner
+    from laguna.survey_config import build_survey, survey_instruments
+    from laguna.timing import CheckpointStore
+
+    firings = itertools.count(1)
+
+    def _run() -> None:
+        n = next(firings)
+        runtime_s = lab.clock.elapsed()
+        checkpoint_path: Optional[Path] = None
+        runner: Optional[SurveyRunner] = None
+        try:
+            survey, options = build_survey(name, spec, lab)
+            checkpoint_path = (
+                Path(lab.run.path_for("surveys", "./surveys")) / f"{name}_{n:04d}.checkpoint.json"
+            )
+            for instrument in survey_instruments(survey):
+                subsystem = lab._subsystems.get(instrument)
+                if subsystem is not None and hasattr(subsystem, "_run_stamp"):
+                    # One stamp for the whole firing, taken at its start — the
+                    # same convention as a single scheduled scan (_scan_gocator).
+                    subsystem._run_stamp = lab.run.stamp(runtime_s)
+            runner = SurveyRunner(
+                lab, survey,
+                checkpoint=CheckpointStore(str(checkpoint_path)),
+                max_scan_speed_mm_s=options.get("max_scan_speed_mm_s"),
+            )
+            done = runner.run()
+        except MotionHalted as exc:
+            # A person or safety trigger already halted the rig; escalating
+            # would pause it a second time and bury the real cause.
+            lab.event_log.log(runtime_s, "survey", name, result=f"interrupted: {exc}")
+            return
+        except Exception as exc:
+            finished = len(runner.completed) if runner is not None else 0
+            lab.event_log.log(runtime_s, "survey", name, result=f"error: {exc}",
+                              notes=f"{finished} passes finished")
+            where = f" Completed passes are recorded in {checkpoint_path}." if checkpoint_path else ""
+            lab.escalate(f"survey {name!r} failed after {finished} pass(es): {exc}.{where}")
+            return
+        lab.run.record_output("surveys", checkpoint_path, runtime_s, survey=name, passes=len(done))
+        lab.event_log.log(runtime_s, "survey", name, result=f"passes={len(done)}",
+                          notes=f"checkpoint={checkpoint_path}")
+
+    return _run
+
+
+def _register_surveys(lab: FlumeLab, surveys_cfg: dict) -> None:
+    """Validate every ``surveys:`` entry and put each on the scheduler.
+
+    Everything that can be wrong with a plan is wrong *here*, at setup, before
+    anything connects or moves: bad geometry, an unknown key, an instrument the
+    lab doesn't have, a missing gantry, or no schedule.
+
+    Args:
+        lab: A lab with its subsystems already added.
+        surveys_cfg: The ``surveys:`` mapping, name -> spec.
+
+    Raises:
+        ValueError: On any invalid entry (see ``survey_config.build_survey``).
+    """
+    from laguna.survey_config import build_survey, survey_instruments
+
+    if not isinstance(surveys_cfg, dict):
+        raise ValueError("'surveys:' must be a mapping of survey name -> spec")
+    for name, spec in surveys_cfg.items():
+        _validate_trigger_config(f"surveys.{name}", spec)
+        survey, _options = build_survey(name, spec)
+        if "interval_s" not in spec and "trigger_at" not in spec:
+            raise ValueError(f"[surveys.{name}] needs 'interval_s' or 'trigger_at' to be scheduled")
+        missing = [i for i in survey_instruments(survey) if i not in lab._subsystems]
+        if missing:
+            raise ValueError(
+                f"[surveys.{name}] uses instrument(s) {missing} that aren't configured in this lab"
+            )
+        gantry = lab._subsystems.get("gantry")
+        if gantry is None:
+            raise ValueError(f"[surveys.{name}] moves the gantry, but there is no 'gantry:' section")
+        if getattr(gantry, "_safe_mode", False):
+            logger.warning(
+                "[surveys.%s] gantry safe_mode is ON: every pass will be refused until motion "
+                "is enabled", name,
+            )
+        logger.info("Survey %r scheduled:\n%s", name, survey.describe())
+        schedule_action(lab, spec, "survey", name, action=_make_survey_action(lab, name, spec))
 
 
 # ------------------------------------------------------------------ #
@@ -531,6 +644,9 @@ def setup_run(
         schedule_action(lab, lab.config.get("gocator"), "gocator", "scan",
                          action=_scan_gocator, exp_schedule=exp_schedule,
                          schedule_col="gocator")
+
+    if "surveys" in active:
+        _register_surveys(lab, lab.config.get("surveys"))
 
     return lab
 
