@@ -1604,7 +1604,9 @@ class GCodeExecutor:
             pending = "; ".join(d for d, _ in self._pending_restores)
             raise RampRestoreError(
                 f"refusing to start motion: ramp/speed restore still failing ({pending}). "
-                "Fix the controller connection, then call retry_ramp_restore()."
+                "Fix the controller connection, then re-run: execute() retries the "
+                "restore first. To retry without moving, call "
+                "retry_ramp_restore() on this executor (gantry.gcode)."
             )
 
     def _describe_linear(self, move: GCodeMove, touches_xy: bool, responder: str) -> str:

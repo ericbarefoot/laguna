@@ -1270,7 +1270,7 @@ class TestConcurrentPairRampRestoreFailure:
         sent_before = len(conn.sent)
 
         follow_up = executor.plan("G1 X20 F600")
-        with pytest.raises(RampRestoreError, match="refusing to start motion"):
+        with pytest.raises(RampRestoreError, match="refusing to start motion.*gantry.gcode"):
             executor.execute(follow_up)
         new_commands = conn.sent[sent_before:]
         assert not any("BMT" in c or "BMB" in c or "JOG" in c for c in new_commands), new_commands

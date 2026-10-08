@@ -11,6 +11,7 @@ import pytest
 from laguna import FlumeLab
 from laguna.camera.network import CameraArray
 from laguna.gauge import SaflWaterLevelSensor
+from laguna.mqtt.subscriber import MqttSubscriber
 from laguna.rangefinder import OD2000Rangefinder, WTT12LRangefinder
 from laguna.rangefinder import subsystem as rangefinder_module
 from laguna.safety import Quiescible
@@ -42,7 +43,8 @@ class TestEveryVerbExists:
         lambda: WTT12LRangefinder({"topic": "t", "pdin_port": 7}, FakeMqttSubscriber()),
         lambda: SaflWaterLevelSensor({"simulated": True}, FakeMqttSubscriber()),
         lambda: CameraArray(hosts=["pi1"]),
-    ], ids=["od2000", "wtt12l", "gauge", "pi_cameras"])
+        lambda: MqttSubscriber({}),
+    ], ids=["od2000", "wtt12l", "gauge", "pi_cameras", "mqtt"])
     def test_implements_the_quiescible_protocol(self, make):
         subsystem = make()
         assert isinstance(subsystem, Quiescible)
