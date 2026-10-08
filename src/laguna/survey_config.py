@@ -31,7 +31,7 @@ how many passes it needs and how much they overlap (see
         interval_s: 1800
 
 With ``roi`` the geometry keys (``origin``, ``length_mm``, ``width_mm``,
-``overlap``) come from the region and giving them is an error.
+``overlap``, ``step_axis``) come from the region and giving them is an error.
 
 Everything but the scheduling keys is the planner's own constructor arguments
 (see :class:`~laguna.survey.Tile` / :class:`~laguna.survey.Traverse`), so
@@ -58,7 +58,7 @@ RUNNER_KEYS = ("max_scan_speed_mm_s",)
 _KINDS = {"tile": Tile, "traverse": Traverse}
 
 #: Tile arguments a ``roi:`` entry derives itself, so spelling them out is a contradiction.
-_ROI_DERIVED_KEYS = ("origin", "length_mm", "width_mm", "overlap")
+_ROI_DERIVED_KEYS = ("origin", "length_mm", "width_mm", "overlap", "step_axis")
 _ROI_KEYS = ("x_mm", "y_mm", "z_mm")
 
 

@@ -321,10 +321,11 @@ class TestRoiForm:
         with pytest.raises(ValueError, match="not both"):
             build_survey("bed", {**ROI_TILE, "axis": "X", "gantry_axis": "X"})
 
-    @pytest.mark.parametrize("key", ["origin", "length_mm", "width_mm", "overlap"])
+    @pytest.mark.parametrize("key", ["origin", "length_mm", "width_mm", "overlap", "step_axis"])
     def test_hand_given_geometry_contradicts_the_region(self, key):
+        value = {"origin": [0, 0, 0], "step_axis": "Y"}.get(key, 1.0)
         with pytest.raises(ValueError, match=key):
-            build_survey("bed", {**ROI_TILE, key: [0, 0, 0] if key == "origin" else 1.0})
+            build_survey("bed", {**ROI_TILE, key: value})
 
     def test_roi_needs_exactly_x_y_and_z(self):
         for roi in ({"x_mm": [0, 1], "y_mm": [0, 1]}, {"x_mm": [0, 1], "y_mm": [0, 1],

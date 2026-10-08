@@ -58,7 +58,7 @@ them into a dated release section when you cut a version.
   event log (`survey_place`) and never aborts the survey.
 - **`surveys:` entries can take a region of interest.** A `kind: tile` entry with `roi: {x_mm, y_mm, z_mm}` is planned
   by `Tile.from_roi()` (passes and overlap worked out from the swath and `min_overlap`), optionally along a
-  `gantry_axis`. `origin`, `length_mm`, `width_mm` and `overlap` come from the region and are refused alongside it.
+  `gantry_axis`. `origin`, `length_mm`, `width_mm`, `overlap` and `step_axis` come from the region and are refused alongside it.
 - **`laguna-picam` CLI and `scripts/picam-remote.sh`** — snapshot or live-view
   a Pi camera from a remote client, relayed client → laguna → pi over SSH
   pipes (no ports opened). See `docs/subsystems/camera.md`. The Pi camera is

@@ -214,7 +214,7 @@ surveys:
     interval_s: 1800
 ```
 
-`origin`, `length_mm`, `width_mm` and `overlap` come from the region, so giving
+`origin`, `length_mm`, `width_mm`, `overlap` and `step_axis` come from the region, so giving
 them alongside `roi` is an error. `gantry_axis` is resolved against the lab's
 frames at each firing; setup only checks the region itself.
 
