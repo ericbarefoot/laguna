@@ -74,6 +74,8 @@ data/processed/
 # ~1.2 GB as .csv, so these must never reach the repo (see
 # GocatorScanner.save_scan / docs/subsystems/scanner.md).
 data/scans/
+# Alignment / calibration runs (laguna.alignment_store) — local to this rig's setup.
+calibration/results/
 *.npz
 *.laz
 *.las

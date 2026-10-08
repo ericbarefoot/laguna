@@ -198,6 +198,26 @@ surveys:
     interval_s: 1800        # or trigger_at: [0, 900, 1800]
 ```
 
+A tile can instead be given as a **region of interest**; the planner then works
+out how many passes it needs and how much they overlap
+(`Tile.from_roi()`):
+
+```yaml
+surveys:
+  bed_tile:
+    kind: tile
+    roi: {x_mm: [100, 700], y_mm: [0, 2400], z_mm: 50}   # experiment-frame bounds
+    swath_mm: auto          # a number, or auto
+    min_overlap: 0.1        # smallest overlap between neighbouring swaths
+    gantry_axis: X          # optional: scan along this gantry axis (or axis: X|Y)
+    scan_speed: 20
+    interval_s: 1800
+```
+
+`origin`, `length_mm`, `width_mm`, `overlap` and `step_axis` come from the region, so giving
+them alongside `roi` is an error. `gantry_axis` is resolved against the lab's
+frames at each firing; setup only checks the region itself.
+
 Everything except the scheduling keys is the planner's own constructor
 argument (`Tile` / `Traverse`), so there is one vocabulary. A typo'd key is an
 error, not a silently ignored default. Everything that can be wrong with a plan

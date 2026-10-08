@@ -9,6 +9,10 @@ again. This module writes each one to the run's folder as soon as it exists
 and reads it back later, so a rerun can start from a known block position, or
 from saved passes, instead of re-scanning. Loading never commands anything.
 
+Results live under ``calibration/results/`` (:data:`CALIBRATION_RESULTS_DIR`),
+deliberately apart from ``data/``: they describe how the rig is set up, not
+what an experiment measured, and are re-made whenever the setup changes.
+
 A saved block position is only valid while the block hasn't moved: the files
 record when they were written, and the caller owns the judgement about
 whether that's still true.
@@ -27,6 +31,10 @@ import numpy as np
 from .scanner.pointcloud import SurfaceScan
 
 logger = logging.getLogger(__name__)
+
+#: Where alignment/calibration runs are written, kept separate from experiment
+#: data (``data/``) on purpose. Relative to the working directory, like ``data/``.
+CALIBRATION_RESULTS_DIR = Path("calibration/results")
 
 #: Names of the three alignment passes, in acquisition order.
 PASS_NAMES = ("P1", "P2", "P3")
@@ -54,7 +62,7 @@ class AlignmentStore:
     """One alignment run's folder: write results as they appear, read them back later.
 
     Args:
-        directory: The run folder (e.g. ``data/scans/seam_test_<time>``).
+        directory: The run folder (e.g. ``calibration/results/seam_test_<time>``).
             Created on the first write, not on construction, so a store
             pointed at an old run for loading never creates anything.
     """
@@ -62,6 +70,24 @@ class AlignmentStore:
     def __init__(self, directory: Union[str, Path]) -> None:
         """Remember the folder; touch nothing."""
         self.directory = Path(directory)
+
+    @classmethod
+    def new_run(
+        cls, root: Union[str, Path] = CALIBRATION_RESULTS_DIR, prefix: str = "seam_test"
+    ) -> "AlignmentStore":
+        """A store for a fresh, timestamped run folder under `root`.
+
+        Nothing is created until the first write.
+
+        Args:
+            root: Folder holding run folders; defaults to
+                :data:`CALIBRATION_RESULTS_DIR`.
+            prefix: Run folder name prefix, matching ``latest()``'s default pattern.
+
+        Returns:
+            A store for ``<root>/<prefix>_<YYYYmmdd_HHMMSS>``.
+        """
+        return cls(Path(root) / time.strftime(f"{prefix}_%Y%m%d_%H%M%S"))
 
     # -- helpers -----------------------------------------------------------
 
@@ -220,11 +246,15 @@ class AlignmentStore:
         })
 
     @staticmethod
-    def latest(root: Union[str, Path], having: str = "block", pattern: str = "seam_test_*") -> Optional["AlignmentStore"]:
+    def latest(
+        root: Union[str, Path] = CALIBRATION_RESULTS_DIR,
+        having: str = "block",
+        pattern: str = "seam_test_*",
+    ) -> Optional["AlignmentStore"]:
         """The most recent run folder under `root` that has a given result.
 
         Args:
-            root: Folder holding run folders, e.g. ``data/scans``.
+            root: Folder holding run folders; defaults to :data:`CALIBRATION_RESULTS_DIR`.
             having: ``"block"``, ``"passes"`` or ``"solution"``.
             pattern: Glob for run folder names.
 

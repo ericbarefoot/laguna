@@ -311,6 +311,13 @@ gocator:
 #     swath_mm: auto            # or a number; auto reads the live active area each firing
 #     scan_speed: 20            # or omit and set max_scan_speed_mm_s to let the scanner pick
 #     interval_s: 1800          # or trigger_at: [0, 900, 1800]
+#   roi_tile:                   # alternative: give a region and let the planner choose passes/overlap
+#     kind: tile
+#     roi: {x_mm: [100, 700], y_mm: [0, 2400], z_mm: 50}
+#     swath_mm: auto
+#     min_overlap: 0.1          # replaces origin / length_mm / width_mm / overlap
+#     scan_speed: 20
+#     interval_s: 1800
 
 # dslr_cameras:                # Canon EOS DSLRs via gphoto2 (pip install laguna[dslr]). Omit to disable.
 #   # Scheduling (choose one):

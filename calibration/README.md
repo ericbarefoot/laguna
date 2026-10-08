@@ -21,7 +21,7 @@ always available.
 | 2c | Seam analysis: forward vs reverse offset along travel | no |
 | 2e | Calibrate `gocator.trigger_delay_s` at your scan speed (5 repeats) | yes |
 
-Every result is written to `data/scans/seam_test_<time>/` as it appears (`AlignmentStore`), so a later run can
+Every result is written to `calibration/results/seam_test_<time>/` as it appears (`AlignmentStore`), apart from experiment data in `data/`, so a later run can
 skip a scan with `LOAD_FROM` / `B_W_KNOWN` (set in the parameters cell). A block position saved before the
 2026-10-08 reverse-scan position fix is wrong and the store warns when it loads one.
 

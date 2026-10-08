@@ -10,6 +10,12 @@ them into a dated release section when you cut a version.
 
 ## [Unreleased]
 
+### Changed
+- **Alignment and calibration runs are written to `calibration/results/`, not `data/scans/`.** The alignment
+  notebook's run folder (`seam_test_<time>`: block position, passes, corners, solution, trigger-delay summary) now
+  comes from `AlignmentStore.new_run()`, and `AlignmentStore.latest()` searches there by default. Runs already in
+  `data/scans/` are left where they are: pass `LOAD_FROM` the old folder to reuse one.
+
 ### Fixed
 - `examples/example_14_scheduled_tiled_scan_hook.py` reused one checkpoint across firings, so every firing after
   the first was a silent no-op; it now makes one per firing.
@@ -50,6 +56,9 @@ them into a dated release section when you cut a version.
 - **`SurveyRunner.run(place_results=True)`** fills `runner.placed` with each pass's result in experiment
   coordinates (`orient_scan` / `orient_profile`). The raw result is kept; a placement failure is logged to the
   event log (`survey_place`) and never aborts the survey.
+- **`surveys:` entries can take a region of interest.** A `kind: tile` entry with `roi: {x_mm, y_mm, z_mm}` is planned
+  by `Tile.from_roi()` (passes and overlap worked out from the swath and `min_overlap`), optionally along a
+  `gantry_axis`. `origin`, `length_mm`, `width_mm`, `overlap` and `step_axis` come from the region and are refused alongside it.
 - **`laguna-picam` CLI and `scripts/picam-remote.sh`** — snapshot or live-view
   a Pi camera from a remote client, relayed client → laguna → pi over SSH
   pipes (no ports opened). See `docs/subsystems/camera.md`. The Pi camera is
