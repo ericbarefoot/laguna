@@ -18,6 +18,9 @@ while writing this documentation.
 - **[Plotting saved scans and profiles](plot-saved-acquisitions.md)** —
   reload a saved Gocator scan or rangefinder transect and run it through
   `plot_acquisition()`, offline, no hardware needed.
+- **[Setting up CI on GitHub](continuous-integration.md)** — a plan, not yet
+  implemented: the workflow, branch protection, and what CI can and cannot
+  check for a hardware project.
 
 For the terse, generated-from-docstrings API surface (every public
 class/method with its signature), see [API reference](../reference/index.md).
