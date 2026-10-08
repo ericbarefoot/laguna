@@ -11,14 +11,13 @@ takes a list of per-camera dicts rather than a single config-file section,
 and has no from_config() precedent; construct and lab.add() it directly.
 
 laguna.mqtt.subscriber.MqttSubscriber is also deliberately not registered,
-even though it has a from_config() and a subsystem_name: each rangefinder
-already builds its own private MqttSubscriber from the shared 'mqtt:'
-section (see RangefinderSubsystem.from_config()), and nothing reads a
-standalone lab.mqtt — registering it here would make add_all() open a
-second, redundant real broker connection for any config that happens to
-have a top-level 'mqtt:' section (e.g. one written just to override
-broker_host/broker_port for the rangefinders), including under
-simulate=True, since laguna.simulation's drop-list only covers registered
+even though it has a from_config() and a subsystem_name: weir, gauge and
+flow already build their own private MqttSubscriber from the shared 'mqtt:'
+section (see their from_config()), and nothing reads a standalone lab.mqtt —
+registering it here would make add_all() open a second, redundant real
+broker connection for any config that happens to have a top-level 'mqtt:'
+section (e.g. one written just to override broker_host/broker_port for
+them), including under simulate=True, since laguna.simulation's drop-list only covers registered
 subsystems. Build and lab.add() an MqttSubscriber directly if you actually
 need a standalone one.
 """

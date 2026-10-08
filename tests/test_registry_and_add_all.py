@@ -79,10 +79,10 @@ class TestRegistry:
         }
 
     def test_mqtt_is_deliberately_not_registered(self):
-        """Each rangefinder builds its own private MqttSubscriber (see
-        RangefinderSubsystem.from_config()) — a standalone lab.mqtt would be
-        redundant and, under simulate=True, a real broker connection nothing
-        reads (see registry.py's module docstring)."""
+        """weir/gauge/flow each build their own private MqttSubscriber — a
+        standalone lab.mqtt would be redundant and, under simulate=True, a
+        real broker connection nothing reads (see registry.py's module
+        docstring)."""
         assert "mqtt" not in SUBSYSTEM_REGISTRY
 
 
@@ -159,19 +159,13 @@ class TestFromConfigAcrossEveryRegistrySubsystem:
         lab.add_all()
         assert set(lab._subsystems) == set(SUBSYSTEM_REGISTRY)
 
-    def test_rangefinder_from_config_builds_its_own_mqtt_subscriber(self, tmp_path):
-        """Each rangefinder gets a private MqttSubscriber built from the
-        shared 'mqtt:' section — see RangefinderSubsystem.from_config()."""
-        lab = FlumeLab(self._full_config_path(tmp_path))
-        lab.add("od2000")
-        assert lab.od2000._mqtt.__class__.__name__ == "MqttSubscriber"
-        assert lab.od2000._mqtt._host == "red.lab"
-
-    def test_two_rangefinders_get_independent_mqtt_subscribers(self, tmp_path):
+    def test_rangefinders_need_no_mqtt(self, tmp_path):
+        """Rangefinders poll the AL1342 over HTTP (GH #22); building one must
+        not create a broker client."""
         lab = FlumeLab(self._full_config_path(tmp_path))
         lab.add("od2000").add("wtt12l")
-        assert lab.od2000._mqtt is not lab.wtt12l._mqtt
-        assert lab.od2000._mqtt._client_id != lab.wtt12l._mqtt._client_id
+        assert not hasattr(lab.od2000, "_mqtt")
+        assert not hasattr(lab.wtt12l, "_mqtt")
 
     def test_dslr_from_config_resolves_output_dir_relative_to_the_yaml(self, tmp_path):
         lab = FlumeLab(self._full_config_path(tmp_path))

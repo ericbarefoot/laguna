@@ -151,245 +151,123 @@ class TestDecodeOd2000Pdin:
 
 
 # ---------------------------------------------------------------------------
-# AL1342 JSON envelope extraction
+# RangefinderSubsystem: HTTP polling (no MQTT) — GH #22
 # ---------------------------------------------------------------------------
 
 
-def _make_al1342_event(pdin_port: int, pdin_hex: str, code: int = 200) -> dict:
-    """Build a realistic AL1342 MQTT event payload for a given port and hex."""
-    return {
-        "code": "event",
-        "cid": 10,
-        "adr": "",
-        "data": {
-            "eventno": "6317",
-            "srcurl": "/timer[1]/counter/datachanged",
-            "payload": {
-                f"/iolinkmaster/port[{pdin_port}]/iolinkdevice/pdin": {
-                    "code": code,
-                    "data": pdin_hex,
-                }
-            },
-        },
-    }
+@pytest.fixture
+def pdin(monkeypatch):
+    """Script what the AL1342's process-data endpoint returns.
 
-
-class TestExtractPdinHex:
-    """Tests for the JSON path used to extract PDIN hex from AL1342 events.
-
-    The exact path /iolinkmaster/port[N]/iolinkdevice/pdin is from the AL1342
-    manual §9.2.22. If the hardware produces a different path structure, these
-    tests will fail with a KeyError that identifies exactly which key is wrong.
+    Set ``pdin.value`` to a hex string, or ``pdin.error`` to an exception to
+    raise instead. ``pdin.reads`` records (host, port, timeout) per request.
     """
 
-    def _extract(self, msg: dict, port: int) -> str:
-        key = f"/iolinkmaster/port[{port}]/iolinkdevice/pdin"
-        return msg["data"]["payload"][key]["data"]
+    class _Pdin:
+        value = _encode_distance_nm(200_000_000)
+        error = None
+        reads: list = []
 
-    def test_port_1_standard_path(self):
-        """Port 1, standard AL1342 event envelope."""
-        msg = _make_al1342_event(1, "0BEBC2000000")
-        hex_str = self._extract(msg, 1)
-        assert hex_str == "0BEBC2000000"
+    state = _Pdin()
+    state.reads = []
 
-    def test_port_4_path(self):
-        """Port 4 — confirm the port number appears in the key with brackets."""
-        msg = _make_al1342_event(4, "0BEBC2000000")
-        hex_str = self._extract(msg, 4)
-        assert hex_str == "0BEBC2000000"
+    def fake_read(host, port, timeout=5.0):
+        state.reads.append((host, port, timeout))
+        if state.error is not None:
+            raise state.error
+        return state.value
 
-    def test_wrong_port_raises_keyerror(self):
-        """Requesting port 2 when OD2000 is on port 1 → KeyError.
-        On hardware: if you see this error, check 'pdin_port' in config.
-        """
-        msg = _make_al1342_event(1, "0BEBC2000000")
-        with pytest.raises(KeyError):
-            self._extract(msg, 2)
-
-    def test_pdin_code_200_means_ok(self):
-        """code=200 in the pdin entry means the IO-Link read succeeded.
-        A non-200 code (e.g. 503) means the port has no device or the device
-        is in SIO/DI mode — check IO-Link COM mode config on the OD2000.
-        """
-        msg = _make_al1342_event(1, "0BEBC2000000", code=200)
-        assert msg["data"]["payload"]["/iolinkmaster/port[1]/iolinkdevice/pdin"]["code"] == 200
-
-    def test_pdin_error_code_503(self):
-        """code=503 means the IO-Link port has no device or is not in COM mode.
-        The 'data' field may be empty or missing in this case.
-        Tests that the code field is accessible without crashing on code != 200.
-        """
-        msg = _make_al1342_event(1, "", code=503)
-        entry = msg["data"]["payload"]["/iolinkmaster/port[1]/iolinkdevice/pdin"]
-        assert entry["code"] == 503
-
-    def test_full_decode_pipeline(self):
-        """End-to-end: AL1342 event → extract hex → decode PDIN."""
-        msg = _make_al1342_event(1, _encode_distance_nm(350_000_000))
-        hex_str = self._extract(msg, 1)
-        result = decode_od2000_pdin(hex_str)
-        assert abs(result["distance_mm"] - 350.0) < 0.001
+    monkeypatch.setattr(rangefinder_module, "read_pdin_hex", fake_read)
+    return state
 
 
-# ---------------------------------------------------------------------------
-# RangefinderSubsystem with a fake MqttSubscriber
-# ---------------------------------------------------------------------------
-
-
-class FakeMqttSubscriber:
-    """Minimal double for MqttSubscriber, injectable into RangefinderSubsystem."""
-
-    subsystem_name = "mqtt"
-
-    def __init__(self):
-        self._is_connected = False
-        self._queues: dict = {}
-        self._topics: list = []
-        self._last_seen: dict = {}
-        self.connected_called = 0
-        self.disconnect_called = 0
-
-    def connect(self) -> bool:
-        self._is_connected = True
-        self.connected_called += 1
-        return True
-
-    def wait_until_connected(self, timeout: float = 5.0, poll_interval: float = 0.05) -> bool:
-        return self._is_connected
-
-    def disconnect(self) -> None:
-        self._is_connected = False
-        self.disconnect_called += 1
-
-    def subscribe(self, topic: str) -> None:
-        if topic not in self._queues:
-            self._queues[topic] = []
-            self._topics.append(topic)
-
-    def push(self, topic: str, payload: dict) -> None:
-        """Test helper: inject a message as if MQTT delivered it."""
-        self._queues.setdefault(topic, []).append(payload)
-
-    def drain(self, topic: str) -> list:
-        self._last_seen.pop(topic, None)
-        items = list(self._queues.get(topic, []))
-        self._queues[topic] = []
-        return items
-
-    def get_latest(self, topic: str) -> dict:
-        items = self._queues.get(topic, [])
-        if items:
-            self._last_seen[topic] = items[-1]
-            self._queues[topic] = []
-        return self._last_seen.get(topic)
-
-    def get_status(self) -> dict:
-        return {"is_connected": self._is_connected}
-
-
-def _make_rangefinder(pdin_port: int = 1):
-    mqtt = FakeMqttSubscriber()
-    config = {"topic": "laguna/od2000", "pdin_port": pdin_port, "offset_mm": 0.0}
-    rf = RangefinderSubsystem(config, mqtt)
-    return rf, mqtt
+def _make_rangefinder(**extra):
+    config = {"pdin_port": 1, "offset_mm": 0.0, "al1342_host": "192.168.1.251", **extra}
+    return RangefinderSubsystem(config)
 
 
 class TestRangefinderSubsystem:
-    def test_connect_delegates_to_mqtt(self):
-        rf, mqtt = _make_rangefinder()
-        result = rf.connect()
-        assert result is True
-        assert mqtt.connected_called == 1
+    def test_construction_needs_no_mqtt(self):
+        """The whole point of #22: no broker, no subscriber, no topic."""
+        rf = _make_rangefinder()
+        assert not hasattr(rf, "_mqtt")
 
-    def test_connect_does_not_double_connect(self):
-        rf, mqtt = _make_rangefinder()
-        mqtt._is_connected = True  # already connected
-        rf.connect()
-        assert mqtt.connected_called == 0  # skipped
+    def test_a_topic_key_is_called_out_as_ignored(self, caplog):
+        with caplog.at_level("WARNING"):
+            _make_rangefinder(topic="laguna/od2000")
+        assert "'topic' is ignored" in caplog.text
 
-    def test_connect_fails_if_broker_handshake_never_completes(self):
-        """Regression: connect() used to return True as soon as the async
-        MQTT handshake was *started*, not once it actually completed."""
-        rf, mqtt = _make_rangefinder()
-        mqtt.wait_until_connected = lambda timeout=5.0, poll_interval=0.05: False
+    def test_connect_probes_the_configured_port(self, pdin):
+        rf = _make_rangefinder(pdin_port=3)
+        assert rf.connect() is True
+        assert pdin.reads == [("192.168.1.251", 3, 5.0)]
+        assert rf._is_connected is True
+
+    def test_connect_fails_when_the_al1342_is_unreachable(self, pdin, caplog):
+        """The reported failure was a rangefinder that said connected and then
+        never produced a sample. A wrong host/port must fail connect() instead."""
+        pdin.error = ConnectionError("no route to host")
+        rf = _make_rangefinder()
+        with caplog.at_level("ERROR"):
+            assert rf.connect() is False
+        assert rf._is_connected is False
+        assert "probe read" in caplog.text and "no route to host" in caplog.text
+
+    def test_connect_fails_when_the_port_has_no_device(self, pdin):
+        pdin.error = RuntimeError("AL1342 returned code 503")
+        assert _make_rangefinder().connect() is False
+
+    def test_connect_fails_without_a_host(self):
+        rf = RangefinderSubsystem({"pdin_port": 1})
         assert rf.connect() is False
 
-    def test_disconnect_delegates(self):
-        rf, mqtt = _make_rangefinder()
+    def test_disconnect_holds_nothing_open(self, pdin):
+        rf = _make_rangefinder()
         rf.connect()
         rf.disconnect()
-        assert mqtt.disconnect_called == 1
         assert rf._is_connected is False
 
     def test_get_status_before_any_reading(self):
-        rf, mqtt = _make_rangefinder()
-        rf.connect()
-        status = rf.get_status()
-        assert status["is_connected"] is True
+        status = _make_rangefinder().get_status()
         assert status["latest_distance_mm"] is None
+        assert status["sample_count"] == 0
 
-    def test_get_distance_from_mqtt_message(self):
-        """Push a realistic AL1342 event and confirm distance_mm is returned."""
-        rf, mqtt = _make_rangefinder(pdin_port=1)
-        rf.connect()
-        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(400_000_000)))
-        dist = rf.get_distance_mm()
-        assert dist is not None
-        assert abs(dist - 400.0) < 0.001
+    def test_status_advertises_no_stream_that_never_arrives(self):
+        status = _make_rangefinder().get_status()
+        assert "topic" not in status and "achieved_rate_hz" not in status
 
-    def test_get_distance_returns_none_when_no_messages(self):
-        rf, mqtt = _make_rangefinder()
-        rf.connect()
-        assert rf.get_distance_mm() is None
+    def test_read_mm_returns_the_polled_distance(self, pdin):
+        pdin.value = _encode_distance_nm(400_000_000)
+        assert abs(_make_rangefinder().read_mm() - 400.0) < 0.001
 
-    def test_get_latest_sample_returns_wall_time(self):
-        """get_latest_sample() returns (wall_time, distance_mm)."""
-        rf, mqtt = _make_rangefinder(pdin_port=1)
-        rf.connect()
-        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(200_000_000)))
-        sample = rf.get_latest_sample()
-        assert sample is not None
-        wall_time, distance_mm = sample
-        assert wall_time > 0
-        assert abs(distance_mm - 200.0) < 0.001
+    def test_offset_mm_applied(self, pdin):
+        rf = _make_rangefinder(offset_mm=50.0)
+        assert abs(rf.read_mm() - 250.0) < 0.001
 
-    def test_wrong_port_in_payload_does_not_crash(self):
-        """If the MQTT message has port[2] but pdin_port=1, the decode silently
-        fails (the sample is dropped). On hardware: if get_distance_mm() always
-        returns None despite MQTT messages arriving, check pdin_port in config.
-        """
-        rf, mqtt = _make_rangefinder(pdin_port=1)
-        rf.connect()
-        # Push a message with port 2 data — should be silently skipped
-        mqtt.push("laguna/od2000", _make_al1342_event(2, _encode_distance_nm(200_000_000)))
-        assert rf.get_distance_mm() is None
+    def test_a_failed_read_raises_instead_of_returning_none(self, pdin):
+        """#22 reported a silent None forever; a failed poll must say why."""
+        pdin.error = TimeoutError("timed out")
+        with pytest.raises(TimeoutError):
+            _make_rangefinder().read_mm()
 
-    def test_offset_mm_applied(self):
-        """offset_mm is added to the raw distance_mm."""
-        mqtt = FakeMqttSubscriber()
-        config = {"topic": "laguna/od2000", "pdin_port": 1, "offset_mm": 50.0}
-        rf = RangefinderSubsystem(config, mqtt)
-        rf.connect()
-        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(200_000_000)))
-        dist = rf.get_distance_mm()
-        assert abs(dist - 250.0) < 0.001
+    def test_a_failed_read_does_not_overwrite_the_last_good_sample(self, pdin):
+        rf = _make_rangefinder()
+        rf.read_mm()
+        pdin.error = TimeoutError("timed out")
+        with pytest.raises(TimeoutError):
+            rf.read_mm()
+        assert rf.get_status()["sample_count"] == 1
+        assert abs(rf.get_status()["latest_distance_mm"] - 200.0) < 0.001
 
-    def test_sample_count_increments(self):
-        rf, mqtt = _make_rangefinder()
-        rf.connect()
-        for _ in range(5):
-            mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(300_000_000)))
-        rf.get_distance_mm()
-        assert rf._sample_count == 5
-
-    def test_get_status_after_readings(self):
-        rf, mqtt = _make_rangefinder()
-        rf.connect()
-        mqtt.push("laguna/od2000", _make_al1342_event(1, _encode_distance_nm(500_000_000)))
-        rf.get_distance_mm()
+    def test_status_reflects_each_reading(self, pdin):
+        rf = _make_rangefinder()
+        rf.read_mm()
+        pdin.value = _encode_distance_nm(500_000_000)
+        rf.read_mm()
         status = rf.get_status()
         assert abs(status["latest_distance_mm"] - 500.0) < 0.001
-        assert status["sample_count"] == 1
+        assert status["sample_count"] == 2
+        assert status["latest_wall_time"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -418,16 +296,14 @@ def _encode_wtt12l_distance_mm(distance_mm: int, status_byte: int = 0x00) -> str
 
 class TestOd2000RangefinderOnDemand:
     def _make(self, **extra_config):
-        mqtt = FakeMqttSubscriber()
-        config = {"topic": "laguna/od2000", "pdin_port": 2, "al1342_host": "192.168.1.251", **extra_config}
-        return OD2000Rangefinder(config, mqtt), mqtt
+        config = {"pdin_port": 2, "al1342_host": "192.168.1.251", **extra_config}
+        return OD2000Rangefinder(config), None
 
     def test_subsystem_name(self):
         assert OD2000Rangefinder.subsystem_name == "od2000"
 
     def test_read_mm_requires_al1342_host(self):
-        mqtt = FakeMqttSubscriber()
-        rf = OD2000Rangefinder({"topic": "laguna/od2000", "pdin_port": 2}, mqtt)
+        rf = OD2000Rangefinder({"pdin_port": 2})
         with pytest.raises(RuntimeError):
             rf.read_mm()
 
@@ -457,23 +333,20 @@ class TestOd2000RangefinderOnDemand:
         assert calls == ["01"]
 
     def test_activate_requires_al1342_host(self):
-        mqtt = FakeMqttSubscriber()
-        rf = OD2000Rangefinder({"topic": "laguna/od2000", "pdin_port": 2}, mqtt)
+        rf = OD2000Rangefinder({"pdin_port": 2})
         with pytest.raises(RuntimeError):
             rf.activate()
 
 
 class TestWtt12lRangefinderOnDemand:
     def test_subsystem_name(self):
-        mqtt = FakeMqttSubscriber()
-        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"})
         assert rf.subsystem_name == "wtt12l"
 
     def test_activate_deactivate_are_noops(self, monkeypatch):
         """The DP4200 analog bridge has no laser control path — activate()/
         deactivate() must not attempt any AL1342 write."""
-        mqtt = FakeMqttSubscriber()
-        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"})
 
         def fail(*a, **kw):
             raise AssertionError("write_acyclic should not be called for WTT12LRangefinder")
@@ -483,8 +356,7 @@ class TestWtt12lRangefinderOnDemand:
         rf.deactivate()
 
     def test_read_mm_uses_dp4200_decoder(self, monkeypatch):
-        mqtt = FakeMqttSubscriber()
-        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"}, mqtt)
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "192.168.1.251"})
         # "2890FD01" -> channel1_raw 0x2890 = 10384 uA -> 10.384 mA -> ~600mm (see decoder tests)
         monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: "2890FD01")
         assert abs(rf.read_mm() - 600) < 50
@@ -499,9 +371,8 @@ class TestWtt12lRangefinderOnDemand:
         cal_path = tmp_path / "wtt12l_cal.csv"
         cal.to_csv(cal_path)
 
-        mqtt = FakeMqttSubscriber()
         rf = WTT12LRangefinder(
-            {"pdin_port": 7, "al1342_host": "192.168.1.251", "calibration_file": str(cal_path)}, mqtt
+            {"pdin_port": 7, "al1342_host": "192.168.1.251", "calibration_file": str(cal_path)}
         )
         # current_ma = 10.384 for this hex (see decoder tests) -> real_height_mm ~= 103.84
         monkeypatch.setattr(rangefinder_module, "read_pdin_hex", lambda host, port, timeout=5.0: "2890FD01")
@@ -603,40 +474,23 @@ class TestDecodeDp4200Wtt12lAnalogPdin:
 
 
 class TestRangefinderSimulated:
-    """simulated: True skips the real MQTT broker and AL1342 HTTP path
-    entirely — connect() succeeds unconditionally, every reading is NaN
-    rather than fabricated. See laguna.simulation."""
+    """simulated: True skips the AL1342 HTTP path entirely — connect()
+    succeeds unconditionally, every reading is NaN rather than fabricated.
+    See laguna.simulation."""
 
     def _rf(self, cls=OD2000Rangefinder, **extra_config):
-        mqtt = FakeMqttSubscriber()
-        config = {"topic": "laguna/od2000", "pdin_port": 2, "simulated": True, **extra_config}
-        return cls(config, mqtt), mqtt
+        config = {"pdin_port": 2, "simulated": True, **extra_config}
+        return cls(config)
 
-    def test_connect_succeeds_with_no_broker(self):
-        rf, mqtt = self._rf()
+    def test_connect_succeeds_with_no_host(self):
+        rf = self._rf()
         assert rf.connect() is True
         assert rf._is_connected is True
-        assert mqtt.connected_called == 0  # real MQTT connect() never touched
-
-    def test_get_distance_mm_is_nan(self):
-        import math
-
-        rf, _ = self._rf()
-        rf.connect()
-        assert math.isnan(rf.get_distance_mm())
-
-    def test_get_latest_sample_is_nan(self):
-        import math
-
-        rf, _ = self._rf()
-        rf.connect()
-        wall_time, distance_mm = rf.get_latest_sample()
-        assert math.isnan(distance_mm)
 
     def test_get_status_reports_connected_with_nan_reading(self):
         import math
 
-        rf, _ = self._rf()
+        rf = self._rf()
         rf.connect()
         status = rf.get_status()
         assert status["is_connected"] is True
@@ -647,20 +501,20 @@ class TestRangefinderSimulated:
         neither that config key nor a real HTTP call."""
         import math
 
-        rf, _ = self._rf()  # no al1342_host in config
+        rf = self._rf()  # no al1342_host in config
         assert math.isnan(rf.read_mm())
 
     def test_od2000_activate_deactivate_do_not_touch_the_network(self):
         """Real activate()/deactivate() call write_acyclic() (a real
         IO-Link HTTP write) — simulated mode must not reach it, and must
         not require al1342_host either."""
-        rf, _ = self._rf(cls=OD2000Rangefinder)
+        rf = self._rf(cls=OD2000Rangefinder)
         rf.activate()    # must not raise despite no al1342_host configured
         rf.deactivate()  # ditto
 
     def test_wtt12l_simulated_too(self):
         import math
 
-        rf, _ = self._rf(cls=WTT12LRangefinder)
+        rf = self._rf(cls=WTT12LRangefinder)
         assert rf.connect() is True
-        assert math.isnan(rf.get_distance_mm())
+        assert math.isnan(rf.read_mm())

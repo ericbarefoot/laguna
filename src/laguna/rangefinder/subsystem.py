@@ -1,12 +1,10 @@
-"""Rangefinder subsystem classes backed by an AL1342 MQTT data stream."""
+"""Rangefinder subsystem classes read on demand from an AL1342 IO-Link master over HTTP."""
 
 from __future__ import annotations
 
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
-
-from laguna.mqtt import MqttSubscriber
 
 if TYPE_CHECKING:
     from laguna.config import Config
@@ -24,38 +22,44 @@ SAFETY_WRITE_TIMEOUT_S = 2.0
 
 
 class RangefinderSubsystem:
-    """Base rangefinder subsystem backed by an AL1342 MQTT data stream.
+    """Base rangefinder subsystem: synchronous reads over the AL1342's HTTP API.
 
-    Provides both a continuous MQTT-based stream for background monitoring
-    (get_distance_mm, get_latest_sample) and synchronous HTTP on-demand access
-    for interactive use (activate, deactivate, read_mm).
+    Every reading is a poll of the IO-Link master's process-data endpoint
+    (``read_mm``), the same path the Pi-side profiler uses during a scan, so
+    live readings, scans and calibration all go through one decode. The
+    AL1342's MQTT push is not used: it tops out near 2 Hz where HTTP polling
+    delivers hundreds of samples per second (see docs/MQTT_AL1342_SETUP.md),
+    and nothing was ever configured to publish rangefinder data to it
+    (GH #22). That leaves the master's MQTT features free for other tools.
 
     Prefer OD2000Rangefinder or WTT12LRangefinder subclasses in practice,
     which set subsystem_name and configure the correct decode/calibration.
 
     Args:
-        config: Dict with keys: topic (MQTT topic), pdin_port (1-8),
-            offset_mm (mounting offset), al1342_host (IP for HTTP access),
-            calibration_file (optional LinearCalibration CSV), simulated
-            (bool, disables real I/O when True).
-        mqtt_subscriber: MqttSubscriber instance for MQTT operations.
+        config: Dict with keys: pdin_port (1-8), offset_mm (mounting
+            offset), al1342_host (IP of the IO-Link master, required for any
+            real read), calibration_file (optional LinearCalibration CSV),
+            simulated (bool, disables real I/O when True).
     """
 
     subsystem_name = "rangefinder"
 
-    def __init__(self, config: Dict[str, Any], mqtt_subscriber: MqttSubscriber):
+    def __init__(self, config: Dict[str, Any]):
         """Initialize a rangefinder subsystem.
 
         Args:
             config: Configuration dict (see class docstring for keys).
-            mqtt_subscriber: MqttSubscriber for MQTT operations.
         """
-        self._topic = config.get("topic", "laguna/od2000")
+        if "topic" in config:
+            logger.warning(
+                "%s: config key 'topic' is ignored — rangefinders poll the AL1342 over HTTP "
+                "and no longer subscribe to MQTT. Remove it from the config.",
+                self.subsystem_name,
+            )
         self._pdin_port = int(config.get("pdin_port", 1))
         self._offset_mm = float(config.get("offset_mm", 0.0))
         self._al1342_host = config.get("al1342_host")
         self._simulated = config.get("simulated", False)
-        self._mqtt = mqtt_subscriber
 
         calibration_file = config.get("calibration_file")
         self._calibration: Optional[LinearCalibration] = (
@@ -64,7 +68,6 @@ class RangefinderSubsystem:
 
         self._latest_sample: Optional[Tuple[float, float]] = None  # (wall_time, distance_mm)
         self._sample_count = 0
-        self._t_first_sample: Optional[float] = None
         self._is_connected = False
         #: Whether *this object* last switched the emitter on. The Pi-side
         #: profiler can also switch it on without telling us, so this only
@@ -77,123 +80,81 @@ class RangefinderSubsystem:
         """Build a rangefinder subsystem from lab configuration.
 
         Args:
-            config: Lab Config with subsystem section (by subsystem_name)
-                and shared 'mqtt:' section.
+            config: Lab Config with a section named by ``subsystem_name``.
 
         Returns:
-            Rangefinder subsystem instance with a private MqttSubscriber.
+            Rangefinder subsystem instance.
         """
-        section = config.get(cls.subsystem_name)
-        mqtt_subscriber = MqttSubscriber(config.get("mqtt"))
-        return cls(section, mqtt_subscriber)
+        return cls(config.get(cls.subsystem_name))
 
     # ------------------------------------------------------------------
     # Subsystem lifecycle
     # ------------------------------------------------------------------
 
     def connect(self) -> bool:
-        """Connect the underlying MQTT subscriber and subscribe to OD2000 topic.
+        """Confirm the AL1342 answers a process-data read for this port.
 
-        Blocks (up to a few seconds) for the broker handshake to actually
-        complete before returning — connect() alone only starts it
-        asynchronously (see MqttSubscriber.wait_until_connected()).
+        There is no persistent connection — every reading is its own HTTP
+        request — so "connected" means a probe read just succeeded. That
+        catches a wrong host or port here, at connect time, instead of as a
+        mysteriously empty stream later (the failure #22 reported).
 
         Returns:
-            True if connected successfully; False if the broker handshake
-            didn't complete in time.
+            True if the probe read succeeded (or simulated); False if no
+            ``al1342_host`` is configured or the read failed. The reason is
+            logged.
         """
         if self._simulated:
             self._is_connected = True
             return True
-        if not self._mqtt._is_connected:
-            ok = self._mqtt.connect()
-            if not ok or not self._mqtt.wait_until_connected():
-                return False
-        self._mqtt.subscribe(self._topic)
+        if not self._al1342_host:
+            logger.error(
+                "%s: 'al1342_host' is not configured — cannot read the sensor",
+                self.subsystem_name,
+            )
+            return False
+        try:
+            self.read_mm()
+        except Exception as exc:
+            logger.error(
+                "%s: probe read of AL1342 %s port %d failed: %s",
+                self.subsystem_name, self._al1342_host, self._pdin_port, exc,
+            )
+            return False
         self._is_connected = True
         return True
 
     def disconnect(self) -> None:
-        """Disconnect the underlying MQTT subscriber."""
-        if self._simulated:
-            self._is_connected = False
-            return
-        self._mqtt.disconnect()
+        """Mark disconnected. Nothing is held open, so there is nothing to release."""
         self._is_connected = False
 
     def get_status(self) -> Dict[str, Any]:
-        """Return connection state and the most recent reading (no I/O)."""
+        """Return connection state and the last on-demand reading (no I/O).
+
+        Readings only happen when something asks for one (``read_mm()``), so
+        ``latest_*`` are as old as the last caller's read, not a live feed.
+        """
         if self._simulated:
             return {
                 "is_connected": self._is_connected,
-                "topic": self._topic,
                 "pdin_port": self._pdin_port,
                 "latest_distance_mm": float("nan"),
                 "latest_wall_time": time.time(),
                 "sample_count": 0,
-                "achieved_rate_hz": float("nan"),
             }
-        distance_mm = None
-        wall_time = None
+        wall_time = distance_mm = None
         if self._latest_sample is not None:
             wall_time, distance_mm = self._latest_sample
-        duration = (
-            time.time() - self._t_first_sample
-            if self._t_first_sample is not None
-            else None
-        )
-        achieved_hz = (
-            self._sample_count / duration
-            if duration is not None and duration > 0
-            else None
-        )
         return {
-            "is_connected": self._is_connected and self._mqtt._is_connected,
-            "topic": self._topic,
+            "is_connected": self._is_connected,
             "pdin_port": self._pdin_port,
             "latest_distance_mm": distance_mm,
             "latest_wall_time": wall_time,
             "sample_count": self._sample_count,
-            "achieved_rate_hz": achieved_hz,
         }
 
     # ------------------------------------------------------------------
-    # Readings
-    # ------------------------------------------------------------------
-
-    def _poll(self) -> None:
-        """Drain MQTT queue and update internal latest reading cache."""
-        messages = self._mqtt.drain(self._topic)
-        for msg in messages:
-            try:
-                hex_str = self._extract_pdin_hex(msg)
-                decoded = self._decode(hex_str)
-                wall_time = time.time()
-                self._latest_sample = (wall_time, decoded["distance_mm"] + self._offset_mm)
-                self._sample_count += 1
-                if self._t_first_sample is None:
-                    self._t_first_sample = wall_time
-            except Exception:
-                pass
-
-    def get_distance_mm(self) -> Optional[float]:
-        """Return the most recent distance reading in mm, or None if no data yet."""
-        if self._simulated:
-            return float("nan")
-        self._poll()
-        if self._latest_sample is None:
-            return None
-        return self._latest_sample[1]
-
-    def get_latest_sample(self) -> Optional[Tuple[float, float]]:
-        """Return (wall_time_unix, distance_mm) for the most recent reading."""
-        if self._simulated:
-            return (time.time(), float("nan"))
-        self._poll()
-        return self._latest_sample
-
-    # ------------------------------------------------------------------
-    # On-demand HTTP access (mirrors laguna.weir's synchronous shape)
+    # HTTP access (synchronous — the only way readings are taken)
     # ------------------------------------------------------------------
 
     def _require_al1342_host(self) -> None:
@@ -291,7 +252,10 @@ class RangefinderSubsystem:
             value = self._calibration.apply(self._calibration_raw_value(decoded))
         else:
             value = decoded["distance_mm"]
-        return value + self._offset_mm
+        distance_mm = value + self._offset_mm
+        self._latest_sample = (time.time(), distance_mm)
+        self._sample_count += 1
+        return distance_mm
 
     def _calibration_raw_value(self, decoded: Dict[str, Any]) -> float:
         """Extract the field from decoded values used for calibration.
@@ -309,18 +273,6 @@ class RangefinderSubsystem:
     # ------------------------------------------------------------------
     # Overridable decode hooks
     # ------------------------------------------------------------------
-
-    def _extract_pdin_hex(self, msg: Dict[str, Any]) -> str:
-        """Extract PDIN hex string from AL1342 MQTT message envelope.
-
-        Args:
-            msg: MQTT message dict from AL1342.
-
-        Returns:
-            Hex-encoded PDIN payload string.
-        """
-        key = f"/iolinkmaster/port[{self._pdin_port}]/iolinkdevice/pdin"
-        return msg["data"]["payload"][key]["data"]
 
     def _decode(self, hex_str: str) -> Dict[str, Any]:
         """Decode raw PDIN hex string to engineering values.

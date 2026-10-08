@@ -22,8 +22,8 @@ VERBS = ("pause", "resume", "stop", "estop")
 
 
 def _od2000(**extra) -> OD2000Rangefinder:
-    config = {"topic": "t", "pdin_port": 2, "al1342_host": "192.168.1.251", **extra}
-    return OD2000Rangefinder(config, FakeMqttSubscriber())
+    config = {"pdin_port": 2, "al1342_host": "192.168.1.251", **extra}
+    return OD2000Rangefinder(config)
 
 
 @pytest.fixture
@@ -40,7 +40,7 @@ def writes(monkeypatch):
 class TestEveryVerbExists:
     @pytest.mark.parametrize("make", [
         lambda: _od2000(),
-        lambda: WTT12LRangefinder({"topic": "t", "pdin_port": 7}, FakeMqttSubscriber()),
+        lambda: WTT12LRangefinder({"pdin_port": 7}),
         lambda: SaflWaterLevelSensor({"simulated": True}, FakeMqttSubscriber()),
         lambda: CameraArray(hosts=["pi1"]),
         lambda: MqttSubscriber({}),
@@ -109,7 +109,7 @@ class TestOd2000Emitter:
         assert note and "emitter state unknown" in note and "unreachable" in note
 
     def test_estop_without_a_configured_host_reports_instead_of_raising(self):
-        rf = OD2000Rangefinder({"topic": "t", "pdin_port": 2}, FakeMqttSubscriber())
+        rf = OD2000Rangefinder({"pdin_port": 2})
         note = rf.estop()
         assert note and "emitter state unknown" in note
 
@@ -136,7 +136,7 @@ class TestOd2000Emitter:
 
 class TestPassiveVerbsAreNoOps:
     def test_wtt12l_has_no_emitter_to_switch(self, writes):
-        rf = WTT12LRangefinder({"topic": "t", "pdin_port": 7, "al1342_host": "h"}, FakeMqttSubscriber())
+        rf = WTT12LRangefinder({"pdin_port": 7, "al1342_host": "h"})
         for verb in VERBS:
             assert getattr(rf, verb)() is None
         assert writes == []
