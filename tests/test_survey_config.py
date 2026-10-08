@@ -13,6 +13,27 @@ TILE = {
     "scan_speed": 20.0, "interval_s": 600,
 }
 
+ROI_TILE = {
+    "kind": "tile", "roi": {"x_mm": [100, 700], "y_mm": [0, 2400], "z_mm": 50},
+    "swath_mm": 1000.0, "scan_speed": 20.0, "interval_s": 600,
+}
+
+
+class _Frames:
+    """Stands in for a FrameRegistry whose experiment frame is rotated 90 degrees."""
+
+    def experiment_axis_for(self, gantry_axis):
+        return {"X": "Y", "Y": "X"}[gantry_axis]
+
+
+class _Lab:
+    frames = _Frames()
+
+    class gocator:        # noqa: N801 - mimics the attribute a lab exposes
+        @staticmethod
+        def get_active_area():
+            return {"width_mm": 1000.0}
+
 
 class TestBuildSurvey:
     def test_tile_is_built_from_its_own_constructor_arguments(self):
@@ -100,6 +121,11 @@ class TestSetupRunWiring:
         lab = setup_run(_config(tmp_path, {"bed": TILE}), simulate=True)
         jobs = [j for j in lab.scheduler._recurring if j["subsystem"] == "survey"]
         assert [j["name"] for j in jobs] == ["bed"]
+
+    def test_a_roi_survey_is_scheduled_and_swath_auto_is_deferred_to_each_firing(self, tmp_path):
+        spec = {**ROI_TILE, "swath_mm": "auto"}
+        lab = setup_run(_config(tmp_path, {"bed": spec}), simulate=True)
+        assert [j["name"] for j in lab.scheduler._recurring if j["subsystem"] == "survey"] == ["bed"]
 
     def test_trigger_at_schedules_one_shot_firings(self, tmp_path):
         spec = {k: v for k, v in TILE.items() if k != "interval_s"} | {"trigger_at": [10, 20]}
@@ -256,3 +282,66 @@ class TestScheduledFiring:
         lab.gocator._active_area["width_mm"] = 400.0             # sensor reconfigured between firings
         action()
         assert len(lab.gocator.acquired) == 2 + 1               # 2 swaths of 200, then 1 of 400
+
+
+class TestRoiForm:
+    def test_roi_matches_tile_from_roi(self):
+        survey, _ = build_survey("bed", ROI_TILE)
+        expected = Tile.from_roi(
+            [100, 700], [0, 2400], 50, swath_mm=1000.0, scan_speed=20.0
+        )
+        assert [(p.start, p.end) for p in survey.passes()] == [
+            (p.start, p.end) for p in expected.passes()
+        ]
+        assert len(survey) == 3 and survey.scan_speed == 20.0
+
+    def test_min_overlap_and_single_pass_centring_are_passed_through(self):
+        spec = {**ROI_TILE, "min_overlap": 0.5}
+        assert len(build_survey("bed", spec)[0]) > 3
+        narrow = {**ROI_TILE, "roi": {"x_mm": [0, 100], "y_mm": [400, 700], "z_mm": 0},
+                  "center_single_pass": False}
+        survey, _ = build_survey("bed", narrow)
+        assert len(survey) == 1 and survey.passes()[0].start[1] == pytest.approx(400.0)
+
+    def test_swath_auto_reads_the_live_active_area(self):
+        spec = {k: v for k, v in ROI_TILE.items() if k != "swath_mm"}
+        survey, _ = build_survey("bed", {**spec, "swath_mm": "auto"}, lab=_Lab())
+        assert survey.swath_mm == 1000.0
+
+    def test_setup_time_validation_needs_no_lab_for_auto_swath(self):
+        survey, _ = build_survey("bed", {**ROI_TILE, "swath_mm": "auto"})
+        assert isinstance(survey, Tile)
+
+    def test_gantry_axis_is_resolved_against_the_labs_frames(self):
+        survey, _ = build_survey("bed", {**ROI_TILE, "gantry_axis": "X"}, lab=_Lab())
+        assert survey.axis == "Y"
+        build_survey("bed", {**ROI_TILE, "gantry_axis": "X"})    # setup-time: no lab, no error
+
+    def test_axis_and_gantry_axis_together_are_refused_even_at_setup(self):
+        with pytest.raises(ValueError, match="not both"):
+            build_survey("bed", {**ROI_TILE, "axis": "X", "gantry_axis": "X"})
+
+    @pytest.mark.parametrize("key", ["origin", "length_mm", "width_mm", "overlap"])
+    def test_hand_given_geometry_contradicts_the_region(self, key):
+        with pytest.raises(ValueError, match=key):
+            build_survey("bed", {**ROI_TILE, key: [0, 0, 0] if key == "origin" else 1.0})
+
+    def test_roi_needs_exactly_x_y_and_z(self):
+        for roi in ({"x_mm": [0, 1], "y_mm": [0, 1]}, {"x_mm": [0, 1], "y_mm": [0, 1],
+                                                       "z_mm": 0, "w": 1}, [0, 1]):
+            with pytest.raises(ValueError, match="'roi' must be a mapping"):
+                build_survey("bed", {**ROI_TILE, "roi": roi})
+
+    def test_a_reversed_region_is_refused_naming_the_survey(self):
+        bad = {**ROI_TILE, "roi": {"x_mm": [700, 100], "y_mm": [0, 2400], "z_mm": 50}}
+        with pytest.raises(ValueError, match=r"\[surveys\.bed\].*max > min"):
+            build_survey("bed", bad)
+
+    def test_roi_is_only_for_tiles(self):
+        with pytest.raises(ValueError, match="only valid for kind 'tile'"):
+            build_survey("line", {"kind": "traverse", "roi": ROI_TILE["roi"],
+                                  "start": [0, 0, 0], "end": [1, 0, 0]})
+
+    def test_a_typo_is_still_an_error(self):
+        with pytest.raises(ValueError, match=r"unknown key.*scan_spede"):
+            build_survey("bed", {**ROI_TILE, "scan_spede": 9})

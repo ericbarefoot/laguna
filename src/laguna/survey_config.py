@@ -16,6 +16,23 @@ hand-written scheduled closure::
         scan_speed: 20
         interval_s: 1800        # or trigger_at: [0, 900, 1800]
 
+A tile can instead be given as a region of interest, and the planner works out
+how many passes it needs and how much they overlap (see
+:meth:`~laguna.survey.Tile.from_roi`)::
+
+    surveys:
+      bed_tile:
+        kind: tile
+        roi: {x_mm: [100, 700], y_mm: [0, 2400], z_mm: 50}
+        swath_mm: auto          # or a number
+        min_overlap: 0.1        # smallest overlap between neighbouring swaths
+        gantry_axis: X          # optional: scan along this *gantry* axis
+        scan_speed: 20
+        interval_s: 1800
+
+With ``roi`` the geometry keys (``origin``, ``length_mm``, ``width_mm``,
+``overlap``) come from the region and giving them is an error.
+
 Everything but the scheduling keys is the planner's own constructor arguments
 (see :class:`~laguna.survey.Tile` / :class:`~laguna.survey.Traverse`), so
 there is one vocabulary, not a config dialect. Unknown keys are an error: a
@@ -39,6 +56,10 @@ SCHEDULING_KEYS = ("interval_s", "trigger_at", "use_schedule")
 RUNNER_KEYS = ("max_scan_speed_mm_s",)
 
 _KINDS = {"tile": Tile, "traverse": Traverse}
+
+#: Tile arguments a ``roi:`` entry derives itself, so spelling them out is a contradiction.
+_ROI_DERIVED_KEYS = ("origin", "length_mm", "width_mm", "overlap")
+_ROI_KEYS = ("x_mm", "y_mm", "z_mm")
 
 
 def build_survey(name: str, spec: Dict[str, Any], lab: Optional[Any] = None) -> Tuple[Survey, Dict[str, Any]]:
@@ -78,6 +99,10 @@ def build_survey(name: str, spec: Dict[str, Any], lab: Optional[Any] = None) -> 
         spec.pop(key, None)
 
     cls = _KINDS[kind]
+    if "roi" in spec:
+        if kind != "tile":
+            raise ValueError(f"[surveys.{name}] 'roi' is only valid for kind 'tile'")
+        return _tile_from_roi(name, spec, lab), runner_options
     allowed = {f.name for f in dataclasses.fields(cls)}
     unknown = sorted(set(spec) - allowed)
     if unknown:
@@ -91,6 +116,60 @@ def build_survey(name: str, spec: Dict[str, Any], lab: Optional[Any] = None) -> 
     try:
         return cls(**spec), runner_options
     except TypeError as exc:                      # a required field is missing
+        raise ValueError(f"[surveys.{name}] {exc}") from exc
+
+
+def _tile_from_roi(name: str, spec: Dict[str, Any], lab: Optional[Any]) -> Tile:
+    """Build a Tile from a ``roi:`` entry via :meth:`Tile.from_roi`.
+
+    Args:
+        name: The survey's key, for error messages.
+        spec: The entry with scheduling/runner keys already removed.
+        lab: As for :func:`build_survey`. Without one, a stand-in swath and
+            axis are used purely to check the region's geometry.
+
+    Raises:
+        ValueError: On a malformed or incomplete ``roi``, a geometry key that
+            ``roi`` already determines, an unknown key, or whatever
+            ``Tile.from_roi`` rejects.
+    """
+    spec = dict(spec)
+    roi = spec.pop("roi")
+    if not isinstance(roi, dict) or set(roi) != set(_ROI_KEYS):
+        raise ValueError(
+            f"[surveys.{name}] 'roi' must be a mapping with exactly the keys {list(_ROI_KEYS)}"
+        )
+    contradictory = sorted(set(spec) & set(_ROI_DERIVED_KEYS))
+    if contradictory:
+        raise ValueError(
+            f"[surveys.{name}] {contradictory} come from 'roi' — remove them, or drop 'roi' "
+            "to give the tile geometry by hand"
+        )
+    tile_fields = {f.name for f in dataclasses.fields(Tile)} - set(_ROI_DERIVED_KEYS)
+    planner_keys = {"min_overlap", "gantry_axis", "center_single_pass"}
+    unknown = sorted(set(spec) - tile_fields - planner_keys)
+    if unknown:
+        raise ValueError(
+            f"[surveys.{name}] unknown key(s) {unknown} for a tile with 'roi'. "
+            f"Allowed: {sorted(tile_fields | planner_keys | set(RUNNER_KEYS) | set(SCHEDULING_KEYS) | {'kind', 'roi'})}"
+        )
+
+    x_mm, y_mm = roi["x_mm"], roi["y_mm"]
+    swath = spec.pop("swath_mm", None)
+    if swath == "auto":
+        swath = None
+    if lab is None:
+        # Setup-time check, before anything is connected: the real swath and
+        # frames are only available per firing. Any positive stand-in
+        # validates the region itself.
+        if swath is None:
+            swath = max(abs(float(hi) - float(lo)) for lo, hi in (x_mm, y_mm)) or 1.0
+        if spec.get("gantry_axis") is not None and "axis" not in spec:
+            spec.pop("gantry_axis")
+            spec["axis"] = "X"
+    try:
+        return Tile.from_roi(x_mm, y_mm, roi["z_mm"], swath_mm=swath, lab=lab, **spec)
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"[surveys.{name}] {exc}") from exc
 
 
