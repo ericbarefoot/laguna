@@ -192,8 +192,8 @@ class TestSetupRunSimulation:
             "gauge": {"port": "/dev/ttyUSB2"},
             "pi_cameras": {"hosts": ["pi1.local"]},
             "dslr_cameras": {"cameras": {"Camera1": {}}},
-            "od2000": {"topic": "laguna/od2000", "pdin_port": 2},
-            "wtt12l": {"topic": "laguna/wtt12l", "pdin_port": 7},
+            "od2000": {"pdin_port": 2},
+            "wtt12l": {"pdin_port": 7},
         }))
 
         lab = setup_run(str(path), simulate=True)
@@ -210,8 +210,8 @@ class TestSetupRunSimulation:
         # actually checking here.
         assert math.isnan(lab.gauge.read_mm())
         assert math.isnan(lab.weir.get_elevation())
-        assert math.isnan(lab.od2000.get_distance_mm())
-        assert math.isnan(lab.wtt12l.get_distance_mm())
+        assert math.isnan(lab.od2000.read_mm())
+        assert math.isnan(lab.wtt12l.read_mm())
 
     def test_gantry_still_gets_simulated_config_through_setup_run(self, tmp_path):
         from laguna.experiment.runner import setup_run

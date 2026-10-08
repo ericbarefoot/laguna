@@ -101,27 +101,22 @@ def build_lab() -> FlumeLab:
     ]
 
     lab.config.config_dict["od2000"] = {
-        "topic": "laguna/od2000",
         "pdin_port": OD2000_PDIN_PORT,
         "offset_mm": 0.0,
         "al1342_host": AL1342_HOST,
     }
     lab.config.config_dict["wtt12l"] = {
-        "topic": "laguna/wtt12l",
         "pdin_port": WTT12L_PDIN_PORT,
         "offset_mm": 0.0,
         "al1342_host": AL1342_HOST,
     }
 
     # lab.add("name") looks up the registry (laguna.registry), pulls that
-    # section's config, and calls from_config() for you — each rangefinder's
-    # from_config() builds its own MqttSubscriber from the shared 'mqtt:'
-    # section automatically (see RangefinderSubsystem.from_config()), which
-    # is genuinely useful on its own, not just plumbing get_distance_mm()/
-    # get_latest_sample() need: get_status() (see the status printout below)
-    # surfaces the live topic, sample count, and achieved rate — a quick,
-    # human-readable way to confirm the AL1342 is actually publishing and
-    # which port/sensor a given reading came from.
+    # section's config, and calls from_config() for you. Rangefinders poll the
+    # AL1342 over HTTP (no MQTT): connect_all() probes each one, so a wrong
+    # al1342_host or pdin_port fails there instead of showing up later as an
+    # empty reading. get_status() (see the status printout below) reports the
+    # last reading, sample count and which port/sensor it came from.
     lab.add("gantry").add("od2000").add("wtt12l")
     return lab
 
@@ -154,13 +149,10 @@ def main():
     # live connection to disable safe_mode, so it comes after connect_all().
     lab.gantry.set_safe_mode(not ALLOW_MOTION)
 
-    # Give the AL1342's MQTT stream a moment to deliver a message, then
-    # show a live reading from each sensor — read-only, no motion.
+    # Show a live HTTP reading from each sensor — read-only, no motion.
     print()
-    print("Waiting 1s for a live MQTT reading from each sensor...")
-    time.sleep(1.0)
-    print(f"  od2000 latest (MQTT): {lab.od2000.get_distance_mm()} mm")
-    print(f"  wtt12l latest (MQTT): {lab.wtt12l.get_distance_mm()} mm")
+    print(f"  od2000 (HTTP): {lab.od2000.read_mm()} mm")
+    print(f"  wtt12l (HTTP): {lab.wtt12l.read_mm()} mm")
 
     print()
     print("System status:")

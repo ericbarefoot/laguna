@@ -1,24 +1,27 @@
 # Rangefinder
 
-OD2000 laser displacement sensor data via an ifm AL1342 IO-Link master and MQTT.
-Lives in `src/laguna/rangefinder/` (subsystem class) and `src/laguna/mqtt/`
-(transport). Pi-side scripts in `src/laguna/pi/` are deployed on-demand via SFTP.
+OD2000 / WTT12L laser displacement sensors read from an ifm AL1342 IO-Link master
+over HTTP. Lives in `src/laguna/rangefinder/`. Scans run Pi-side inside
+`gantry_agent.py` (see "Topographic profiling" below).
 
 ---
 
 ## Hardware chain
 
 ```
-SICK OD2000 → IO-Link COM3 → ifm AL1342 → Ethernet → Pi Mosquitto :1883
-                                                              ↓
-                                               MqttSubscriber (paho-mqtt)
-                                                              ↓
-                                               RangefinderSubsystem (laguna)
+SICK OD2000 → IO-Link COM3 → ifm AL1342 → Ethernet ← HTTP poll ← RangefinderSubsystem (laguna)
+                                                   ← HTTP poll ← gantry_agent.py (scans, ~380 Hz)
 ```
 
-The AL1342 acts as an MQTT **client**: it connects to the Pi's Mosquitto broker
-and publishes OD2000 process data cyclically on a timer. Laguna subscribes and
-decodes the raw IO-Link PDIN hex payload.
+Every reading is a synchronous HTTP request to the AL1342's process-data
+endpoint, decoded from the raw IO-Link PDIN hex payload. Live reads and scans
+use the same path, so they share one decode and one calibration.
+
+Laguna does **not** subscribe to the AL1342's MQTT push for rangefinder data:
+the AL1342 tops out near 2 Hz over MQTT where HTTP polling gives hundreds of
+samples per second, and nothing was ever configured to publish it (GH #22).
+The AL1342's MQTT features themselves are untouched and remain available to
+other tools; see `docs/MQTT_AL1342_SETUP.md`.
 
 Before using this subsystem for the first time, complete the one-time hardware
 bring-up in `docs/MQTT_AL1342_SETUP.md`.
@@ -52,7 +55,7 @@ The OD2000 has two useful operating modes:
 
 Set mode via the OD2000's IO-Link parameter interface (LR DEVICE or AL1342
 web UI parameter write) before a scan session. The laguna code makes no
-assumptions about the sensor's internal mode — the delivered MQTT rate is
+assumptions about the sensor's internal mode — the achieved poll rate is
 what matters.
 
 ---
@@ -62,47 +65,35 @@ what matters.
 `OD2000Rangefinder`/`WTT12LRangefinder` (both subclasses of the shared
 `RangefinderSubsystem`) follow the same `connect()`/`disconnect()`/
 `get_status()` subsystem shape as `laguna.weir`, so they attach to
-`FlumeLab` the same way (`lab.add(...)` → `lab.od2000`/`lab.wtt12l`):
+`FlumeLab` the same way (`lab.add(...)` → `lab.od2000`/`lab.wtt12l`).
+`al1342_host` is required — it is the AL1342's raw IP (it has no DNS):
 
 ```python
 from laguna.config import Config
-from laguna.mqtt import MqttSubscriber
 from laguna.rangefinder import OD2000Rangefinder
 
 config = Config("config/example_config.yaml")
+rangefinder = OD2000Rangefinder(config.get("od2000"))
 
-mqtt_sub = MqttSubscriber(config.get("mqtt"))
-rangefinder = OD2000Rangefinder(config.get("od2000"), mqtt_sub)
-
-rangefinder.connect()        # connects to MQTT broker, subscribes to od2000 topic
-
-# Instantaneous read (drains buffer, returns latest)
-dist_mm = rangefinder.get_distance_mm()
-print(f"{dist_mm:.3f} mm")
-
-# Burst collection
-import time
-time.sleep(1.0)
-sample = rangefinder.get_latest_sample()   # (wall_time, distance_mm)
-print(rangefinder.get_status())
-
-rangefinder.disconnect()
-```
-
-### On-demand reads (no MQTT)
-
-For a one-off interactive read — mirroring `weir.get_elevation()`'s
-synchronous shape — `activate()`/`read_mm()` poll the AL1342 directly over
-HTTP instead of the MQTT stream. Requires `al1342_host` in config
-(the AL1342 has no DNS of its own):
-
-```python
-rangefinder.connect()
+rangefinder.connect()           # probes the AL1342; False (and logs why) if unreachable
 rangefinder.activate()          # turns the OD2000's laser on (no-op for WTT12L)
-print(rangefinder.read_mm())    # single on-demand HTTP read, offset_mm/calibration applied
+print(rangefinder.read_mm())    # one HTTP read, offset_mm/calibration applied; raises on failure
+print(rangefinder.get_status()) # last reading + sample count, no I/O
 rangefinder.deactivate()
 rangefinder.disconnect()
 ```
+
+`get_status()` reports the last reading anyone took, not a live feed — a
+reading only happens when something calls `read_mm()`.
+
+### Safety verbs
+
+`pause()`, `stop()` and `estop()` switch the OD2000's laser **off** (always
+attempted, with a short 2 s write so a halt never waits on an unreachable
+AL1342); `resume()` switches it back on only if this object had it on. A
+note is returned if the emitter could not be confirmed off. A transect in
+flight is stopped by the gantry's own verbs, not here. The WTT12L has no
+emitter control, so its verbs do nothing.
 
 ---
 
@@ -223,11 +214,7 @@ subclass without changing the public API.
 
 ## Open items
 
-- Measure achieved AL1342 MQTT publish rate on real hardware (start at 10 Hz,
-  lower the timer interval until the rate stabilizes)
 - Confirm PDIN byte layout against actual output (decode and compare with LR
   DEVICE readout)
-- Verify whether hostname `red.lab` resolves in AL1342 MQTT callback URLs
-  (substitute Pi IP if not)
 - Approach B upgrade path: wire OD2000 Q2/Qa → INB 7 for hardware-triggered
   capture-latch position recording (see `docs/RANGEFINDER_PROFILING.md`)
