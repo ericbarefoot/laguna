@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from laguna.alignment_store import PASS_NAMES, AlignmentStore
+from laguna.alignment_store import CALIBRATION_RESULTS_DIR, PASS_NAMES, AlignmentStore
 from laguna.scanner.pointcloud import SurfaceScan
 
 
@@ -117,3 +117,27 @@ class TestLatestAndProvenance:
         new, old = AlignmentStore(tmp_path / "new"), AlignmentStore(tmp_path / "old")
         path = new.note_loaded_from(old, ["block", "passes"])
         assert "old" in path.read_text() and "passes" in path.read_text()
+
+
+class TestNewRun:
+    def test_defaults_to_the_calibration_folder_not_data(self):
+        store = AlignmentStore.new_run()
+        assert store.directory.parent == CALIBRATION_RESULTS_DIR
+        assert "data" not in store.directory.parts
+        assert store.directory.name.startswith("seam_test_")
+
+    def test_creates_nothing_until_the_first_write(self, tmp_path):
+        store = AlignmentStore.new_run(tmp_path / "results")
+        assert not (tmp_path / "results").exists()
+        store.save_block([1.0, 2.0])
+        assert store.directory.is_dir() and store.directory.parent == tmp_path / "results"
+
+    def test_latest_finds_a_new_run_in_the_same_root(self, tmp_path):
+        store = AlignmentStore.new_run(tmp_path)
+        store.save_block([3.0, 4.0])
+        assert AlignmentStore.latest(tmp_path).directory == store.directory
+
+    def test_latest_searches_the_calibration_folder_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        AlignmentStore.new_run().save_block([5.0, 6.0])
+        assert AlignmentStore.latest() is not None
