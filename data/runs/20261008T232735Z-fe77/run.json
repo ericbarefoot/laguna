@@ -1,0 +1,17 @@
+{
+  "run_id": "20261008T232735Z-fe77",
+  "speed_factor": 1.0,
+  "started_wall": 1791502066.9395955,
+  "ended_wall": null,
+  "pauses": [],
+  "outputs": [
+    {
+      "subsystem": "surveys",
+      "path": "data/runs/20261008T232735Z-fe77/surveys/hw_check_tile_0001.checkpoint.json",
+      "runtime_s": 15.008431196212769,
+      "wall_time": 1791502101.1842952,
+      "survey": "hw_check_tile",
+      "passes": 1
+    }
+  ]
+}
