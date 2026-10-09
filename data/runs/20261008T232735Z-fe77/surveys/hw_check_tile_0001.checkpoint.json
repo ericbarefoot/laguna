@@ -1,0 +1,13 @@
+{
+  "events": [
+    {
+      "id": 0,
+      "runtime_s": 34.241647243499756,
+      "wall_time": 1791502101.1812336,
+      "name": "tile 1/1"
+    }
+  ],
+  "meta": {
+    "survey_fingerprint": "57df5aaf8799c6d7"
+  }
+}

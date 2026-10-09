@@ -1,0 +1,30 @@
+{
+  "run_id": "20261008T232919Z-164f",
+  "speed_factor": 1.0,
+  "started_wall": 1791502175.7368455,
+  "ended_wall": 1791502629.7607296,
+  "pauses": [
+    [
+      1791502590.9902394,
+      1791502629.7607296
+    ]
+  ],
+  "outputs": [
+    {
+      "subsystem": "surveys",
+      "path": "data/runs/20261008T232919Z-164f/surveys/hw_check_tile_0001.checkpoint.json",
+      "runtime_s": 15.018066167831421,
+      "wall_time": 1791502249.0274954,
+      "survey": "hw_check_tile",
+      "passes": 2
+    },
+    {
+      "subsystem": "surveys",
+      "path": "data/runs/20261008T232919Z-164f/surveys/hw_check_tile_0002.checkpoint.json",
+      "runtime_s": 255.0291121006012,
+      "wall_time": 1791502491.7015514,
+      "survey": "hw_check_tile",
+      "passes": 2
+    }
+  ]
+}

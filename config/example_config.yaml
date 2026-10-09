@@ -319,6 +319,9 @@ gocator:
 #     interval_s: 1800
 
 # dslr_cameras:                # Canon EOS DSLRs via gphoto2 (pip install laguna[dslr]). Omit to disable.
+#   # A failed capture, a dropped camera or a serial mismatch pauses the whole experiment.
+#   # Connect is all-or-nothing: if one configured camera is missing, none connect. Each
+#   # camera's clock is set from the PC at pre-flight so EXIF times line up. See docs/subsystems/camera.md.
 #   # Scheduling (choose one):
 #   interval_s: 20
 #   # trigger_at: [20, 40, 60]
@@ -327,17 +330,21 @@ gocator:
 #                               #   (download is the only copy). One value for ALL cameras:
 #                               #   libgphoto2 holds a single capture target per host.
 #   card_reserve_shots: 500     # card mode: below this much free space, delete the oldest verified shots
+#   log_level: INFO             # Python logging level for this subsystem
+#   event_log_verbosity: INFO   # lowest level that also reaches the event log (independent of log_level)
 #   cameras:                    # any number; each bound by body serial, never by USB port
 #     Camera1:
-#       serial: "852078018710"  # EOS body serial — list with scripts/setup_dslr_udev.py
+#       serial: "CHANGEME"      # EOS body serial — list with scripts/setup_dslr_udev.py
 #       # device: /dev/dslr_camera1   # optional udev symlink, tried first (serial still checked)
 #       imageformat: RAW + L    # camera's own value; omit to leave as set on the body
 #       exposure:               # camera must be on M, lens on MF, auto power-off disabled
 #         iso: "800"
 #         aperture: "5.6"
 #         shutter: "1/125"
-#       output_dir: ./captures/Camera1
+#       # card_reserve_shots: 500   # per-camera override of the value above
+#       # output_dir: ./captures/Camera1  # default: <run dir>/Camera1, else ./captures/Camera1.
+#       #                         # Setting it explicitly overrides timing.run_dir: files then
+#       #                         # stay here instead of under the run directory.
 #     Camera2:
 #       serial: "CHANGEME"
 #       exposure: {iso: "800", aperture: "5.6", shutter: "1/125"}
-#       output_dir: ./captures/Camera2
