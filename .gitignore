@@ -66,14 +66,14 @@ env/
 
 # Project specific
 tmp/
-config/local_config.yaml
-config/config_line_scan.yaml
-data/raw/
-data/processed/
-# Gocator scans — a single full-resolution surface is ~30 MB as .npz and
-# ~1.2 GB as .csv, so these must never reach the repo (see
-# GocatorScanner.save_scan / docs/subsystems/scanner.md).
-data/scans/
+# Local rig configs: only config/example_config.yaml is tracked. Copy it to start your own.
+/config/*
+!/config/example_config.yaml
+
+# Everything under the top-level data/ (scans, runs, raw, processed) stays local. A Gocator scan alone is
+# ~30 MB as .npz and ~1.2 GB as .csv (see GocatorScanner.save_scan / docs/subsystems/scanner.md).
+# Anchored, so the laguna.data package under src/ is unaffected.
+/data/
 # Alignment / calibration runs (laguna.alignment_store) — local to this rig's setup.
 calibration/results/
 *.npz
@@ -84,7 +84,7 @@ logs/
 *.log
 
 # Sandbox (development scripts, not part of the package)
-sandbox/
+/sandbox/
 
 # Personal/team notes (incident reports, scratch write-ups) — not part of the package
 notes/
