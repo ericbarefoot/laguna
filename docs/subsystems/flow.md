@@ -74,10 +74,26 @@ a known frequency, measure the actual discharge — bucket and stopwatch, a
 flow meter, whatever's available), then inverting that fit numerically to
 answer "what Hz gives me this many L/min." See
 [the API reference](../reference/flow.md#calibration) for
-`PumpCalibrationPoint`/`PumpCalibration.fit()`/`hz_for_lpm()`, and
-`config/example_pump_calibration.csv` for a worked example file (fit from
-made-up but plausible data — replace with real measurements from your own
-pump before trusting it).
+`PumpCalibrationPoint`/`PumpCalibration.fit()`/`hz_for_lpm()`. The CSV a
+fit writes looks like this (made-up but plausible data — replace it with
+real measurements from your own pump before trusting it):
+
+```csv
+# laguna pump calibration
+device,example flume pump - main inlet
+coeffs,"[0.0009999999999999968, 0.1000000000000002, -3.263375893225244e-15]"
+hz_max,60.0
+r_squared,1.0
+created_at,2026-08-26T14:18:16
+
+freq_hz,discharge_lpm
+10.0,1.1
+20.0,2.4
+30.0,3.9
+40.0,5.6
+50.0,7.5
+60.0,9.6
+```
 
 ```python
 from laguna.flow.calibration import PumpCalibration, PumpCalibrationPoint

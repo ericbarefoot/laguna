@@ -34,7 +34,7 @@ timing:
 
 # Flow controller (Fuji VFD pump + solenoid valves). Omit section to disable.
 # flow:
-#   calibration_file: config/example_pump_calibration.csv  # preferred — see docs/reference/pump_calibration.md
+#   calibration_file: config/pump_calibration.csv  # your own fit; preferred — see docs/reference/pump_calibration.md
 #   # Only used when calibration_file is unset. The values below are a
 #   # legacy per-pump fit — see docs/reference/pump_calibration.md for why
 #   # a real calibration_file is preferred (this inline quadratic can't

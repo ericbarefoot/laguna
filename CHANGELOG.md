@@ -12,8 +12,9 @@ them into a dated release section when you cut a version.
 
 ### Changed
 - **Local files are no longer tracked.** `/data/` (everything under the top-level `data/`), `/sandbox/` and
-  `/config/` (except the `config/example_*` files) are ignored, and `config/config_scan.yaml` and
-  `sandbox/camera_coordinator.py` are untracked. The files stay on disk; a fresh clone won't have them. Start a
+  `/config/` (except `config/example_config.yaml`) are ignored, and `config/config_scan.yaml`,
+  `config/example_gauge_mqtt.yaml`, `config/example_pump_calibration.csv` and `sandbox/camera_coordinator.py` are
+  untracked. The files stay on disk; a fresh clone won't have them. Start a
   rig config by copying `config/example_config.yaml`. The ignore rules are anchored to the repository root, so
   `src/laguna/data/` is unaffected.
 - **Alignment and calibration runs are written to `calibration/results/`, not `data/scans/`.** The alignment

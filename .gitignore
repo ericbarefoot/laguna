@@ -66,9 +66,9 @@ env/
 
 # Project specific
 tmp/
-# Local rig configs: only the example_* files in config/ are tracked. Copy one to start your own.
+# Local rig configs: only config/example_config.yaml is tracked. Copy it to start your own.
 /config/*
-!/config/example_*
+!/config/example_config.yaml
 
 # Everything under the top-level data/ (scans, runs, raw, processed) stays local. A Gocator scan alone is
 # ~30 MB as .npz and ~1.2 GB as .csv (see GocatorScanner.save_scan / docs/subsystems/scanner.md).
