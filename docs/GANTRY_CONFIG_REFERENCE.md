@@ -81,7 +81,7 @@ re-homed against a different reference or physically remounted.
 | Setup | X (mm) | Y (mm) | Z (mm) | Confirmed | Source |
 |---|---|---|---|---|---|
 | `config/example_config.yaml` | −5 → 2130 | −5 → 1200 | 0 → 520 | 2026-08-25 | shipped config |
-| `config/config_scan.yaml` (Basin A) | −5 → 2130 | −5 → 1200 | 0 → 470 | 2026-08-25 | shipped config + interactive session notes ("zmax is 470 zmin is 0") |
+| `config/config_scan.yaml` (Basin A; local, no longer tracked) | −5 → 2130 | −5 → 1200 | 0 → 470 | 2026-08-25 | shipped config + interactive session notes ("zmax is 470 zmin is 0") |
 
 **Z disagrees between the two (520 vs. 470) and that hasn't been
 reconciled** — don't copy one over the other without re-measuring which

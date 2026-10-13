@@ -33,7 +33,7 @@ build a `FrameRegistry` straight from the config file:
 from laguna.config import Config
 from laguna.frames import FrameRegistry
 
-cfg = Config("config/config_scan.yaml")
+cfg = Config("config/my_rig.yaml")     # your own config; start from config/example_config.yaml
 frames = FrameRegistry.from_config(cfg.config_dict.get("frames"))
 ```
 

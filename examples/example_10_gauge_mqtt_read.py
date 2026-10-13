@@ -34,9 +34,16 @@ import time
 
 from laguna import FlumeLab
 
-# See config/example_gauge_mqtt.yaml — mqtt.broker_host/node_name and
-# gauge.offset_mm live there; adjust it for your setup rather than this file.
-CONFIG_FILE = "config/example_gauge_mqtt.yaml"
+# Your own config, e.g. copied from config/example_config.yaml. It needs only these sections;
+# mqtt.broker_host/node_name and gauge.offset_mm live there, so adjust them for your setup
+# rather than editing this file:
+#
+#   mqtt:
+#     broker_host: red.lab
+#     node_name: "UCRS Confluence Node 1"
+#   gauge:
+#     offset_mm: 625.0   # measured reference — see confluence_config.json on the node
+CONFIG_FILE = "config/my_gauge_mqtt.yaml"
 
 
 def main():
