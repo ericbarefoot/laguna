@@ -340,11 +340,25 @@ class PiGantryConnection(SnapConnection):
         Deploys gantry_agent.py to the Pi, launches it as a persistent
         process, waits for ready signal, and starts the reader thread.
 
+        A no-op if the connection is already live: a second session would
+        overwrite the live channel/agent handles, and the new agent could
+        not open the serial port the first one holds exclusively — so the
+        attempt would fail *and* strand the working session unreachable.
+        If a previous session's handles are present but dead, they are torn
+        down first. A failed attempt closes its own half-open session
+        rather than leaving the handles pointing at it.
+
         Raises:
             ImportError: If paramiko is not installed.
             SnapMotionError: If connection fails or agent launch times out.
             OSError: If SSH connection fails.
         """
+        if self.is_connected:
+            logger.info("connect() called while already connected to %s — no-op", self.host)
+            return
+        if self._channel is not None or self._client is not None:
+            self.disconnect()
+
         try:
             import paramiko  # type: ignore[import]
         except ImportError as exc:
@@ -361,15 +375,19 @@ class PiGantryConnection(SnapConnection):
             kwargs["key_filename"] = os.path.expanduser(self.ssh_key)
         if self.ssh_passphrase:
             kwargs["passphrase"] = self.ssh_passphrase
-        client.connect(self.host, **kwargs)
-
-        sftp = client.open_sftp()
         try:
-            sftp.put(str(AGENT_SCRIPT), REMOTE_AGENT_PATH)
-        finally:
-            sftp.close()
+            client.connect(self.host, **kwargs)
 
-        self._warn_about_stale_port_holders(client)
+            sftp = client.open_sftp()
+            try:
+                sftp.put(str(AGENT_SCRIPT), REMOTE_AGENT_PATH)
+            finally:
+                sftp.close()
+
+            self._warn_about_stale_port_holders(client)
+        except BaseException:
+            client.close()
+            raise
 
         safe_flag = "" if self.safe_mode else " --allow-motion"
         modem_flag = " --legacy-modem-lines" if self.legacy_modem_lines else ""
@@ -378,41 +396,48 @@ class PiGantryConnection(SnapConnection):
             f"--port {self.remote_serial_device} --baud {self.remote_baud}"
             f"{safe_flag}{modem_flag}"
         )
-        stdin, stdout, _stderr = client.exec_command(remote_cmd)
-        channel = stdout.channel
+        try:
+            stdin, stdout, _stderr = client.exec_command(remote_cmd)
+            channel = stdout.channel
 
-        self._client = client
-        self._channel = channel
-        # Keep the stdin file object alive for the connection's lifetime.
-        # paramiko's ChannelStdinFile.close() calls channel.shutdown_write(),
-        # and BufferedFile.__del__ calls close() — so letting this be
-        # garbage collected sends EOF on the agent's stdin, and the agent
-        # (whose main loop is `for raw_line in sys.stdin`) shuts down
-        # cleanly and exits mid-session. Because paramiko's objects sit in
-        # reference cycles, that collection happened on the *cyclic*
-        # collector's schedule rather than at a fixed point, so the agent
-        # appeared to die at random times — 10ms into one run, 36s into
-        # another — and more readily in allocation-heavy processes (a full
-        # FlumeLab with MQTT subscribers) than in small scripts. Confirmed
-        # 2026-07-31: an explicit gc.collect() right after connect() flips
-        # channel.eof_sent False->True and kills the agent every time.
-        self._stdin = stdin
-        self._stdout_buf = b""
-        self._next_id = 1
-        self._pending = {}
-        self._scan_running = False
-        # Drain anything left in the scan result queue from a prior connection
-        while True:
-            try:
-                self._scan_result_queue.get_nowait()
-            except queue.Empty:
-                break
+            self._client = client
+            self._channel = channel
+            # Keep the stdin file object alive for the connection's lifetime.
+            # paramiko's ChannelStdinFile.close() calls channel.shutdown_write(),
+            # and BufferedFile.__del__ calls close() — so letting this be
+            # garbage collected sends EOF on the agent's stdin, and the agent
+            # (whose main loop is `for raw_line in sys.stdin`) shuts down
+            # cleanly and exits mid-session. Because paramiko's objects sit in
+            # reference cycles, that collection happened on the *cyclic*
+            # collector's schedule rather than at a fixed point, so the agent
+            # appeared to die at random times — 10ms into one run, 36s into
+            # another — and more readily in allocation-heavy processes (a full
+            # FlumeLab with MQTT subscribers) than in small scripts. Confirmed
+            # 2026-07-31: an explicit gc.collect() right after connect() flips
+            # channel.eof_sent False->True and kills the agent every time.
+            self._stdin = stdin
+            self._stdout_buf = b""
+            self._next_id = 1
+            self._pending = {}
+            self._scan_running = False
+            # Drain anything left in the scan result queue from a prior connection
+            while True:
+                try:
+                    self._scan_result_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-        self._await_ready()
+            self._await_ready()
 
-        self._reader_stop.clear()
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+            self._reader_stop.clear()
+            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader_thread.start()
+        except BaseException:
+            # Close only what this attempt opened; disconnect() also resets
+            # the handles so a retry starts clean.
+            self.disconnect()
+            client.close()  # disconnect() only knows the client once it was assigned
+            raise
 
         self._connect_requested = True
         logger.info("Connected to gantry agent on %s via SSH", self.host)

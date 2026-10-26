@@ -724,3 +724,95 @@ class TestPerCommandTimeout:
         cmd = MMCCommands(FakeSnapConnection({}))
         with pytest.raises(TypeError, match="input number"):
             cmd.read_input_bit("INB 3")
+
+
+class TestConnectIdempotent:
+    """A second connect() on a live connection must not open another SSH
+    session: the new agent can't get the serial port the first holds
+    exclusively, and the failed attempt used to overwrite the live handles,
+    stranding the working session (every later command failed with
+    SnapMotionError 0)."""
+
+    @staticmethod
+    def _install_fake_paramiko(monkeypatch, *, ready=True):
+        import sys
+        import types
+
+        made = []
+
+        class _Stdout:
+            def __init__(self, channel):
+                self.channel = channel
+
+        class _SFTP:
+            def put(self, *a):
+                pass
+
+            def close(self):
+                pass
+
+        class _Client:
+            def __init__(self):
+                self.closed = False
+                self.channel = _FakeChannel()
+                if ready:
+                    self.channel.queue_line({"ready": True})
+                made.append(self)
+
+            def set_missing_host_key_policy(self, _):
+                pass
+
+            def connect(self, *a, **k):
+                pass
+
+            def open_sftp(self):
+                return _SFTP()
+
+            def exec_command(self, cmd):
+                return object(), _Stdout(self.channel), None
+
+            def close(self):
+                self.closed = True
+
+        fake = types.SimpleNamespace(
+            SSHClient=_Client, AutoAddPolicy=lambda: None
+        )
+        monkeypatch.setitem(sys.modules, "paramiko", fake)
+        return made
+
+    def test_second_connect_is_a_noop_on_live_connection(self, monkeypatch):
+        made = self._install_fake_paramiko(monkeypatch)
+        conn, channel = _make_connection()
+        live_client = conn._client
+        conn.connect()
+        assert made == []  # no new SSH session attempted
+        assert conn._channel is channel
+        assert conn._client is live_client
+        assert conn.is_connected is True
+        conn.disconnect()
+
+    def test_failed_connect_leaves_no_handles_behind(self, monkeypatch):
+        import laguna.robot.macron.pi_bridge as pb
+
+        made = self._install_fake_paramiko(monkeypatch, ready=False)
+        monkeypatch.setattr(pb, "READY_TIMEOUT", 0.05)
+        conn = PiGantryConnection(
+            host="red.lab", ssh_user="oak", remote_serial_device="/dev/ttyFAKE", timeout=0.05
+        )
+        with pytest.raises(SnapMotionError):
+            conn.connect()
+        assert conn._channel is None
+        assert conn._client is None
+        assert conn.is_connected is False
+        assert made[0].closed is True
+
+    def test_dead_handles_are_replaced_on_reconnect(self, monkeypatch):
+        made = self._install_fake_paramiko(monkeypatch)
+        conn, channel = _make_connection()
+        channel._exit_ready = True  # agent exited; handles stale
+        assert conn.is_connected is False
+        conn.connect()
+        assert len(made) == 1
+        assert conn._channel is made[0].channel
+        assert conn.is_connected is True
+        conn.disconnect()
