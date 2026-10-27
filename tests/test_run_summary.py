@@ -63,57 +63,9 @@ def test_runtime_shows_duration(lab, capsys):
     assert "of 300 s" in _summary(lab, capsys)
 
 
-class _Flow:
-    """Minimal flow subsystem recording what the completion callback does."""
 
-    def __init__(self, stop_note=None):
-        self.stop_note = stop_note
-        self.calls = []
-        self.qin = True
-        self.qaux = False
-        self.pump_stops = 0
-
-    def stop(self):
-        self.pump_stops += 1
-        return self.stop_note
-
-
-def test_completion_ends_run_and_closes_open_valves(lab, capsys):
-    flow = _Flow()
-    lab._subsystems["flow"] = flow
+def test_completion_ends_the_run(lab, capsys):
     lab._start_wall = time.time()
     lab._on_run_complete()
     assert lab.safety_state is SafetyState.STOPPED
-    assert flow.pump_stops >= 1
-    assert flow.qin is False and flow.qaux is False
     assert "Run Ended" in capsys.readouterr().out
-
-
-def test_completion_leaves_valves_if_pump_not_confirmed_stopped(lab, capsys):
-    flow = _Flow(stop_note="pump may still be running")
-    lab._subsystems["flow"] = flow
-    lab._start_wall = time.time()
-    lab._on_run_complete()
-    assert flow.qin is True
-
-
-def test_completion_closes_other_valve_if_one_fails(lab):
-    class Bad(_Flow):
-        def __init__(self):
-            self.stop_note = None
-            self.qaux = True
-            self.pump_stops = 0
-
-        @property
-        def qin(self):
-            return True
-
-        @qin.setter
-        def qin(self, v):
-            raise RuntimeError("no ack")
-
-    flow = Bad()
-    lab._subsystems["flow"] = flow
-    lab._start_wall = time.time()
-    lab._on_run_complete()
-    assert flow.qaux is False

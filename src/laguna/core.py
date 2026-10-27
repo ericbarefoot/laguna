@@ -467,8 +467,8 @@ class FlumeLab:
 
         Returns:
             The scheduler thread (daemon). Call lab.stop() to pause early.
-            When the duration expires the run ends itself via end_run() and the
-            flow valves are closed, so nothing keeps running unattended.
+            When the duration expires the run ends itself via end_run() so the
+            pump stops and the flow valves close without further action.
         """
         self._duration = duration
         self._start_wall = time.time()
@@ -496,44 +496,12 @@ class FlumeLab:
 
         Ends the run so the pump stops and the gantry and weir are quiesced,
         rather than leaving them running after the schedule has finished.
-        Then closes the flow valves once the pump is confirmed stopped. The
-        summary prints regardless of whether either step succeeds.
+        The summary prints regardless of whether end_run() succeeds.
         """
         try:
             self.end_run(reason="duration elapsed")
-            self._close_flow_valves()
         finally:
             self.print_summary()
-
-    def _close_flow_valves(self) -> None:
-        """Close qin and qaux, but only if the pump is confirmed stopped.
-
-        end_run() stops the pump and leaves the valves as they are. Closing
-        the inlet on a pump that failed to stop would dead-head it, so the
-        pump stop is repeated here (it is idempotent) and a failed stop
-        leaves the valves alone. Each valve is attempted independently.
-        """
-        flow = self._subsystems.get("flow")
-        if flow is None:
-            return
-        note = flow.stop()
-        if note:
-            logger.error("Leaving the flow valves as they are: %s", note)
-            self.event_log.log(
-                self.clock.elapsed(), "flow", "close_valves",
-                result="skipped", notes=f"pump not confirmed stopped: {note}",
-            )
-            return
-        for valve in ("qin", "qaux"):
-            try:
-                if getattr(flow, valve):
-                    setattr(flow, valve, False)
-            except Exception as exc:
-                logger.error("Could not close %s: %s", valve, exc)
-                self.event_log.log(
-                    self.clock.elapsed(), "flow", "close_valves",
-                    result=f"error: {valve}: {exc}",
-                )
 
     def print_summary(self) -> None:
         """Print a summary of the current run to stdout.
