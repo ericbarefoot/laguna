@@ -99,7 +99,12 @@ class FlowController(ABC):
 
     @abstractmethod
     def stop(self) -> Optional[str]:
-        """End cleanly: stop the pump, leaving the valves as they are."""
+        """End cleanly: stop the pump, then close any open valves.
+
+        Closed is the off state for qin and qaux. The valves are left alone
+        if the pump could not be confirmed stopped, since closing the inlet
+        on a running pump would dead-head it.
+        """
         ...
 
     @abstractmethod
@@ -492,7 +497,12 @@ class SaflFlowController(FlowController, SubsystemLogging):
         return None
 
     def stop(self) -> Optional[str]:
-        """Stop the pump, leaving the valves at their current state.
+        """Stop the pump, then close any open valves.
+
+        Closed is the off state for qin and qaux. If the pump cannot be
+        confirmed stopped the valves are left as they are, since closing the
+        inlet on a running pump would dead-head it. Each valve is attempted
+        independently.
 
         Returns:
             Note about any issues encountered, or None if successful.
@@ -503,7 +513,15 @@ class SaflFlowController(FlowController, SubsystemLogging):
         except Exception as exc:
             logger.error("Could not stop the pump: %s", exc)
             return f"pump may still be running: {exc}"
-        return None
+        problems = []
+        for valve in ("qin", "qaux"):
+            try:
+                if getattr(self, valve):
+                    setattr(self, valve, False)
+            except Exception as exc:
+                logger.error("Could not close %s on stop: %s", valve, exc)
+                problems.append(valve)
+        return f"pump stopped but could not close: {', '.join(problems)}" if problems else None
 
     def estop(self) -> Optional[str]:
         """Pump off and both valves closed, each attempted independently.

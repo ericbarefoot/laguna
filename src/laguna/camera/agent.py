@@ -15,7 +15,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from laguna.camera._log import utc_local_ts
+
+# The coordinator copies this file alone to the Pi, where laguna is not installed,
+# so it must not import from the laguna package. Keep in sync with _log.utc_local_ts.
+def utc_local_ts() -> tuple[str, str]:
+    """Return (utc_str, local_str) with millisecond precision for log lines."""
+    now = time.time()
+    utc = time.strftime("%H:%M:%S", time.gmtime(now)) + f".{int(now % 1 * 1000):03d}Z"
+    local = time.strftime("%H:%M:%S", time.localtime(now))
+    return utc, local
 
 
 def _log(msg: str) -> None:

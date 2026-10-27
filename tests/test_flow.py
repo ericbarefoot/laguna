@@ -227,6 +227,36 @@ class TestSaflFlowControllerConnected:
         commands = [payload["command"] for topic, payload in mqtt.published if topic == "node/vfd/commands"]
         assert commands == ["start_motor", "stop_motor"]
 
+    def test_stop_closes_open_valves(self):
+        controller, mqtt = _make_flow()
+        controller.connect()
+        _accept_all_vfd_replies(mqtt, ok=True)
+        _accept_all_valve_replies(mqtt, ok=True)
+        controller.qin = True
+        controller.qaux = True
+        assert controller.stop() is None
+        assert controller.qin is False and controller.qaux is False
+
+    def test_stop_leaves_valves_if_pump_not_confirmed_stopped(self):
+        controller, mqtt = _make_flow()
+        controller.connect()
+        _accept_all_valve_replies(mqtt, ok=True)
+        controller.qin = True
+        _accept_all_vfd_replies(mqtt, ok=False)
+        assert controller.stop() is not None
+        assert controller.qin is True
+
+    def test_stop_closes_other_valve_if_one_fails(self):
+        controller, mqtt = _make_flow()
+        controller.connect()
+        _accept_all_valve_replies(mqtt, ok=True)
+        controller.qin = True
+        controller.qaux = True
+        _accept_all_vfd_replies(mqtt, ok=True)
+        _accept_all_valve_replies(mqtt, ok=False)
+        note = controller.stop()
+        assert "qin" in note and "qaux" in note
+
     def test_qin_and_qaux_publish_to_the_valve_channel_and_log(self):
         controller, mqtt = _make_flow()
         controller.connect()
