@@ -250,11 +250,14 @@ class Scheduler:
                 self._event_log.log(self._clock.elapsed(), "scheduler", "stop", "ok")
             self._clock.pause()
 
-    def run_async(self, duration: float) -> threading.Thread:
+    def run_async(
+        self, duration: float, on_complete: Optional[Callable[[], Any]] = None
+    ) -> threading.Thread:
         """Run the scheduler in a background daemon thread.
 
         Args:
             duration: Duration in experiment runtime seconds to run.
+            on_complete: Optional callback, as for run().
 
         Returns:
             The daemon thread so the caller can join() it if needed.
@@ -271,7 +274,11 @@ class Scheduler:
                 "Scheduler.run_async() needs a started, unpaused clock — resume it first"
             )
         t = threading.Thread(
-            target=self.run, args=(duration,), daemon=True, name="scheduler-main"
+            target=self.run,
+            args=(duration,),
+            kwargs={"on_complete": on_complete},
+            daemon=True,
+            name="scheduler-main",
         )
         t.start()
         return t

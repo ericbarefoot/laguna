@@ -467,6 +467,8 @@ class FlumeLab:
 
         Returns:
             The scheduler thread (daemon). Call lab.stop() to pause early.
+            When the duration expires the run ends itself via end_run(), so the
+            pump and other subsystems are stopped without further action.
         """
         self._duration = duration
         self._start_wall = time.time()
@@ -478,7 +480,7 @@ class FlumeLab:
         thread = threading.Thread(
             target=self.scheduler.run,
             args=(duration,),
-            kwargs={"on_complete": self.print_summary},
+            kwargs={"on_complete": self._on_run_complete},
             daemon=True,
             name="scheduler-main",
         )
@@ -488,6 +490,18 @@ class FlumeLab:
         logger.info("  lab.resume(N)       — resume for N more seconds")
         logger.info("  lab.disconnect_all() — clean shutdown when finished")
         return thread
+
+    def _on_run_complete(self) -> None:
+        """Scheduler callback when the duration expires naturally.
+
+        Ends the run so the pump stops and the gantry and weir are quiesced,
+        rather than leaving them running after the schedule has finished.
+        The summary prints regardless of whether end_run() succeeds.
+        """
+        try:
+            self.end_run(reason="duration elapsed")
+        finally:
+            self.print_summary()
 
     def print_summary(self) -> None:
         """Print a summary of the completed experiment to stdout.
@@ -645,7 +659,7 @@ class FlumeLab:
             logger.info("Resuming schedule for %.1f more seconds...", remaining_s)
         if remaining_s <= 0:
             return None
-        return self.scheduler.run_async(remaining_s)
+        return self.scheduler.run_async(remaining_s, on_complete=self._on_run_complete)
 
     def _scheduler_gate(self) -> Optional[str]:
         """Scheduler.gate: refuse any firing unless the rig is RUNNING."""
