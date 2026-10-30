@@ -4,42 +4,37 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import laspy
 import numpy as np
 import rasterio
 from matplotlib import patches
 from matplotlib.axes import Axes
 
-from ..frames import AffineTransform
 from .config import PostprocessConfig
+from .orient import oriented_points
 from .regions import Circle, Polygon, Rect, Shape
 
 
 def scan_grid(
-    path: str | Path,
+    scan: str | Path,
+    cfg: PostprocessConfig | None = None,
     cell: float = 2.0,
     zclip: tuple[float, float] = (0.5, 99.5),
-    transform: AffineTransform | None = None,
 ) -> tuple[np.ndarray, tuple]:
     """Grid a whole scan to mean z per cell, for plotting.
 
     Args:
-        path: ``.laz``/``.las`` file.
+        scan: The scan's ``.laz``, ``.las`` or ``.npz``.
+        cfg: If given, the points are oriented per ``cfg.orient`` first, so
+            the plot is in the coordinates the ROI and shapes use.
         cell: Cell size, mm.
         zclip: Percentiles outside which points are ignored, so stray returns
             don't set the colour scale.
-        transform: Applied to the points first, e.g.
-            :attr:`PostprocessConfig.transform` to plot in experiment
-            coordinates.
 
     Returns:
         ``(z, extent)``: a 2-D array (NaN = empty, row 0 = top) and
         ``(xmin, xmax, ymin, ymax)`` for ``imshow``.
     """
-    las = laspy.read(path)
-    x, y, z = np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)
-    if transform is not None:
-        x, y, z = transform.apply(np.column_stack([x, y, z])).T
+    x, y, z = oriented_points(scan, cfg).T
     lo, hi = np.percentile(z, zclip)
     keep = (z >= lo) & (z <= hi)
     x, y, z = x[keep], y[keep], z[keep]

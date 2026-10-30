@@ -1,8 +1,9 @@
 """Turn saved scans into ground-surface DEMs on a fixed grid.
 
-Per scan: transform into the experiment frame (when ``cfg.frame`` is set),
-then ROI rectangle and z window (``las2las``), then include/exclude shapes, then ``lasnoise``, then ``lasground_new``, then ``las2dem``, then
-DEM cells in excluded areas set to nodata.
+Per scan: orient the points (:mod:`~laguna.postprocess.orient`, per
+``cfg.orient``), then ROI rectangle and z window (``las2las``), then
+include/exclude shapes, then ``lasnoise``, then ``lasground_new``, then
+``las2dem``, then DEM cells in excluded areas set to nodata.
 
 Order matters. Noise is removed *before* ground filtering because
 ``lasground_new`` seeds its surface from the lowest points. Stray low
@@ -23,7 +24,7 @@ Outputs under ``cfg.out_path`` for each scan:
 
 Files are built in a temp dir and renamed into place, so an interrupted
 run never leaves a half-written output. A scan is skipped when its outputs
-came from the same input (size + mtime) and the same
+came from the same input file (size + mtime) and the same
 :meth:`~laguna.postprocess.config.PostprocessConfig.processing_hash`.
 """
 
@@ -46,9 +47,9 @@ import laspy
 import numpy as np
 import rasterio
 
-from ..frames import AffineTransform
 from .config import PostprocessConfig
 from .lastools import run_tool
+from .orient import SCAN_SUFFIXES, prepare_points, scan_files, source_file
 from .regions import keep_mask
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ class ScanResult:
     Attributes:
         scan: Scan file stem.
         status: ``"ok"``, ``"skipped"`` (already up to date) or ``"failed"``.
-        n_input: Points in the input file.
+        n_input: Valid points in the input file.
         n_roi: Points left after the ROI rectangle and z window.
         n_shapes: Points left after the include/exclude shapes.
         n_denoised: Points left after denoising.
@@ -112,30 +113,24 @@ def _fingerprint(path: Path) -> dict:
 
 
 def is_current(scan: str | Path, cfg: PostprocessConfig) -> bool:
-    """Return True if the scan's outputs match its file and ``cfg``."""
-    scan = Path(scan)
+    """Return True if the scan's outputs match its input file and ``cfg``."""
     p = output_paths(scan, cfg)
     if not (p["dem"].exists() and p["meta"].exists()):
         return False
+    try:
+        src = source_file(scan, cfg)
+    except FileNotFoundError:
+        return False
     meta = json.loads(p["meta"].read_text())
-    return meta.get("config_hash") == cfg.processing_hash() and meta.get("input") == _fingerprint(
-        scan
-    )
+    return meta.get("config_hash") == cfg.processing_hash() and meta.get("input") == {
+        "file": src.name,
+        **_fingerprint(src),
+    }
 
 
 def _count(path: Path) -> int:
     with laspy.open(path) as f:
         return f.header.point_count
-
-
-def _orient(src: Path, dst: Path, transform: AffineTransform) -> None:
-    las = laspy.read(src)
-    xyz = transform.apply(np.column_stack([las.x, las.y, las.z]))
-    if len(xyz):
-        # Re-centre the offsets so the moved coordinates still fit LAS's int32 range.
-        las.change_scaling(offsets=np.floor(xyz.min(axis=0)))
-    las.x, las.y, las.z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-    las.write(dst)
 
 
 def _apply_shapes(src: Path, dst: Path, cfg: PostprocessConfig) -> None:
@@ -188,7 +183,9 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
     raised, so one bad scan doesn't stop a batch.
 
     Args:
-        scan: ``.laz``/``.las`` file.
+        scan: The scan's ``.laz``, ``.las`` or ``.npz``; the file actually
+            read is chosen by ``cfg.orient`` (see
+            :func:`~laguna.postprocess.orient.source_file`).
         cfg: Processing settings.
         force: Reprocess even if the outputs are already current.
 
@@ -207,10 +204,8 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
     res = ScanResult(scan.stem, "ok")
     try:
         with open(tmp / "log", "w") as log:
-            src = scan
-            if not cfg.transform.is_identity:
-                _orient(scan, tmp / "oriented.laz", cfg.transform)
-                src = tmp / "oriented.laz"
+            input_file = source_file(scan, cfg)
+            src, res.n_input = prepare_points(scan, cfg, tmp)
             r = cfg.roi
             zargs = ["-keep_z", *cfg.z_range] if cfg.z_range else []
             run_tool(
@@ -227,7 +222,7 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
                 tmp / "roi.laz",
                 log=log,
             )
-            res.n_input, res.n_roi = _count(scan), _count(tmp / "roi.laz")
+            res.n_roi = _count(tmp / "roi.laz")
             cur = tmp / "roi.laz"
 
             if cfg.include or cfg.exclude:
@@ -305,7 +300,7 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
 
         meta = {
             "config_hash": cfg.processing_hash(),
-            "input": _fingerprint(scan),
+            "input": {"file": input_file.name, **_fingerprint(input_file)},
             "processed_at": datetime.now().isoformat(timespec="seconds"),
             "config": cfg.to_dict(),
             "result": asdict(res),
@@ -336,14 +331,23 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
 
 
 def find_scans(inputs: Iterable[str | Path]) -> list[Path]:
-    """Expand files and directories (not recursive) to a sorted list of ``.laz``/``.las``."""
-    scans = []
+    """Expand files and directories (not recursive) to one path per scan, sorted.
+
+    A scan saved as both ``.laz`` and ``.npz`` is listed once, by its point
+    file; one saved only as ``.npz`` is listed by that.
+    """
+    paths = []
     for i in map(Path, inputs):
         if i.is_dir():
-            scans += [p for p in i.iterdir() if p.suffix.lower() in (".laz", ".las")]
+            paths += [p for p in i.iterdir() if p.suffix.lower() in SCAN_SUFFIXES]
         else:
-            scans.append(i)
-    return sorted({p.resolve() for p in scans})
+            paths.append(i)
+    by_stem = {}
+    for p in paths:
+        p = p.resolve()
+        files = scan_files(p)
+        by_stem[p.with_suffix("")] = files["points"] or files["npz"] or p
+    return sorted(by_stem.values())
 
 
 def run(
@@ -362,7 +366,11 @@ def run(
 
     Returns:
         One result per scan, sorted by name.
+
+    Raises:
+        ValueError: If ``cfg`` fails :meth:`PostprocessConfig.validate`.
     """
+    cfg.validate()
     scans = find_scans(inputs)
     logger.info("post-processing %d scans into %s", len(scans), cfg.out_path)
     results = []

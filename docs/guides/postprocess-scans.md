@@ -9,8 +9,8 @@ the region shapes, scheduling and the final masking.
 
 Each scan goes through these steps:
 
-1. **Experiment frame** (optional): move the points from the scan's own
-   coordinates into the experiment frame with a rigid transform.
+1. **Orient** (optional): move the points into the experiment frame, with
+   a fixed transform or from each scan's own metadata.
 2. **ROI**: keep the ROI rectangle and an optional z window (`las2las`).
 3. **Include/exclude shapes**: keep only points inside the include
    polygons, if there are any, and drop points inside any exclude shape.
@@ -47,28 +47,52 @@ because how you process an experiment's scans usually changes after the
 scans are taken. Start from `examples/example_postprocess.yaml`; it
 documents every key. All lengths are in mm, as written by `save_las`.
 
-### Experiment frame
+### Scan files and orientation
 
-A saved `.laz` is in scanner coordinates: the travel axis is centred on the
-pass rather than on the flume. Set `frame` to a rigid transform that maps
-those coordinates into the experiment frame. It uses the same keys as
-`frames.experiment` in the rig config (`rotation_deg` about Z, then
-`translation` or `origin`, or a 4x4 `matrix`):
+`GocatorScanner.save_scan` writes each scan as a `.laz` (points only) and an
+`.npz` (the full grid plus metadata: where the pass started and ended, its
+travel axis, and the sensor mounting). Post-processing accepts a folder of
+either kind or both. A `.laz`/`.npz` pair counts as one scan.
+
+`orient` decides how each scan is placed before anything else happens. The
+ROI, `z_range`, shapes and DEM grid are all in the coordinates it produces.
+
+| `orient` | Coordinates | Reads | Needs |
+|---|---|---|---|
+| `scanner` (default) | as saved: the pass, centred on its middle | `.laz`, else `.npz` | nothing |
+| `frame` | experiment, by one fixed transform | `.laz`, else `.npz` | `frame` |
+| `metadata` | experiment, from each scan's own gantry position | `.npz` | `rig_config` |
 
 ```yaml
-frame: {rotation_deg: 0, origin: [320, -480, 20]}   # this scan point becomes (0, 0, 0)
+orient: metadata
+rig_config: ../config_phase0.yaml               # its frames: section is used
+frame: {rotation_deg: 0, origin: [330, -480, 0]}   # used when orient: frame
 ```
 
-The frame is applied first, so `roi`, `z_range`, the shapes and the DEM grid
-are all in experiment coordinates. If you change `frame` you have to redraw
-the shapes as well, and every scan is reprocessed. Leave `frame` unset to
-work in scanner coordinates.
+- **`metadata`** runs `laguna.frames.orient_scan` on every `.npz`, using
+  the rig config's `frames` section (experiment frame and Gocator mount).
+  Each scan is placed from where its own pass actually ran, including its
+  direction, so passes needn't start in the same place. The rig's `frames`
+  section is part of the settings hash, so editing it reprocesses every
+  scan. A scan without an `.npz` fails, with a message naming the missing
+  file.
+- **`frame`** applies one rigid transform to every scan. It uses the same
+  keys as `frames.experiment` (`rotation_deg` about Z, then `translation`
+  or `origin`, or a 4x4 `matrix`). Use it when only `.laz` files exist and
+  every pass covers the same ground.
+- **`scanner`** leaves the coordinates as they were saved.
 
-`lasnoise` and `lasground_new` grid the points from the coordinate origin.
-A frame that shifts by a multiple of `noise.step_xy` and `ground.step` (for
-example 30 mm with the defaults) gives exactly the DEM you would get in
-scanner coordinates. Any other shift can change the result by a fraction of
-a millimetre in a few percent of cells.
+`frame` and `rig_config` can both be set. Only the one `orient` selects is
+used, so switching routes is a one-word change. On the command line,
+`--orient` overrides the file. Switching changes the coordinates, so the
+shapes have to be redrawn, and every scan is reprocessed.
+
+An `.npz` read under `scanner` or `frame` gives exactly the DEM its `.laz`
+would. `lasnoise` and `lasground_new` grid points from the coordinate
+origin, so moving a scan by anything other than a multiple of
+`noise.step_xy` and `ground.step` (30 mm with the defaults) can change a
+few percent of cells by a fraction of a millimetre. The two experiment-frame
+routes can differ slightly from each other for the same reason.
 
 ## Drawing the ROI and exclusion zones
 

@@ -7,6 +7,7 @@ not imported here, because it needs a Jupyter kernel.
 """
 
 from .config import (
+    ORIENT_MODES,
     DemParams,
     GroundParams,
     NoiseParams,
@@ -15,10 +16,12 @@ from .config import (
     save_postprocess_config,
 )
 from .lastools import LastoolsError
+from .orient import oriented_points, scan_files, source_file
 from .pipeline import ScanResult, find_scans, is_current, output_paths, process_scan, run
 from .regions import Circle, Polygon, Rect
 
 __all__ = [
+    "ORIENT_MODES",
     "Circle",
     "DemParams",
     "GroundParams",
@@ -31,8 +34,11 @@ __all__ = [
     "find_scans",
     "is_current",
     "load_postprocess_config",
+    "oriented_points",
     "output_paths",
     "process_scan",
     "run",
     "save_postprocess_config",
+    "scan_files",
+    "source_file",
 ]

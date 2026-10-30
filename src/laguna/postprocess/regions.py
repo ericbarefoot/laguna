@@ -32,7 +32,9 @@ class Rect:
     label: str = ""
 
     def __post_init__(self):
-        """Reject empty or inverted rectangles."""
+        """Coerce edges to float and reject empty or inverted rectangles."""
+        self.xmin, self.ymin = float(self.xmin), float(self.ymin)
+        self.xmax, self.ymax = float(self.xmax), float(self.ymax)
         if self.xmin >= self.xmax or self.ymin >= self.ymax:
             raise ValueError(f"degenerate rectangle: {self}")
 
@@ -71,7 +73,8 @@ class Circle:
     label: str = ""
 
     def __post_init__(self):
-        """Reject non-positive radii."""
+        """Coerce to float and reject non-positive radii."""
+        self.x, self.y, self.r = float(self.x), float(self.y), float(self.r)
         if self.r <= 0:
             raise ValueError(f"circle radius must be positive: {self}")
 

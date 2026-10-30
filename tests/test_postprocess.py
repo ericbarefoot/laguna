@@ -7,23 +7,31 @@ they are skipped otherwise.
 
 import copy
 
+import shutil
+
 import numpy as np
 import pytest
+import yaml
 
 laspy = pytest.importorskip("laspy")
 pytest.importorskip("lazrs")
 pytest.importorskip("rasterio")
 
+from laguna.frames import FrameRegistry, orient_scan  # noqa: E402
 from laguna.postprocess import (  # noqa: E402
     Circle,
     Polygon,
     PostprocessConfig,
     Rect,
+    find_scans,
     load_postprocess_config,
+    oriented_points,
     process_scan,
     run,
     save_postprocess_config,
 )
+from laguna.postprocess.orient import write_points  # noqa: E402
+from laguna.scanner.pointcloud import SensorMounting, SurfaceScan  # noqa: E402
 from laguna.postprocess.cli import main as cli_main  # noqa: E402
 from laguna.postprocess.lastools import lastools_bin  # noqa: E402
 from laguna.postprocess.preview import read_dem  # noqa: E402
@@ -77,6 +85,7 @@ class TestConfig:
             exclude=[Circle(1, 2, 3, label="a")],
             include=[Polygon([(0, 0), (1, 0), (0, 1)])],
             z_range=(1, 2),
+            orient="frame",
             frame={"rotation_deg": 90, "origin": [5, 0, 0]},
         )
         path = tmp_path / "pp.yaml"
@@ -87,13 +96,31 @@ class TestConfig:
         assert back.grid_shape == (20, 10)
         assert back.transform.apply([5, 0, 0]) == pytest.approx([0, 0, 0])
 
-    def test_invalid_frame_rejected(self):
-        """A frame that isn't a rigid transform fails at load, not mid-run."""
+    def test_orient_settings_validated(self, tmp_path):
+        """Each orient mode's missing or invalid settings fail at load, not mid-run."""
         roi = {"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1}
-        with pytest.raises(ValueError):
-            PostprocessConfig.from_dict({"roi": roi, "frame": {"scale": 2}})
-        with pytest.raises(ValueError):
-            PostprocessConfig.from_dict({"roi": roi, "frame": {"matrix": np.diag([2, 1, 1, 1])}})
+        bad = [
+            {"orient": "sideways"},
+            {"orient": "frame"},
+            {"orient": "frame", "frame": {"scale": 2}},
+            {"orient": "frame", "frame": {"matrix": np.diag([2, 1, 1, 1]).tolist()}},
+            {"orient": "metadata"},
+            {"orient": "metadata", "rig_config": "missing.yaml"},
+        ]
+        for extra in bad:
+            path = tmp_path / "pp.yaml"
+            path.write_text(yaml.safe_dump({"roi": roi, **extra}))
+            with pytest.raises((ValueError, FileNotFoundError)):
+                load_postprocess_config(path)
+
+    def test_unused_orient_settings_are_ignored(self, tmp_path):
+        """Both frame and rig_config can be set; only the active one counts."""
+        cfg = PostprocessConfig(roi=Rect(0, 0, 1, 1), frame={"translation": [1, 0, 0]})
+        cfg.validate()
+        assert cfg.transform.is_identity
+        assert cfg.processing_hash() == PostprocessConfig(roi=Rect(0, 0, 1, 1)).processing_hash()
+        cfg.orient = "frame"
+        assert cfg.transform.apply([0, 0, 0]) == pytest.approx([1, 0, 0])
 
     def test_hash_ignores_labels_output_and_cores(self):
         """Only settings that change outputs change the hash."""
@@ -191,7 +218,11 @@ class TestPipeline:
     def test_frame_is_applied_before_roi(self, synthetic_scan, tmp_path):
         """Points are moved into the frame, and the DEM is the same surface turned."""
         plain = _cfg(tmp_path / "plain")
-        turned = _cfg(tmp_path / "turned", frame={"rotation_deg": 90, "translation": [100, 0, 5]})
+        turned = _cfg(
+            tmp_path / "turned",
+            orient="frame",
+            frame={"rotation_deg": 90, "translation": [100, 0, 5]},
+        )
         assert process_scan(synthetic_scan, plain).status == "ok"
         assert process_scan(synthetic_scan, turned).status == "ok"
 
@@ -239,3 +270,125 @@ class TestPipeline:
         assert "1 processed" in capsys.readouterr().out
         assert cli_main(["status", str(synthetic_scan), "-c", str(path)]) == 0
         assert "all scans up to date" in capsys.readouterr().out
+
+
+#: Mounting, pass and frames shaped like the first gantry dataset: sensor Y runs
+#: along -X (a reverse pass), and the experiment frame is turned a quarter turn.
+MOUNTING = {"scan_x": "+Y", "scan_y": "-X", "scan_z": "+Z"}
+RIG_FRAMES = {
+    "experiment": {"origin": [1400, 300, 0], "rotation_deg": -90},
+    "instruments": {"gocator": {"translation": [50, 20, 0]}},
+}
+
+
+@pytest.fixture(scope="module")
+def paired_scan(tmp_path_factory):
+    """Save a scan the way ``GocatorScanner.save_scan`` does: ``.npz`` grid plus ``.laz``."""
+    xs = np.arange(0, 100, 0.5)
+    ys = np.arange(0, 100, 0.5)
+    gx, gy = np.meshgrid(xs, ys)
+    z = BED_Z + 20 * np.exp(-((gx - 30) ** 2 + (gy - 60) ** 2) / (2 * 10**2))
+    surface = SurfaceScan(
+        z_mm=z,
+        x_mm=xs,
+        y_mm=ys,
+        metadata={
+            "gantry_axis": "X",
+            "gantry_start": [1500.0, 200.0, 0.0],
+            "gantry_start_mm": 1500.0,
+            "gantry_end_mm": 1400.0,
+        },
+        is_uniform=True,
+        mounting=SensorMounting.from_config(MOUNTING),
+    )
+    d = tmp_path_factory.mktemp("paired")
+    surface.save_npz(d / "scan_paired.npz")
+    surface.save_las(d / "scan_paired.laz")
+    (d / "rig.yaml").write_text(yaml.safe_dump({"frames": RIG_FRAMES}))
+    return d / "scan_paired.laz"
+
+
+def _metadata_cfg(paired_scan, out):
+    """A metadata-oriented config whose ROI covers the scan in experiment coordinates."""
+    xyz = orient_scan(
+        SurfaceScan.from_npz(paired_scan.with_suffix(".npz")),
+        frames=FrameRegistry.from_config(RIG_FRAMES),
+    ).to_points()
+    lo, hi = np.floor(xyz.min(axis=0)), np.ceil(xyz.max(axis=0))
+    cfg = PostprocessConfig(
+        roi=Rect(lo[0], lo[1], hi[0], hi[1]),
+        orient="metadata",
+        rig_config=str(paired_scan.parent / "rig.yaml"),
+        cores=2,
+        output_dir=str(out),
+    )
+    cfg.dem.kill = 5
+    return cfg, xyz
+
+
+class TestScanFiles:
+    """LAZ only, NPZ only, or both."""
+
+    def test_pairs_are_listed_once(self, paired_scan, tmp_path):
+        """A .laz/.npz pair is one scan; a lone .npz is a scan too."""
+        assert find_scans([paired_scan.parent]) == [paired_scan]
+        shutil.copy(paired_scan.with_suffix(".npz"), tmp_path / "lone.npz")
+        assert find_scans([tmp_path, paired_scan.with_suffix(".npz")]) == sorted(
+            [paired_scan, tmp_path / "lone.npz"]
+        )
+
+    def test_npz_and_laz_give_the_same_points(self, paired_scan):
+        """In scanner coordinates the .npz grid and the .laz are the same cloud."""
+        cfg = PostprocessConfig(roi=Rect(0, 0, 1, 1))
+        from_laz = oriented_points(paired_scan, cfg)
+        npz_only = paired_scan.parent / "npz_only"
+        npz_only.mkdir(exist_ok=True)
+        shutil.copy(paired_scan.with_suffix(".npz"), npz_only / "scan_paired.npz")
+        from_npz = oriented_points(npz_only / "scan_paired.npz", cfg)
+        np.testing.assert_allclose(from_npz, from_laz, atol=1e-3)
+
+    def test_metadata_orients_with_the_rig_frames(self, paired_scan):
+        """orient: metadata gives exactly what orient_scan gives."""
+        cfg, expected = _metadata_cfg(paired_scan, "unused")
+        np.testing.assert_allclose(oriented_points(paired_scan, cfg), expected)
+
+
+@needs_lastools
+class TestOrientedPipeline:
+    """The orient modes through the whole pipeline."""
+
+    def test_metadata_route(self, paired_scan, tmp_path):
+        """The DEM matches one built from orient_scan's points in scanner mode."""
+        cfg, xyz = _metadata_cfg(paired_scan, tmp_path / "meta")
+        res = process_scan(paired_scan, cfg)
+        assert res.status == "ok", res.error
+        assert res.n_input == len(xyz)
+
+        laz = tmp_path / "ref" / "scan_paired.laz"
+        laz.parent.mkdir()
+        write_points(xyz, laz)
+        ref = PostprocessConfig(roi=cfg.roi, cores=2, output_dir=str(tmp_path / "ref_out"))
+        ref.dem.kill = 5
+        assert process_scan(laz, ref).status == "ok"
+        z, _ = read_dem(cfg.out_path / "dem" / "scan_paired.tif")
+        z_ref, _ = read_dem(ref.out_path / "dem" / "scan_paired.tif")
+        np.testing.assert_array_equal(z, z_ref)
+        assert np.isfinite(z).mean() > 0.9
+
+    def test_metadata_needs_the_npz(self, paired_scan, tmp_path):
+        """A LAZ-only scan fails under orient: metadata, naming the missing file."""
+        cfg, _ = _metadata_cfg(paired_scan, tmp_path / "out")
+        shutil.copy(paired_scan, tmp_path / "laz_only.laz")
+        res = process_scan(tmp_path / "laz_only.laz", cfg)
+        assert res.status == "failed" and "laz_only.npz" in res.error
+
+    def test_cli_orient_override(self, paired_scan, tmp_path, capsys):
+        """--orient switches routes without editing the config."""
+        cfg, _ = _metadata_cfg(paired_scan, "out")
+        cfg.orient = "scanner"
+        path = tmp_path / "pp.yaml"
+        save_postprocess_config(cfg, path)
+        assert cli_main(["run", str(paired_scan), "-c", str(path), "--orient", "metadata"]) == 0
+        assert "1 processed" in capsys.readouterr().out
+        assert cli_main(["status", str(paired_scan), "-c", str(path)]) == 0
+        assert "scan_paired" in capsys.readouterr().out

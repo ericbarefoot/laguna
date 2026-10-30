@@ -43,13 +43,13 @@ def _r(v: float) -> float:
 class ShapeEditor:
     """Edit ``cfg.roi``, ``cfg.include`` and ``cfg.exclude`` by drawing on a scan.
 
-    The scan is drawn in ``cfg.frame`` coordinates, so set ``frame`` before
-    drawing shapes. ``cfg`` is modified in place. **Save config** writes it to
+    The scan is drawn in the coordinates ``cfg.orient`` puts it in, so set
+    ``orient`` (and ``frame`` or ``rig_config``) before drawing shapes. ``cfg`` is modified in place. **Save config** writes it to
     ``config_path``. **Preview DEM** runs the whole pipeline on this scan,
     writing to ``<out_path>/_preview``, and plots the result.
 
     Args:
-        scan: Scan file to draw on. Shapes apply to every scan, so pick one
+        scan: Scan to draw on (``.laz``, ``.las`` or ``.npz``). Shapes apply to every scan, so pick one
             with good coverage.
         cfg: Config to edit.
         config_path: YAML file to save to; leave as None to turn off saving.
@@ -70,7 +70,7 @@ class ShapeEditor:
         self.pending = None
         self._overlay = []
 
-        grid, ext = scan_grid(self.scan, cell, transform=cfg.transform)
+        grid, ext = scan_grid(self.scan, cfg, cell)
         with plt.ioff():
             self.fig, self.ax = plt.subplots(figsize=(8, 7.5))
         vmin, vmax = np.nanpercentile(grid, [2, 98])

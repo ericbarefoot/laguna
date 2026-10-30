@@ -6,7 +6,7 @@ import argparse
 import logging
 import sys
 
-from .config import load_postprocess_config
+from .config import ORIENT_MODES, load_postprocess_config
 from .pipeline import ScanResult, find_scans, is_current, run
 
 
@@ -35,13 +35,14 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name, help=help_)
         p.add_argument("inputs", nargs="+", help="scan files or directories")
         p.add_argument("-c", "--config", required=True, help="post-processing YAML")
+        p.add_argument("--orient", choices=ORIENT_MODES, help="override the config's orient")
         if name == "run":
             p.add_argument("-f", "--force", action="store_true", help="reprocess everything")
             p.add_argument("-j", "--cores", type=int, help="override the config's cores")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-    cfg = load_postprocess_config(a.config)
+    cfg = load_postprocess_config(a.config, orient=a.orient)
     if a.cmd == "status":
         stale = [s for s in find_scans(a.inputs) if not is_current(s, cfg)]
         print("\n".join(s.name for s in stale) or "all scans up to date")

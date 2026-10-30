@@ -7,13 +7,19 @@
 #
 # Values below are from the first gantry tray dataset (scanner-local coordinates).
 
-# Rigid transform from scanner coordinates to the experiment frame, applied
-# before everything else; every setting below is then in experiment
-# coordinates. Same keys as frames.experiment in the rig config: rotation_deg
-# (about Z), then translation or origin ([x, y, z] mm), or a 4x4 matrix.
-# null keeps scanner coordinates.
-frame: null
-# frame: {rotation_deg: 0, origin: [320, -480, 20]}   # this scan point becomes (0, 0, 0)
+# How each scan is placed before anything else; every setting below is in
+# the coordinates this produces.
+#   scanner   keep the coordinates the scan was saved in (.laz, else .npz)
+#   frame     apply the fixed transform `frame` to every scan (.laz, else .npz)
+#   metadata  place each scan from its own .npz metadata and the frames section of
+#             `rig_config` (laguna.frames.orient_scan); needs the .npz
+# Only the setting the chosen mode uses is read, so both can stay filled in.
+# `laguna-postprocess --orient ...` overrides this.
+orient: scanner
+# Same keys as frames.experiment in the rig config: rotation_deg (about Z), then
+# translation or origin ([x, y, z] mm), or a 4x4 matrix.
+frame: {rotation_deg: 0, origin: [330, -480, 0]}   # this scan point becomes (0, 0, 0)
+rig_config: null   # e.g. ../config_phase0.yaml, relative to this file
 
 # Area to keep. It also fixes the DEM grid, so every DEM lines up cell for cell.
 roi: {type: rect, xmin: 320, ymin: -480, xmax: 752, ymax: 368}
