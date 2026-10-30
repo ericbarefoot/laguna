@@ -43,7 +43,8 @@ def _r(v: float) -> float:
 class ShapeEditor:
     """Edit ``cfg.roi``, ``cfg.include`` and ``cfg.exclude`` by drawing on a scan.
 
-    ``cfg`` is modified in place. **Save config** writes it to
+    The scan is drawn in ``cfg.frame`` coordinates, so set ``frame`` before
+    drawing shapes. ``cfg`` is modified in place. **Save config** writes it to
     ``config_path``. **Preview DEM** runs the whole pipeline on this scan,
     writing to ``<out_path>/_preview``, and plots the result.
 
@@ -69,7 +70,7 @@ class ShapeEditor:
         self.pending = None
         self._overlay = []
 
-        grid, ext = scan_grid(self.scan, cell)
+        grid, ext = scan_grid(self.scan, cell, transform=cfg.transform)
         with plt.ioff():
             self.fig, self.ax = plt.subplots(figsize=(8, 7.5))
         vmin, vmax = np.nanpercentile(grid, [2, 98])

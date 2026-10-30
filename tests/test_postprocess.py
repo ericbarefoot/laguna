@@ -77,6 +77,7 @@ class TestConfig:
             exclude=[Circle(1, 2, 3, label="a")],
             include=[Polygon([(0, 0), (1, 0), (0, 1)])],
             z_range=(1, 2),
+            frame={"rotation_deg": 90, "origin": [5, 0, 0]},
         )
         path = tmp_path / "pp.yaml"
         save_postprocess_config(cfg, path)
@@ -84,6 +85,15 @@ class TestConfig:
         assert back.to_dict() == cfg.to_dict()
         assert back.out_path == (tmp_path / "postprocessed").resolve()
         assert back.grid_shape == (20, 10)
+        assert back.transform.apply([5, 0, 0]) == pytest.approx([0, 0, 0])
+
+    def test_invalid_frame_rejected(self):
+        """A frame that isn't a rigid transform fails at load, not mid-run."""
+        roi = {"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1}
+        with pytest.raises(ValueError):
+            PostprocessConfig.from_dict({"roi": roi, "frame": {"scale": 2}})
+        with pytest.raises(ValueError):
+            PostprocessConfig.from_dict({"roi": roi, "frame": {"matrix": np.diag([2, 1, 1, 1])}})
 
     def test_hash_ignores_labels_output_and_cores(self):
         """Only settings that change outputs change the hash."""
@@ -177,6 +187,26 @@ class TestPipeline:
         inside = exc.contains(xmin + cols + 0.5, ymax - rows - 0.5)
         assert np.isnan(z[inside]).all()
         assert np.isfinite(z[~inside]).mean() > 0.9
+
+    def test_frame_is_applied_before_roi(self, synthetic_scan, tmp_path):
+        """Points are moved into the frame, and the DEM is the same surface turned."""
+        plain = _cfg(tmp_path / "plain")
+        turned = _cfg(tmp_path / "turned", frame={"rotation_deg": 90, "translation": [100, 0, 5]})
+        assert process_scan(synthetic_scan, plain).status == "ok"
+        assert process_scan(synthetic_scan, turned).status == "ok"
+
+        # (x, y, z) -> (100 - y, x, z + 5): the debris block at (15, 85) lands at (15, 15).
+        las = laspy.read(turned.out_path / "clip" / "scan_synthetic.laz")
+        x, y, z = np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)
+        debris = (z > BED_Z + 15) & ~MOUND.contains(100 - y, x)
+        assert debris.sum() > 10
+        assert (x[debris].mean(), y[debris].mean()) == pytest.approx((15, 15), abs=1)
+
+        z0, _ = read_dem(plain.out_path / "dem" / "scan_synthetic.tif")
+        z1, _ = read_dem(turned.out_path / "dem" / "scan_synthetic.tif")
+        diff = z1 - (np.rot90(z0) + 5)
+        assert np.isfinite(diff).mean() > 0.9
+        assert np.nanmedian(np.abs(diff)) < 0.05
 
     def test_rerun_skips_until_settings_change(self, synthetic_scan, tmp_path):
         """A current scan is skipped; changing a setting reprocesses it."""

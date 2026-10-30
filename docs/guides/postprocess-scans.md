@@ -9,13 +9,15 @@ the region shapes, scheduling and the final masking.
 
 Each scan goes through these steps:
 
-1. **ROI**: keep the ROI rectangle and an optional z window (`las2las`).
-2. **Include/exclude shapes**: keep only points inside the include
+1. **Experiment frame** (optional): move the points from the scan's own
+   coordinates into the experiment frame with a rigid transform.
+2. **ROI**: keep the ROI rectangle and an optional z window (`las2las`).
+3. **Include/exclude shapes**: keep only points inside the include
    polygons, if there are any, and drop points inside any exclude shape.
-3. **Denoise** (`lasnoise`): remove isolated points.
-4. **Ground filter** (`lasground_new`): keep the ground surface and drop
+4. **Denoise** (`lasnoise`): remove isolated points.
+5. **Ground filter** (`lasground_new`): keep the ground surface and drop
    debris and scan artefacts sitting on it.
-5. **DEM** (`las2dem`): grid on the ROI's fixed grid, then set the cells in
+6. **DEM** (`las2dem`): grid on the ROI's fixed grid, then set the cells in
    excluded areas to nodata.
 
 Denoising runs *before* ground filtering on purpose. The ground filter
@@ -43,8 +45,30 @@ add noise or refuse to run, and the pipeline reports the scan as failed.
 Settings live in a YAML file of their own. This is not the rig config,
 because how you process an experiment's scans usually changes after the
 scans are taken. Start from `examples/example_postprocess.yaml`; it
-documents every key. All lengths are in the scan's own units, which is mm
-for `save_las` output.
+documents every key. All lengths are in mm, as written by `save_las`.
+
+### Experiment frame
+
+A saved `.laz` is in scanner coordinates: the travel axis is centred on the
+pass rather than on the flume. Set `frame` to a rigid transform that maps
+those coordinates into the experiment frame. It uses the same keys as
+`frames.experiment` in the rig config (`rotation_deg` about Z, then
+`translation` or `origin`, or a 4x4 `matrix`):
+
+```yaml
+frame: {rotation_deg: 0, origin: [320, -480, 20]}   # this scan point becomes (0, 0, 0)
+```
+
+The frame is applied first, so `roi`, `z_range`, the shapes and the DEM grid
+are all in experiment coordinates. If you change `frame` you have to redraw
+the shapes as well, and every scan is reprocessed. Leave `frame` unset to
+work in scanner coordinates.
+
+`lasnoise` and `lasground_new` grid the points from the coordinate origin.
+A frame that shifts by a multiple of `noise.step_xy` and `ground.step` (for
+example 30 mm with the defaults) gives exactly the DEM you would get in
+scanner coordinates. Any other shift can change the result by a fraction of
+a millimetre in a few percent of cells.
 
 ## Drawing the ROI and exclusion zones
 

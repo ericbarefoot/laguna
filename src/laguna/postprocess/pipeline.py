@@ -1,7 +1,7 @@
 """Turn saved scans into ground-surface DEMs on a fixed grid.
 
-Per scan: ROI rectangle and z window (``las2las``), then include/exclude
-shapes, then ``lasnoise``, then ``lasground_new``, then ``las2dem``, then
+Per scan: transform into the experiment frame (when ``cfg.frame`` is set),
+then ROI rectangle and z window (``las2las``), then include/exclude shapes, then ``lasnoise``, then ``lasground_new``, then ``las2dem``, then
 DEM cells in excluded areas set to nodata.
 
 Order matters. Noise is removed *before* ground filtering because
@@ -46,6 +46,7 @@ import laspy
 import numpy as np
 import rasterio
 
+from ..frames import AffineTransform
 from .config import PostprocessConfig
 from .lastools import run_tool
 from .regions import keep_mask
@@ -127,6 +128,16 @@ def _count(path: Path) -> int:
         return f.header.point_count
 
 
+def _orient(src: Path, dst: Path, transform: AffineTransform) -> None:
+    las = laspy.read(src)
+    xyz = transform.apply(np.column_stack([las.x, las.y, las.z]))
+    if len(xyz):
+        # Re-centre the offsets so the moved coordinates still fit LAS's int32 range.
+        las.change_scaling(offsets=np.floor(xyz.min(axis=0)))
+    las.x, las.y, las.z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    las.write(dst)
+
+
 def _apply_shapes(src: Path, dst: Path, cfg: PostprocessConfig) -> None:
     las = laspy.read(src)
     keep = keep_mask(np.asarray(las.x), np.asarray(las.y), cfg.roi, cfg.include, cfg.exclude)
@@ -196,12 +207,16 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
     res = ScanResult(scan.stem, "ok")
     try:
         with open(tmp / "log", "w") as log:
+            src = scan
+            if not cfg.transform.is_identity:
+                _orient(scan, tmp / "oriented.laz", cfg.transform)
+                src = tmp / "oriented.laz"
             r = cfg.roi
             zargs = ["-keep_z", *cfg.z_range] if cfg.z_range else []
             run_tool(
                 "las2las",
                 "-i",
-                scan,
+                src,
                 "-keep_xy",
                 r.xmin,
                 r.ymin,

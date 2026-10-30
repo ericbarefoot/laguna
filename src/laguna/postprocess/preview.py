@@ -10,12 +10,16 @@ import rasterio
 from matplotlib import patches
 from matplotlib.axes import Axes
 
+from ..frames import AffineTransform
 from .config import PostprocessConfig
 from .regions import Circle, Polygon, Rect, Shape
 
 
 def scan_grid(
-    path: str | Path, cell: float = 2.0, zclip: tuple[float, float] = (0.5, 99.5)
+    path: str | Path,
+    cell: float = 2.0,
+    zclip: tuple[float, float] = (0.5, 99.5),
+    transform: AffineTransform | None = None,
 ) -> tuple[np.ndarray, tuple]:
     """Grid a whole scan to mean z per cell, for plotting.
 
@@ -24,6 +28,9 @@ def scan_grid(
         cell: Cell size, mm.
         zclip: Percentiles outside which points are ignored, so stray returns
             don't set the colour scale.
+        transform: Applied to the points first, e.g.
+            :attr:`PostprocessConfig.transform` to plot in experiment
+            coordinates.
 
     Returns:
         ``(z, extent)``: a 2-D array (NaN = empty, row 0 = top) and
@@ -31,6 +38,8 @@ def scan_grid(
     """
     las = laspy.read(path)
     x, y, z = np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)
+    if transform is not None:
+        x, y, z = transform.apply(np.column_stack([x, y, z])).T
     lo, hi = np.percentile(z, zclip)
     keep = (z >= lo) & (z <= hi)
     x, y, z = x[keep], y[keep], z[keep]

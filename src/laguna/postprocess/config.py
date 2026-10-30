@@ -2,8 +2,9 @@
 
 This is separate from the rig's :class:`laguna.config.Config`. One file
 describes how to process one experiment's scans, and it usually changes
-after the scans are taken. All lengths are in the scan's own units, mm for
-``SurfaceScan.save_las`` output.
+after the scans are taken. All lengths are in mm, as written by
+``SurfaceScan.save_las``. Every setting except ``frame`` is in the
+coordinates ``frame`` maps into (the scan's own if it is not set).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import yaml
 
+from ..frames import AffineTransform
 from .regions import Rect, Shape, shape_from_dict
 
 
@@ -67,6 +69,13 @@ class PostprocessConfig:
     """Everything that decides how a scan becomes a DEM.
 
     Attributes:
+        frame: Rigid transform from the scan's own coordinates to the
+            experiment frame, applied before anything else. Same keys as
+            ``frames.experiment`` in the rig config (see
+            :meth:`laguna.frames.AffineTransform.from_config`):
+            ``rotation_deg`` about Z, then ``translation`` or ``origin``
+            ([x, y, z] mm), or a 4x4 ``matrix``. None keeps the scan's
+            coordinates.
         roi: Area to keep. It also fixes the DEM grid (origin = upper-left
             corner, size from ``dem.step``), so every DEM made with one config
             can be differenced cell by cell.
@@ -87,6 +96,7 @@ class PostprocessConfig:
     """
 
     roi: Rect
+    frame: dict | None = None
     include: list[Shape] = field(default_factory=list)
     exclude: list[Shape] = field(default_factory=list)
     z_range: tuple[float, float] | None = None
@@ -103,6 +113,11 @@ class PostprocessConfig:
         return (Path(self.base_dir) / self.output_dir).resolve()
 
     @property
+    def transform(self) -> AffineTransform:
+        """``frame`` as a transform (identity when ``frame`` is None)."""
+        return AffineTransform.from_config(self.frame)
+
+    @property
     def grid_shape(self) -> tuple[int, int]:
         """``(nrows, ncols)`` of the DEM grid."""
         s = self.dem.step
@@ -114,6 +129,7 @@ class PostprocessConfig:
     def to_dict(self) -> dict:
         """Return the YAML-ready form (``base_dir`` excluded)."""
         return {
+            "frame": self.frame,
             "roi": self.roi.to_dict(),
             "include": [s.to_dict() for s in self.include],
             "exclude": [s.to_dict() for s in self.exclude],
@@ -130,13 +146,17 @@ class PostprocessConfig:
         """Build from the :meth:`to_dict` form; missing sections take defaults.
 
         Raises:
-            ValueError: If ``roi`` is not a rectangle.
+            ValueError: If ``roi`` is not a rectangle, or ``frame`` is not a
+                valid rigid transform.
         """
         roi = shape_from_dict({"type": "rect", **d["roi"]})
         if not isinstance(roi, Rect):
             raise ValueError("roi must be a rectangle")
+        frame = d.get("frame") or None
+        AffineTransform.from_config(frame)
         return cls(
             roi=roi,
+            frame=frame,
             include=[shape_from_dict(s) for s in d.get("include") or []],
             exclude=[shape_from_dict(s) for s in d.get("exclude") or []],
             z_range=tuple(d["z_range"]) if d.get("z_range") else None,

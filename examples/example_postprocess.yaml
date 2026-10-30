@@ -1,11 +1,19 @@
 # laguna.postprocess config: how saved scans become ground-surface DEMs.
 # Copy this next to your scans and edit it, by hand or with
-# examples/example_16_postprocess_roi_editor.ipynb. All lengths are in the
-# scan's own units: mm for SurfaceScan.save_las output.
+# examples/example_16_postprocess_roi_editor.ipynb. All lengths are in mm
+# (SurfaceScan.save_las output).
 #
 #   laguna-postprocess run <scan dir> -c <this file>
 #
 # Values below are from the first gantry tray dataset (scanner-local coordinates).
+
+# Rigid transform from scanner coordinates to the experiment frame, applied
+# before everything else; every setting below is then in experiment
+# coordinates. Same keys as frames.experiment in the rig config: rotation_deg
+# (about Z), then translation or origin ([x, y, z] mm), or a 4x4 matrix.
+# null keeps scanner coordinates.
+frame: null
+# frame: {rotation_deg: 0, origin: [320, -480, 20]}   # this scan point becomes (0, 0, 0)
 
 # Area to keep. It also fixes the DEM grid, so every DEM lines up cell for cell.
 roi: {type: rect, xmin: 320, ymin: -480, xmax: 752, ymax: 368}
