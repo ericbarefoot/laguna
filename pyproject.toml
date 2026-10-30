@@ -37,6 +37,7 @@ dependencies = [
 
 [project.scripts]
 laguna-picam = "laguna.camera.picam:main"
+laguna-postprocess = "laguna.postprocess.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -69,6 +70,15 @@ storage = [
 ]
 viz = [
     "matplotlib>=3.7",        # laguna.viz.plot_acquisition() — quick-look scan/profile plots
+]
+postprocess = [
+    # laguna.postprocess: saved scans -> DEMs. The point-cloud steps run in
+    # LAStools (installed separately; see docs/guides/postprocess-scans.md).
+    "laspy[lazrs]>=2.5",
+    "rasterio>=1.4",          # DEM masking and reading
+    "matplotlib>=3.7",        # region geometry and plots
+    "ipympl>=0.9",            # ShapeEditor, the notebook ROI/exclusion editor
+    "ipywidgets>=8",
 ]
 
 [tool.setuptools]

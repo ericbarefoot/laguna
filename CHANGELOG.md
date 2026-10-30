@@ -44,6 +44,14 @@ them into a dated release section when you cut a version.
   back, so such scans could not be reloaded. `save_npz` now writes plain values and `from_npz` reads the old files.
 
 ### Added
+- **`laguna.postprocess`: saved scans to ground-surface DEMs.** Each scan goes through an ROI rectangle and z
+  window, include/exclude shapes (polygon, rectangle, circle), `lasnoise`, `lasground_new` and `las2dem`, and lands
+  on a grid fixed by the ROI, so DEMs can be differenced cell by cell. Exclusion zones are removed before denoising
+  and ground filtering, and their DEM cells are set to nodata rather than interpolated. Settings live in their own
+  YAML file (`examples/example_postprocess.yaml`). `laguna-postprocess run|status` and `postprocess.run()` skip scans
+  whose outputs match the input and settings, and report a failed scan without stopping the batch.
+  `examples/example_16_postprocess_roi_editor.ipynb` draws the shapes on a plotted scan (`ShapeEditor`) and previews
+  the DEM. Needs the new `postprocess` extra and LAStools.
 - **Surveys can be scheduled from config.** A `surveys:` section (`laguna.survey_config`) takes `kind: tile` or
   `traverse` entries, the `Tile`/`Traverse` constructor arguments plus `interval_s`/`trigger_at` and
   `max_scan_speed_mm_s`; `swath_mm: auto` reads the live active area at each firing. Unknown keys are an error and
