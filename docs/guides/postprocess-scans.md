@@ -74,7 +74,9 @@ frame: {rotation_deg: 0, origin: [330, -480, 0]}   # used when orient: frame
   Each scan is placed from where its own pass actually ran, including its
   direction, so passes needn't start in the same place. The rig's `frames`
   section is part of the settings hash, so editing it reprocesses every
-  scan. A scan without an `.npz` fails, with a message naming the missing
+  scan. Set `carried_by` for the Gocator there if it isn't mounted on the
+  gantry's Z axis; otherwise Z's position is added to every height (see
+  [frames](../subsystems/frames.md)). A scan without an `.npz` fails, with a message naming the missing
   file.
 - **`frame`** applies one rigid transform to every scan. It uses the same
   keys as `frames.experiment` (`rotation_deg` about Z, then `translation`
@@ -85,7 +87,8 @@ frame: {rotation_deg: 0, origin: [330, -480, 0]}   # used when orient: frame
 `frame` and `rig_config` can both be set. Only the one `orient` selects is
 used, so switching routes is a one-word change. On the command line,
 `--orient` overrides the file. Switching changes the coordinates, so the
-shapes have to be redrawn, and every scan is reprocessed.
+shapes have to be redrawn and `z_range` re-checked (heights can move too),
+and every scan is reprocessed.
 
 An `.npz` read under `scanner` or `frame` gives exactly the DEM its `.laz`
 would. `lasnoise` and `lasground_new` grid points from the coordinate

@@ -601,3 +601,52 @@ class TestAxisCorrespondence:
     def test_unknown_axis_name_is_an_error(self):
         with pytest.raises(ValueError, match="'X', 'Y' or 'Z'"):
             self._frames(0).gantry_axis_for("W")
+
+
+class TestCarriedBy:
+    """An instrument that isn't on an axis ignores that axis's position."""
+
+    OFF_Z = {
+        "experiment": {"translation": [500.0, 300.0, 0.0]},
+        "instruments": {"gocator": {"translation": [0.0, 0.0, -325.0], "carried_by": ["X", "Y"]}},
+    }
+
+    def test_default_is_every_axis(self):
+        """Without carried_by, all three axes move the instrument, as before."""
+        r = FrameRegistry.from_config(RIG)
+        assert r.frame_for("gocator").carried_by == ("X", "Y", "Z")
+        np.testing.assert_allclose(
+            r.to_experiment("gocator", [0, 0, 0], [10, 20, 30]), [510, 320, -295]
+        )
+
+    def test_to_experiment_and_point_for_ignore_z(self):
+        """The gantry's Z position doesn't move an instrument that isn't on Z."""
+        r = FrameRegistry.from_config(self.OFF_Z)
+        np.testing.assert_allclose(
+            r.to_experiment("gocator", [0, 0, 0], [10, 20, 30]), [510, 320, -325]
+        )
+        np.testing.assert_allclose(r.experiment_point_for("gocator", [10, 20, 30]), [510, 320, -325])
+        pts = r.to_experiment("gocator", np.zeros((2, 3)), [[1, 2, 3], [4, 5, 6]])
+        np.testing.assert_allclose(pts[:, 2], [-325, -325])
+
+    def test_orient_scan_ignores_gantry_z(self):
+        """A scan's heights don't depend on where Z happened to be."""
+        r = FrameRegistry.from_config(self.OFF_Z)
+        low = make_scan(gantry_axis="X", gantry_start_mm=700.0, gantry_start=[700.0, 0.0, 0.0])
+        high = make_scan(gantry_axis="X", gantry_start_mm=700.0, gantry_start=[700.0, 0.0, 50.0])
+        z_low = orient_scan(low, frames=r).to_points()[:, 2]
+        z_high = orient_scan(high, frames=r).to_points()[:, 2]
+        np.testing.assert_allclose(z_high, z_low)
+        np.testing.assert_allclose(z_low, 1.0 - 325.0)
+
+    def test_travel_axis_must_carry_the_sensor(self):
+        """A pass along an axis that doesn't carry the sensor is an error."""
+        r = FrameRegistry.from_config(self.OFF_Z)
+        scan = make_scan(gantry_axis="Z", gantry_start_mm=0.0, gantry_start=[0.0, 0.0, 0.0])
+        with pytest.raises(ValueError, match="carried_by"):
+            orient_scan(scan, frames=r)
+
+    def test_unknown_axis_rejected(self):
+        """carried_by only accepts X, Y and Z."""
+        with pytest.raises(ValueError):
+            InstrumentFrame.from_config("gocator", {"carried_by": ["X", "Theta"]})
