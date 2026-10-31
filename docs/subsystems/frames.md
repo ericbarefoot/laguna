@@ -61,6 +61,7 @@ frames:
   instruments:                    # measured once, when the rig is built
     gocator:
       translation: [0, 0, -325]   # translation ONLY — see the warning below
+      carried_by: [X, Y]          # not mounted on the Z axis
     od2000:
       translation: [52.0, -18.0, 0]
     wtt12l:
@@ -74,7 +75,16 @@ with no entry is assumed to measure at the gantry's commanded point.
 Per-instrument keys: `translation`, `rotation_deg`, `axes` (a sensor axis map,
 same form as `gocator.mounting`), `matrix` (an explicit 4×4), and
 `reference_point` for a sensor whose measurement point isn't at its own frame
-origin. `rotation` is applied before `translation`, so a translation always
+origin, and `carried_by`, the gantry axes that actually move the instrument
+(default `[X, Y, Z]`).
+
+`carried_by` matters when an instrument isn't on every axis, e.g. a Gocator
+bolted to the carriage beside the Z axis. Its height doesn't change when Z
+moves, so placing its readings (`to_experiment`, `experiment_point_for`,
+`orient_scan`, `orient_gocator_profile`) ignores the Z position. Otherwise
+every scan's heights would shift by wherever Z happened to be. Put the
+sensor's fixed height in its `translation` instead. `gantry_target_for` is
+unchanged: it still returns a full X/Y/Z command. `rotation` is applied before `translation`, so a translation always
 reads in the target frame — "move the origin over there".
 
 ### Rotating the experiment frame: use `origin`, not `translation`
