@@ -581,26 +581,94 @@ class FlumeLab:
         )
         self._for_each_subsystem(verb, only=lagged)
 
+    def _spin_up_halted(self) -> Optional[str]:
+        """Reason a spin-up must stop, or None; also the gate for resume()'s pre-roll."""
+        if self._spinup_abort.is_set():
+            return "a pause/stop/estop arrived during spin-up"
+        if self._safety_state.severity > SafetyState.PAUSED.severity:
+            return f"rig is {self._safety_state.name}"
+        return None
+
+    def _release_clock(self, lagged: Dict[str, float]) -> bool:
+        """Restart the clock after a spin-up unless a safety verb has landed.
+
+        The clock is restarted outside ``_state_lock`` (its resume hook
+        writes a file, and an estop must never queue behind that), so the
+        verdict is re-checked afterwards and the clock re-frozen if a verb
+        landed in between.
+
+        Returns:
+            True if the clock is running; False if the spin-up was abandoned.
+        """
+        halted = self._spin_up_halted()
+        if halted is None and self.clock.is_running and self.clock.is_paused:
+            self.clock.resume()
+            halted = self._spin_up_halted()
+            if halted is not None:
+                self.clock.pause()
+        if halted is not None:
+            self._abandon_spin_up(lagged)
+            return False
+        return True
+
+    def _resume_lagged(self, lagged: Dict[str, float]) -> bool:
+        """Bring the lagged subsystems up for resume(), then wait out the lag.
+
+        A lagged subsystem that never got its T=0 action (an aborted
+        start()) is given that action instead of resume(): it was never
+        running, so there is no setpoint for resume() to restore, and it
+        would otherwise start at whatever the drive last held.
+
+        Returns:
+            True if the lag elapsed with every subsystem up; False if it was
+            abandoned or a subsystem failed, leaving the rig PAUSED with the
+            clock frozen.
+        """
+        now = self.clock.elapsed()
+        due = self.scheduler.pending(lagged, up_to=now)
+        notes: Dict[str, str] = {}
+        failed = self._for_each_subsystem("resume", only=set(lagged) - due, notes=notes)
+        # Every resume() returns None on success and a note on a problem, so
+        # any note from a lagged subsystem counts: starting the clock with no
+        # flow is unrepeatable lost data, a retry costs a few seconds.
+        problems = [f"{n}.resume() raised" for n in failed]
+        problems += [f"{n}: {note}" for n, note in notes.items()]
+        if due and not problems:
+            problems += self.scheduler.preroll(due, up_to=now, gate=self._spin_up_halted)
+        if problems:
+            if self._spin_up_halted() is not None:
+                self._abandon_spin_up(lagged)
+                return False
+            detail = "; ".join(problems)
+            logger.error(
+                "Spin-up failed (%s); staying PAUSED with the clock frozen. Fix it and "
+                "call resume() again.", detail,
+            )
+            self.event_log.log(
+                self.clock.elapsed(), "flume_lab", "spinup_failed", result="error", notes=detail
+            )
+            self._for_each_subsystem("pause", only=lagged)
+            return False
+        return self._spin_up(lagged)
+
     def _run_scheduled(
         self, duration: float, lagged: Dict[str, float], on_complete: Optional[Any] = None
     ) -> None:
         """Body of start()'s scheduler thread: spin-up first if any, then the schedule."""
-        if lagged:
-            problems = self.scheduler.preroll(lagged)
-            if problems:
-                self.escalate("pre-roll failed before T=0: " + "; ".join(problems))
-                return
-            if not self._spin_up(lagged):
-                return
-            with self._state_lock:
-                # Nothing may restart the clock out of a stop condition.
-                halted = self._safety_state is not SafetyState.RUNNING
-                if not halted:
-                    self.clock.resume()
-            if halted:
-                self._abandon_spin_up(lagged)
-                return
-        self.scheduler.run(duration, on_complete=on_complete)
+        try:
+            if lagged:
+                problems = self.scheduler.preroll(lagged)
+                if problems:
+                    self.escalate("pre-roll failed before T=0: " + "; ".join(problems))
+                    return
+                if not self._spin_up(lagged) or not self._release_clock(lagged):
+                    return
+            self.scheduler.run(duration, on_complete=on_complete)
+        except Exception as exc:
+            # Otherwise the thread dies silently with the pump possibly on
+            # and the rig still reporting RUNNING.
+            logger.exception("Scheduler thread failed")
+            self.escalate(f"scheduler thread failed: {exc}")
 
     def print_summary(self) -> None:
         """Print a summary of the completed experiment to stdout.
@@ -746,12 +814,15 @@ class FlumeLab:
         logger.info("Resuming from pause...")
         lagged = self._lagged_subsystems()
         if lagged:
-            self._spinup_abort.clear()
-            self._for_each_subsystem("resume", only=lagged)
-            if not self._spin_up(lagged):
-                return None
-            if self._spinup_abort.is_set():
-                self._abandon_spin_up(lagged)
+            with self._state_lock:
+                # Re-checked with the abort flag cleared under one lock hold:
+                # an estop landing between the checks above and here would
+                # otherwise have its signal wiped and the pump restarted.
+                if self._safety_state.severity > SafetyState.PAUSED.severity:
+                    logger.error("Refusing to resume: the rig is %s.", self._safety_state.name)
+                    return None
+                self._spinup_abort.clear()
+            if not self._resume_lagged(lagged) or not self._release_clock(lagged):
                 return None
         if self.clock.is_running and self.clock.is_paused:
             self.clock.resume()
@@ -1043,6 +1114,7 @@ class FlumeLab:
         order: tuple = (),
         only: Optional[Collection[str]] = None,
         skip: Collection[str] = (),
+        notes: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Call `verb` on every subsystem that has it, guarded individually.
 
@@ -1056,7 +1128,9 @@ class FlumeLab:
         a loop: GocatorScanner.stop() raised when disconnected, aborting the
         loop, so every subsystem registered after it was never stopped.
 
-        `only` restricts the verb to those names; `skip` excludes some.
+        `only` restricts the verb to those names; `skip` excludes some. If
+        `notes` is given, each returned note is also stored in it by name, for
+        a caller that must treat a note as a failure (see _resume_lagged).
         """
         names = list(order) + [n for n in self._subsystems if n not in order]
         names = [n for n in names if (only is None or n in only) and n not in skip]
@@ -1085,6 +1159,8 @@ class FlumeLab:
                 )
                 continue
             if note:
+                if notes is not None:
+                    notes[name] = str(note)
                 logger.warning("%s.%s(): %s", name, verb, note)
                 self.event_log.log(
                     self.clock.elapsed(), name, verb, result="ok", notes=str(note)
@@ -1093,10 +1169,11 @@ class FlumeLab:
 
     def _escalate_state(self, state: SafetyState) -> None:
         """Move to `state` unless the rig is already in a more severe one."""
-        self._spinup_abort.set()
         with self._state_lock:
             if state.severity >= self._safety_state.severity:
                 self._safety_state = state
+        # After the update, so a spin-up woken by this reads the new state.
+        self._spinup_abort.set()
 
     def _on_safety_trigger(self, tier: SafetyTier, name: str) -> None:
         """Dispatch a monitor trip to the matching verb."""

@@ -24,6 +24,8 @@ class Probe:
         if lag is not None:
             self.resume_lag_s = lag
         self.calls = []
+        self.resume_result = None   # a note (or an exception) to return from resume()
+        self.on_resume = None       # callable run inside resume(), e.g. to land an estop
 
     def _rec(self, verb):
         self.calls.append((verb, self.lab.clock.is_paused, self.lab.safety_state))
@@ -36,6 +38,11 @@ class Probe:
 
     def resume(self):
         self._rec("resume")
+        if self.on_resume:
+            self.on_resume()
+        if isinstance(self.resume_result, Exception):
+            raise self.resume_result
+        return self.resume_result
 
     def stop(self):
         self._rec("stop")
@@ -238,22 +245,39 @@ class TestStartWithLag:
 
     def test_pause_during_the_start_lag_leaves_the_clock_at_zero_and_resume_carries_on(self):
         lab, pump, cam = _lab(lag=5)
+        in_wait = threading.Event()
+        lab.scheduler.at(0.0, in_wait.set, subsystem="flow", name="set")
         thread = lab.start(60)
-        time.sleep(0.1)
+        assert in_wait.wait(2), "the pre-roll never ran"
         lab.pause(reason="test")
         thread.join(timeout=2)
 
         assert not thread.is_alive()
         assert lab.clock.is_paused and lab.clock.elapsed() < 0.01
         assert not lab.scheduler.is_running
+        assert pump.verbs()[-1] == "pause"
 
-        lab.safety_monitor.tripped_by = lambda tier=None: None
-        lab.config.config_dict["flow"]["resume_lag_s"] = 0.05
         pump.resume_lag_s = 0.05
         resumed = lab.resume()
         assert resumed is not None and lab.scheduler.is_running
         lab.pause()
         resumed.join(timeout=2)
+
+    @pytest.mark.parametrize("verb,state", [("estop", SafetyState.ESTOPPED),
+                                            ("end_run", SafetyState.STOPPED)])
+    def test_estop_or_end_run_during_the_start_lag_keeps_the_clock_frozen(self, verb, state):
+        lab, pump, _ = _lab(lag=5)
+        in_wait = threading.Event()
+        lab.scheduler.at(0.0, in_wait.set, subsystem="flow", name="set")
+        thread = lab.start(60)
+        assert in_wait.wait(2)
+        getattr(lab, verb)(reason="test")
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert lab.safety_state is state
+        assert lab.clock.is_paused and not lab.scheduler.is_running
+        assert pump.verbs()[-1] == ("estop" if verb == "estop" else "stop")
 
     def test_a_failed_preroll_action_pauses_instead_of_starting_the_clock(self):
         lab, _, _ = _lab(lag=0.05)
@@ -295,3 +319,223 @@ class TestSchedulerPreroll:
         lab.scheduler.at(30.0, lambda: fired.append(1), subsystem="flow", name="later")
         assert lab.scheduler.preroll({"flow"}) == []
         assert fired == []
+
+
+class TestResumeIsNotRacedByASafetyVerb:
+    """A verb landing at any point in resume() must leave the clock frozen."""
+
+    def test_an_estop_between_the_trigger_check_and_the_lagged_resume(self):
+        lab, pump, cam = _lab(lag=0.2)
+        lab.clock.start()
+        lab.pause()
+        pump.calls.clear(), cam.calls.clear()
+
+        def estop_after_check(tier=None):
+            lab.estop(reason="test")
+            return None
+
+        lab.safety_monitor.tripped_by = estop_after_check
+        assert lab.resume() is None
+
+        assert "resume" not in pump.verbs(), "the pump was restarted under an estop"
+        assert "resume" not in cam.verbs()
+        assert lab.safety_state is SafetyState.ESTOPPED and lab.clock.is_paused
+
+    @pytest.mark.parametrize("verb,state", [("pause", SafetyState.PAUSED),
+                                            ("estop", SafetyState.ESTOPPED)])
+    def test_a_verb_landing_after_the_wait_but_before_the_clock_restarts(self, verb, state):
+        lab, pump, cam = _lab(lag=0.05)
+        lab.clock.start()
+        lab.pause()
+        cam.calls.clear()
+        real = lab._spin_up
+
+        def spin_up_then_verb(lagged):
+            ok = real(lagged)
+            getattr(lab, verb)(reason="test")
+            return ok
+
+        lab._spin_up = spin_up_then_verb
+        assert lab.resume() is None
+
+        assert lab.clock.is_paused and lab.safety_state is state
+        assert "resume" not in cam.verbs()
+
+    def test_an_estop_landing_during_the_lagged_resume_itself(self):
+        lab, pump, cam = _lab(lag=5)
+        lab.clock.start()
+        lab.pause()
+        cam.calls.clear()
+        pump.on_resume = lambda: lab.estop(reason="test")
+
+        t0 = time.monotonic()
+        assert lab.resume() is None
+
+        assert time.monotonic() - t0 < 2, "the estop's abort signal was lost"
+        assert lab.clock.is_paused and lab.safety_state is SafetyState.ESTOPPED
+        assert "resume" not in cam.verbs()
+
+    def test_end_run_during_the_lag(self):
+        lab, pump, cam = _lab(lag=5)
+        lab.clock.start()
+        lab.pause()
+        pump.calls.clear(), cam.calls.clear()
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("r", lab.resume()), daemon=True)
+        t.start()
+        deadline = time.monotonic() + 2
+        while "resume" not in pump.verbs() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        lab.end_run(reason="test")
+        t.join(timeout=2)
+
+        assert not t.is_alive() and out["r"] is None
+        assert lab.safety_state is SafetyState.STOPPED and lab.clock.is_paused
+        assert pump.verbs()[-1] == "stop" and "resume" not in cam.verbs()
+
+
+class TestFailedLaggedResume:
+    @pytest.mark.parametrize("failure", [
+        "pump did not restart: no ack",
+        RuntimeError("confluence unreachable"),
+    ])
+    def test_a_failed_lagged_resume_does_not_start_the_clock(self, failure):
+        lab, pump, cam = _lab(lag=0.05)
+        lab.clock.start()
+        lab.pause()
+        pump.calls.clear(), cam.calls.clear()
+        pump.resume_result = failure
+        before = len(open(lab.event_log._path).read())
+
+        assert lab.resume() is None
+
+        assert lab.safety_state is SafetyState.PAUSED
+        assert lab.clock.is_paused, "the clock started with no flow"
+        assert "resume" not in cam.verbs()
+        assert pump.verbs()[-1] == "pause", "a half-started pump was left running"
+        rows = open(lab.event_log._path).read()[before:]
+        assert "spinup_failed" in rows and "spinup_wait" not in rows
+
+    def test_it_fails_fast_rather_than_waiting_out_the_lag(self):
+        lab, pump, _ = _lab(lag=5)
+        lab.clock.start()
+        lab.pause()
+        pump.resume_result = "pump did not restart"
+        t0 = time.monotonic()
+        lab.resume()
+        assert time.monotonic() - t0 < 2
+
+    def test_resume_works_again_once_the_subsystem_recovers(self):
+        lab, pump, cam = _lab(lag=0.05)
+        lab.clock.start()
+        lab.pause()
+        pump.resume_result = "pump did not restart"
+        assert lab.resume() is None and lab.clock.is_paused
+        pump.resume_result = None
+        lab.resume()
+        assert not lab.clock.is_paused and lab.safety_state is SafetyState.RUNNING
+
+
+class TestResumeAfterAnAbortedStart:
+    def _aborted_start(self, lab):
+        """start() while PAUSED: the gate refuses the pre-roll, as an early pause would."""
+        lab.pause(reason="before start")
+        thread = lab.start(60)
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    def test_resume_fires_the_pending_t0_action_before_the_clock_and_instead_of_resume(self):
+        lab, pump, _ = _lab(lag=0.05)
+        seen = []
+        lab.scheduler.at(0.0, lambda: seen.append(lab.clock.is_paused),
+                         subsystem="flow", name="set")
+        self._aborted_start(lab)
+        assert seen == [], "the gate should have refused the pre-roll"
+        pump.calls.clear()
+
+        resumed = lab.resume()
+
+        assert seen == [True], "T=0 action must fire once, with the clock still frozen"
+        assert "resume" not in pump.verbs(), "resume() would restart at a stale setpoint"
+        assert resumed is not None and lab.scheduler.is_running
+        time.sleep(0.2)
+        assert seen == [True], "the T=0 action fired a second time"
+        lab.pause()
+        resumed.join(timeout=2)
+
+    def test_a_failed_t0_action_is_retried_not_dropped(self):
+        lab, pump, _ = _lab(lag=0.05)
+        attempts = []
+
+        def flaky():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("no ack")
+
+        lab.scheduler.at(0.0, flaky, subsystem="flow", name="set")
+        thread = lab.start(60)
+        thread.join(timeout=2)
+        assert lab.safety_state is SafetyState.PAUSED and len(attempts) == 1
+
+        resumed = lab.resume()
+
+        assert len(attempts) == 2 and not lab.clock.is_paused
+        assert resumed is not None
+        lab.pause()
+        resumed.join(timeout=2)
+
+    def test_a_t0_action_that_fails_on_resume_keeps_the_rig_paused(self):
+        lab, pump, cam = _lab(lag=0.05)
+
+        def always_fails():
+            raise RuntimeError("no ack")
+
+        lab.scheduler.at(0.0, always_fails, subsystem="flow", name="set")
+        lab.start(60).join(timeout=2)
+        cam.calls.clear()
+
+        assert lab.resume() is None
+        assert lab.clock.is_paused and lab.safety_state is SafetyState.PAUSED
+        assert "resume" not in cam.verbs()
+
+
+class TestSchedulerThreadFailure:
+    def test_an_exception_on_the_scheduler_thread_pauses_the_rig(self):
+        lab, _, _ = _lab(lag=0.05)
+
+        def boom(*a, **k):
+            raise RuntimeError("scheduler blew up")
+
+        lab.scheduler.run = boom
+        thread = lab.start(60)
+        thread.join(timeout=2)
+        assert lab.safety_state is SafetyState.PAUSED
+
+
+class TestSchedulerPendingAndGate:
+    def test_pending_names_only_unfired_due_entries_of_the_given_subsystems(self):
+        lab = FlumeLab()
+        lab.scheduler.at(0.0, lambda: None, subsystem="flow", name="a")
+        lab.scheduler.at(0.0, lambda: None, subsystem="camera", name="b")
+        lab.scheduler.at(30.0, lambda: None, subsystem="weir", name="c")
+        assert lab.scheduler.pending({"flow", "weir"}, up_to=0.0) == {"flow"}
+        lab.scheduler.preroll({"flow"})
+        assert lab.scheduler.pending({"flow", "weir"}, up_to=0.0) == set()
+
+    def test_a_failed_action_stays_pending(self):
+        lab = FlumeLab()
+
+        def boom():
+            raise RuntimeError("x")
+
+        lab.scheduler.at(0.0, boom, subsystem="flow", name="a")
+        assert lab.scheduler.preroll({"flow"})
+        assert lab.scheduler.pending({"flow"}) == {"flow"}
+
+    def test_a_gate_override_replaces_the_default_gate(self):
+        lab = FlumeLab()
+        lab.pause()                       # the default gate refuses while PAUSED
+        fired = []
+        lab.scheduler.at(0.0, lambda: fired.append(1), subsystem="flow", name="a")
+        assert lab.scheduler.preroll({"flow"}, gate=lambda: None) == []
+        assert fired == [1]

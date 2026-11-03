@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from typing import Any, Callable, Collection, List, Optional
+from typing import Any, Callable, Collection, List, Optional, Set
 
 from .clock import ExperimentClock
 from .event_log import EventLog
@@ -234,7 +234,19 @@ class Scheduler:
             time.sleep(poll)
         return False
 
-    def preroll(self, subsystems: Collection[str], up_to: float = 0.0) -> List[str]:
+    def pending(self, subsystems: Collection[str], up_to: float = 0.0) -> Set[str]:
+        """Names in `subsystems` with a one-shot due at or before `up_to` that has not fired."""
+        return {
+            e["subsystem"] for e in self._oneshot
+            if not e["_fired"] and e["subsystem"] in subsystems and e["runtime_s"] <= up_to
+        }
+
+    def preroll(
+        self,
+        subsystems: Collection[str],
+        up_to: float = 0.0,
+        gate: Optional[Callable[[], Optional[str]]] = None,
+    ) -> List[str]:
         """Fire the one-shot actions `subsystems` have due at T=0, before the clock runs.
 
         Lets a slow-to-settle subsystem (a pump) be commanded *ahead* of
@@ -249,10 +261,14 @@ class Scheduler:
             subsystems: Only one-shot entries registered for these subsystem
                 names are fired.
             up_to: Fire entries scheduled at or before this runtime.
+            gate: Veto check used instead of ``self.gate`` (which refuses
+                everything unless the rig is RUNNING, as it isn't during
+                ``resume()``). Returns a reason to skip, or None.
 
         Returns:
             One description per action that was skipped or raised; empty if
-            every action ran. An entry that did not run is left unfired.
+            every action ran. An entry that did not complete is left
+            unfired, so a later resume() retries it rather than losing it.
         """
         problems: List[str] = []
         now = self._clock.elapsed()
@@ -263,17 +279,18 @@ class Scheduler:
                 continue
             label = f"{entry['subsystem']}/{entry['name']}"
             reason = None
-            if self.gate is not None:
+            check = gate if gate is not None else self.gate
+            if check is not None:
                 try:
-                    reason = self.gate()
+                    reason = check()
                 except Exception as exc:  # fail closed
                     reason = f"gate check failed: {exc}"
             if reason is not None:
                 problems.append(f"{label} skipped: {reason}")
                 continue
-            entry["_fired"] = True
             try:
                 entry["action"]()
+                entry["_fired"] = True
             except Exception as exc:
                 logger.warning("Pre-roll action %s failed: %s", label, exc)
                 problems.append(f"{label} failed: {exc}")

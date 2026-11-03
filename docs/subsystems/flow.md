@@ -184,10 +184,16 @@ instant they are resumed. Set `resume_lag_s` (wall seconds, default 0) on
   case it landed before their `resume()` had finished. `lab.resume()` then
   tries again from the start of the lag.
 
-The wait is logged as `spinup_wait` (and `spinup_aborted` if cut short) in the
-event log. A subsystem's `resume()` that returns a note instead of raising
-(for example "pump did not restart") is logged but does not stop the lag, so
-check the log for such notes before trusting the flow.
+The wait is logged as `spinup_wait` (and `spinup_aborted` if cut short).
+
+If a lagged subsystem's `resume()` raises or returns a note (for example
+"pump did not restart"), the resume fails: the lab skips the wait, re-pauses
+the lagged subsystems, stays `PAUSED` with the clock frozen, and logs
+`spinup_failed`. Fix the cause and call `lab.resume()` again. If the start was
+aborted before a lagged subsystem's T=0 action ran, `lab.resume()` runs that
+action (still with the clock frozen) instead of calling the subsystem's
+`resume()`, which would have no setpoint to restore. A T=0 action that fails
+is retried on the next `resume()`, not dropped.
 
 ## Scheduling it via `setup_run()`
 
