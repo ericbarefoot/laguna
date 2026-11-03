@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from typing import Callable, List, Optional, Any
+from typing import Any, Callable, Collection, List, Optional
 
 from .clock import ExperimentClock
 from .event_log import EventLog
@@ -233,6 +233,53 @@ class Scheduler:
                 return not stop_event.is_set()
             time.sleep(poll)
         return False
+
+    def preroll(self, subsystems: Collection[str], up_to: float = 0.0) -> List[str]:
+        """Fire the one-shot actions `subsystems` have due at T=0, before the clock runs.
+
+        Lets a slow-to-settle subsystem (a pump) be commanded *ahead* of
+        T=0, so its spin-up lag elapses on the wall clock while runtime is
+        still frozen. Runs on the caller's thread, one action at a time,
+        because the caller must know whether the command went out before
+        it starts counting the lag — run() dispatches on daemon threads and
+        can't tell it. Each action goes through ``gate`` like any other
+        firing, and is marked fired so run() doesn't repeat it.
+
+        Args:
+            subsystems: Only one-shot entries registered for these subsystem
+                names are fired.
+            up_to: Fire entries scheduled at or before this runtime.
+
+        Returns:
+            One description per action that was skipped or raised; empty if
+            every action ran. An entry that did not run is left unfired.
+        """
+        problems: List[str] = []
+        now = self._clock.elapsed()
+        for entry in self._oneshot:
+            if entry["_fired"] or entry["subsystem"] not in subsystems:
+                continue
+            if entry["runtime_s"] > up_to:
+                continue
+            label = f"{entry['subsystem']}/{entry['name']}"
+            reason = None
+            if self.gate is not None:
+                try:
+                    reason = self.gate()
+                except Exception as exc:  # fail closed
+                    reason = f"gate check failed: {exc}"
+            if reason is not None:
+                problems.append(f"{label} skipped: {reason}")
+                continue
+            entry["_fired"] = True
+            try:
+                entry["action"]()
+            except Exception as exc:
+                logger.warning("Pre-roll action %s failed: %s", label, exc)
+                problems.append(f"{label} failed: {exc}")
+                if self._event_log:
+                    self._event_log.log(now, entry["subsystem"], entry["name"], f"error: {exc}")
+        return problems
 
     def stop(self) -> None:
         """Interrupt run() and pause the experiment clock.

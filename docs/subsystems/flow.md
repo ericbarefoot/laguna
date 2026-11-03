@@ -143,6 +143,7 @@ flow:
   C1: 58.49
   C2: 0.08956
   # command_timeout_s: 5.0    # seconds to wait for a confluence reply before failing
+  # resume_lag_s: 10          # pump spin-up time — see "Spin-up lag" below
   # A topic_* key overrides the mqtt.node_name-derived default for a single
   # subsystem if ever needed, e.g.:
   # vfd_topic_status: "SAFL Confluence Node 1/Fuji_Frenic_VFD"
@@ -161,6 +162,32 @@ The `flow:` section is commented out by default in
 if you don't have a pump/VFD attached. Build with
 `SaflFlowController.from_config(config)`, not the constructor directly, so
 the topic defaults get derived from `mqtt.node_name`.
+
+## Spin-up lag: `resume_lag_s`
+
+A pump takes time to reach full flow, but gauges and cameras are ready the
+instant they are resumed. Set `resume_lag_s` (wall seconds, default 0) on
+`flow:` — or on any other subsystem's config section, or as a
+`resume_lag_s` attribute on the object — and the experiment clock waits for it:
+
+- **`lab.resume()`** resumes every lagged subsystem first, with the clock
+  still frozen and the rig still `PAUSED`, then blocks for the longest lag.
+  Only then does the clock restart and everything else resume. The lag is not
+  counted as experiment time. With no lag set, the order is unchanged.
+- **`lab.start()`** starts the clock frozen at T=0. Before releasing it, the
+  scheduler fires the lagged subsystems' own T=0 actions (for `flow`, the
+  `use_schedule` setpoint row at `time_s == 0`), waits the lag, then starts
+  runtime. A lag on a subsystem that has no T=0 action simply delays T=0. If
+  one of those actions fails, the lab pauses with the clock still at 0.
+- A pause, stop or estop during the lag ends the wait immediately and leaves
+  the clock frozen. The lagged subsystems are sent the matching verb again, in
+  case it landed before their `resume()` had finished. `lab.resume()` then
+  tries again from the start of the lag.
+
+The wait is logged as `spinup_wait` (and `spinup_aborted` if cut short) in the
+event log. A subsystem's `resume()` that returns a note instead of raising
+(for example "pump did not restart") is logged but does not stop the lag, so
+check the log for such notes before trusting the flow.
 
 ## Scheduling it via `setup_run()`
 

@@ -10,6 +10,15 @@ them into a dated release section when you cut a version.
 
 ## [Unreleased]
 
+### Added
+- **`resume_lag_s`: per-subsystem spin-up before the experiment clock runs.** Set it in any subsystem's config
+  section (e.g. `flow: {resume_lag_s: 10}`) or as an attribute on the object. `lab.resume()` now resumes lagged
+  subsystems first with the clock frozen and the rig `PAUSED`, blocks for the longest lag, then restarts the
+  clock and resumes the rest. `lab.start()` does the same at T=0: the clock starts frozen, the lagged
+  subsystems' T=0 scheduled actions fire first (`Scheduler.preroll()`), then runtime starts after the lag. A
+  pause/stop/estop during the lag abandons it with the clock frozen and re-sends the verb to the lagged
+  subsystems. With no lag configured, behaviour is unchanged. See `docs/subsystems/flow.md`.
+
 ### Changed
 - **Local files are no longer tracked.** `/data/` (everything under the top-level `data/`), `/sandbox/` and
   `/config/` (except `config/example_config.yaml`) are ignored, and `config/config_scan.yaml`,
