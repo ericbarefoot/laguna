@@ -186,6 +186,25 @@ instant they are resumed. Set `resume_lag_s` (wall seconds, default 0) on
 
 The wait is logged as `spinup_wait` (and `spinup_aborted` if cut short).
 
+Other behaviour worth knowing:
+
+- **Ctrl-C during the lag** (or any exception out of `resume()`) re-pauses the
+  lagged subsystems before it propagates, so the pump is never left running
+  under a rig that reports `PAUSED`. The clock stays frozen.
+- **Safety monitor.** `resume()` rearms the monitor *before* the lag, so a
+  trigger that trips again while the pump spins up pauses the rig at once. The
+  monitor latches a tier after it fires, which is why this matters after a
+  monitor-driven pause.
+- **Pre-roll blocks.** The T=0 action is fired on the calling thread (so the
+  command is known to have gone out). A slow or hung action holds `start()`'s
+  scheduler thread, or `resume()`, for up to the VFD command timeout (5 s by
+  default). A pause and `resume()` during `start()`'s pre-roll waits for that
+  action instead of firing it a second time, and `start()`'s own spin-up
+  steps aside for the `resume()`.
+- **Meant for pumps.** `resume_lag_s` on a motion subsystem would run its
+  scheduled T=0 actions from `lab.resume()`. That is still a human-called
+  verb, but put the lag on `flow`, not the gantry.
+
 If a lagged subsystem's `resume()` raises or returns a note (for example
 "pump did not restart"), the resume fails: the lab skips the wait, re-pauses
 the lagged subsystems, stays `PAUSED` with the clock frozen, and logs

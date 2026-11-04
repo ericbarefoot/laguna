@@ -40,7 +40,7 @@ class Probe:
         self._rec("resume")
         if self.on_resume:
             self.on_resume()
-        if isinstance(self.resume_result, Exception):
+        if isinstance(self.resume_result, BaseException):
             raise self.resume_result
         return self.resume_result
 
@@ -539,3 +539,118 @@ class TestSchedulerPendingAndGate:
         lab.scheduler.at(0.0, lambda: fired.append(1), subsystem="flow", name="a")
         assert lab.scheduler.preroll({"flow"}, gate=lambda: None) == []
         assert fired == [1]
+
+
+class TestInterruptedSpinUp:
+    """A BaseException (Ctrl-C) during the lag must not leave the pump running."""
+
+    def test_keyboard_interrupt_during_the_wait_repauses_the_pump(self, monkeypatch):
+        lab, pump, cam = _lab(lag=5)
+        lab.clock.start()
+        lab.pause()
+        pump.calls.clear(), cam.calls.clear()
+
+        def interrupted(timeout=None):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(lab._spinup_abort, "wait", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            lab.resume()
+
+        assert pump.verbs() == ["resume", "pause"]
+        assert "resume" not in cam.verbs()
+        assert lab.safety_state is SafetyState.PAUSED and lab.clock.is_paused
+
+    def test_keyboard_interrupt_inside_a_subsystem_resume(self):
+        lab, pump, cam = _lab(lag=5)
+        lab.clock.start()
+        lab.pause()
+        pump.calls.clear()
+        pump.resume_result = KeyboardInterrupt()
+        with pytest.raises(KeyboardInterrupt):
+            lab.resume()
+        assert pump.verbs()[-1] == "pause"
+        assert lab.clock.is_paused
+
+
+class TestMonitorDuringTheLag:
+    def test_a_pause_trigger_that_fires_again_during_the_lag_is_seen(self):
+        from laguna.safety import CallableTrigger, SafetyTier
+
+        lab, pump, cam = _lab(lag=3)
+        flag = {"on": False}
+        lab.safety_monitor._poll_s = 0.02
+        lab.safety_monitor.add(CallableTrigger(lambda: flag["on"], tier=SafetyTier.PAUSE, name="level"))
+        lab.clock.start()
+        lab.safety_monitor.start()
+        try:
+            # First trip: the monitor pauses the rig and latches PAUSE as fired.
+            flag["on"] = True
+            deadline = time.time() + 2
+            while lab.safety_state is not SafetyState.PAUSED and time.time() < deadline:
+                time.sleep(0.01)
+            assert lab.safety_state is SafetyState.PAUSED
+            flag["on"] = False
+            time.sleep(0.1)
+            pump.calls.clear()
+
+            result = {}
+            t = threading.Thread(target=lambda: result.setdefault("r", lab.resume()))
+            t.start()
+            time.sleep(0.4)  # well inside the 3 s lag
+            flag["on"] = True
+            t.join(timeout=2)
+
+            assert not t.is_alive(), "the monitor trip during the lag was ignored"
+            assert result["r"] is None
+            assert pump.verbs()[-1] == "pause"
+            assert lab.safety_state is SafetyState.PAUSED and lab.clock.is_paused
+        finally:
+            lab.safety_monitor.stop()
+
+
+class TestPauseResumeDuringStartPreroll:
+    def test_the_t0_action_fires_once_and_one_spin_up_runs(self):
+        lab, pump, cam = _lab(lag=0.6)
+        fired = []
+
+        def slow():
+            fired.append(time.time())
+            time.sleep(0.5)
+
+        lab.scheduler.at(0.0, slow, subsystem="flow", name="setpoint")
+        before = len([r for r in _event_rows(lab) if "spinup_wait" in r])
+        thread = lab.start(60)
+        time.sleep(0.15)          # inside the slow T=0 action
+        lab.pause()
+        lab.resume()
+        assert len(fired) == 1, "the T=0 action ran twice"
+        waits = [r for r in _event_rows(lab) if "spinup_wait" in r]
+        assert len(waits) - before == 1
+        assert lab.safety_state is SafetyState.RUNNING and not lab.clock.is_paused
+        lab.pause()
+        thread.join(timeout=3)
+
+
+def _event_rows(lab):
+    return [line for line in open(lab.event_log._path).read().splitlines()]
+
+
+class TestSimulatedRehearsal:
+    def test_estop_mid_lag_in_a_simulated_lab(self, tmp_path):
+        lab = FlumeLab(simulate=True)
+        pump = Probe(lab, "flow", lag=2)
+        lab.add(pump)
+        lab.clock.start()
+        lab.pause()
+        pump.calls.clear()
+
+        t = threading.Thread(target=lab.resume)
+        t.start()
+        time.sleep(0.3)
+        lab.estop(reason="rehearsal")
+        t.join(timeout=3)
+
+        assert not t.is_alive()
+        assert lab.safety_state is SafetyState.ESTOPPED and lab.clock.is_paused
+        assert pump.verbs()[0] == "resume" and "estop" in pump.verbs()

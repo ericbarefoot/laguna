@@ -43,6 +43,9 @@ class Scheduler:
         self._event_log = event_log
         self._recurring: List[dict] = []
         self._oneshot: List[dict] = []
+        # Serialises preroll(): start()'s thread and a resume() during its
+        # pre-roll would otherwise both fire the same T=0 action.
+        self._preroll_lock = threading.Lock()
         # One Event per run() call, not one shared Event that run() clears:
         # with a shared one, a quick pause-then-resume cleared it before the
         # old loop's next poll saw it set, and two loops ran at once,
@@ -257,6 +260,11 @@ class Scheduler:
         can't tell it. Each action goes through ``gate`` like any other
         firing, and is marked fired so run() doesn't repeat it.
 
+        A slow or hung action blocks the caller (and so start()'s scheduler
+        thread, or resume()) for as long as the action takes, up to the VFD
+        command timeout (5 s by default). Concurrent callers are serialised,
+        so an action never fires twice; the second waits and then sees it fired.
+
         Args:
             subsystems: Only one-shot entries registered for these subsystem
                 names are fired.
@@ -270,6 +278,15 @@ class Scheduler:
             every action ran. An entry that did not complete is left
             unfired, so a later resume() retries it rather than losing it.
         """
+        with self._preroll_lock:
+            return self._preroll_locked(subsystems, up_to, gate)
+
+    def _preroll_locked(
+        self,
+        subsystems: Collection[str],
+        up_to: float,
+        gate: Optional[Callable[[], Optional[str]]],
+    ) -> List[str]:
         problems: List[str] = []
         now = self._clock.elapsed()
         for entry in self._oneshot:

@@ -219,6 +219,11 @@ class FlumeLab:
         # A spin-up wait (see _spin_up) sleeps on it, so a verb called during
         # the lag ends the wait at once instead of after the full lag.
         self._spinup_abort = threading.Event()
+        # Bumped by every safety verb alongside the event. start()'s spin-up
+        # thread compares it with the value it began under: a pause + resume()
+        # during its pre-roll clears the event, so the event alone would let
+        # that thread wait out a second lag and release the clock beside resume().
+        self._spinup_gen = 0
         #: The CheckpointStore for the current experiment() block — mark
         #: completed events with ``lab.checkpoint.mark_complete(...)``.
         self.checkpoint: Optional[CheckpointStore] = None
@@ -488,6 +493,7 @@ class FlumeLab:
         self._duration = duration
         self._start_wall = time.time()
         self._spinup_abort.clear()
+        gen = self._spinup_gen
         self.clock.start()
         self.run.started()
         if lagged:
@@ -497,7 +503,7 @@ class FlumeLab:
         )
         thread = threading.Thread(
             target=self._run_scheduled,
-            args=(duration, lagged),
+            args=(duration, lagged, gen),
             kwargs={"on_complete": self.print_summary},
             daemon=True,
             name="scheduler-main",
@@ -652,16 +658,31 @@ class FlumeLab:
         return self._spin_up(lagged)
 
     def _run_scheduled(
-        self, duration: float, lagged: Dict[str, float], on_complete: Optional[Any] = None
+        self,
+        duration: float,
+        lagged: Dict[str, float],
+        gen: int = 0,
+        on_complete: Optional[Any] = None,
     ) -> None:
-        """Body of start()'s scheduler thread: spin-up first if any, then the schedule."""
+        """Body of start()'s scheduler thread: spin-up first if any, then the schedule.
+
+        `gen` is ``_spinup_gen`` as start() saw it. If a safety verb has landed
+        since, whoever called it owns the way forward (resume() runs its own
+        spin-up), so this thread returns rather than race it.
+        """
         try:
             if lagged:
                 problems = self.scheduler.preroll(lagged)
+                if self._spinup_gen != gen:
+                    return
                 if problems:
                     self.escalate("pre-roll failed before T=0: " + "; ".join(problems))
                     return
-                if not self._spin_up(lagged) or not self._release_clock(lagged):
+                if not self._spin_up(lagged):
+                    return
+                if self._spinup_gen != gen:
+                    return
+                if not self._release_clock(lagged):
                     return
             self.scheduler.run(duration, on_complete=on_complete)
         except Exception as exc:
@@ -822,8 +843,25 @@ class FlumeLab:
                     logger.error("Refusing to resume: the rig is %s.", self._safety_state.name)
                     return None
                 self._spinup_abort.clear()
-            if not self._resume_lagged(lagged) or not self._release_clock(lagged):
-                return None
+            # The lagged subsystems are running from here on while the rig reports
+            # PAUSED. Ctrl-C (KeyboardInterrupt) or any other BaseException must not
+            # leave it that way, so quiesce them again before it propagates.
+            # The monitor is rearmed first: it latches a fired tier until rearm(),
+            # so after a monitor-driven pause a repeat trip during the lag would be ignored.
+            try:
+                self.safety_monitor.rearm()
+                if not self._resume_lagged(lagged) or not self._release_clock(lagged):
+                    return None
+            except BaseException:
+                logger.critical("resume() interrupted during spin-up; re-pausing %s.", ", ".join(sorted(lagged)))
+                self._for_each_subsystem("pause", only=lagged)
+                self.event_log.log(
+                    self.clock.elapsed(), "flume_lab", "spinup_aborted",
+                    notes="resume() interrupted (exception); lagged subsystems re-paused",
+                )
+                if self.clock.is_running and not self.clock.is_paused:
+                    self.clock.pause()
+                raise
         if self.clock.is_running and self.clock.is_paused:
             self.clock.resume()
         self._for_each_subsystem("resume", skip=lagged)
@@ -1172,7 +1210,10 @@ class FlumeLab:
         with self._state_lock:
             if state.severity >= self._safety_state.severity:
                 self._safety_state = state
-        # After the update, so a spin-up woken by this reads the new state.
+        # After the update, so a spin-up woken by this reads the new state. Set
+        # on every escalation, even a long-after PAUSED -> STOPPED: start() and
+        # resume() clear it, so a stale flag can't outlive the run it belongs to.
+        self._spinup_gen += 1
         self._spinup_abort.set()
 
     def _on_safety_trigger(self, tier: SafetyTier, name: str) -> None:
