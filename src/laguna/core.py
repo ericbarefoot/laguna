@@ -499,7 +499,14 @@ class FlumeLab:
         The summary prints regardless of whether end_run() succeeds.
         """
         try:
-            self.end_run(reason="duration elapsed")
+            try:
+                self.end_run(reason="duration elapsed")
+            except BaseException:
+                # Nobody is watching the scheduler thread: if the orderly stop
+                # failed, make the rig safe the hard way rather than leave the
+                # pump running with the schedule over.
+                logger.exception("end_run() failed at end of run; escalating to estop")
+                self.estop(reason="end_run failed at end of run")
         finally:
             self.print_summary()
 
@@ -552,7 +559,7 @@ class FlumeLab:
             SafetyState.PAUSED: "Run Paused",
             SafetyState.STOPPED: "Run Ended",
             SafetyState.ESTOPPED: "Run E-Stopped",
-        }[self._safety_state]
+        }.get(self._safety_state, f"Run {self._safety_state.name.title()}")
         if self._start_wall is None:
             title = "No Run Started"
         of_total = f" of {self._duration:.0f} s" if self._duration else ""

@@ -69,3 +69,47 @@ def test_completion_ends_the_run(lab, capsys):
     lab._on_run_complete()
     assert lab.safety_state is SafetyState.STOPPED
     assert "Run Ended" in capsys.readouterr().out
+
+
+def test_completion_through_a_real_scheduler_ends_the_run(lab, capsys):
+    thread = lab.start(0.3)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert lab.safety_state is SafetyState.STOPPED
+    assert "Run Ended" in capsys.readouterr().out
+
+
+def test_resumed_run_ends_itself_too(lab, capsys):
+    thread = lab.start(1.0)
+    time.sleep(0.2)
+    lab.pause()
+    thread.join(timeout=5)
+    capsys.readouterr()
+    resumed = lab.resume()
+    assert resumed is not None
+    resumed.join(timeout=10)
+    assert not resumed.is_alive()
+    assert lab.safety_state is SafetyState.STOPPED
+    assert "Run Ended" in capsys.readouterr().out
+
+
+def test_failed_end_run_escalates_to_estop_and_still_prints(lab, capsys, monkeypatch):
+    lab._start_wall = time.time()
+
+    def boom(reason="manual"):
+        raise RuntimeError("stop blew up")
+
+    monkeypatch.setattr(lab, "end_run", boom)
+    lab._on_run_complete()  # must not raise out of the scheduler thread
+    assert lab.safety_state is SafetyState.ESTOPPED
+    assert "Run E-Stopped" in capsys.readouterr().out
+
+
+def test_summary_survives_an_unknown_safety_state(lab, capsys):
+    class _Odd:
+        name = "ODD"
+        severity = 99
+
+    lab._start_wall = time.time()
+    lab._safety_state = _Odd()
+    assert "Run Odd" in _summary(lab, capsys)

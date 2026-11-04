@@ -222,6 +222,7 @@ class TestSaflFlowControllerConnected:
         controller, mqtt = _make_flow()
         controller.connect()
         _accept_all_vfd_replies(mqtt, ok=True)
+        _accept_all_valve_replies(mqtt, ok=True)
         assert controller.start() is True
         assert controller.stop() is None
         commands = [payload["command"] for topic, payload in mqtt.published if topic == "node/vfd/commands"]
@@ -253,9 +254,37 @@ class TestSaflFlowControllerConnected:
         controller.qin = True
         controller.qaux = True
         _accept_all_vfd_replies(mqtt, ok=True)
-        _accept_all_valve_replies(mqtt, ok=False)
+        mqtt.auto_reply_on(
+            "node/valve/commands",
+            "node/valve/replies",
+            lambda payload: {
+                "request_id": payload["request_id"],
+                "ok": payload["args"]["channel"] != 0,  # reject qin only
+            },
+        )
         note = controller.stop()
-        assert "qin" in note and "qaux" in note
+        assert "qin" in note and "qaux" not in note
+        assert controller.qaux is False
+        valve_channels = [
+            payload["args"]["channel"]
+            for topic, payload in mqtt.published
+            if topic == "node/valve/commands" and not payload["args"]["state"]
+        ]
+        assert 1 in valve_channels
+
+    def test_stop_closes_valves_even_if_cache_says_closed(self):
+        # Fresh controller / reconnect: cache reads closed, valve may not be.
+        controller, mqtt = _make_flow()
+        controller.connect()
+        _accept_all_vfd_replies(mqtt, ok=True)
+        _accept_all_valve_replies(mqtt, ok=True)
+        assert controller.qin is False and controller.qaux is False
+        assert controller.stop() is None
+        closes = [
+            payload for topic, payload in mqtt.published
+            if topic == "node/valve/commands" and payload["args"]["state"] is False
+        ]
+        assert len(closes) == 2
 
     def test_qin_and_qaux_publish_to_the_valve_channel_and_log(self):
         controller, mqtt = _make_flow()
@@ -441,7 +470,8 @@ class TestSaflFlowControllerSimulated:
         assert controller.stop() is None
 
         actions = [row[2] for row in event_log.rows]
-        assert actions == ["set_flowrate", "start", "stop"]
+        # stop() closes both valves after the pump, and each close is logged.
+        assert actions == ["set_flowrate", "start", "stop", "qin", "qaux"]
 
     def test_get_flowrate_echoes_the_commanded_setpoint_not_nan(self):
         controller, _ = _make_flow(simulated=True)
