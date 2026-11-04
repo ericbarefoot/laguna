@@ -8,6 +8,7 @@ so this is the normal case, not a corner case.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -87,12 +88,57 @@ class TestGocatorRunDirectoryRouting:
 
     def test_unset_output_dir_goes_under_run_directory(self, tmp_path):
         lab = self._lab(tmp_path, {})
-        assert lab.gocator._output_dir == lab.run.directory / "SCAN"
+        assert lab.gocator._output_dir == lab.run.directory / "gocator"
 
     def test_explicit_output_dir_is_kept(self, tmp_path):
         mine = tmp_path / "separate_drive"
         lab = self._lab(tmp_path, {"output_dir": str(mine)})
         assert lab.gocator._output_dir == mine
+
+
+class TestCameraRunDirectoryRouting:
+    """DSLR and Pi frames follow the run directory unless output_dir is set."""
+
+    def _lab(self, tmp_path, body, run_dir=True):
+        import yaml
+
+        from laguna.experiment.runner import setup_run
+
+        if run_dir:
+            body.setdefault("timing", {"run_dir": str(tmp_path / "runs")})
+        path = tmp_path / "cfg.yaml"
+        path.write_text(yaml.safe_dump(body))
+        return setup_run(str(path), simulate=True)
+
+    def test_dslr_frames_land_under_the_run_directory(self, tmp_path):
+        hangang = tmp_path / "hangang-drive"
+        lab = self._lab(tmp_path, {
+            "dslr_cameras": {"cameras": {
+                "Nakdong": {},
+                "Hangang": {"output_dir": str(hangang)},
+            }},
+        })
+        assert lab.dslr_cameras.output_dirs["Nakdong"] == (
+            lab.run.directory / "dslr_cameras" / "Nakdong"
+        )
+        assert lab.dslr_cameras.output_dirs["Hangang"] == hangang
+        assert not (lab.run.directory / "dslr_cameras" / "Hangang").exists()
+
+    def test_pi_frames_land_under_the_run_directory(self, tmp_path):
+        lab = self._lab(tmp_path, {"pi_cameras": {"hosts": ["sirius.lab"]}})
+        assert lab.pi_cameras.output_dir == lab.run.directory / "pi_cameras"
+
+    def test_configured_pi_output_dir_beats_the_run_directory(self, tmp_path):
+        mine = tmp_path / "separate_drive"
+        lab = self._lab(tmp_path, {"pi_cameras": {"output_dir": str(mine)}})
+        assert lab.pi_cameras.output_dir == mine
+        assert not (lab.run.directory / "pi_cameras").exists()
+
+    def test_pi_without_a_run_directory_stays_in_captures_pi(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        lab = self._lab(tmp_path, {"pi_cameras": {"hosts": ["sirius.lab"]}}, run_dir=False)
+        assert lab.pi_cameras.output_dir == Path("./captures/pi")
+        assert (tmp_path / "captures" / "pi").is_dir()
 
 
 class TestTimeline:

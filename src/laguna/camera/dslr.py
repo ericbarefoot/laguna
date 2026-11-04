@@ -88,6 +88,12 @@ class DslrCameraSubsystem(SubsystemLogging):
         #: Cameras whose output_dir was set on purpose; set_output_root()
         #: leaves these alone (GH #43).
         self._explicit_output = {n for n, c in (cameras or {}).items() if (c or {}).get("output_dir")}
+        #: Where each camera's files go. set_output_root() fills this even for
+        #: a simulated subsystem, which has names but no camera objects yet.
+        self.output_dirs: Dict[str, Path] = {
+            name: Path((cfg or {}).get("output_dir", f"./captures/{name}")).expanduser()
+            for name, cfg in (cameras or {}).items()
+        }
         if simulated:
             return
         for name, cfg in (cameras or {}).items():
@@ -161,11 +167,16 @@ class DslrCameraSubsystem(SubsystemLogging):
         Only for cameras with no ``output_dir`` of their own: an explicit
         one (a separate drive, say) is a deliberate choice and wins.
         """
-        for name, cam in self.cameras.items():
+        root = Path(root)
+        for name in self._camera_names:
             if name in self._explicit_output:
-                logger.info("[%s] keeping configured output_dir %s", name, cam.output_dir)
-            else:
-                cam.output_dir = Path(root) / name
+                kept = self.cameras[name].output_dir if name in self.cameras else self.output_dirs[name]
+                logger.info("[%s] keeping configured output_dir %s", name, kept)
+                continue
+            dest = root / name
+            self.output_dirs[name] = dest
+            if name in self.cameras:
+                self.cameras[name].output_dir = dest
 
     # ------------------------------------------------------------------
     # Connection

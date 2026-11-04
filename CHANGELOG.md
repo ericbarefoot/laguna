@@ -11,6 +11,7 @@ them into a dated release section when you cut a version.
 ## [Unreleased]
 
 ### Changed
+- **Pi frames for a run go under that run's `pi_cameras/` directory.** A configured `pi_cameras.output_dir` still wins, and a run with no run directory still writes `./captures/pi`. DSLR frames stay in `dslr_cameras/<camera>/` and Gocator scans stay in `gocator/`.
 - **Local files are no longer tracked.** `/data/` (everything under the top-level `data/`), `/sandbox/` and
   `/config/` (except `config/example_config.yaml`) are ignored, and `config/config_scan.yaml`,
   `config/example_gauge_mqtt.yaml`, `config/example_pump_calibration.csv` and `sandbox/camera_coordinator.py` are
