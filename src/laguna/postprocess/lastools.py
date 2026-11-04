@@ -55,3 +55,8 @@ def run_tool(tool: str, *args: object, log: TextIO | None = None) -> None:
         log.write(f"$ {' '.join(cmd)}\n{output}\n")
     if proc.returncode != 0 or "license failure" in output or "ERROR:" in output:
         raise LastoolsError(f"{tool} failed:\n{output.strip()}")
+    # Unlicensed tools can keep only part of a big cloud, warn, and exit 0.
+    # A DEM built from a truncated cloud looks fine, so treat it as a failure.
+    for line in output.splitlines():
+        if "WARNING" in line and "licen" in line.lower():
+            raise LastoolsError(f"{tool} reported a license warning (output may be truncated):\n{line.strip()}")

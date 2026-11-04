@@ -31,12 +31,13 @@ came from the same input file (size + mtime) and the same
 from __future__ import annotations
 
 import csv
-import fcntl
+import fcntl  # POSIX only: postprocessing needs Linux or macOS
 import json
 import logging
 import os
 import shutil
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -49,7 +50,7 @@ import rasterio
 
 from .config import PostprocessConfig
 from .lastools import run_tool
-from .orient import SCAN_SUFFIXES, prepare_points, scan_files, source_file
+from .orient import SCAN_SUFFIXES, prepare_points, scan_base, scan_files, source_file
 from .regions import keep_mask
 
 logger = logging.getLogger(__name__)
@@ -115,17 +116,25 @@ def _fingerprint(path: Path) -> dict:
 def is_current(scan: str | Path, cfg: PostprocessConfig) -> bool:
     """Return True if the scan's outputs match its input file and ``cfg``."""
     p = output_paths(scan, cfg)
-    if not (p["dem"].exists() and p["meta"].exists()):
+    if not all(p[k].exists() for k in ("clip", "dem", "meta")):
         return False
     try:
         src = source_file(scan, cfg)
-    except FileNotFoundError:
+        meta = json.loads(p["meta"].read_text())
+        return meta.get("config_hash") == cfg.processing_hash() and meta.get("input") == {
+            "file": src.name,
+            **_fingerprint(src),
+        }
+    except (FileNotFoundError, ValueError, AttributeError):
+        # Missing input, or a truncated/corrupt meta file: reprocess rather
+        # than abort the whole batch.
         return False
-    meta = json.loads(p["meta"].read_text())
-    return meta.get("config_hash") == cfg.processing_hash() and meta.get("input") == {
-        "file": src.name,
-        **_fingerprint(src),
-    }
+
+
+def _require_points(n: int, stage: str, before: int | None) -> None:
+    """Fail the scan if a stage left nothing, rather than write an empty DEM as ``ok``."""
+    if n <= 0:
+        raise ValueError(f"no points left after {stage} (had {before})")
 
 
 def _count(path: Path) -> int:
@@ -171,7 +180,9 @@ def _append_manifest(out: Path, row: dict) -> None:
     with open(out / "manifest.csv", "a", newline="") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         w = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
-        if f.tell() == 0:
+        # Size after taking the lock: another writer may have added the header
+        # since this handle was opened, and tell() on an append handle is stale.
+        if os.fstat(f.fileno()).st_size == 0:
             w.writeheader()
         w.writerow(row)
 
@@ -223,12 +234,14 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
                 log=log,
             )
             res.n_roi = _count(tmp / "roi.laz")
+            _require_points(res.n_roi, "the ROI and z window", res.n_input)
             cur = tmp / "roi.laz"
 
             if cfg.include or cfg.exclude:
                 _apply_shapes(cur, tmp / "shapes.laz", cfg)
                 cur = tmp / "shapes.laz"
             res.n_shapes = _count(cur)
+            _require_points(res.n_shapes, "the include/exclude shapes", res.n_roi)
 
             if cfg.noise.enabled:
                 n = cfg.noise
@@ -249,6 +262,7 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
                 )
                 cur = tmp / "clean.laz"
             res.n_denoised = _count(cur)
+            _require_points(res.n_denoised, "denoising", res.n_shapes)
 
             demargs = []
             if cfg.ground.enabled:
@@ -271,6 +285,7 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
                 )
                 cur = tmp / "ground.laz"
                 res.n_ground = int((laspy.read(cur).classification == 2).sum())
+                _require_points(res.n_ground, "ground classification", res.n_denoised)
                 demargs = ["-keep_class", 2]
 
             nrows, ncols = cfg.grid_shape
@@ -297,6 +312,8 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
                 log=log,
             )
             res.dem_nodata_frac = round(_mask_dem(tmp / "dem_raw.tif", tmp / "dem.tif", cfg), 4)
+            if res.dem_nodata_frac >= 1.0:
+                raise ValueError("the DEM is empty inside the kept area")
 
         meta = {
             "config_hash": cfg.processing_hash(),
@@ -307,6 +324,9 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
         }
         (tmp / "meta.json").write_text(json.dumps(meta, indent=1))
 
+        # Not atomic as a set. meta goes last because it is the "done" marker
+        # is_current() trusts: if this is interrupted, the scan reads as stale
+        # and is redone. Don't reorder.
         os.replace(cur, p["clip"])
         os.replace(tmp / "dem.tif", p["dem"])
         os.replace(tmp / "log", p["log"])
@@ -323,11 +343,28 @@ def process_scan(scan: str | Path, cfg: PostprocessConfig, force: bool = False) 
     except Exception as e:  # noqa: BLE001 - one bad scan must not stop the batch
         res.status, res.error = "failed", f"{type(e).__name__}: {e}"
         if (tmp / "log").exists():
-            shutil.copy(tmp / "log", p["log"])
+            # Beside the log, not over it: a still-valid earlier result keeps its log.
+            try:
+                shutil.copy(tmp / "log", p["log"].with_name(p["log"].stem + ".failed.log"))
+            except OSError:
+                logger.exception("could not save the failure log for %s", scan.name)
         logger.error("post-processing %s failed: %s", scan.name, res.error)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return res
+
+
+def _sweep_stale_tmp(tmp: Path, max_age_s: float = 24 * 3600) -> None:
+    """Remove work dirs left by a killed run. Recent ones may belong to a live run."""
+    if not tmp.is_dir():
+        return
+    cutoff = time.time() - max_age_s
+    for d in tmp.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def find_scans(inputs: Iterable[str | Path]) -> list[Path]:
@@ -346,7 +383,7 @@ def find_scans(inputs: Iterable[str | Path]) -> list[Path]:
     for p in paths:
         p = p.resolve()
         files = scan_files(p)
-        by_stem[p.with_suffix("")] = files["points"] or files["npz"] or p
+        by_stem[scan_base(p)] = files["points"] or files["npz"] or p
     return sorted(by_stem.values())
 
 
@@ -371,6 +408,7 @@ def run(
         ValueError: If ``cfg`` fails :meth:`PostprocessConfig.validate`.
     """
     cfg.validate()
+    _sweep_stale_tmp(cfg.out_path / "tmp")
     scans = find_scans(inputs)
     logger.info("post-processing %d scans into %s", len(scans), cfg.out_path)
     results = []

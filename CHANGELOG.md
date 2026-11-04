@@ -53,7 +53,8 @@ them into a dated release section when you cut a version.
   YAML file (`examples/example_postprocess.yaml`). `laguna-postprocess run|status` and `postprocess.run()` skip scans
   whose outputs match the input and settings, and report a failed scan without stopping the batch.
   `examples/example_16_postprocess_roi_editor.ipynb` draws the shapes on a plotted scan (`ShapeEditor`) and previews
-  the DEM. Needs the new `postprocess` extra and LAStools.
+  the DEM. Needs the new `postprocess` extra and LAStools. Linux/macOS only. A scan fails (rather than writing an
+  empty or truncated DEM) when a stage leaves no points, the DEM is empty, or LAStools prints a licence warning.
 - **Surveys can be scheduled from config.** A `surveys:` section (`laguna.survey_config`) takes `kind: tile` or
   `traverse` entries, the `Tile`/`Traverse` constructor arguments plus `interval_s`/`trigger_at` and
   `max_scan_speed_mm_s`; `swath_mm: auto` reads the live active area at each firing. Unknown keys are an error and

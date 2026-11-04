@@ -39,6 +39,7 @@ have a `64` suffix (`las2las64`). `lasnoise`, `lasground_new` and `las2dem`
 need a license beyond a few million points per file, so copy
 `lastoolslicense.txt` into the same `bin/` folder. Without it these tools
 add noise or refuse to run, and the pipeline reports the scan as failed.
+Postprocessing runs on Linux or macOS only (it locks the manifest with `fcntl`).
 
 ## Settings
 

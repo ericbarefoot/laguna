@@ -74,6 +74,7 @@ viz = [
 postprocess = [
     # laguna.postprocess: saved scans -> DEMs. The point-cloud steps run in
     # LAStools (installed separately; see docs/guides/postprocess-scans.md).
+    # Linux/macOS only: the manifest lock uses fcntl.
     "laspy[lazrs]>=2.5",
     "rasterio>=1.4",          # DEM masking and reading
     "matplotlib>=3.7",        # region geometry and plots

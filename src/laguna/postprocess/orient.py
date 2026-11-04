@@ -27,11 +27,29 @@ POINT_SUFFIXES = (".laz", ".las")
 SCAN_SUFFIXES = POINT_SUFFIXES + (".npz",)
 
 
+def scan_base(scan: str | Path) -> Path:
+    """Return the scan's path without its file suffix.
+
+    Only a scan suffix (``.laz``, ``.las``, ``.npz``) is removed. A name
+    with a dot in it, like ``pass_0.5m``, keeps it: ``Path.with_suffix``
+    would turn ``pass_0.5m.laz`` into ``pass_0`` and silently pick the
+    wrong file.
+    """
+    scan = Path(scan)
+    if scan.suffix.lower() in SCAN_SUFFIXES:
+        return scan.with_name(scan.stem)
+    return scan
+
+
+def _sibling(base: Path, suffix: str) -> Path:
+    return base.with_name(base.name + suffix)
+
+
 def scan_files(scan: str | Path) -> dict[str, Path | None]:
     """Return the scan's ``"points"`` (``.laz``/``.las``) and ``"npz"`` files, None if absent."""
-    base = Path(scan).with_suffix("")
-    points = next((p for p in (base.with_suffix(s) for s in POINT_SUFFIXES) if p.exists()), None)
-    npz = base.with_suffix(".npz")
+    base = scan_base(scan)
+    points = next((p for p in (_sibling(base, s) for s in POINT_SUFFIXES) if p.exists()), None)
+    npz = _sibling(base, ".npz")
     return {"points": points, "npz": npz if npz.exists() else None}
 
 
@@ -46,13 +64,13 @@ def source_file(scan: str | Path, cfg: PostprocessConfig | None = None) -> Path:
     if cfg is not None and cfg.orient == "metadata":
         if files["npz"] is None:
             raise FileNotFoundError(
-                f"orient: metadata needs {Path(scan).with_suffix('.npz').name}, which "
+                f"orient: metadata needs {_sibling(scan_base(scan), '.npz').name}, which "
                 "holds the gantry position; only the point file was found"
             )
         return files["npz"]
     src = files["points"] or files["npz"]
     if src is None:
-        raise FileNotFoundError(f"no .laz, .las or .npz for {Path(scan).with_suffix('')}")
+        raise FileNotFoundError(f"no .laz, .las or .npz for {scan_base(scan)}")
     return src
 
 
