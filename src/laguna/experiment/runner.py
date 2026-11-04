@@ -380,18 +380,29 @@ def setup_run(
         # Route scans under the run directory so a run's whole output tree is
         # one self-contained artifact — unless the user set gocator.output_dir
         # on purpose, which wins (see laguna.run_context.RunContext.path_for).
+        # The folder name is SCAN, next to DSLR and PI.
         lab.gocator._output_dir = lab.run.path_for(
-            "gocator",
+            "SCAN",
             str(lab.gocator._output_dir),
             configured_dir=lab.config.get("gocator").get("output_dir"),
         )
 
     if "dslr_cameras" in lab._subsystems and lab.run.root is not None:
-        lab.dslr_cameras.set_output_root(lab.run.path_for("dslr_cameras", "."))
+        # DSLR/<camera name>/. An explicit per-camera output_dir still wins.
+        lab.dslr_cameras.set_output_root(lab.run.path_for("DSLR", "."))
 
     pi_output_dir: Optional[Path] = None
     if "pi_cameras" in lab._subsystems:
-        pi_output_dir = Path(lab.config.get("pi_cameras").get("output_dir", "./captures/pi"))
+        if lab.run.root is not None:
+            # Keep this run's frames in <run_id>/PI. A configured output_dir
+            # (a separate drive, or the bench override) still wins.
+            pi_output_dir = lab.run.path_for(
+                "PI",
+                "./captures/pi",
+                configured_dir=lab.config.get("pi_cameras").get("output_dir"),
+            )
+        else:
+            pi_output_dir = Path(lab.config.get("pi_cameras").get("output_dir", "./captures/pi"))
         pi_output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ #

@@ -87,7 +87,7 @@ class TestGocatorRunDirectoryRouting:
 
     def test_unset_output_dir_goes_under_run_directory(self, tmp_path):
         lab = self._lab(tmp_path, {})
-        assert lab.gocator._output_dir == lab.run.directory / "gocator"
+        assert lab.gocator._output_dir == lab.run.directory / "SCAN"
 
     def test_explicit_output_dir_is_kept(self, tmp_path):
         mine = tmp_path / "separate_drive"
