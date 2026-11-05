@@ -290,11 +290,27 @@ class FlumeLab:
                        ``"gantry"``, see laguna.registry.SUBSYSTEM_REGISTRY)
                        to build via that class's ``from_config(self.config)``.
 
+        Idempotent: re-adding the same instance, or a registry name that is
+        already registered, is a no-op. Registering a *different* instance
+        under a taken name raises rather than replacing — the replacement
+        would be a fresh, unconnected handle to hardware the old one may
+        still hold (e.g. the gantry's exclusive serial port), orphaning the
+        live one and making a second ``connect()`` possible.
+
         Returns:
             self — so calls can be chained: ``lab.add(cam).add("gantry")``
+
+        Raises:
+            ValueError: If the subsystem has no ``subsystem_name``, is an
+                unknown registry name, or a different subsystem is already
+                registered under the same name.
         """
         if isinstance(subsystem, str):
             from .registry import SUBSYSTEM_REGISTRY
+
+            if subsystem in self._subsystems:
+                logger.info("Subsystem '%s' already registered — add() is a no-op", subsystem)
+                return self
 
             subsystem_cls = SUBSYSTEM_REGISTRY.get(subsystem)
             if subsystem_cls is None:
@@ -309,6 +325,16 @@ class FlumeLab:
             raise ValueError(
                 f"{type(subsystem).__name__} has no 'subsystem_name' attribute; "
                 "cannot register as a FlumeLab subsystem."
+            )
+        existing = self._subsystems.get(name)
+        if existing is subsystem:
+            logger.info("Subsystem '%s' already registered — add() is a no-op", name)
+            return self
+        if existing is not None:
+            raise ValueError(
+                f"A different subsystem is already registered as {name!r}; "
+                "replacing it would orphan the live handle. Disconnect it and "
+                "build a new FlumeLab instead."
             )
         self._subsystems[name] = subsystem
         setattr(self, name, subsystem)
