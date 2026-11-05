@@ -467,8 +467,10 @@ class FlumeLab:
 
         Returns:
             The scheduler thread (daemon). Call lab.stop() to pause early.
-            When the duration expires the run ends itself via end_run() so the
-            pump stops and the flow valves close without further action.
+            When the duration expires the scheduler first waits for actions still
+            in flight (a scan, a capture) to finish, then the run ends itself via
+            end_run() so the pump stops and the flow valves close without further
+            action. A pause/stop/estop during that wait cancels the auto-end.
         """
         self._duration = duration
         self._start_wall = time.time()

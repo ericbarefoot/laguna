@@ -113,3 +113,23 @@ def test_summary_survives_an_unknown_safety_state(lab, capsys):
     lab._start_wall = time.time()
     lab._safety_state = _Odd()
     assert "Run Odd" in _summary(lab, capsys)
+
+
+def test_natural_end_waits_for_an_in_flight_scan_before_stopping_subsystems(lab):
+    events = []
+
+    class Scanner:
+        subsystem_name = "scanner"
+
+        def stop(self):
+            events.append("stop")
+
+        def get_status(self):
+            return {}
+
+    lab.add(Scanner())
+    lab.scheduler.at(0.1, lambda: (time.sleep(0.8), events.append("scan_done")), subsystem="scanner", name="scan")
+    thread = lab.start(0.3)
+    thread.join(timeout=10)
+    assert events == ["scan_done", "stop"]
+    assert lab.safety_state is SafetyState.STOPPED
