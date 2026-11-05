@@ -83,8 +83,19 @@ bolted to the carriage beside the Z axis. Its height doesn't change when Z
 moves, so placing its readings (`to_experiment`, `experiment_point_for`,
 `orient_scan`, `orient_gocator_profile`) ignores the Z position. Otherwise
 every scan's heights would shift by wherever Z happened to be. Put the
-sensor's fixed height in its `translation` instead. `gantry_target_for` is
-unchanged: it still returns a full X/Y/Z command. `rotation` is applied before `translation`, so a translation always
+sensor's fixed height in its `translation` instead.
+
+The commands follow the same rule. `gantry_target_for` and `retarget` return
+**NaN** on an axis the instrument isn't carried by, since moving that axis
+would not change where it measures. `lab.place()` leaves those axes out of the
+move entirely, and a survey backfills them with the axis's live position, so a
+NaN never reaches the gantry. If you call `gantry_target_for` yourself, don't
+pass the NaNs to `move_to`. The target's component along an uncarried axis is
+ignored: placing the Gocator at experiment `z = 0` moves only X and Y, and it
+stays at its fixed height. A survey pass that travels along an uncarried axis
+is refused before any motion.
+
+`rotation` is applied before `translation`, so a translation always
 reads in the target frame — "move the origin over there".
 
 ### Rotating the experiment frame: use `origin`, not `translation`

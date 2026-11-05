@@ -646,6 +646,53 @@ class TestCarriedBy:
         with pytest.raises(ValueError, match="carried_by"):
             orient_scan(scan, frames=r)
 
+    def test_gantry_target_leaves_uncarried_axes_unspecified(self):
+        """Nothing to command on an axis that doesn't move the instrument: NaN, not a stray Z."""
+        r = FrameRegistry.from_config(self.OFF_Z)
+        target = r.gantry_target_for("gocator", [700, 400, 0])
+        np.testing.assert_allclose(target[:2], [200, 100])
+        assert np.isnan(target[2])
+
+    def test_default_target_has_no_nan(self):
+        r = FrameRegistry.from_config(RIG)
+        assert np.isfinite(r.gantry_target_for("gocator", [700, 400, 0])).all()
+
+    def test_round_trip_on_the_carried_axes(self):
+        r = FrameRegistry.from_config(self.OFF_Z)
+        for point in ([700, 400, 0], [510, 320, 77], [500, 300, -5]):
+            back = r.experiment_point_for("gocator", r.gantry_target_for("gocator", point))
+            np.testing.assert_allclose(back[:2], point[:2])
+            assert back[2] == pytest.approx(-325.0)  # the sensor's fixed height
+
+    def test_to_experiment_ignores_nan_on_uncarried_axes(self):
+        r = FrameRegistry.from_config(self.OFF_Z)
+        target = r.gantry_target_for("gocator", [700, 400, 0])
+        np.testing.assert_allclose(
+            r.to_experiment("gocator", [0, 0, 0], target)[:2], [700, 400]
+        )
+
+    def test_retarget_specifies_only_the_new_instruments_carried_axes(self):
+        cfg = {
+            "experiment": {"translation": [0.0, 0.0, 0.0]},
+            "instruments": {
+                "od2000": {"translation": [10.0, 5.0, 0.0]},
+                "gocator": {"translation": [0.0, 0.0, -325.0], "carried_by": ["X", "Y"]},
+            },
+        }
+        r = FrameRegistry.from_config(cfg)
+        out = r.retarget("od2000", "gocator", [100, 100, 50])
+        np.testing.assert_allclose(out[:2], [110, 105])
+        assert np.isnan(out[2])
+        # The other way: the od2000 is on Z, so it gets a Z that puts it at the
+        # gocator's measurement height from a gantry Z the gocator ignores.
+        back = r.retarget("gocator", "od2000", [100, 100, 999])
+        np.testing.assert_allclose(back, [90, 95, -325])
+
+    def test_retarget_default_rig_unchanged(self):
+        r = FrameRegistry.from_config(RIG)
+        np.testing.assert_allclose(r.retarget("od2000", "wtt12l", [1, 2, 3]), [1, 2 - 49, 3])
+        assert np.isfinite(r.retarget("od2000", "gocator", [1, 2, 3])).all()
+
     def test_unknown_axis_rejected(self):
         """carried_by only accepts X, Y and Z."""
         with pytest.raises(ValueError):
