@@ -467,6 +467,10 @@ class FlumeLab:
 
         Returns:
             The scheduler thread (daemon). Call lab.stop() to pause early.
+            When the duration expires the scheduler first waits for actions still
+            in flight (a scan, a capture) to finish, then the run ends itself via
+            end_run() so the pump stops and the flow valves close without further
+            action. A pause/stop/estop during that wait cancels the auto-end.
         """
         self._duration = duration
         self._start_wall = time.time()
@@ -478,7 +482,7 @@ class FlumeLab:
         thread = threading.Thread(
             target=self.scheduler.run,
             args=(duration,),
-            kwargs={"on_complete": self.print_summary},
+            kwargs={"on_complete": self._on_run_complete},
             daemon=True,
             name="scheduler-main",
         )
@@ -489,11 +493,33 @@ class FlumeLab:
         logger.info("  lab.disconnect_all() — clean shutdown when finished")
         return thread
 
+    def _on_run_complete(self) -> None:
+        """Scheduler callback when the duration expires naturally.
+
+        Ends the run so the pump stops and the gantry and weir are quiesced,
+        rather than leaving them running after the schedule has finished.
+        The summary prints regardless of whether end_run() succeeds.
+        """
+        try:
+            try:
+                self.end_run(reason="duration elapsed")
+            except BaseException:
+                # Nobody is watching the scheduler thread: if the orderly stop
+                # failed, make the rig safe the hard way rather than leave the
+                # pump running with the schedule over.
+                logger.exception("end_run() failed at end of run; escalating to estop")
+                self.estop(reason="end_run failed at end of run")
+        finally:
+            self.print_summary()
+
     def print_summary(self) -> None:
-        """Print a summary of the completed experiment to stdout.
+        """Print a summary of the current run to stdout.
 
         Called automatically when the scheduled duration expires. Can also be
-        called manually at any point during or after an experiment.
+        called manually at any point during or after a run. The header says
+        where the run stands (in progress, paused, ended, e-stopped), and
+        the event counts and captures cover only this run: the event log
+        appends across runs, so rows from before start() are left out.
         """
         import csv as _csv
         from datetime import datetime
@@ -504,33 +530,49 @@ class FlumeLab:
             if self._start_wall else "unknown"
         )
 
-        # Parse the event log for counts and capture paths
+        # Parse the event log for counts and capture paths, for this run only
+        since = self._start_wall if self._start_wall else float("inf")
         event_counts: Dict[tuple, int] = {}
         capture_paths: list = []
         try:
             with open(self.event_log._path, newline="") as f:
                 for row in _csv.DictReader(f):
+                    try:
+                        if float(row.get("wall_time_unix", "")) < since:
+                            continue
+                    except ValueError:
+                        continue
                     sub = row.get("subsystem", "")
                     evt = row.get("event_type", "")
                     if sub in ("flume_lab", "scheduler"):
                         continue
                     event_counts[(sub, evt)] = event_counts.get((sub, evt), 0) + 1
                     if sub in ("pi_cameras", "dslr_cameras") and evt == "capture":
-                        result = row.get("result", "")
-                        for part in result.split():
+                        # log_event() puts file= in notes, not result.
+                        detail = f'{row.get("notes", "")} {row.get("result", "")}'
+                        for part in detail.split():
                             if part.startswith("file="):
                                 capture_paths.append((sub, part[len("file="):]))
         except Exception:
             pass
 
+        title = {
+            SafetyState.RUNNING: "Run In Progress",
+            SafetyState.PAUSED: "Run Paused",
+            SafetyState.STOPPED: "Run Ended",
+            SafetyState.ESTOPPED: "Run E-Stopped",
+        }.get(self._safety_state, f"Run {self._safety_state.name.title()}")
+        if self._start_wall is None:
+            title = "No Run Started"
+        of_total = f" of {self._duration:.0f} s" if self._duration else ""
         sep = "=" * 52
         lines = [
             "",
             sep,
-            "  Experiment Complete",
+            f"  {title}",
             sep,
             f"  Started   {start_str}",
-            f"  Runtime   {runtime:.1f} s  ({runtime / 60:.1f} min)",
+            f"  Runtime   {runtime:.1f} s{of_total}  ({runtime / 60:.1f} min)",
             f"  Log       {self.event_log._path}",
             "",
             "  Subsystems",
@@ -645,7 +687,7 @@ class FlumeLab:
             logger.info("Resuming schedule for %.1f more seconds...", remaining_s)
         if remaining_s <= 0:
             return None
-        return self.scheduler.run_async(remaining_s)
+        return self.scheduler.run_async(remaining_s, on_complete=self._on_run_complete)
 
     def _scheduler_gate(self) -> Optional[str]:
         """Scheduler.gate: refuse any firing unless the rig is RUNNING."""

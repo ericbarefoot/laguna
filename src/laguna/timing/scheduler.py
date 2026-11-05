@@ -49,6 +49,11 @@ class Scheduler:
         # double-firing every action.
         self._stop_event = threading.Event()
         self._run_lock = threading.Lock()
+        # Threads of dispatched actions that have not finished. Registered
+        # before the thread starts, so a firing that has not yet reached its
+        # gate check still counts as in flight.
+        self._inflight: set = set()
+        self._inflight_lock = threading.Lock()
         self._running = False
         #: Asked immediately before every firing; a non-None return is the
         #: reason to skip it. FlumeLab sets this to refuse firings unless the
@@ -125,7 +130,9 @@ class Scheduler:
         Args:
             duration: Duration in experiment runtime seconds to run.
             on_complete: Optional callback invoked only when the duration expires
-                naturally (not when stop() is called externally).
+                naturally (not when stop() is called externally). It runs after
+                every action dispatched during the run has finished, however long
+                that takes; a stop() during that wait cancels the callback.
 
         Raises:
             RuntimeError: If the clock is not running, is paused, or another
@@ -147,6 +154,12 @@ class Scheduler:
         natural = False
         try:
             natural = self._loop(duration, stop_event)
+            if natural:
+                # Let actions dispatched up to the end (a long scan, a capture
+                # scheduled at exactly `duration`) finish before the run is
+                # reported over: on_complete ends the run, which would abort
+                # them and discard their data. A pause/stop/estop cuts the wait.
+                natural = self._drain(stop_event)
         except Exception as exc:
             # A crashed loop used to vanish silently with the clock still
             # running, so the run looked alive while nothing was collected.
@@ -234,6 +247,27 @@ class Scheduler:
             time.sleep(poll)
         return False
 
+    def _drain(self, stop_event: threading.Event, poll: float = 0.05) -> bool:
+        """Wait for dispatched actions to finish. False if stop() cut the wait short."""
+        announced = False
+        while True:
+            with self._inflight_lock:
+                busy = [t.name for t in self._inflight]
+            if not busy:
+                return not stop_event.is_set()
+            if stop_event.is_set():
+                return False
+            if not announced:
+                announced = True
+                logger.info("Duration elapsed; waiting for %d action(s) in flight: %s",
+                            len(busy), ", ".join(sorted(busy)))
+                if self._event_log:
+                    self._event_log.log(
+                        self._clock.elapsed(), "scheduler", "waiting_for_actions",
+                        notes=", ".join(sorted(busy)),
+                    )
+            time.sleep(poll)
+
     def stop(self) -> None:
         """Interrupt run() and pause the experiment clock.
 
@@ -250,11 +284,14 @@ class Scheduler:
                 self._event_log.log(self._clock.elapsed(), "scheduler", "stop", "ok")
             self._clock.pause()
 
-    def run_async(self, duration: float) -> threading.Thread:
+    def run_async(
+        self, duration: float, on_complete: Optional[Callable[[], Any]] = None
+    ) -> threading.Thread:
         """Run the scheduler in a background daemon thread.
 
         Args:
             duration: Duration in experiment runtime seconds to run.
+            on_complete: Optional callback, as for run().
 
         Returns:
             The daemon thread so the caller can join() it if needed.
@@ -271,7 +308,11 @@ class Scheduler:
                 "Scheduler.run_async() needs a started, unpaused clock — resume it first"
             )
         t = threading.Thread(
-            target=self.run, args=(duration,), daemon=True, name="scheduler-main"
+            target=self.run,
+            args=(duration,),
+            kwargs={"on_complete": on_complete},
+            daemon=True,
+            name="scheduler-main",
         )
         t.start()
         return t
@@ -305,6 +346,13 @@ class Scheduler:
             stop_event: The dispatching run's stop token.
         """
         def _run():
+            try:
+                _run_checked()
+            finally:
+                with self._inflight_lock:
+                    self._inflight.discard(threading.current_thread())
+
+        def _run_checked():
             reason = None
             if stop_event is not None and stop_event.is_set():
                 reason = "scheduler stopped"
@@ -328,4 +376,7 @@ class Scheduler:
                     except Exception:
                         logger.exception("Could not record %s/%s's failure", subsystem, name)
 
-        threading.Thread(target=_run, daemon=True, name=f"sched-{subsystem}-{name}").start()
+        thread = threading.Thread(target=_run, daemon=True, name=f"sched-{subsystem}-{name}")
+        with self._inflight_lock:
+            self._inflight.add(thread)
+        thread.start()
