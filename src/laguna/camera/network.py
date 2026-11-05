@@ -122,6 +122,9 @@ class CameraArray(SubsystemLogging):
         self.log_level = log_level
         self.event_log_verbosity = event_log_verbosity
         self._simulated = simulated
+        #: Where fetched frames are written. setup_run() sets this from the
+        #: run directory, or leaves the historical ./captures/pi default.
+        self.output_dir = Path("./captures/pi")
 
     @classmethod
     def from_config(cls, config: "Config") -> "CameraArray":

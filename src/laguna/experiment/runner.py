@@ -387,12 +387,19 @@ def setup_run(
         )
 
     if "dslr_cameras" in lab._subsystems and lab.run.root is not None:
+        # <run>/dslr_cameras/<camera>/. An explicit per-camera output_dir still wins.
         lab.dslr_cameras.set_output_root(lab.run.path_for("dslr_cameras", "."))
 
-    pi_output_dir: Optional[Path] = None
     if "pi_cameras" in lab._subsystems:
-        pi_output_dir = Path(lab.config.get("pi_cameras").get("output_dir", "./captures/pi"))
+        # Same resolution as the scanner: a configured output_dir wins, a run
+        # directory gets pi_cameras/, and no run directory keeps ./captures/pi.
+        pi_output_dir = lab.run.path_for(
+            "pi_cameras",
+            "./captures/pi",
+            configured_dir=lab.config.get("pi_cameras").get("output_dir"),
+        )
         pi_output_dir.mkdir(parents=True, exist_ok=True)
+        lab.pi_cameras.output_dir = pi_output_dir
 
     # ------------------------------------------------------------------ #
     # Connect                                                              #
@@ -520,7 +527,7 @@ def setup_run(
             for r in results:
                 if not r.success:
                     logger.warning("  %s FAILED: %s", r.hostname, r.error)
-            fetched = lab.pi_cameras.fetch_images(results, pi_output_dir)
+            fetched = lab.pi_cameras.fetch_images(results, lab.pi_cameras.output_dir)
             for host, path in fetched.items():
                 logger.info("  %s -> %s", host, Path(path).name)
         except Exception as e:
