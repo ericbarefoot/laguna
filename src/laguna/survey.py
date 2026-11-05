@@ -930,7 +930,13 @@ class SurveyRunner:
         self._resolve_scan_speeds(dry_run)
         self._fill_tile_accel()
         for p in self.survey.passes():
-            self._gantry_axis_for(p.axis)      # fail before any motion, not mid-survey
+            scan_axis = self._gantry_axis_for(p.axis)      # fail before any motion, not mid-survey
+            carried = self.lab.frames.frame_for(p.instrument).carried_by
+            if scan_axis not in carried:
+                raise ValueError(
+                    f"pass {p.index}: {p.instrument} is carried by gantry axes {list(carried)}, "
+                    f"so it cannot scan along {scan_axis}"
+                )
         done: List[Pass] = []
         for p in self.pending():
             p = self._with_resolved_speed(p)
@@ -1207,6 +1213,11 @@ class SurveyRunner:
             axis_index = _AXIS_INDEX[gantry_axis]
             overrides: Dict[str, Any] = {}
             end_mm = float(end_gantry[axis_index])
+            if end_mm != end_mm:
+                raise ValueError(
+                    f"pass {p.index}: {p.instrument} is not carried by gantry axis "
+                    f"{gantry_axis}, so it cannot scan along it (see carried_by)"
+                )
             if p.overrun_end is not None:
                 # Lead-out: send the axis one ramp past the swath end so it is
                 # still at speed there, but end the capture at the swath end.
@@ -1374,7 +1385,9 @@ class SurveyRunner:
         xyz = self.lab.frames.gantry_target_for(
             p.instrument, list(p.end), reference_point=reference_point
         )
-        by_name = {"X": float(xyz[0]), "Y": float(xyz[1]), "Z": float(xyz[2])}
+        # NaN marks an axis the instrument is not carried by: like Theta, it
+        # stays where it is.
+        by_name = {n: float(v) for n, v in zip("XYZ", xyz) if v == v}
         gantry = self.lab.gantry
         return [
             by_name[axis.name] if axis.name in by_name

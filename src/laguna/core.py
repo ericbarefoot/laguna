@@ -699,6 +699,11 @@ class FlumeLab:
         per instrument, allowing the same scan to be re-run with a different
         sensor. Offsets and the experiment frame come from ``lab.frames``.
 
+        Only the gantry axes that carry the instrument move (see
+        ``InstrumentFrame.carried_by``); an instrument on a fixed-height mount
+        has its Z, say, left alone, and that component of ``experiment_point``
+        is ignored.
+
         Args:
             instrument: Instrument key, e.g. ``"od2000"``.
             experiment_point: [x, y, z] in experiment coordinates.
@@ -721,8 +726,13 @@ class FlumeLab:
             instrument, list(experiment_point), [round(v, 3) for v in target],
         )
         # Theta is outside the Cartesian frame model — leave it untouched by
-        # using the keyword form rather than a full vector.
-        return self.move_to(X=target[0], Y=target[1], Z=target[2], speed=speed)
+        # using the keyword form rather than a full vector. Axes the instrument
+        # is not carried by come back NaN; they are left out of the move
+        # entirely, never passed on, so they stay where they are.
+        axes = {n: float(v) for n, v in zip("XYZ", target) if v == v}  # v == v: not NaN
+        if not axes:
+            raise ValueError(f"place({instrument!r}): the instrument is carried by no gantry axis")
+        return self.move_to(speed=speed, **axes)
 
     def acquire_scan(
         self,

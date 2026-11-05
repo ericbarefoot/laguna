@@ -22,6 +22,7 @@ exhaustive *what* — every public class, method, and parameter.
 | [Reference frames](frames.md) | `FrameRegistry` — one coordinate system for every instrument |
 | [Survey](survey.md) | Multi-pass coverage: `Tile`, `Traverse` |
 | [Visualization](viz.md) | `plot_acquisition()`, `plot_trajectory()` — quick-look plots for scans/profiles/planned passes |
+| [Post-processing](postprocess.md) | `run()`, `PostprocessConfig`, `ShapeEditor`: saved scans to ground-surface DEMs |
 | [Schedule](schedule.md) | Time-elevation schedule loading and interpolation |
 | [Timing](timing.md) | Experiment clock, scheduler, checkpointing, event log |
 | [Experiment runner](experiment.md) | YAML-driven experiment setup and blocking run, run context |
