@@ -7,9 +7,10 @@ This avoids hardcoding hardware assumptions in the core.
 """
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Collection, Dict, Iterator, List, Optional
 import json
 import logging
+import math
 import threading
 import time
 
@@ -213,6 +214,16 @@ class FlumeLab:
         self._subsystems: Dict[str, Any] = {}
 
         self._duration: Optional[float] = None   # set by start(), used by resume()
+
+        # Set by every safety verb (pause/end_run/estop) via _escalate_state().
+        # A spin-up wait (see _spin_up) sleeps on it, so a verb called during
+        # the lag ends the wait at once instead of after the full lag.
+        self._spinup_abort = threading.Event()
+        # Bumped by every safety verb alongside the event. start()'s spin-up
+        # thread compares it with the value it began under: a pause + resume()
+        # during its pre-roll clears the event, so the event alone would let
+        # that thread wait out a second lag and release the clock beside resume().
+        self._spinup_gen = 0
         #: The CheckpointStore for the current experiment() block — mark
         #: completed events with ``lab.checkpoint.mark_complete(...)``.
         self.checkpoint: Optional[CheckpointStore] = None
@@ -310,6 +321,9 @@ class FlumeLab:
                 f"{type(subsystem).__name__} has no 'subsystem_name' attribute; "
                 "cannot register as a FlumeLab subsystem."
             )
+        # Validated here, at setup, so a typo'd lag fails before a run
+        # rather than partway through a resume.
+        self._resume_lag_s(name, subsystem)
         self._subsystems[name] = subsystem
         setattr(self, name, subsystem)
         if hasattr(subsystem, "attach_event_log"):
@@ -460,6 +474,13 @@ class FlumeLab:
     def start(self, duration: float) -> threading.Thread:
         """Start the experiment clock and scheduler in a background thread.
 
+        If any subsystem has a ``resume_lag_s`` (see :meth:`resume`), the
+        clock starts frozen at T=0. The scheduler thread first fires those
+        subsystems' T=0 actions (the pump's setpoint), waits out the longest
+        lag, and only then releases the clock, so runtime 0 is when the
+        slowest subsystem is up. A pause/stop/estop during the wait ends it
+        with the clock still frozen at 0; :meth:`resume` carries on from there.
+
         Args:
             duration: How long to run the scheduler, in experiment-time seconds.
                 Stored so that resume() with no arguments continues for the
@@ -468,16 +489,21 @@ class FlumeLab:
         Returns:
             The scheduler thread (daemon). Call lab.stop() to pause early.
         """
+        lagged = self._lagged_subsystems()
         self._duration = duration
         self._start_wall = time.time()
+        self._spinup_abort.clear()
+        gen = self._spinup_gen
         self.clock.start()
         self.run.started()
+        if lagged:
+            self.clock.pause()
         self.event_log.log(
             0.0, "flume_lab", "experiment_start", notes=f"run_id={self.run.run_id}"
         )
         thread = threading.Thread(
-            target=self.scheduler.run,
-            args=(duration,),
+            target=self._run_scheduled,
+            args=(duration, lagged, gen),
             kwargs={"on_complete": self.print_summary},
             daemon=True,
             name="scheduler-main",
@@ -488,6 +514,182 @@ class FlumeLab:
         logger.info("  lab.resume(N)       — resume for N more seconds")
         logger.info("  lab.disconnect_all() — clean shutdown when finished")
         return thread
+
+    def _resume_lag_s(self, name: str, subsystem: Any) -> float:
+        """Spin-up time, in seconds, `subsystem` needs before runtime may count.
+
+        Read from the subsystem's own ``resume_lag_s`` attribute if it has
+        one, else from ``resume_lag_s`` in its config section; 0 if neither.
+
+        Raises:
+            ValueError: If the value is not a finite number >= 0.
+        """
+        lag = getattr(subsystem, "resume_lag_s", None)
+        if lag is None:
+            try:
+                lag = self.config.get(name).get("resume_lag_s")
+            except (KeyError, AttributeError):
+                lag = None
+        if lag is None:
+            return 0.0
+        try:
+            value = float(lag)
+        except (TypeError, ValueError):
+            value = math.nan
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"{name}.resume_lag_s must be a finite number of seconds >= 0, got {lag!r}"
+            )
+        return value
+
+    def _lagged_subsystems(self) -> Dict[str, float]:
+        """Subsystems with a nonzero ``resume_lag_s``, mapped to that lag."""
+        lags = {n: self._resume_lag_s(n, s) for n, s in self._subsystems.items()}
+        return {n: lag for n, lag in lags.items() if lag > 0}
+
+    def _spin_up(self, lagged: Dict[str, float]) -> bool:
+        """Wait out the longest lag in `lagged`; False if a safety verb cut it short.
+
+        The wait is wall time, not runtime, by design: the clock is frozen
+        for it, and a pump takes as long to spin up in a fast rehearsal as in
+        a real run. Because the clock is paused, none of it counts as
+        experiment time.
+        """
+        lag = max(lagged.values())
+        names = ", ".join(f"{n}={lagged[n]:g}s" for n in sorted(lagged))
+        logger.info("Waiting %.1fs for spin-up (%s) before the clock runs...", lag, names)
+        self.event_log.log(
+            self.clock.elapsed(), "flume_lab", "spinup_wait", notes=f"{lag:g}s ({names})"
+        )
+        if self._spinup_abort.wait(lag):
+            self._abandon_spin_up(lagged)
+            return False
+        return True
+
+    def _abandon_spin_up(self, lagged: Dict[str, float]) -> None:
+        """Record an interrupted spin-up and re-quiesce what it had started.
+
+        A pause/stop/estop landing while the lagged subsystems' resume() was
+        still running is only seen afterwards, so that verb may have reached
+        a subsystem before its resume() did. Re-sending the verb matching
+        the current state makes sure the pump is not left running under a
+        rig that reports itself halted.
+        """
+        state = self._safety_state
+        verb = {SafetyState.ESTOPPED: "estop", SafetyState.STOPPED: "stop"}.get(state, "pause")
+        logger.warning(
+            "Spin-up interrupted (rig is %s); re-sending %s() to %s. The clock stays "
+            "frozen at %.1fs.", state.name, verb, ", ".join(sorted(lagged)), self.clock.elapsed(),
+        )
+        self.event_log.log(
+            self.clock.elapsed(), "flume_lab", "spinup_aborted",
+            notes=f"rig {state.name} during spin-up of {', '.join(sorted(lagged))}; clock not started",
+        )
+        self._for_each_subsystem(verb, only=lagged)
+
+    def _spin_up_halted(self) -> Optional[str]:
+        """Reason a spin-up must stop, or None; also the gate for resume()'s pre-roll."""
+        if self._spinup_abort.is_set():
+            return "a pause/stop/estop arrived during spin-up"
+        if self._safety_state.severity > SafetyState.PAUSED.severity:
+            return f"rig is {self._safety_state.name}"
+        return None
+
+    def _release_clock(self, lagged: Dict[str, float]) -> bool:
+        """Restart the clock after a spin-up unless a safety verb has landed.
+
+        The clock is restarted outside ``_state_lock`` (its resume hook
+        writes a file, and an estop must never queue behind that), so the
+        verdict is re-checked afterwards and the clock re-frozen if a verb
+        landed in between.
+
+        Returns:
+            True if the clock is running; False if the spin-up was abandoned.
+        """
+        halted = self._spin_up_halted()
+        if halted is None and self.clock.is_running and self.clock.is_paused:
+            self.clock.resume()
+            halted = self._spin_up_halted()
+            if halted is not None:
+                self.clock.pause()
+        if halted is not None:
+            self._abandon_spin_up(lagged)
+            return False
+        return True
+
+    def _resume_lagged(self, lagged: Dict[str, float]) -> bool:
+        """Bring the lagged subsystems up for resume(), then wait out the lag.
+
+        A lagged subsystem that never got its T=0 action (an aborted
+        start()) is given that action instead of resume(): it was never
+        running, so there is no setpoint for resume() to restore, and it
+        would otherwise start at whatever the drive last held.
+
+        Returns:
+            True if the lag elapsed with every subsystem up; False if it was
+            abandoned or a subsystem failed, leaving the rig PAUSED with the
+            clock frozen.
+        """
+        now = self.clock.elapsed()
+        due = self.scheduler.pending(lagged, up_to=now)
+        notes: Dict[str, str] = {}
+        failed = self._for_each_subsystem("resume", only=set(lagged) - due, notes=notes)
+        # Every resume() returns None on success and a note on a problem, so
+        # any note from a lagged subsystem counts: starting the clock with no
+        # flow is unrepeatable lost data, a retry costs a few seconds.
+        problems = [f"{n}.resume() raised" for n in failed]
+        problems += [f"{n}: {note}" for n, note in notes.items()]
+        if due and not problems:
+            problems += self.scheduler.preroll(due, up_to=now, gate=self._spin_up_halted)
+        if problems:
+            if self._spin_up_halted() is not None:
+                self._abandon_spin_up(lagged)
+                return False
+            detail = "; ".join(problems)
+            logger.error(
+                "Spin-up failed (%s); staying PAUSED with the clock frozen. Fix it and "
+                "call resume() again.", detail,
+            )
+            self.event_log.log(
+                self.clock.elapsed(), "flume_lab", "spinup_failed", result="error", notes=detail
+            )
+            self._for_each_subsystem("pause", only=lagged)
+            return False
+        return self._spin_up(lagged)
+
+    def _run_scheduled(
+        self,
+        duration: float,
+        lagged: Dict[str, float],
+        gen: int = 0,
+        on_complete: Optional[Any] = None,
+    ) -> None:
+        """Body of start()'s scheduler thread: spin-up first if any, then the schedule.
+
+        `gen` is ``_spinup_gen`` as start() saw it. If a safety verb has landed
+        since, whoever called it owns the way forward (resume() runs its own
+        spin-up), so this thread returns rather than race it.
+        """
+        try:
+            if lagged:
+                problems = self.scheduler.preroll(lagged)
+                if self._spinup_gen != gen:
+                    return
+                if problems:
+                    self.escalate("pre-roll failed before T=0: " + "; ".join(problems))
+                    return
+                if not self._spin_up(lagged):
+                    return
+                if self._spinup_gen != gen:
+                    return
+                if not self._release_clock(lagged):
+                    return
+            self.scheduler.run(duration, on_complete=on_complete)
+        except Exception as exc:
+            # Otherwise the thread dies silently with the pump possibly on
+            # and the rig still reporting RUNNING.
+            logger.exception("Scheduler thread failed")
+            self.escalate(f"scheduler thread failed: {exc}")
 
     def print_summary(self) -> None:
         """Print a summary of the completed experiment to stdout.
@@ -593,6 +795,15 @@ class FlumeLab:
         If a scheduled run (start()) was in progress, its scheduler restarts
         for the remaining time, or for `remaining_s` if given.
 
+        A subsystem with a nonzero ``resume_lag_s`` (a top-level key in its
+        config section, or an attribute on the object) is resumed *first*,
+        while the clock stays frozen and the rig stays PAUSED; resume() then
+        blocks for the longest such lag so e.g. a pump is at flow before any
+        experiment time passes. Everything else resumes with the clock,
+        as before. A pause/stop/estop during the wait abandons the resume
+        with the clock still frozen. The lag is wall seconds, unaffected by
+        the clock's speed factor.
+
         Args:
             remaining_s: How long to run the schedule, experiment-seconds.
                 Defaults to whatever was left of start()'s duration.
@@ -622,9 +833,38 @@ class FlumeLab:
             return None
 
         logger.info("Resuming from pause...")
+        lagged = self._lagged_subsystems()
+        if lagged:
+            with self._state_lock:
+                # Re-checked with the abort flag cleared under one lock hold:
+                # an estop landing between the checks above and here would
+                # otherwise have its signal wiped and the pump restarted.
+                if self._safety_state.severity > SafetyState.PAUSED.severity:
+                    logger.error("Refusing to resume: the rig is %s.", self._safety_state.name)
+                    return None
+                self._spinup_abort.clear()
+            # The lagged subsystems are running from here on while the rig reports
+            # PAUSED. Ctrl-C (KeyboardInterrupt) or any other BaseException must not
+            # leave it that way, so quiesce them again before it propagates.
+            # The monitor is rearmed first: it latches a fired tier until rearm(),
+            # so after a monitor-driven pause a repeat trip during the lag would be ignored.
+            try:
+                self.safety_monitor.rearm()
+                if not self._resume_lagged(lagged) or not self._release_clock(lagged):
+                    return None
+            except BaseException:
+                logger.critical("resume() interrupted during spin-up; re-pausing %s.", ", ".join(sorted(lagged)))
+                self._for_each_subsystem("pause", only=lagged)
+                self.event_log.log(
+                    self.clock.elapsed(), "flume_lab", "spinup_aborted",
+                    notes="resume() interrupted (exception); lagged subsystems re-paused",
+                )
+                if self.clock.is_running and not self.clock.is_paused:
+                    self.clock.pause()
+                raise
         if self.clock.is_running and self.clock.is_paused:
             self.clock.resume()
-        self._for_each_subsystem("resume")
+        self._for_each_subsystem("resume", skip=lagged)
         self.safety_monitor.rearm()
         self.event_log.log(self.clock.elapsed(), "flume_lab", "experiment_resume")
         with self._state_lock:
@@ -906,7 +1146,14 @@ class FlumeLab:
         """Where the rig is in the pause/stop/estop lifecycle."""
         return self._safety_state
 
-    def _for_each_subsystem(self, verb: str, order: tuple = ()) -> List[str]:
+    def _for_each_subsystem(
+        self,
+        verb: str,
+        order: tuple = (),
+        only: Optional[Collection[str]] = None,
+        skip: Collection[str] = (),
+        notes: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
         """Call `verb` on every subsystem that has it, guarded individually.
 
         Notes returned by a subsystem go to the **event log**, not just the
@@ -918,8 +1165,13 @@ class FlumeLab:
         fix for the defect where emergency_stop() called stop() unguarded in
         a loop: GocatorScanner.stop() raised when disconnected, aborting the
         loop, so every subsystem registered after it was never stopped.
+
+        `only` restricts the verb to those names; `skip` excludes some. If
+        `notes` is given, each returned note is also stored in it by name, for
+        a caller that must treat a note as a failure (see _resume_lagged).
         """
         names = list(order) + [n for n in self._subsystems if n not in order]
+        names = [n for n in names if (only is None or n in only) and n not in skip]
         failed: List[str] = []
         for name in names:
             subsystem = self._subsystems.get(name)
@@ -945,6 +1197,8 @@ class FlumeLab:
                 )
                 continue
             if note:
+                if notes is not None:
+                    notes[name] = str(note)
                 logger.warning("%s.%s(): %s", name, verb, note)
                 self.event_log.log(
                     self.clock.elapsed(), name, verb, result="ok", notes=str(note)
@@ -956,6 +1210,11 @@ class FlumeLab:
         with self._state_lock:
             if state.severity >= self._safety_state.severity:
                 self._safety_state = state
+        # After the update, so a spin-up woken by this reads the new state. Set
+        # on every escalation, even a long-after PAUSED -> STOPPED: start() and
+        # resume() clear it, so a stale flag can't outlive the run it belongs to.
+        self._spinup_gen += 1
+        self._spinup_abort.set()
 
     def _on_safety_trigger(self, tier: SafetyTier, name: str) -> None:
         """Dispatch a monitor trip to the matching verb."""

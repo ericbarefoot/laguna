@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from typing import Callable, List, Optional, Any
+from typing import Any, Callable, Collection, List, Optional, Set
 
 from .clock import ExperimentClock
 from .event_log import EventLog
@@ -43,6 +43,9 @@ class Scheduler:
         self._event_log = event_log
         self._recurring: List[dict] = []
         self._oneshot: List[dict] = []
+        # Serialises preroll(): start()'s thread and a resume() during its
+        # pre-roll would otherwise both fire the same T=0 action.
+        self._preroll_lock = threading.Lock()
         # One Event per run() call, not one shared Event that run() clears:
         # with a shared one, a quick pause-then-resume cleared it before the
         # old loop's next poll saw it set, and two loops ran at once,
@@ -233,6 +236,84 @@ class Scheduler:
                 return not stop_event.is_set()
             time.sleep(poll)
         return False
+
+    def pending(self, subsystems: Collection[str], up_to: float = 0.0) -> Set[str]:
+        """Names in `subsystems` with a one-shot due at or before `up_to` that has not fired."""
+        return {
+            e["subsystem"] for e in self._oneshot
+            if not e["_fired"] and e["subsystem"] in subsystems and e["runtime_s"] <= up_to
+        }
+
+    def preroll(
+        self,
+        subsystems: Collection[str],
+        up_to: float = 0.0,
+        gate: Optional[Callable[[], Optional[str]]] = None,
+    ) -> List[str]:
+        """Fire the one-shot actions `subsystems` have due at T=0, before the clock runs.
+
+        Lets a slow-to-settle subsystem (a pump) be commanded *ahead* of
+        T=0, so its spin-up lag elapses on the wall clock while runtime is
+        still frozen. Runs on the caller's thread, one action at a time,
+        because the caller must know whether the command went out before
+        it starts counting the lag — run() dispatches on daemon threads and
+        can't tell it. Each action goes through ``gate`` like any other
+        firing, and is marked fired so run() doesn't repeat it.
+
+        A slow or hung action blocks the caller (and so start()'s scheduler
+        thread, or resume()) for as long as the action takes, up to the VFD
+        command timeout (5 s by default). Concurrent callers are serialised,
+        so an action never fires twice; the second waits and then sees it fired.
+
+        Args:
+            subsystems: Only one-shot entries registered for these subsystem
+                names are fired.
+            up_to: Fire entries scheduled at or before this runtime.
+            gate: Veto check used instead of ``self.gate`` (which refuses
+                everything unless the rig is RUNNING, as it isn't during
+                ``resume()``). Returns a reason to skip, or None.
+
+        Returns:
+            One description per action that was skipped or raised; empty if
+            every action ran. An entry that did not complete is left
+            unfired, so a later resume() retries it rather than losing it.
+        """
+        with self._preroll_lock:
+            return self._preroll_locked(subsystems, up_to, gate)
+
+    def _preroll_locked(
+        self,
+        subsystems: Collection[str],
+        up_to: float,
+        gate: Optional[Callable[[], Optional[str]]],
+    ) -> List[str]:
+        problems: List[str] = []
+        now = self._clock.elapsed()
+        for entry in self._oneshot:
+            if entry["_fired"] or entry["subsystem"] not in subsystems:
+                continue
+            if entry["runtime_s"] > up_to:
+                continue
+            label = f"{entry['subsystem']}/{entry['name']}"
+            reason = None
+            check = gate if gate is not None else self.gate
+            if check is not None:
+                try:
+                    reason = check()
+                except Exception as exc:  # fail closed
+                    reason = f"gate check failed: {exc}"
+            if reason is not None:
+                problems.append(f"{label} skipped: {reason}")
+                continue
+            try:
+                entry["action"]()
+                entry["_fired"] = True
+            except Exception as exc:
+                logger.warning("Pre-roll action %s failed: %s", label, exc)
+                problems.append(f"{label} failed: {exc}")
+                if self._event_log:
+                    self._event_log.log(now, entry["subsystem"], entry["name"], f"error: {exc}")
+        return problems
 
     def stop(self) -> None:
         """Interrupt run() and pause the experiment clock.
