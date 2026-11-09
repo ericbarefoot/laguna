@@ -199,7 +199,9 @@ multiple hosts can be compared directly.
 ```
 
 The format is `HH:MM:SS.mmmZ` (UTC) followed by `/HH:MM:SS` (local time on that
-Pi). The shared helper `utc_local_ts()` in `camera/_log.py` produces both strings.
+Pi). `utc_local_ts()` in `camera/agent.py` produces both strings. The helper
+lives in the agent script because that file is copied to the Pi and run with
+plain `python3`, and the Pi does not have the `laguna` package installed.
 
 **Image filenames** use ISO 8601 UTC derived from the scheduled `target_time`,
 not the wall-clock time of the actual shutter:
