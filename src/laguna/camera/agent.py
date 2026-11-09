@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Camera agent — runs on each Raspberry Pi.
 
+CameraArray copies this file to /tmp/laguna_camera_agent.py and runs it with
+a bare `python3`. The Pi does not have the laguna package installed, so this
+file must stay standalone and must not import laguna.
+
 Invoked by the coordinator over SSH:
     python3 camera_agent.py <target_unix_timestamp> [output_dir]
 
@@ -15,7 +19,17 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from laguna.camera._log import utc_local_ts
+
+def utc_local_ts() -> tuple[str, str]:
+    """Return (utc_str, local_str) with millisecond precision for log lines.
+
+    Kept in this file on purpose: the script is executed on the Pi, outside
+    the laguna package.
+    """
+    now = time.time()
+    utc = time.strftime("%H:%M:%S", time.gmtime(now)) + f".{int(now % 1 * 1000):03d}Z"
+    local = time.strftime("%H:%M:%S", time.localtime(now))
+    return utc, local
 
 
 def _log(msg: str) -> None:
