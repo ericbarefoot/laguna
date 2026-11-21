@@ -214,6 +214,46 @@ class TestSchedulerFiring:
 # ---------------------------------------------------------------------------
 
 
+class TestNaturalEndWaitsForInFlightActions:
+    def test_on_complete_runs_after_a_slow_action_finishes(self):
+        scheduler, clock, _ = _scheduler()
+        order = []
+
+        def slow_scan():
+            time.sleep(0.5)
+            order.append("scan_done")
+
+        scheduler.at(runtime_s=1.0, action=slow_scan, name="scan")
+        clock.start()
+        scheduler.run(1.0, on_complete=lambda: order.append("complete"))
+        assert order == ["scan_done", "complete"]
+
+    def test_an_action_at_exactly_the_end_is_not_lost_to_the_end_of_run(self):
+        """Dispatched on a thread that may not have started when run() ends."""
+        for _ in range(30):
+            scheduler, clock, _ = _scheduler()
+            ran = []
+            scheduler.at(runtime_s=0.5, action=lambda: ran.append(1), name="final")
+            clock.start()
+            scheduler.run(0.5, on_complete=lambda: None)
+            assert ran == [1]
+
+    def test_stop_during_the_wait_cancels_on_complete(self):
+        scheduler, clock, _ = _scheduler()
+        release = threading.Event()
+        completed = []
+        scheduler.at(runtime_s=0.5, action=lambda: release.wait(5), name="scan")
+        clock.start()
+        t = threading.Thread(target=scheduler.run, args=(0.5,), kwargs={"on_complete": lambda: completed.append(1)})
+        t.start()
+        assert _wait_for(lambda: len(scheduler._inflight) == 1 and clock.elapsed() >= 0.5)
+        time.sleep(0.2)
+        scheduler.stop()
+        t.join(timeout=2)
+        release.set()
+        assert not t.is_alive() and completed == []
+
+
 class TestCheckpoint:
     def test_a_fresh_start_moves_the_old_checkpoint_aside_instead_of_deleting_it(self, tmp_path):
         """resume=False used to delete the only record of which passes of a

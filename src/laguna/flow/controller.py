@@ -99,7 +99,12 @@ class FlowController(ABC):
 
     @abstractmethod
     def stop(self) -> Optional[str]:
-        """End cleanly: stop the pump, leaving the valves as they are."""
+        """End cleanly: stop the pump, then close both valves.
+
+        Closed is the off state for qin and qaux. The valves are left alone
+        if the VFD did not acknowledge the stop, since closing the inlet
+        on a running pump would dead-head it.
+        """
         ...
 
     @abstractmethod
@@ -492,7 +497,14 @@ class SaflFlowController(FlowController, SubsystemLogging):
         return None
 
     def stop(self) -> Optional[str]:
-        """Stop the pump, leaving the valves at their current state.
+        """Stop the pump, then close both valves.
+
+        Closed is the off state for qin and qaux. The close is always sent,
+        not skipped on the cached valve state. If the VFD does not acknowledge
+        the stop the valves are left as they are, since closing the inlet on
+        a running pump would dead-head it. That check is the node's ack of
+        the stop command, not a readback of the drive: a coasting pump may
+        briefly face a closed inlet. Each valve is attempted independently.
 
         Returns:
             Note about any issues encountered, or None if successful.
@@ -503,7 +515,18 @@ class SaflFlowController(FlowController, SubsystemLogging):
         except Exception as exc:
             logger.error("Could not stop the pump: %s", exc)
             return f"pump may still be running: {exc}"
-        return None
+        problems = []
+        for valve in ("qin", "qaux"):
+            try:
+                # Always send the close: qin/qaux are a cache of the last write,
+                # so after a reconnect, a new process or a crashed session they
+                # read False even if the valve is physically open. Closing an
+                # already-closed valve costs one round trip.
+                setattr(self, valve, False)
+            except Exception as exc:
+                logger.error("Could not close %s on stop: %s", valve, exc)
+                problems.append(valve)
+        return f"pump stopped but could not close: {', '.join(problems)}" if problems else None
 
     def estop(self) -> Optional[str]:
         """Pump off and both valves closed, each attempted independently.
