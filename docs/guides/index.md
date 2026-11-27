@@ -18,6 +18,9 @@ while writing this documentation.
 - **[Plotting saved scans and profiles](plot-saved-acquisitions.md)** —
   reload a saved Gocator scan or rangefinder transect and run it through
   `plot_acquisition()`, offline, no hardware needed.
+- **[Post-processing scans into DEMs](postprocess-scans.md)**: set an ROI
+  and exclusion zones, then turn a folder of saved scans into denoised,
+  ground-filtered DEMs on one shared grid. Runs offline with LAStools.
 - **[Setting up CI on GitHub](continuous-integration.md)** — a plan, not yet
   implemented: the workflow, branch protection, and what CI can and cannot
   check for a hardware project.

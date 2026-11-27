@@ -1,0 +1,50 @@
+# laguna.postprocess config: how saved scans become ground-surface DEMs.
+# Copy this next to your scans and edit it, by hand or with
+# examples/example_16_postprocess_roi_editor.ipynb. All lengths are in mm
+# (SurfaceScan.save_las output).
+#
+#   laguna-postprocess run <scan dir> -c <this file>
+#
+# Values below are from the first gantry tray dataset (scanner-local coordinates).
+
+# How each scan is placed before anything else; every setting below is in
+# the coordinates this produces.
+#   scanner   keep the coordinates the scan was saved in (.laz, else .npz)
+#   frame     apply the fixed transform `frame` to every scan (.laz, else .npz)
+#   metadata  place each scan from its own .npz metadata and the frames section of
+#             `rig_config` (laguna.frames.orient_scan); needs the .npz
+# Only the setting the chosen mode uses is read, so both can stay filled in.
+# `laguna-postprocess --orient ...` overrides this.
+orient: scanner
+# Same keys as frames.experiment in the rig config: rotation_deg (about Z), then
+# translation or origin ([x, y, z] mm), or a 4x4 matrix.
+frame: {rotation_deg: 0, origin: [330, -480, 0]}   # this scan point becomes (0, 0, 0)
+rig_config: null   # e.g. ../config_phase0.yaml, relative to this file
+
+# Area to keep. It also fixes the DEM grid, so every DEM lines up cell for cell.
+roi: {type: rect, xmin: 320, ymin: -480, xmax: 752, ymax: 368}
+
+# If not empty, keep only points inside at least one of these (type polygon/rect/circle).
+include: []
+
+# Dropped before denoising and ground filtering; their DEM cells become nodata.
+exclude:
+- {type: circle, x: 765, y: -100, r: 75, label: obstruction at mound centre}
+# - {type: polygon, points: [[400, 0], [450, 0], [450, 40]], label: bolt}
+# - {type: rect, xmin: 600, ymin: 300, xmax: 640, ymax: 368, label: clamp}
+
+# Optional z window applied with the ROI; null to disable.
+z_range: [20, 100]
+
+# lasnoise: drop points with fewer than `isolated` neighbours in the surrounding
+# 3x3x3 cells of step_xy x step_xy x step_z.
+noise: {enabled: true, step_xy: 3, step_z: 3, isolated: 8}
+
+# lasground_new: when enabled the DEM is built from ground points only.
+ground: {enabled: true, step: 10, offset: 0.5, spike: 1, bulge: 1}
+
+# las2dem: cell size, longest TIN edge to interpolate across, nodata value.
+dem: {step: 1, kill: 25, nodata: -9999}
+
+output_dir: postprocessed   # relative to this file
+cores: 8

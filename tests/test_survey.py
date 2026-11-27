@@ -812,6 +812,57 @@ class TestSurveyRunner:
         assert seen["axis"] == "X"
         assert runner.results[0].path == "fake.csv"  # ProfileResult, not the Gocator SurfaceScan branch
 
+    def test_uncarried_axis_is_backfilled_not_commanded(self):
+        """An instrument not carried by Z gets its live Z, never a NaN."""
+        from laguna.frames import FrameRegistry
+
+        survey = Traverse(
+            start=(0, 0, 0), end=(100, 0, 0), instruments=("od2000",), scan_speed=20.0,
+        )
+        lab = FakeLab()
+        lab.frames = FrameRegistry.from_config(
+            {"instruments": {"od2000": {"translation": [0, 0, -50], "carried_by": ["X", "Y"]}}}
+        )
+        lab.od2000 = object()
+
+        class FakeGantry:
+            _axes = [Axis("X", 1), Axis("Y", 2), Axis("Z", 5)]
+
+            class cmd:
+                @staticmethod
+                def get_actual_position(axis):
+                    return 7.0
+
+        lab.gantry = FakeGantry()
+        seen = {}
+
+        def _acquire_scan(instrument, start=None, end=None, **kw):
+            seen["end"] = end
+
+            class _R:
+                path = "x"
+
+            return _R()
+
+        lab.acquire_scan = _acquire_scan
+        SurveyRunner(lab, survey).run(keep_results=True)
+        assert seen["end"] == [100.0, 0.0, 7.0]
+
+    def test_scan_along_an_uncarried_axis_is_refused_before_any_motion(self):
+        from laguna.frames import FrameRegistry
+
+        survey = Traverse(
+            start=(0, 0, 0), end=(0, 0, 100), axis="Z", instruments=("od2000",), scan_speed=20.0,
+        )
+        lab = FakeLab()
+        lab.frames = FrameRegistry.from_config(
+            {"instruments": {"od2000": {"carried_by": ["X", "Y"]}}}
+        )
+        lab.od2000 = object()
+        with pytest.raises(ValueError, match="cannot scan along"):
+            SurveyRunner(lab, survey).run()
+        assert lab.placed == []
+
 
 class TestRampLeadInIntegration:
     """SurveyRunner wiring for the issue #58 fix.

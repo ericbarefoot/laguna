@@ -40,6 +40,7 @@ Config::
         gocator:
           axes: {scan_x: -Y, scan_y: +X, scan_z: +Z}   # see scanner.mounting
           translation: [0, 0, -325]                    # standoff below the carriage
+          carried_by: [X, Y]                           # not on the Z axis: its height is fixed
         od2000:
           translation: [52.0, -18.0, 0]
         wtt12l:
@@ -330,6 +331,10 @@ class InstrumentFrame:
         reference_point: The point *in the instrument's own frame* that
             "where it measures" refers to — the laser dot for a rangefinder.
             Defaults to that frame's origin.
+        carried_by: The gantry axes that move this instrument. Defaults to
+            all of X, Y and Z. An instrument that isn't on an axis (e.g. a
+            Gocator bolted to the carriage beside the Z axis) ignores that
+            axis's position when its readings are placed.
     """
 
     def __init__(
@@ -337,6 +342,7 @@ class InstrumentFrame:
         name: str,
         mount: Optional[AffineTransform] = None,
         reference_point: Sequence[float] = (0.0, 0.0, 0.0),
+        carried_by: Sequence[str] = ("X", "Y", "Z"),
     ) -> None:
         """Initialize an instrument frame.
 
@@ -347,9 +353,11 @@ class InstrumentFrame:
             reference_point: The point in the instrument's frame that
                 represents "where it measures" (e.g., laser dot). Defaults
                 to origin (0, 0, 0).
+            carried_by: Gantry axes ("X", "Y", "Z") that move the instrument.
 
         Raises:
-            ValueError: If reference_point does not have 3 values.
+            ValueError: If reference_point does not have 3 values, or
+                carried_by names something other than X, Y or Z.
         """
         self.name = name
         self.mount = mount or AffineTransform.identity()
@@ -359,6 +367,24 @@ class InstrumentFrame:
                 f"{name}: reference_point must have 3 values, got "
                 f"{self.reference_point.size}"
             )
+        self.carried_by = tuple(str(a).upper() for a in carried_by)
+        for axis in self.carried_by:
+            _axis_index(axis)
+        self._carried_mask = np.array([a in self.carried_by for a in "XYZ"], dtype=float)
+
+    def carried_position(self, gantry_position: Sequence[float]) -> np.ndarray:
+        """Return the part of a gantry position that actually moves this instrument.
+
+        Args:
+            gantry_position: ``(3,)`` or ``(N, 3)`` gantry X/Y/Z positions.
+
+        Returns:
+            The same shape, with axes not in ``carried_by`` set to 0 (including
+            any that were NaN).
+        """
+        # where(), not a multiply: a NaN in a non-carried axis (what
+        # gantry_target_for() returns there) must become 0, not stay NaN.
+        return np.where(self._carried_mask.astype(bool), np.asarray(gantry_position, dtype=float), 0.0)
 
     @property
     def offset(self) -> np.ndarray:
@@ -376,17 +402,22 @@ class InstrumentFrame:
 
         Args:
             name: Instrument key.
-            config: Config dict (see AffineTransform.from_config()).
+            config: Config dict: the transform keys of
+                AffineTransform.from_config(), plus optional
+                ``reference_point`` and ``carried_by`` (e.g. ``[X, Y]``).
 
         Returns:
-            InstrumentFrame with the specified mount and reference point.
+            InstrumentFrame with the specified mount, reference point and
+            carrying axes.
         """
         config = dict(config or {})
         reference_point = config.pop("reference_point", (0.0, 0.0, 0.0))
+        carried_by = config.pop("carried_by", ("X", "Y", "Z"))
         return cls(
             name=name,
             mount=AffineTransform.from_config(config),
             reference_point=reference_point,
+            carried_by=carried_by,
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -505,15 +536,14 @@ class FrameRegistry:
             instrument: Instrument key, e.g. ``"gocator"``.
             points: ``(3,)`` or ``(N, 3)`` in the *instrument's own* frame.
             gantry_position: Where the gantry was when the reading was taken,
-                in gantry coordinates.
+                in gantry coordinates. Axes the instrument isn't carried by
+                are ignored (see ``InstrumentFrame.carried_by``).
 
         Returns:
             The same shape, in experiment coordinates.
         """
         frame = self.frame_for(instrument)
-        gantry_points = frame.mount.apply(points) + np.asarray(
-            gantry_position, dtype=float
-        )
+        gantry_points = frame.mount.apply(points) + frame.carried_position(gantry_position)
         return self.experiment_from_gantry.apply(gantry_points)
 
     def gantry_axis_for(self, experiment_axis: str) -> str:
@@ -615,8 +645,12 @@ class FrameRegistry:
                 instrument's configured reference point.
 
         Returns:
-            ``(3,)`` gantry position to command, e.g. via
-            ``lab.move_to(list(target))``.
+            ``(3,)`` gantry position to command. Axes the instrument is not
+            carried by (``InstrumentFrame.carried_by``) are NaN: moving them
+            would not change where the instrument measures, so there is
+            nothing to command. Never pass the NaNs to a move; use
+            ``lab.place()``, which skips them, or drop them with
+            ``np.isfinite``.
         """
         target_gantry = self.experiment_to_gantry(
             np.asarray(experiment_point, dtype=float)
@@ -627,7 +661,9 @@ class FrameRegistry:
             if reference_point is not None
             else frame.offset
         )
-        return target_gantry - offset
+        target = target_gantry - offset
+        target[~frame._carried_mask.astype(bool)] = np.nan
+        return target
 
     def experiment_point_for(
         self,
@@ -646,12 +682,14 @@ class FrameRegistry:
 
         Args:
             instrument: Instrument key.
-            gantry_position: Commanded gantry position, gantry frame.
+            gantry_position: Commanded gantry position, gantry frame. Axes the
+                instrument isn't carried by are ignored.
 
         Returns:
             ``(3,)`` point in experiment coordinates.
         """
-        measured_gantry = np.asarray(gantry_position, dtype=float) + self.frame_for(instrument).offset
+        frame = self.frame_for(instrument)
+        measured_gantry = frame.carried_position(gantry_position) + frame.offset
         return self.gantry_to_experiment(measured_gantry)
 
     def retarget(
@@ -668,16 +706,19 @@ class FrameRegistry:
         Args:
             from_instrument: Source instrument key.
             to_instrument: Target instrument key.
-            gantry_position: [x, y, z, ...] original gantry position.
+            gantry_position: [x, y, z, ...] original gantry position. Axes
+                ``from_instrument`` is not carried by are ignored.
 
         Returns:
-            [x, y, z, ...] gantry position for the target instrument.
+            [x, y, z, ...] gantry position for the target instrument. Axes
+            ``to_instrument`` is not carried by are NaN (nothing to command
+            there); see :meth:`gantry_target_for`.
         """
-        delta = (
-            self.frame_for(from_instrument).offset
-            - self.frame_for(to_instrument).offset
-        )
-        return np.asarray(gantry_position, dtype=float) + delta
+        src, dst = self.frame_for(from_instrument), self.frame_for(to_instrument)
+        out = np.asarray(gantry_position, dtype=float).copy()
+        out[:3] = src.carried_position(out[:3]) + src.offset - dst.offset
+        out[:3][~dst._carried_mask.astype(bool)] = np.nan
+        return out
 
     def describe(self) -> Dict[str, Any]:
         """Human-readable summary for logs and get_status().
@@ -753,7 +794,8 @@ def orient_scan(
         instrument: Which instrument frame to use.
         frames: The lab's FrameRegistry.
         gantry_start: Full [x, y, z] gantry position at the start of the
-            pass. Reconstructed from the scan's metadata when omitted.
+            pass. Reconstructed from the scan's metadata when omitted. Axes
+            not in the instrument's ``carried_by`` are ignored.
         dtype: Output dtype for the transformed grid.
         output: Optional path to also write the oriented scan to — format
             inferred from the suffix (.csv/.las/.laz/.ply/.npz).
@@ -763,7 +805,8 @@ def orient_scan(
 
     Raises:
         ValueError: If no starting position is given and the metadata
-            doesn't carry one, or `output`'s suffix isn't recognized.
+            doesn't carry one, the pass's travel axis isn't one that carries
+            the instrument, or `output`'s suffix isn't recognized.
     """
     from .scanner.pointcloud import SensorMounting, SurfaceScan
 
@@ -807,6 +850,12 @@ def orient_scan(
     # must supply the translation only — a rotation here as well would
     # apply the sensor's turn twice, silently.
     frame = frames.frame_for(instrument)
+    if axis is not None and axis not in frame.carried_by:
+        raise ValueError(
+            f"the scan travelled along gantry {axis}, but frames.instruments."
+            f"{instrument}.carried_by is {list(frame.carried_by)}; an axis that "
+            "doesn't carry the sensor can't have moved it"
+        )
     scan_rotated = not getattr(scan, "mounting", None) or not scan.mounting.is_identity
     frame_rotates = not np.allclose(frame.mount.matrix[:3, :3], np.eye(3), atol=_RIGID_TOL)
     if scan_rotated and frame_rotates:
@@ -867,7 +916,7 @@ def orient_scan(
         # must not add gantry_start[travel_col] a second time.
         gantry_start[travel_col] = 0.0
 
-    offset = frame.offset + np.asarray(gantry_start, dtype=float)
+    offset = frame.offset + frame.carried_position(gantry_start)
     transformed = frames.experiment_from_gantry.apply(full_points + offset)
 
     rows, cols = scan.z_mm.shape
@@ -974,7 +1023,7 @@ def orient_gocator_profile(
         )
 
     gantry_points = profile.to_points(drop_invalid=True, dtype=np.float64, frame="gantry")
-    offset = frame.offset + np.asarray(gantry_position, dtype=float)
+    offset = frame.offset + frame.carried_position(gantry_position)
     experiment_points = frames.experiment_from_gantry.apply(gantry_points + offset)
     experiment_points = experiment_points.astype(dtype, copy=False)
 

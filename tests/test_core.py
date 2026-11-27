@@ -185,6 +185,24 @@ class TestPlace:
         _, axes = gantry.move_to_calls[0]
         assert (axes["X"], axes["Y"], axes["Z"]) == (1.0, 2.0, 3.0)
 
+    def test_only_moves_the_axes_that_carry_the_instrument(self):
+        lab = FlumeLab()
+        lab.frames = FrameRegistry.from_config(
+            {
+                "experiment": {"translation": [500.0, 300.0, 0.0]},
+                "instruments": {
+                    "gocator": {"translation": [0.0, 0.0, -325.0], "carried_by": ["X", "Y"]},
+                },
+            }
+        )
+        gantry = FakeGantry()
+        lab.add(gantry)
+        lab.place("gocator", [700.0, 400.0, 0.0], speed=5.0)
+        vector, axes = gantry.move_to_calls[0]
+        assert vector is None and "Z" not in axes
+        assert axes["X"] == pytest.approx(200.0) and axes["Y"] == pytest.approx(100.0)
+        assert all(v == v for v in axes.values()), "a NaN reached move_to()"
+
     def test_requires_gantry_subsystem(self):
         with pytest.raises(RuntimeError):
             FlumeLab().place("od2000", [0, 0, 0])

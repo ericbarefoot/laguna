@@ -80,6 +80,7 @@ nav:
       - Driving the gantry safely: guides/gantry-motion.md
       - Setting up CI on GitHub: guides/continuous-integration.md
       - Plotting saved scans and profiles: guides/plot-saved-acquisitions.md
+      - Post-processing scans into DEMs: guides/postprocess-scans.md
       - "Plan: gantry geometry visualization": guides/gantry-geometry-visualization-plan.md
   - Gantry:
       - Usage guide: GANTRY_GUIDE.md
@@ -119,6 +120,7 @@ nav:
       - Reference frames: reference/frames.md
       - Survey: reference/survey.md
       - Visualization: reference/viz.md
+      - Post-processing: reference/postprocess.md
       - Schedule: reference/schedule.md
       - Timing: reference/timing.md
       - Experiment runner: reference/experiment.md
