@@ -117,6 +117,81 @@ symlink for its hub port, run:
 python scripts/setup_dslr_udev.py --config config/my_run.yaml
 ```
 
+## Fixed exposure and white balance
+
+By default the Pi agent uses libcamera's **automatic** exposure (AE) and white
+balance (AWB). Because the camera is opened fresh for each capture, both
+algorithms restart from scratch every frame and have only a few frames to
+settle, so brightness and colour vary through a run (and between Pis). For
+anything quantitative, fix them.
+
+```yaml
+pi_cameras:
+  hosts: [antares.laguna, sirius.laguna]
+  exposure:
+    mode: calibrated                              # auto (default) | manual | calibrated
+    calibration_file: ./pi_camera_calibration.json
+```
+
+| Mode | Behaviour |
+|---|---|
+| `auto` | AE/AWB on. Historical behaviour and the default. A warning is logged at run start. |
+| `manual` | Fixed `exposure_time_us`, `analogue_gain`, `awb_gains: [red, blue]` from the config; `per_host:` overrides individual values for one Pi. |
+| `calibrated` | Per-host values from `calibration_file`, produced by the procedure below. |
+
+### Calibrating at the start of an experiment
+
+Do this under the lighting the run will use — lamps on and warmed up, water
+at the working level.
+
+```bash
+laguna-picam --config config/my_config.yaml calibrate
+```
+
+Each Pi runs AE/AWB for `warmup_s` seconds (default 5), samples several frames
+and reports the median exposure time, gain and colour gains. A host whose
+frames still disagree by more than 5 % is marked `NOT CONVERGED` — wait for
+the scene to settle and run it again. A preview JPEG per camera is downloaded
+next to the calibration file (`<name>_previews/`); look at them, then confirm
+at the prompt. The values are written only if **every** camera calibrated and
+you confirm, so a calibration never covers some of the cameras. An existing
+file is not replaced unless you pass `--overwrite`.
+
+The file is plain JSON (`format`, `hosts: {host: {exposure_time_us,
+analogue_gain, awb_gains}}`); edit a value by hand if you want a different
+exposure from the one auto picked. Keep it with the run's data.
+
+Then start the run with `mode: calibrated`. Every capture applies those
+values with AE/AWB **off**.
+
+### Guarantees
+
+- A locked mode never degrades to auto. A missing, unreadable or incomplete
+  calibration file raises when the config is read, before the run starts. If
+  the Pi has no `picamera2`, the capture fails (and is reported as a missed
+  capture) rather than producing an auto-exposed frame.
+- The Pi opens the camera ~3 s before the target time so the fixed values have
+  taken effect; timing metadata still describes the actual capture.
+- The agent returns what the camera *reported* for each frame. The event log's
+  `capture` row carries `exposure_mode`, `exposure_time_us`, `analogue_gain` and
+  `colour_gains`; a frame that differs from what was commanded (beyond sensor
+  quantisation, 5 %) also logs an `exposure_mismatch` warning. `exposure_settings`
+  at run start records the mode and values in force.
+- In `auto` mode with the legacy path, per-frame values are not available.
+
+### Previewing with the same settings
+
+```bash
+laguna-picam --config config/my_config.yaml snap 1 --locked -o shot.jpg
+```
+
+`--locked` applies the config's `exposure` for that camera to `snap`/`stream`
+(or give `--shutter-us`, `--gain` and `--awbgains R,B` together).
+
+Not covered by simulation: `simulate=True` exercises the config, the
+calibration file and the event log, but it cannot tell whether the chosen
+values suit the real lighting — only a calibration on the real rig can.
+
 ## Remote view and snapshot (`laguna-picam`)
 
 For a human looking at a Pi camera from another machine, with commands going

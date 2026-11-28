@@ -400,6 +400,7 @@ def setup_run(
         )
         pi_output_dir.mkdir(parents=True, exist_ok=True)
         lab.pi_cameras.output_dir = pi_output_dir
+        lab.pi_cameras.log_exposure_settings()
 
     # ------------------------------------------------------------------ #
     # Connect                                                              #
@@ -527,6 +528,8 @@ def setup_run(
             for r in results:
                 if not r.success:
                     logger.warning("  %s FAILED: %s", r.hostname, r.error)
+                elif r.exposure_warning:
+                    logger.warning("  %s exposure mismatch: %s", r.hostname, r.exposure_warning)
             fetched = lab.pi_cameras.fetch_images(results, lab.pi_cameras.output_dir)
             for host, path in fetched.items():
                 logger.info("  %s -> %s", host, Path(path).name)

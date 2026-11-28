@@ -10,7 +10,23 @@ them into a dated release section when you cut a version.
 
 ## [Unreleased]
 
+### Added
+- **Fixed exposure and white balance for the Pi cameras.** Until now the Pi agent left libcamera's auto-exposure and
+  auto-white-balance on, restarted for every frame, so brightness and colour drifted through a run. New
+  `pi_cameras.exposure:` config (`mode: auto | manual | calibrated`; default `auto`, so existing configs are
+  unchanged). `laguna-picam calibrate` lets AE/AWB converge on every Pi under the real lighting, shows the values and
+  preview frames, and — only after confirmation, and only if every camera succeeded — saves a calibration file that
+  `mode: calibrated` applies to every capture. An existing calibration file is never overwritten without
+  `--overwrite`. A locked mode never falls back to auto: a missing or incomplete calibration stops the run from
+  starting, and an agent without `picamera2` fails the capture instead of taking an auto-exposed frame.
+  Each capture's reported exposure time, gain and colour gains are recorded in the event log, with an
+  `exposure_mismatch` warning if a frame differs from what was commanded; `exposure_settings` is logged at run start.
+  `laguna-picam snap/stream` take `--locked` (or `--shutter-us/--gain/--awbgains`) to preview with the same settings.
+  See `docs/subsystems/camera.md`.
+
 ### Changed
+- **The Pi camera agent's command line changed** to `camera_agent.py capture <target_time> [output_dir] [--controls JSON]`
+  (or `calibrate`); the bare positional form is gone. `CameraArray` is the only caller and is updated.
 - **Pi frames for a run go under that run's `pi_cameras/` directory.** A configured `pi_cameras.output_dir` still wins, and a run with no run directory still writes `./captures/pi`. DSLR frames stay in `dslr_cameras/<camera>/` and Gocator scans stay in `gocator/`.
 - **Local files are no longer tracked.** `/data/` (everything under the top-level `data/`), `/sandbox/` and
   `/config/` (except `config/example_config.yaml`) are ignored, and `config/config_scan.yaml`,

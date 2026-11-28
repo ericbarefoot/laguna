@@ -16,6 +16,7 @@ import logging
 import os
 import math
 import os
+import shlex
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import paramiko
 
 from ..subsystem_logging import SubsystemLogging
+from .exposure import ExposureControls, ExposureSettings, compare_controls
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -74,6 +76,13 @@ class CaptureResult:
         latency_ms: Time from target to actual capture start in milliseconds.
         clock_offset_s: Measured clock offset (Pi time − PC time) in seconds.
         error: Error message if capture failed.
+        exposure_mode: "locked" if AE/AWB were disabled and fixed controls applied,
+            "auto" otherwise (None if the agent did not say).
+        exposure_time_us: Exposure the camera reported for the frame (locked captures).
+        analogue_gain: Gain the camera reported for the frame (locked captures).
+        colour_gains: ``[red, blue]`` white-balance gains reported for the frame.
+        exposure_warning: Set when a locked capture's reported values differ from
+            what was commanded; the frame is kept but should not be trusted.
     """
 
     hostname: str
@@ -85,6 +94,36 @@ class CaptureResult:
     capture_duration_ms: Optional[float] = None
     latency_ms: Optional[float] = None
     clock_offset_s: Optional[float] = None         # Pi time − PC time
+    error: Optional[str] = None
+    exposure_mode: Optional[str] = None
+    exposure_time_us: Optional[float] = None
+    analogue_gain: Optional[float] = None
+    colour_gains: Optional[List[float]] = None
+    exposure_warning: Optional[str] = None
+
+
+@dataclass
+class CalibrationResult:
+    """Outcome of calibrating one Pi's exposure and white balance.
+
+    Attributes:
+        hostname: Hostname of the Raspberry Pi camera.
+        success: True if AE/AWB values were read back.
+        controls: The converged values, ready to confirm and save.
+        converged: True if the sampled frames agreed closely enough.
+        spread: Largest relative max-min across the sampled frames.
+        filename: Preview JPEG on the Pi (None on failure).
+        local_preview: Where the preview was fetched to, if it was.
+        error: Error message if calibration failed.
+    """
+
+    hostname: str
+    success: bool
+    controls: Optional[ExposureControls] = None
+    converged: bool = False
+    spread: Optional[float] = None
+    filename: Optional[str] = None
+    local_preview: Optional[Path] = None
     error: Optional[str] = None
 
 
@@ -102,6 +141,7 @@ class CameraArray(SubsystemLogging):
         log_level: str = "INFO",
         event_log_verbosity: str = "INFO",
         simulated: bool = False,
+        exposure: Optional[ExposureSettings] = None,
     ):
         """Initialize a networked Pi camera array.
 
@@ -114,6 +154,13 @@ class CameraArray(SubsystemLogging):
             event_log_verbosity: Event log verbosity (default 'INFO').
             simulated: If True, skip real SSH and hardware I/O, return placeholder
                 results (default False; see laguna.simulation module docstring).
+            exposure: Fixed exposure / white-balance settings (default: automatic,
+                the historical behaviour). See laguna.camera.exposure.
+
+        Raises:
+            ValueError: If ``exposure`` is a locked mode that has no controls for
+                one of ``hosts`` — found here, before a run starts, so a gap never
+                becomes silently automatic frames.
         """
         self.hosts = hosts
         self.ssh_user = ssh_user
@@ -122,6 +169,8 @@ class CameraArray(SubsystemLogging):
         self.log_level = log_level
         self.event_log_verbosity = event_log_verbosity
         self._simulated = simulated
+        self.exposure = exposure if exposure is not None else ExposureSettings()
+        self.exposure.validate_hosts(self.hosts)
         #: Where fetched frames are written. setup_run() sets this from the
         #: run directory, or leaves the historical ./captures/pi default.
         self.output_dir = Path("./captures/pi")
@@ -145,6 +194,7 @@ class CameraArray(SubsystemLogging):
             log_level=pi_cfg.get("log_level", "INFO"),
             event_log_verbosity=pi_cfg.get("event_log_verbosity", "INFO"),
             simulated=pi_cfg.get("simulated", False),
+            exposure=ExposureSettings.from_config(pi_cfg.get("exposure")),
         )
 
     def _connect(self, hostname: str) -> paramiko.SSHClient:
@@ -167,19 +217,27 @@ class CameraArray(SubsystemLogging):
     def _log(self, hostname: str, msg: str) -> None:
         logger.debug("[%s] %s", hostname, msg)
 
-    def _run_capture_on_host(
-        self, hostname: str, target_time: float, timeout: float = 60.0
-    ) -> CaptureResult:
-        """Open SSH connection, deploy agent, execute capture, return result.
+    def _exec_agent(
+        self, hostname: str, agent_args: str, timeout: float
+    ) -> "tuple[Optional[dict], Optional[str]]":
+        """Deploy the agent to one Pi, run it, and parse its JSON line.
 
-        timeout: seconds from now (PC clock) to wait for the agent to finish.
+        Args:
+            hostname: Pi to run on.
+            agent_args: Already shell-quoted arguments after the agent path
+                (e.g. ``"capture 1700000000.0 /tmp/x"``).
+            timeout: Seconds from now (PC clock) to wait for the agent to finish.
+
+        Returns:
+            ``(data, None)`` on success, or ``(None, error_message)``. An
+            ``{"error": ...}`` result from the agent is returned as an error.
         """
         self._log(hostname, "Connecting via SSH...")
         try:
             client = self._connect(hostname)
         except Exception as exc:
             self._log(hostname, f"SSH connect FAILED: {exc}")
-            return CaptureResult(hostname=hostname, success=False, error=f"SSH connect: {exc}")
+            return None, f"SSH connect: {exc}"
         self._log(hostname, "Connected. Deploying agent script...")
 
         try:
@@ -187,11 +245,11 @@ class CameraArray(SubsystemLogging):
         except Exception as exc:
             self._log(hostname, f"Deploy FAILED: {exc}")
             client.close()
-            return CaptureResult(hostname=hostname, success=False, error=f"Deploy: {exc}")
-        self._log(hostname, "Agent deployed. Launching capture...")
+            return None, f"Deploy: {exc}"
+        self._log(hostname, "Agent deployed. Launching...")
 
         try:
-            cmd = f"python3 {REMOTE_AGENT_PATH} {target_time:.6f} {REMOTE_CAPTURE_DIR}"
+            cmd = f"python3 {REMOTE_AGENT_PATH} {agent_args}"
             _, _stdout_stream, _ = client.exec_command(cmd)
             channel = _stdout_stream.channel
 
@@ -212,6 +270,7 @@ class CameraArray(SubsystemLogging):
                         stdout_buf += channel.recv(4096)
                     while channel.recv_stderr_ready():
                         chunk = channel.recv_stderr(4096).decode(errors="replace")
+                        stderr_buf += chunk.encode()
                         for line in chunk.splitlines():
                             self._log(hostname, line)
                     break
@@ -219,10 +278,7 @@ class CameraArray(SubsystemLogging):
                     self._log(hostname, f"TIMEOUT after {timeout:.0f}s — killing channel")
                     channel.close()
                     client.close()
-                    return CaptureResult(
-                        hostname=hostname, success=False,
-                        error=f"Agent timed out after {timeout:.0f}s",
-                    )
+                    return None, f"Agent timed out after {timeout:.0f}s"
                 time.sleep(POLL_INTERVAL)
 
             exit_code = channel.recv_exit_status()
@@ -231,31 +287,49 @@ class CameraArray(SubsystemLogging):
         except Exception as exc:
             self._log(hostname, f"exec FAILED: {exc}")
             client.close()
-            return CaptureResult(hostname=hostname, success=False, error=f"exec_command: {exc}")
+            return None, f"exec_command: {exc}"
         finally:
             client.close()
 
         if not raw_out:
             raw_err = stderr_buf.decode(errors="replace").strip()
-            return CaptureResult(
-                hostname=hostname,
-                success=False,
-                error=f"No stdout from agent (exit {exit_code}). stderr: {raw_err}",
-            )
+            return None, f"No stdout from agent (exit {exit_code}). stderr: {raw_err}"
 
         try:
             data = json.loads(raw_out)
         except json.JSONDecodeError as exc:
-            return CaptureResult(
-                hostname=hostname, success=False,
-                error=f"JSON parse: {exc} — got: {raw_out!r}",
-            )
+            return None, f"JSON parse: {exc} — got: {raw_out!r}"
 
         if "error" in data:
-            return CaptureResult(hostname=hostname, success=False, error=data["error"])
+            return None, data["error"]
+        return data, None
+
+    def _run_capture_on_host(
+        self, hostname: str, target_time: float, timeout: float = 60.0
+    ) -> CaptureResult:
+        """Open SSH connection, deploy agent, execute capture, return result.
+
+        timeout: seconds from now (PC clock) to wait for the agent to finish.
+
+        In a locked exposure mode the host's fixed controls are sent to the
+        agent, and the frame's reported values are checked against them: a
+        difference sets ``exposure_warning`` on the result.
+        """
+        try:
+            controls = self.exposure.controls_for(hostname)
+        except KeyError as exc:
+            # Refuse rather than capture in auto mode.
+            return CaptureResult(hostname=hostname, success=False, error=str(exc.args[0]))
+
+        args = f"capture {target_time:.6f} {shlex.quote(REMOTE_CAPTURE_DIR)}"
+        if controls is not None:
+            args += f" --controls {shlex.quote(json.dumps(controls.to_dict()))}"
+        data, error = self._exec_agent(hostname, args, timeout)
+        if error is not None:
+            return CaptureResult(hostname=hostname, success=False, error=error)
 
         self._log(hostname, "Capture successful.")
-        return CaptureResult(
+        result = CaptureResult(
             hostname=hostname,
             success=True,
             filename=data.get("filename"),
@@ -263,7 +337,135 @@ class CameraArray(SubsystemLogging):
             capture_time_mid=data.get("capture_time_mid"),
             capture_duration_ms=data.get("capture_duration_ms"),
             latency_ms=data.get("latency_ms"),
+            exposure_mode=data.get("exposure_mode"),
+            exposure_time_us=data.get("exposure_time_us"),
+            analogue_gain=data.get("analogue_gain"),
+            colour_gains=data.get("colour_gains"),
         )
+        if controls is not None:
+            if result.exposure_mode != "locked":
+                result.exposure_warning = (
+                    f"fixed exposure requested but agent reported mode {result.exposure_mode!r}"
+                )
+            else:
+                result.exposure_warning = compare_controls(
+                    controls, result.exposure_time_us, result.analogue_gain, result.colour_gains
+                )
+        return result
+
+    def calibrate(self, warmup_s: Optional[float] = None) -> Dict[str, CalibrationResult]:
+        """Let AE/AWB converge on every Pi and read back the values they chose.
+
+        Meant to be run by an operator at the start of an experiment, under
+        the lighting the run will use, via ``laguna-picam calibrate``. It
+        captures nothing for the dataset and is never scheduled.
+
+        Args:
+            warmup_s: Seconds to run auto mode before sampling (default: the
+                ``exposure.warmup_s`` setting).
+
+        Returns:
+            Results keyed by hostname. Failures are returned, not raised, so
+            one dead Pi does not hide the others' results.
+        """
+        warmup = self.exposure.warmup_s if warmup_s is None else warmup_s
+        if self._simulated:
+            return {
+                h: CalibrationResult(
+                    hostname=h, success=False, error="simulated: no hardware to calibrate"
+                )
+                for h in self.hosts
+            }
+
+        results: Dict[str, CalibrationResult] = {}
+
+        def worker(hostname: str) -> None:
+            args = f"calibrate {shlex.quote(REMOTE_CAPTURE_DIR)} --warmup-s {warmup:.3f}"
+            data, error = self._exec_agent(hostname, args, timeout=warmup + 60)
+            if error is not None:
+                results[hostname] = CalibrationResult(hostname=hostname, success=False, error=error)
+                return
+            try:
+                controls = ExposureControls.from_dict(
+                    {
+                        "exposure_time_us": data["exposure_time_us"],
+                        "analogue_gain": data["analogue_gain"],
+                        "awb_gains": data["colour_gains"],
+                    },
+                    hostname,
+                )
+            except (KeyError, ValueError, TypeError) as exc:
+                results[hostname] = CalibrationResult(
+                    hostname=hostname, success=False, error=f"bad calibration from agent: {exc}"
+                )
+                return
+            results[hostname] = CalibrationResult(
+                hostname=hostname,
+                success=True,
+                controls=controls,
+                converged=bool(data.get("converged")),
+                spread=data.get("spread"),
+                filename=data.get("filename"),
+            )
+
+        threads = [threading.Thread(target=worker, args=(h,), daemon=True) for h in self.hosts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=warmup + 90)
+        return {h: results[h] for h in self.hosts if h in results} | {
+            h: CalibrationResult(hostname=h, success=False, error="calibration did not finish")
+            for h in self.hosts
+            if h not in results
+        }
+
+    def fetch_calibration_previews(
+        self, results: Dict[str, CalibrationResult], output_dir: Path
+    ) -> None:
+        """Download each calibration preview JPEG so the operator can eyeball it.
+
+        Sets ``local_preview`` on each result that was fetched. A failed fetch
+        is reported on stdout and does not fail calibration.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for res in results.values():
+            if not res.success or not res.filename:
+                continue
+            try:
+                client = self._connect(res.hostname)
+                sftp = client.open_sftp()
+                local = output_dir / f"{res.hostname}_{Path(res.filename).name}"
+                sftp.get(res.filename, str(local))
+                sftp.close()
+                client.close()
+                res.local_preview = local
+            except Exception as exc:
+                print(f"  [warn] Could not fetch preview from {res.hostname}: {exc}")
+
+    def log_exposure_settings(self) -> None:
+        """Record the exposure mode (and fixed values) for each host in the event log.
+
+        Called once at the start of a run so the log says what the frames
+        that follow were captured with.
+        """
+        if not self.exposure.locked:
+            logger.warning(
+                "pi_cameras: exposure and white balance are AUTOMATIC — frames will vary "
+                "with scene and camera start-up. See pi_cameras.exposure in the docs."
+            )
+            self.log_event("exposure_settings", level="WARNING", mode="auto")
+            return
+        for host in self.hosts:
+            c = self.exposure.controls_for(host)
+            self.log_event(
+                "exposure_settings",
+                host=host,
+                mode=self.exposure.mode,
+                exposure_time_us=c.exposure_time_us,
+                analogue_gain=c.analogue_gain,
+                awb_gains=",".join(f"{g:g}" for g in c.awb_gains),
+            )
 
     def connect(self) -> bool:
         """No persistent connection needed — SSH is opened per capture."""
@@ -306,6 +508,7 @@ class CameraArray(SubsystemLogging):
             "hosts": self.hosts,
             "ssh_user": self.ssh_user,
             "ssh_key": self.ssh_key,
+            "exposure_mode": self.exposure.mode,
         }
 
     def check_connectivity(self) -> Dict[str, bool]:
@@ -448,7 +651,17 @@ class CameraArray(SubsystemLogging):
                 sftp.close()
                 client.close()
                 local_paths[result.hostname] = local
-                self.log_event("capture", host=result.hostname, file=str(local))
+                self.log_event(
+                    "capture", host=result.hostname, file=str(local),
+                    **self._exposure_fields(result),
+                )
+                if result.exposure_warning:
+                    self.log_event(
+                        "exposure_mismatch", level="WARNING", host=result.hostname,
+                        file=str(local),
+                        # Notes are space-separated key=value pairs.
+                        detail=result.exposure_warning.replace(" ", "_"),
+                    )
             except Exception as exc:
                 print(f"  [warn] Could not fetch image from {result.hostname}: {exc}")
 
@@ -457,6 +670,20 @@ class CameraArray(SubsystemLogging):
             self.log_event("capture_partial_failure", level="WARNING", failed=failed)
 
         return local_paths
+
+    @staticmethod
+    def _exposure_fields(result: CaptureResult) -> Dict[str, Any]:
+        """Event-log fields describing how a frame was exposed (empty if unknown)."""
+        if result.exposure_time_us is None:
+            return {}
+        fields: Dict[str, Any] = {
+            "exposure_mode": result.exposure_mode,
+            "exposure_time_us": result.exposure_time_us,
+            "analogue_gain": result.analogue_gain,
+        }
+        if result.colour_gains:
+            fields["colour_gains"] = ",".join(f"{g:g}" for g in result.colour_gains)
+        return fields
 
     def report_simultaneity(self, results: List[CaptureResult]) -> dict:
         """Compute timing statistics and print a summary."""

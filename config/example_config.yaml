@@ -60,6 +60,18 @@ timing:
 #   # trigger_at: [60, 120, 180]   # capture at these specific runtime seconds
 #   # use_schedule: true            # fire at schedule CSV time_s rows;
 #   #                               # add a pi_cameras column (1/0) to filter which rows trigger
+#   # Exposure / white balance. Omit for the historical behaviour: libcamera's
+#   # AUTO exposure and white balance, restarted for every frame, so brightness and
+#   # colour drift through a run. To fix them (see docs/subsystems/camera.md):
+#   # exposure:
+#   #   mode: calibrated           # auto (default) | manual | calibrated
+#   #   calibration_file: ./pi_camera_calibration.json   # written by: laguna-picam calibrate
+#   #   warmup_s: 5                # AE/AWB warm-up used by calibrate
+#   #   # mode: manual instead takes fixed values, optionally per host:
+#   #   # exposure_time_us: 8000
+#   #   # analogue_gain: 2.0
+#   #   # awb_gains: [1.9, 1.6]    # [red, blue]
+#   #   # per_host: {pi2.local: {exposure_time_us: 12000}}
 
 # Reference frames: bring every instrument's data into one coordinate system,
 # and let you name a PLACE instead of a robot position. Omit entirely for
