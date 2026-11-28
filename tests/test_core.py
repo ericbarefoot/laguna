@@ -51,6 +51,38 @@ class TestFlumeLab:
         with pytest.raises(ValueError):
             lab.add(object())
 
+    def test_add_same_instance_twice_is_noop(self, lab):
+        sub = FakeSubsystem()
+        lab.add(sub).add(sub)
+        assert lab.fake is sub
+        assert list(lab._subsystems) == ["fake"]
+
+    def test_add_different_instance_under_taken_name_raises(self, lab):
+        first = FakeSubsystem()
+        lab.add(first)
+        with pytest.raises(ValueError, match="already registered"):
+            lab.add(FakeSubsystem())
+        assert lab.fake is first
+        assert lab._subsystems["fake"] is first
+
+    def test_add_registry_name_twice_does_not_rebuild(self, lab, monkeypatch):
+        from laguna.registry import SUBSYSTEM_REGISTRY
+
+        built = []
+
+        class _Builder(FakeSubsystem):
+            @classmethod
+            def from_config(cls, config):
+                built.append(1)
+                return cls()
+
+        monkeypatch.setitem(SUBSYSTEM_REGISTRY, "fake", _Builder)
+        lab.add("fake")
+        first = lab.fake
+        lab.add("fake")
+        assert len(built) == 1
+        assert lab.fake is first
+
     def test_getattr_returns_registered_subsystem(self, lab):
         sub = FakeSubsystem()
         lab.add(sub)
